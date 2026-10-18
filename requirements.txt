@@ -1,0 +1,12 @@
+PySide6>=6.6
+pyqtgraph>=0.13
+ccxt>=4.4
+pandas>=2.0
+numpy>=1.26
+pyarrow>=14
+keyring>=24
+python-dateutil>=2.8
+
+# dev / packaging
+pytest>=8
+pyinstaller>=6

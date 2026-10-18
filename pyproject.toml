@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bitrader"
+version = "0.1.0"
+description = "Binance desktop trading workstation with backtesting"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "biTrader" }]
+dependencies = [
+    "PySide6>=6.6",
+    "pyqtgraph>=0.13",
+    "ccxt>=4.4",
+    "pandas>=2.0",
+    "numpy>=1.26",
+    "pyarrow>=14",
+    "keyring>=24",
+    "python-dateutil>=2.8",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pyinstaller>=6"]
+build = ["pyinstaller>=6"]
+
+[project.scripts]
+bitrader = "btrader.__main__:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"

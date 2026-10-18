@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+*.spec.bak
+
+# Data / logs
+*.db
+*.log
+cache/
+.bitrader/
+
+# IDE
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
