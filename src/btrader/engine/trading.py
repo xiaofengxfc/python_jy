@@ -45,6 +45,8 @@ class OrderResult:
     order: dict
     mode: RunMode
     quote_notional: float
+    amount_base: float = 0.0
+    amount_exchange: float = 0.0
 
 
 class TradingService:
@@ -69,6 +71,38 @@ class TradingService:
             raise OrderRejected("价格无效，无法计算下单数量。")
         raw = quote / price
         return self.rest.amount_to_precision(market_type, symbol, raw)
+
+    def exchange_amount(
+        self, market_type: MarketType, symbol: str, base_qty: float, price: float
+    ) -> tuple[float, float]:
+        """Convert a base-coin quantity into the exchange's amount unit.
+
+        Returns ``(exchange_amount, base_qty)``. For inverse contracts the
+        exchange amount is a number of contracts (each worth ``contractSize``
+        USD), so the returned base quantity is the rounded value that the paper
+        account and the risk checks should use. Spot and linear markets keep
+        the base quantity itself as the exchange amount.
+
+        Raises ``OrderRejected`` when the rounded size falls below the market
+        minimum (e.g. less than one contract on coin-M).
+        """
+        spec = self.rest.contract_spec(market_type, symbol)
+        raw = spec.base_to_contracts(base_qty, price)
+        if raw <= 0:
+            raise OrderRejected("数量无效，无法计算下单量。")
+        if spec.min_amount > 0 and raw < spec.min_amount - 1e-12:
+            raise OrderRejected(
+                f"下单量 {format_amount(raw)} 低于最小下单量 "
+                f"{format_amount(spec.min_amount)}。（{spec.describe()}）"
+            )
+        exchange_amount = self.rest.amount_to_precision(market_type, symbol, raw)
+        if exchange_amount <= 0:
+            raise OrderRejected(
+                f"下单量 {format_amount(raw)} 无法满足交易所的最小下单单位。"
+                f"（{spec.describe()}）"
+            )
+        rounded_base = spec.contracts_to_base(exchange_amount, price)
+        return exchange_amount, rounded_base
 
     def estimate_cost(self, amount: float, price: float) -> float:
         return abs(amount) * price
@@ -98,21 +132,25 @@ class TradingService:
         """Best-effort current exposure used by the position limit.
 
         Paper mode is exact; live mode queries the exchange and falls back to 0
-        (i.e. only the new order is checked) if the query fails.
+        (i.e. only the new order is checked) if the query fails. Coin-margined
+        positions are reported in contracts, so they go through the contract
+        spec to produce a USD notional.
         """
         if req.mode is RunMode.PAPER:
-            return self.paper.position_quote(req.symbol, price)
+            held = self.paper.account.positions.get(req.symbol)
+            return abs(held.contracts) * price if held and held.contracts else 0.0
         if not self.rest.has_credentials:
             return 0.0
         try:
             positions = self.rest.fetch_positions(req.market_type, [req.symbol])
         except Exception:
             return 0.0
+        spec = self.rest.contract_spec(req.market_type, req.symbol)
         total = 0.0
         for position in positions:
             contracts = float(position.get("contracts") or 0)
             mark = float(position.get("markPrice") or price or 0)
-            total += abs(contracts) * mark
+            total += spec.notional(contracts, mark)
         return total
 
     # ------------------------------------------------------------------ submit
@@ -124,9 +162,16 @@ class TradingService:
         if req.order_type == OrderType.MARKET.value and price <= 0:
             raise OrderRejected("市价单需要最新成交价作为参考。")
 
-        amount = self.rest.amount_to_precision(req.market_type, req.symbol, req.amount)
-        if amount <= 0:
-            raise OrderRejected("数量精度处理后为 0，请增加下单数量。")
+        # Callers always express size in base coins; convert it to whatever the
+        # exchange expects (coins for spot/linear, contracts for coin-M).
+        exchange_amount, base_qty = self.exchange_amount(
+            req.market_type, req.symbol, req.amount, price
+        )
+        if exchange_amount <= 0:
+            spec = self.rest.contract_spec(req.market_type, req.symbol)
+            raise OrderRejected(
+                f"数量精度处理后为 0，请增加下单数量。（{spec.describe()}）"
+            )
 
         if (
             req.market_type is MarketType.SPOT
@@ -135,9 +180,9 @@ class TradingService:
         ):
             held = self.paper.account.positions.get(req.symbol)
             available = held.contracts if held else 0.0
-            if amount > available + 1e-12:
+            if base_qty > available + 1e-12:
                 raise OrderRejected(
-                    f"现货不能做空：当前持有 {format_amount(available)}，无法卖出 {format_amount(amount)}。"
+                    f"现货不能做空：当前持有 {format_amount(available)}，无法卖出 {format_amount(base_qty)}。"
                     "如需做空请切换到合约市场。"
                 )
 
@@ -146,7 +191,7 @@ class TradingService:
                 symbol=req.symbol,
                 side=req.side,
                 order_type=req.order_type,
-                amount=amount,
+                amount=base_qty,
                 price=price,
                 reduce_only=req.reduce_only,
                 leverage=req.leverage,
@@ -162,19 +207,19 @@ class TradingService:
                 symbol=req.symbol,
                 side=req.side,
                 order_type=req.order_type,
-                amount=amount,
+                amount=base_qty,
                 price=price,
                 reduce_only=req.reduce_only,
                 allow_short=req.market_type.is_futures,
             )
-            quote = abs(amount) * price
+            quote = abs(base_qty) * price
             self.risk.record_order()
             self.db.save_order("paper", req.market_type.value, order, req.mode.value)
             log.info(
                 "纸面下单 %s %s %s %s @ %s",
-                req.symbol, req.side, format_amount(amount), req.order_type, price,
+                req.symbol, req.side, format_amount(base_qty), req.order_type, price,
             )
-            return OrderResult(order, req.mode, quote)
+            return OrderResult(order, req.mode, quote, base_qty, exchange_amount)
 
         if self.network is Network.MAINNET and not self.rest.has_credentials:
             raise OrderRejected("实盘下单需要先配置 API Key。")
@@ -184,7 +229,7 @@ class TradingService:
             params["reduceOnly"] = True
         if req.order_type == OrderType.MARKET.value:
             order = self.rest.create_order(
-                req.market_type, req.symbol, "market", req.side, amount, None, params
+                req.market_type, req.symbol, "market", req.side, exchange_amount, None, params
             )
         else:
             order = self.rest.create_order(
@@ -192,19 +237,19 @@ class TradingService:
                 req.symbol,
                 "limit",
                 req.side,
-                amount,
+                exchange_amount,
                 self.rest.price_to_precision(req.market_type, req.symbol, price),
                 params,
             )
-        quote = abs(amount) * price
+        quote = abs(base_qty) * price
         self.risk.record_order()
         self.db.save_order(self._account_id(), req.market_type.value, order, req.mode.value)
         log.info(
             "实盘下单 %s %s %s %s @ %s -> %s",
-            req.symbol, req.side, format_amount(amount), req.order_type, price,
+            req.symbol, req.side, format_amount(base_qty), req.order_type, price,
             order.get("id"),
         )
-        return OrderResult(order, req.mode, quote)
+        return OrderResult(order, req.mode, quote, base_qty, exchange_amount)
 
     # ------------------------------------------------------------------ cancel
     def cancel(self, market_type: MarketType, symbol: str, order_id: str, mode: RunMode) -> None:

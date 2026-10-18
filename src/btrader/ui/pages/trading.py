@@ -50,6 +50,7 @@ class TradingPage(QWidget):
         self.runner = TaskRunner(self, max_threads=3)
         self._symbols: list[str] = []
         self._ticker: Ticker | None = None
+        self._spec = None  # ContractSpec for the selected symbol
         self._df = pd.DataFrame()
         self._loading = False
 
@@ -238,6 +239,11 @@ class TradingPage(QWidget):
         self.estimate_label.setObjectName("Muted")
         card.body().addWidget(self.estimate_label)
 
+        self.unit_hint = QLabel("")
+        self.unit_hint.setObjectName("Muted")
+        self.unit_hint.setWordWrap(True)
+        card.body().addWidget(self.unit_hint)
+
         buttons = QHBoxLayout()
         self.buy_btn = QPushButton("买入 / 做多")
         self.buy_btn.setObjectName("Buy")
@@ -266,11 +272,36 @@ class TradingPage(QWidget):
 
     def _build_bottom_tabs(self) -> QWidget:
         self.bottom_tabs = QTabWidget()
+
+        open_page = QWidget()
+        open_layout = QVBoxLayout(open_page)
+        open_layout.setContentsMargins(0, 0, 0, 0)
+        open_layout.setSpacing(4)
+        open_bar = QHBoxLayout()
+        open_bar.addStretch(1)
+        self.cancel_btn = QPushButton("撤销选中委托")
+        self.cancel_btn.setObjectName("Flat")
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.clicked.connect(self._cancel_selected_order)
+        open_bar.addWidget(self.cancel_btn)
+        open_layout.addLayout(open_bar)
+        self.open_orders_table = DataTable(
+            ["时间", "交易对", "方向", "类型", "价格", "数量", "已成交", "状态", "ID"]
+        )
+        self.open_orders_table.setColumnHidden(8, True)
+        self.open_orders_table.itemSelectionChanged.connect(
+            lambda: self.cancel_btn.setEnabled(self.open_orders_table.currentRow() >= 0)
+        )
+        open_layout.addWidget(self.open_orders_table, 1)
+        self._open_orders_page = open_page
+        self.bottom_tabs.addTab(open_page, "当前委托")
+
         self.orders_table = DataTable(["时间", "交易对", "方向", "类型", "价格", "数量", "状态"])
         self.trades_table = DataTable(["时间", "交易对", "方向", "价格", "数量", "手续费"])
-        self.bottom_tabs.addTab(self.orders_table, "当前委托 / 历史")
+        self.bottom_tabs.addTab(self.orders_table, "历史委托")
         self.bottom_tabs.addTab(self.trades_table, "成交记录")
-        self.bottom_tabs.setFixedHeight(180)
+        self.bottom_tabs.setFixedHeight(200)
+        self._open_orders: list[dict] = []
         return self.bottom_tabs
 
     # ------------------------------------------------------------- data loads
@@ -359,7 +390,7 @@ class TradingPage(QWidget):
     def _refresh_book(self) -> None:
         market = self._market()
         symbol = self.current_symbol()
-        if not symbol or self.bottom_tabs.currentIndex() == 1:
+        if not symbol or self.bottom_tabs.currentIndex() == 2:
             return
 
         def fetch():
@@ -370,6 +401,8 @@ class TradingPage(QWidget):
     def _apply_ticker(self, symbol: str, raw: dict) -> None:
         ticker = ticker_from_ccxt(symbol, raw)
         self._ticker = ticker
+        # Paper limit orders rest until the live price crosses them.
+        self._fill_paper_limits(symbol, ticker.last)
         self.price_label.setText(f"{ticker.last:,.4f}")
         self.change_label.setText(f"{ticker.change_pct:+.2f}%")
         color = UP if ticker.change_pct >= 0 else DOWN
@@ -394,6 +427,26 @@ class TradingPage(QWidget):
             pct = spread / book.best_bid * 100
             self.book_spread.setText(f"价差 {spread:.4f} ({pct:.3f}%)")
 
+    def _fill_paper_limits(self, symbol: str, price: float) -> None:
+        """Fill resting paper limit orders when the live price crosses them."""
+        if not price or price <= 0:
+            return
+        mode = self.mode_combo.currentData()
+        if mode != RunMode.PAPER.value:
+            return
+        filled = self.ctx.paper.try_fill(symbol, price, price)
+        if not filled:
+            return
+        market = self._market()
+        for order in filled:
+            self.ctx.db.save_order("paper", market.value, order, RunMode.PAPER.value)
+            self.status.emit(
+                f"限价委托成交：{symbol} {format_amount(float(order.get('amount') or 0))} "
+                f"@ {float(order.get('average') or 0):,.4f}"
+            )
+        self._refresh_orders()
+        self._refresh_trades()
+
     # ----------------------------------------------------------------- events
     def current_symbol(self) -> str:
         return self.symbol_combo.currentText().strip()
@@ -404,6 +457,7 @@ class TradingPage(QWidget):
     def _on_market_changed(self) -> None:
         market = self._market()
         self.ctx.set_market_type(market)
+        self._spec = None  # contract size differs per market
         self._set_futures_controls()
         self._load_symbols()
 
@@ -413,9 +467,38 @@ class TradingPage(QWidget):
             return
         self.ctx.settings.last_symbol = symbol
         self.ctx.save_settings()
+        self._load_contract_spec()
         self._load_klines(reset_zoom=True)
         self._refresh_live()
         self._refresh_book()
+
+    def _load_contract_spec(self) -> None:
+        """Fetch how many coins one contract represents (coin-M only, cheap)."""
+        symbol = self.current_symbol()
+        market = self._market()
+        self._spec = None
+        if not symbol:
+            return
+        rest = self.ctx.rest_for(market)
+
+        def fetch():
+            return rest.contract_spec(market, symbol)
+
+        def done(spec) -> None:
+            self._spec = spec
+            self._update_estimate()
+
+        self.runner.run(fetch, done, lambda _m: None)
+
+    def _unit_hint_text(self, spec) -> str:
+        if spec is None:
+            return ""
+        if spec.is_inverse:
+            return (
+                f"币本位合约：{spec.describe()}。"
+                "数量按币填写，下单时会自动换算成张数（不足 1 张会被拒绝）。"
+            )
+        return ""
 
     def _on_timeframe_changed(self, timeframe: str) -> None:
         self.ctx.settings.timeframe = timeframe
@@ -461,9 +544,16 @@ class TradingPage(QWidget):
             amount = self.amount_spin.value()
             quote = amount * price
         leverage = self.leverage_spin.value() if self._market().is_futures else 1.0
-        self.estimate_label.setText(
-            f"预计：{quote:,.2f} USDT  |  数量 {format_amount(amount)}  |  杠杆 {leverage:g}x"
-        )
+        text = f"预计：{quote:,.2f} USDT  |  数量 {format_amount(amount)}  |  杠杆 {leverage:g}x"
+        spec = self._spec
+        if spec is not None and spec.is_inverse and price > 0 and amount > 0:
+            contracts = spec.base_to_contracts(amount, price)
+            text = (
+                f"预计：{quote:,.2f} USDT  |  {format_amount(amount)} {spec.base} "
+                f"≈ {format_amount(contracts)} 张  |  杠杆 {leverage:g}x"
+            )
+        self.estimate_label.setText(text)
+        self.unit_hint.setText(self._unit_hint_text(spec))
 
     # --------------------------------------------------------------- ordering
     def _submit_order(self, side: str) -> None:
@@ -546,10 +636,10 @@ class TradingPage(QWidget):
 
     def _refresh_orders(self) -> None:
         rows = self.ctx.db.recent_orders(100)
+        from datetime import datetime
+
         self.orders_table.setRowCount(0)
         for row, record in enumerate(rows):
-            from datetime import datetime
-
             ts = datetime.fromtimestamp((record["created_at"] or 0) / 1000)
             self.orders_table.set_row(
                 row,
@@ -563,6 +653,90 @@ class TradingPage(QWidget):
                     record["status"] or "",
                 ],
             )
+        self._refresh_open_orders()
+
+    def _refresh_open_orders(self) -> None:
+        """List resting orders: paper orders live in memory, live orders on Binance."""
+        mode = RunMode(self.mode_combo.currentData())
+        market = self._market()
+        if mode is RunMode.PAPER:
+            open_orders = [
+                dict(order)
+                for order in self.ctx.paper.account.orders
+                if order.get("status") == "open"
+            ]
+            self._apply_open_orders(list(reversed(open_orders)))
+            return
+        if not self.ctx.rest.has_credentials:
+            self._apply_open_orders([])
+            return
+        rest = self.ctx.rest_for(market)
+
+        def fetch():
+            return rest.fetch_open_orders(market)
+
+        self.runner.run(fetch, self._apply_open_orders, lambda _m: self._apply_open_orders([]))
+
+    def _apply_open_orders(self, orders: list[dict]) -> None:
+        from datetime import datetime
+
+        self._open_orders = list(orders)
+        self.open_orders_table.setRowCount(0)
+        for row, order in enumerate(self._open_orders):
+            ts = datetime.fromtimestamp((order.get("timestamp") or 0) / 1000)
+            self.open_orders_table.set_row(
+                row,
+                [
+                    ts.strftime("%m-%d %H:%M:%S"),
+                    order.get("symbol", ""),
+                    "买入" if order.get("side") == "buy" else "卖出",
+                    "市价" if order.get("type") == "market" else "限价",
+                    f"{float(order.get('price') or 0):,.4f}",
+                    format_amount(float(order.get("amount") or 0)),
+                    format_amount(float(order.get("filled") or 0)),
+                    order.get("status") or "",
+                    str(order.get("id") or ""),
+                ],
+            )
+        self.cancel_btn.setEnabled(False)
+        index = self.bottom_tabs.indexOf(self._open_orders_page)
+        if index >= 0:
+            self.bottom_tabs.setTabText(index, f"当前委托 ({len(self._open_orders)})")
+
+    def _cancel_selected_order(self) -> None:
+        row = self.open_orders_table.currentRow()
+        if row < 0 or row >= len(self._open_orders):
+            return
+        order = self._open_orders[row]
+        order_id = str(order.get("id") or "")
+        symbol = order.get("symbol") or self.current_symbol()
+        if not order_id:
+            return
+        mode = RunMode(self.mode_combo.currentData())
+        market = self._market()
+        if not QMessageBox.question(
+            self,
+            "撤销委托",
+            f"确认撤销 {symbol} 的委托 {order_id}？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) == QMessageBox.StandardButton.Yes:
+            return
+        self.cancel_btn.setEnabled(False)
+
+        def cancel():
+            self.ctx.trading.cancel(market, symbol, order_id, mode)
+            return True
+
+        def done(_ok) -> None:
+            self.status.emit(f"已撤销委托 {order_id}")
+            self._refresh_orders()
+
+        def failed(message: str) -> None:
+            self.cancel_btn.setEnabled(True)
+            self._show_error(message)
+
+        self.runner.run(cancel, done, failed)
 
     def _refresh_trades(self) -> None:
         mode = RunMode(self.mode_combo.currentData())

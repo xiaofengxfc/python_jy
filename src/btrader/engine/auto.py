@@ -151,7 +151,17 @@ class AutoTrader(QObject):
         else:
             try:
                 balance = self.trading.rest.fetch_balance(self.config.market_type)
-                self._equity = float(balance.get("total", {}).get("USDT") or 0.0)
+                totals = balance.get("total") or {}
+                spec = self.trading.rest.contract_spec(
+                    self.config.market_type, self.config.symbol
+                )
+                if self.config.market_type is MarketType.COINM:
+                    # Coin-M wallets hold the margin coin (BTC for BTCUSD), so the
+                    # wallet balance has to be marked to USD before sizing.
+                    asset = spec.settle or spec.base or "BTC"
+                    self._equity = float(totals.get(asset) or 0.0) * price
+                else:
+                    self._equity = float(totals.get("USDT") or 0.0)
             except Exception:
                 pass
 
@@ -159,13 +169,15 @@ class AutoTrader(QObject):
         if price <= 0:
             return
         notional = self._equity * self.config.position_pct * self.config.leverage
+        # ``desired_qty`` is always expressed in base coins; TradingService
+        # converts it to contracts for coin-margined markets.
         desired_qty = target * notional / price
 
         if self.config.mode is RunMode.PAPER:
             position = self.trading.paper.account.positions.get(self.config.symbol)
             current_qty = position.contracts if position else 0.0
         else:
-            current_qty = self._live_position_qty()
+            current_qty = self._live_position_qty(price)
 
         delta = desired_qty - current_qty
         if abs(delta) * price < 10.0:  # ignore dust
@@ -200,7 +212,11 @@ class AutoTrader(QObject):
             f"(目标仓位 {target:+.0%}) → {result.order.get('status', '')}",
         )
 
-    def _live_position_qty(self) -> float:
+    def _live_position_qty(self, price: float) -> float:
+        """Current live position expressed in base coins."""
+        spec = self.trading.rest.contract_spec(self.config.market_type, self.config.symbol)
+        if self.config.market_type is MarketType.SPOT:
+            return self._live_spot_balance(spec)
         try:
             positions = self.trading.rest.fetch_positions(
                 self.config.market_type, [self.config.symbol]
@@ -212,5 +228,14 @@ class AutoTrader(QObject):
             contracts = float(position.get("contracts") or 0)
             if position.get("side") == "short":
                 contracts = -contracts
-            total += contracts
+            mark = float(position.get("markPrice") or price or 0)
+            total += spec.contracts_to_base(contracts, mark)
         return total
+
+    def _live_spot_balance(self, spec) -> float:
+        try:
+            balance = self.trading.rest.fetch_balance(self.config.market_type)
+        except Exception:
+            return 0.0
+        asset = spec.base or self.config.symbol.split("/")[0]
+        return float((balance.get("total") or {}).get(asset) or 0.0)

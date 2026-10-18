@@ -9,6 +9,7 @@ from typing import Any
 
 import ccxt
 
+from ..core.contracts import DEFAULT_SPEC, ContractSpec
 from ..core.credentials import Credentials
 from ..core.types import MarketType, Network
 
@@ -26,6 +27,7 @@ class BinanceREST:
         self.network = network
         self.credentials = credentials or Credentials()
         self._clients: dict[MarketType, ccxt.Exchange] = {}
+        self._specs: dict[tuple[MarketType, str], ContractSpec] = {}
         self._lock = threading.RLock()
 
     # --------------------------------------------------------------- clients
@@ -58,6 +60,34 @@ class BinanceREST:
     def reset(self) -> None:
         with self._lock:
             self._clients.clear()
+            self._specs.clear()
+
+    def contract_spec(self, market: MarketType, symbol: str) -> ContractSpec:
+        """Contract size / minimum amount for a symbol, cached after first use."""
+        key = (market, symbol)
+        with self._lock:
+            cached = self._specs.get(key)
+            if cached is not None:
+                return cached
+        spec = DEFAULT_SPEC
+        try:
+            client = self.client(market)
+            client.load_markets()
+            raw = client.market(symbol) or {}
+            limits = (raw.get("limits") or {}).get("amount") or {}
+            spec = ContractSpec(
+                contract_size=float(raw.get("contractSize") or 1.0),
+                inverse=bool(raw.get("inverse", False)),
+                base=raw.get("base") or "",
+                quote=raw.get("quote") or "",
+                settle=raw.get("settle") or "",
+                min_amount=float(limits.get("min") or 0.0),
+            )
+        except Exception as exc:
+            log.debug("无法读取 %s 的合约规格: %s", symbol, exc)
+        with self._lock:
+            self._specs[key] = spec
+        return spec
 
     @property
     def has_credentials(self) -> bool:
@@ -180,8 +210,12 @@ class BinanceREST:
         try:
             client.load_markets()
             return float(client.amount_to_precision(symbol, amount))
-        except Exception:
-            return float(amount)
+        except Exception as exc:
+            # ccxt rejects amounts below the market minimum. Return 0 so the
+            # caller refuses the order instead of sending an unrounded (and
+            # potentially far too large) quantity to the exchange.
+            log.debug("数量精度处理失败 %s %s: %s", symbol, amount, exc)
+            return 0.0
 
     def price_to_precision(self, market_type: MarketType, symbol: str, price: float) -> float:
         client = self.client(market_type)

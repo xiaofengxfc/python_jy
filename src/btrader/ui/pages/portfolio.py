@@ -3,23 +3,20 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QTimer, Signal
 from PySide6.QtWidgets import (
-    QGridLayout,
     QHBoxLayout,
     QLabel,
-    QMessageBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
 from ...context import AppContext
-from ...core.types import MarketType, RunMode
+from ...core.types import MarketType
 from ...exchange.symbols import format_amount
-from ..theme import DOWN, TEXT_DIM, UP
+from ..theme import DOWN, UP
 from ..widgets.common import Card, MetricCard, money_text, pnl_color
 from ..widgets.tables import DataTable
 from ..workers import TaskRunner
@@ -109,6 +106,8 @@ class PortfolioPage(QWidget):
             self.mode_label.setText("未配置 API Key，仅显示纸面数据")
             self.positions_table.setRowCount(0)
             self.balances_table.setRowCount(0)
+            self.equity_card.set_title("总权益 (USDT)")
+            self.available_card.set_title("可用余额")
             self.equity_card.set_value("--")
             self.available_card.set_value("--")
             self.pnl_card.set_value("--")
@@ -120,7 +119,16 @@ class PortfolioPage(QWidget):
         def fetch():
             balance = rest.fetch_balance(market)
             positions = rest.fetch_positions(market) if market.is_futures else []
-            return balance, positions
+            specs = {}
+            for position in positions:
+                symbol = position.get("symbol") or ""
+                if symbol:
+                    specs[symbol] = rest.contract_spec(market, symbol)
+            settle = ""
+            if market is MarketType.COINM:
+                coin_spec = rest.contract_spec(market, self.ctx.settings.last_symbol)
+                settle = coin_spec.settle or coin_spec.base or "BTC"
+            return balance, positions, specs, settle
 
         self.runner.run(fetch, self._apply_account, self._show_error)
 
@@ -171,10 +179,12 @@ class PortfolioPage(QWidget):
         self._refresh_paper()
 
     def _apply_account(self, payload) -> None:
-        balance, positions = payload
-        total = float(balance.get("total", {}).get("USDT") or 0)
-        free = float(balance.get("free", {}).get("USDT") or 0)
-        used = float(balance.get("used", {}).get("USDT") or 0)
+        balance, positions, specs, settle_asset = payload
+        market = self.ctx.market_type
+        totals = balance.get("total") or {}
+        frees = balance.get("free") or {}
+        total = float(totals.get("USDT") or 0)
+        free = float(frees.get("USDT") or 0)
         unrealized = 0.0
 
         self.positions_table.setRowCount(0)
@@ -186,14 +196,24 @@ class PortfolioPage(QWidget):
             pnl = float(position.get("unrealizedPnl") or 0)
             unrealized += pnl
             side = "多" if (position.get("side") or "long") == "long" else "空"
+            mark = float(position.get("markPrice") or 0)
+            p_spec = specs.get(position.get("symbol", ""))
+            if p_spec is not None and p_spec.is_inverse and mark > 0:
+                # Binance reports coin-M sizes in contracts; show both units.
+                qty = (
+                    f"{format_amount(abs(contracts))} 张"
+                    f" ({format_amount(p_spec.contracts_to_base(abs(contracts), mark))} {p_spec.base})"
+                )
+            else:
+                qty = format_amount(abs(contracts))
             self.positions_table.set_row(
                 row,
                 [
                     position.get("symbol", ""),
                     side,
-                    format_amount(abs(contracts)),
+                    qty,
                     f"{float(position.get('entryPrice') or 0):,.4f}",
-                    f"{float(position.get('markPrice') or 0):,.4f}",
+                    f"{mark:,.4f}",
                     f"{pnl:+,.2f}",
                     f"{float(position.get('leverage') or 1):g}x",
                     f"{float(position.get('liquidationPrice') or 0):,.4f}",
@@ -202,8 +222,22 @@ class PortfolioPage(QWidget):
             )
             row += 1
 
-        self.equity_card.set_value(money_text(total))
-        self.available_card.set_value(money_text(free))
+        if market is MarketType.COINM:
+            # Coin-M wallets hold the margin coin, not USDT.
+            asset = settle_asset or "BTC"
+            coin_total = float(totals.get(asset) or 0)
+            coin_free = float(frees.get(asset) or 0)
+            self.equity_card.set_title(f"总权益 ({asset})")
+            self.available_card.set_title(f"可用 ({asset})")
+            self.equity_card.set_value(
+                format_amount(coin_total), f"未实现 {unrealized:+,.2f} USDT"
+            )
+            self.available_card.set_value(format_amount(coin_free))
+        else:
+            self.equity_card.set_title("总权益 (USDT)")
+            self.available_card.set_title("可用余额")
+            self.equity_card.set_value(money_text(total))
+            self.available_card.set_value(money_text(free))
         self.pnl_card.set_value(f"{unrealized:+,.2f}", pnl_color(unrealized))
         self.realized_card.set_value("--")
 

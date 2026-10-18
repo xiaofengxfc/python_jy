@@ -60,3 +60,37 @@ def test_theme_stylesheet_contains_tokens(app):
 
     assert theme.ACCENT in theme.STYLESHEET
     assert "#f0b90b" in theme.STYLESHEET
+
+
+def test_paper_limit_order_fills_when_price_crosses(app, ctx):
+    """A resting paper limit order fills on the next ticker that crosses it."""
+    from btrader.core.types import MarketType, RunMode
+    from btrader.engine.trading import OrderRequest
+
+    window = MainWindow(ctx)
+    page = window.trading_page
+    assert page.mode_combo.currentData() == RunMode.PAPER.value
+
+    ctx.trading.submit(
+        OrderRequest(
+            symbol="BTC/USDT",
+            side="buy",
+            order_type="limit",
+            amount=0.01,
+            price=500.0,
+            market_type=MarketType.SPOT,
+            mode=RunMode.PAPER,
+        )
+    )
+    page._refresh_orders()
+    assert page.open_orders_table.rowCount() == 1
+
+    # Price still above the limit: the order must keep resting.
+    page._apply_ticker("BTC/USDT", {"last": 600.0, "high": 620.0, "low": 590.0})
+    assert page.open_orders_table.rowCount() == 1
+
+    # Price crosses the limit: the order fills at the limit price.
+    page._apply_ticker("BTC/USDT", {"last": 400.0, "high": 610.0, "low": 390.0})
+    assert page.open_orders_table.rowCount() == 0
+    assert ctx.paper.account.position_for("BTC/USDT").contracts == pytest.approx(0.01)
+    window.close()

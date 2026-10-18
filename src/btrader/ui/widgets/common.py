@@ -50,6 +50,9 @@ class MetricCard(Card):
         else:
             self.value.setStyleSheet("")
 
+    def set_title(self, text: str) -> None:
+        self.label.setText(text)
+
 
 def pnl_color(value: float) -> str:
     if value > 0:

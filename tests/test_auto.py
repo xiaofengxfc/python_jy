@@ -42,8 +42,22 @@ class StubKlines:
 
 
 class StubREST(BinanceREST):
+    """Offline REST double: fixed contract specs, integer contract rounding."""
+
     def amount_to_precision(self, market_type, symbol, amount):
+        spec = self.contract_spec(market_type, symbol)
+        if spec.inverse:
+            return float(int(amount))  # Binance coin-M trades whole contracts
         return float(amount)
+
+    def contract_spec(self, market_type, symbol):
+        from btrader.core.contracts import ContractSpec
+
+        if market_type is MarketType.COINM:
+            return ContractSpec(
+                contract_size=100.0, inverse=True, base="BTC", quote="USD", settle="BTC"
+            )
+        return ContractSpec(contract_size=1.0, inverse=False, base="BTC", quote="USDT")
 
 
 @pytest.fixture
