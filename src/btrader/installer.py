@@ -855,6 +855,12 @@ def _channels_status_json(exe: str, channel: str) -> dict | None:
     if payload is None:
         return None
     channels = payload.get("channels")
+    if channels is None:
+        # A gateway that is still booting answers with an error envelope that
+        # may still parse as JSON. Treating that as "no channel" made a bound,
+        # working account flip to 未注册插件 for a page refresh; fall back to
+        # the local inventory instead.
+        return None
     entry: dict = {}
     if isinstance(channels, dict):
         candidate = channels.get(channel)
@@ -867,8 +873,11 @@ def _channels_status_json(exe: str, channel: str) -> dict | None:
                 break
     if not entry:
         # The channel is known to the gateway only when it appears at all; an
-        # absent entry is still authoritative ("not installed").
-        order = payload.get("channelOrder") or []
+        # absent entry is authoritative only when the payload actually carries
+        # an ordering, otherwise the shape is not one we can read.
+        order = payload.get("channelOrder")
+        if not isinstance(order, list):
+            return None
         if channel in order:
             return {"plugin": True, "configured": False, "running": False}
         return {"plugin": False, "configured": False, "running": False}

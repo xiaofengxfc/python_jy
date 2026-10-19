@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import io
 import os
+import threading
 import time
 
 import pytest
@@ -388,10 +389,25 @@ def test_a_pending_login_is_reused_not_restarted(fake_env, monkeypatch) -> None:
     fake_env["which"]["openclaw"] = "/usr/local/bin/openclaw"
     spawned = []
 
+    class PendingStream:
+        """Keeps the pipe open the way a wizard waiting for a scan does.
+
+        An empty stream ends immediately, which the worker correctly reports as
+        "done" — that fake cannot represent a pending code, so the reuse path
+        was never exercised.
+        """
+
+        def __iter__(self):
+            yield "正在等待操作...\n"
+            threading.Event().wait(5)
+
+        def close(self) -> None:
+            pass
+
     class BlockingProcess(FakeProcess):
         def __init__(self) -> None:
             super().__init__(["正在等待操作..."])
-            self.stdout = io.StringIO("")
+            self.stdout = PendingStream()
 
     def popen(*args, **kwargs):
         spawned.append(args)
@@ -451,7 +467,7 @@ def test_qr_svg_encodes_the_captured_link(fake_env, monkeypatch) -> None:
     )
     installer = OpenClawInstaller()
     login = installer.start_login()
-    assert login["state"] == "waiting"
+    assert login["state"] == "waiting", login["error"]
     # The reader thread fills the link in; the image can only be built after.
     deadline = time.time() + 5
     while time.time() < deadline and not installer.login_status()["has_qr"]:

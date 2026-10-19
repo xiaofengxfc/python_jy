@@ -50,6 +50,46 @@ def test_disabled_notifier_queues_nothing() -> None:
     assert notifier.status()["pending"] == 0
 
 
+def test_default_timeout_outlasts_a_real_send() -> None:
+    """A real ``message send`` takes ~30 s: Node start plus a gateway trip.
+
+    The old 20 s deadline fired first on every single send, so the notifier
+    reported a timeout while the message actually reached WeChat — which is
+    exactly what "扫码登录成功但无法通知" looked like from the page.
+    """
+    notifier = WeChatNotifier(NotifySettings(enabled=True, target="wxid-123"))
+    assert notifier.timeout >= 60.0
+
+
+def test_empty_target_falls_back_to_the_bound_account(captured, monkeypatch) -> None:
+    """A completed scan already knows where to deliver, so nothing to type.
+
+    The plugin stores the scanning account's WeChat id; with exactly one bound
+    account that id is the recipient. Requiring the user to copy it by hand was
+    the reason notifications stayed silent right after a successful login.
+    """
+    monkeypatch.setattr(
+        "btrader.notify._bound_wechat_target",
+        lambda: {"target": "abc@im.wechat", "account": "acc-1", "source": "account"},
+    )
+    notifier = WeChatNotifier(NotifySettings(enabled=True, target=""), timeout=1.0)
+    notifier.send_now("hello")
+    args = captured["args"]
+    assert args[args.index("--target") + 1] == "abc@im.wechat"
+    # The account travels with it: a send without ``--account`` fails once the
+    # gateway has more than one binding.
+    assert args[args.index("--account") + 1] == "acc-1"
+
+
+def test_ambiguous_bindings_still_refuse_an_empty_target(captured, monkeypatch) -> None:
+    """Two accounts means no safe default; guessing could deliver elsewhere."""
+    monkeypatch.setattr("btrader.notify._bound_wechat_target", lambda: None)
+    notifier = WeChatNotifier(NotifySettings(enabled=True, target=""), timeout=1.0)
+    with pytest.raises(NotifyError):
+        notifier.send_now("hello")
+    assert "args" not in captured
+
+
 def test_events_can_be_switched_off_individually() -> None:
     notifier = _notifier(on_fill=False)
     try:
@@ -65,7 +105,11 @@ def test_empty_message_is_ignored() -> None:
     assert _notifier().notify("   ") is False
 
 
-def test_send_now_requires_a_target() -> None:
+def test_send_now_requires_a_target(monkeypatch) -> None:
+    # Pin "nothing is bound": without this the test would read the real
+    # ``~/.openclaw`` state and pass or fail depending on the developer's own
+    # WeChat binding.
+    monkeypatch.setattr("btrader.notify._bound_wechat_target", lambda: None)
     notifier = WeChatNotifier(NotifySettings(enabled=True, target=""))
     with pytest.raises(NotifyError, match="接收目标"):
         notifier.send_now("hello")

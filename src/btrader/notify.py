@@ -99,7 +99,11 @@ class WeChatNotifier:
         self,
         settings: NotifySettings,
         *,
-        timeout: float = 20.0,
+        # A single ``message send`` is a full Node start plus a gateway round
+        # trip; measured at ~30 s on a warm machine. The old 20 s deadline
+        # fired first every time, so every notification "failed" while the
+        # message actually went through.
+        timeout: float = 90.0,
         queue_size: int = 50,
     ) -> None:
         self.settings = settings
@@ -155,7 +159,7 @@ class WeChatNotifier:
         text = _prepare(text)
         if not text:
             raise NotifyError("消息内容为空")
-        if not normalize_target(self.settings.target):
+        if not self._resolve_target()[0]:
             raise NotifyError("尚未填写微信接收目标，无法发送。")
         try:
             return self._run(text)
@@ -214,7 +218,7 @@ class WeChatNotifier:
             if not job.text:
                 continue
             try:
-                if not normalize_target(self.settings.target):
+                if not self._resolve_target()[0]:
                     # Enqueued while a target was set, target cleared before we
                     # got here. Retrying would only repeat the same refusal.
                     continue
@@ -254,6 +258,24 @@ class WeChatNotifier:
             pass
         return None
 
+    def _resolve_target(self) -> tuple[str, str]:
+        """The recipient and account to send to.
+
+        An empty target falls back to the one bound WeChat account. The QR scan
+        writes the scanner's own WeChat id into the plugin's account file, and
+        that id is exactly what ``--target`` expects — requiring the user to
+        copy it out of a log is why "已经扫码登录但仍然发不出去" happened.
+        Ambiguous bindings (two accounts) still refuse, rather than guessing.
+        """
+        target = normalize_target(self.settings.target)
+        account = str(self.settings.account or "").strip()
+        if target:
+            return target, account
+        bound = _bound_wechat_target()
+        if bound is None:
+            return "", account
+        return bound["target"], account or bound["account"]
+
     def _run(self, text: str, *, from_queue: bool = False) -> dict:
         command = self._resolve_command()
         if not command:
@@ -262,10 +284,9 @@ class WeChatNotifier:
                 "或在设置中填写可执行文件的完整路径。"
             )
         channel = (self.settings.channel or DEFAULT_CHANNEL).strip() or DEFAULT_CHANNEL
-        target = normalize_target(self.settings.target)
+        target, account = self._resolve_target()
         if not target:
             raise NotifyError("尚未填写微信接收目标，无法发送。")
-        account = str(self.settings.account or "").strip()
         args = [
             command,
             "message",
@@ -474,6 +495,23 @@ def normalize_target(raw: str) -> str:
     if text.lower().startswith("weixin:"):
         text = text.split(":", 1)[1].strip()
     return text
+
+
+def _bound_wechat_target() -> dict | None:
+    """The single bound WeChat account's own recipient id, if unambiguous.
+
+    Imported lazily: the installer pulls in the whole gateway/CLI surface, and
+    the notifier is constructed during application start-up.
+    """
+    try:
+        from .installer import wechat_targets
+    except Exception:  # pragma: no cover - import cycle guard
+        return None
+    try:
+        targets = wechat_targets()
+    except Exception:  # pragma: no cover - best effort
+        return None
+    return targets[0] if len(targets) == 1 else None
 
 
 def target_warning(target: str) -> str:

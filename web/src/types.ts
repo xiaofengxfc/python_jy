@@ -212,8 +212,12 @@ export interface NotifyStatus {
   enabled: boolean;
   channel: string;
   target: string;
+  /** Account id used for the send; empty means the gateway's default. */
+  account: string;
   command: string;
   available: boolean;
+  /** Non-empty when the target cannot match a WeChat conversation. */
+  target_warning: string;
   last_error: string;
   /** Unix seconds of the last failure, 0 when there has not been one. */
   last_error_at: number;

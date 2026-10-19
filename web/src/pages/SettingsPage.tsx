@@ -94,6 +94,26 @@ export default function SettingsPage({ settings, onSaved }: Props) {
     void loadChannel();
   }, [install?.state, install?.running, loadChannel]);
 
+  // A binding knows its own recipient id, so a fresh install never has to be
+  // told what to put in 接收目标 by hand. Fill it only while it is empty: an
+  // explicit value the user typed always wins.
+  useEffect(() => {
+    if (!channel || channel.targets.length !== 1) return;
+    const only = channel.targets[0];
+    if (!only) return;
+    setDraft((current) => {
+      if (!current || current.notify.target.trim()) return current;
+      return {
+        ...current,
+        notify: {
+          ...current.notify,
+          target: only.target,
+          account: current.notify.account || only.account,
+        },
+      };
+    });
+  }, [channel]);
+
   const registerChannel = async () => {
     setChannelBusy(true);
     setChannelNote("");
@@ -106,15 +126,20 @@ export default function SettingsPage({ settings, onSaved }: Props) {
     }
   };
 
-  const openLogin = async () => {
+  const openLogin = async (force = false) => {
     setChannelBusy(true);
     setChannelNote("");
     try {
-      const result = await api<LoginStatus>("/api/install/openclaw/login", {
-        method: "POST",
-      });
+      // ``force`` cancels the pending wizard and prints a fresh code: the
+      // button exists for the "过期/扫不了" case, and reusing the old session
+      // would hand back the very code the user just rejected.
+      const result = await api<LoginStatus>(
+        `/api/install/openclaw/login${force ? "?force=true" : ""}`,
+        { method: "POST" },
+      );
       setLogin(result);
       setQrNonce((n) => n + 1);
+      if (force) setChannelNote("已重新生成二维码，请重新扫描。");
     } catch (error) {
       setChannelNote(error instanceof Error ? error.message : String(error));
     } finally {
@@ -451,6 +476,10 @@ export default function SettingsPage({ settings, onSaved }: Props) {
     );
   }
 
+  // The one bound recipient, if there is exactly one. Narrowed here because
+  // the array index is optional and the card below reads it several times.
+  const boundTarget = channel?.targets.length === 1 ? channel?.targets[0] : undefined;
+
   return (
     <>
       <div className="page-head">
@@ -762,17 +791,26 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                 />
                 启用微信推送
               </label>
+              {/* A bound channel plus a closed master switch is the state that
+                  looks like "已经登录但收不到通知"; say it instead of leaving
+                  the user to discover a checkbox. */}
+              {channel?.configured && !draft.notify.enabled && (
+                <div className="hint" style={{ color: "var(--warn, #b45309)" }}>
+                  微信通道已绑定，但推送总开关是关的：成交、风控通知都不会发出。
+                  勾选上面的“启用微信推送”并保存后生效。
+                </div>
+              )}
               <div className="form-grid">
                 <div className="field">
                   <label className="field-label" htmlFor="notify-target">
                     <span>接收目标</span>
-                    <em>会话 ID</em>
+                    <em>形如 xxx@im.wechat</em>
                   </label>
                   <input
                     id="notify-target"
                     value={draft.notify.target}
                     onChange={(event) => patchNotify({ target: event.target.value })}
-                    placeholder="先给 ClawBot 发一条消息，再填写它返回的会话 ID"
+                    placeholder="先给 ClawBot 发一条消息，或点下方“填入已绑定账号”"
                   />
                 </div>
                 <div className="field">
@@ -787,6 +825,48 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                     placeholder="openclaw-weixin"
                   />
                 </div>
+              </div>
+              {/* The bound account already knows its own WeChat id, so the user
+                  should never have to copy it out of a log. One click fills it. */}
+              {boundTarget && (
+                <div className="install-head" style={{ marginTop: 2 }}>
+                  <span className="faint" style={{ fontSize: 11 }}>
+                    已绑定账号：{channel?.account || boundTarget.account}
+                    {boundTarget.target !== draft.notify.target &&
+                      `，可用接收目标 ${boundTarget.target}`}
+                  </span>
+                  <span className="spacer" />
+                  <button
+                    type="button"
+                    className="btn-sm"
+                    disabled={boundTarget.target === draft.notify.target}
+                    onClick={() =>
+                      patchNotify({
+                        target: boundTarget.target,
+                        account: boundTarget.account,
+                      })
+                    }
+                  >
+                    填入已绑定账号
+                  </button>
+                </div>
+              )}
+              {notifyStatus?.target_warning && (
+                <div className="hint" style={{ color: "var(--warn, #b45309)" }}>
+                  {notifyStatus.target_warning}
+                </div>
+              )}
+              <div className="field">
+                <label className="field-label" htmlFor="notify-account">
+                  <span>账号</span>
+                  <em>绑定多个微信账号时填写，留空用默认</em>
+                </label>
+                <input
+                  id="notify-account"
+                  value={draft.notify.account}
+                  onChange={(event) => patchNotify({ account: event.target.value })}
+                  placeholder="例：6b0e6d3bca3a-im-bot"
+                />
               </div>
               <div className="field">
                 <label className="field-label" htmlFor="notify-command">
@@ -1050,7 +1130,11 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                       {login.has_qr && (login.state === "waiting" || login.state === "starting") ? (
                         <>
                           <img
-                            src={`/api/install/openclaw/login/qr.svg?n=${qrNonce}`}
+                            // Keyed on the server's revision: the wizard
+                            // refreshes an expiring code on its own, and the
+                            // page must show the new one instead of the dead
+                            // SVG the browser already cached.
+                            src={`/api/install/openclaw/login/qr.svg?n=${qrNonce}-${login.revision}`}
                             alt="微信扫码登录二维码"
                             width={220}
                             height={220}
@@ -1064,7 +1148,7 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                               type="button"
                               className="btn-sm"
                               disabled={channelBusy}
-                              onClick={() => void openLogin()}
+                              onClick={() => void openLogin(true)}
                             >
                               刷新二维码
                             </button>
