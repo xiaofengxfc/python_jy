@@ -49,9 +49,8 @@ class AppContext:
             log.warning("恢复纸面账户失败，使用初始资金", exc_info=True)
         self.risk = RiskManager(self.settings.risk)
         self.trading = TradingService(self.settings, self.rest, self.risk, self.paper, self.db)
-        # The token lives in the keyring; the service reads it per request so a
-        # token saved from the settings page applies without a restart.
-        self.news = NewsService(self.credentials.load_news)
+        # Keyless feed: announcements plus two RSS outlets, no token to manage.
+        self.news = NewsService()
 
         self.klines = KlineStore(self.market_rest, paths.kline_cache_dir(), source="mainnet")
 
@@ -76,9 +75,10 @@ class AppContext:
     def market_rest_for(self, market: MarketType) -> BinanceREST:
         """The charting client: read-only candles, tickers and order books.
 
-        Spot goes to Binance's public mirror, so a testnet session still charts
-        real prices. Futures has no such mirror; it stays on the session's
-        network (see ``BinanceREST._prefer_public_data``).
+        Always the real venue feed, whatever the trading network is: spot goes
+        to Binance's public mirror, futures to fapi/dapi directly. A testnet
+        session trades against the sandbox but must not be shown simulated
+        prices, which would silently disagree with any other chart.
         """
         if market not in self._data_rest:
             base = self._market_rest.get(market) or self.rest_for(market)

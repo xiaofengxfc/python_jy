@@ -27,6 +27,7 @@ from ..core.credentials import Credentials
 from ..core.types import TIMEFRAME_SECONDS, MarketType, Network, RunMode
 from ..engine.auto import AutoTrader, AutoTraderConfig
 from ..exchange.rest import BinanceREST
+from ..news import NewsService
 from .. import paths
 
 log = logging.getLogger(__name__)
@@ -82,10 +83,6 @@ class CredentialsPayload(BaseModel):
     api_key: str = ""
     api_secret: str = ""
     verify: bool = True
-
-
-class NewsTokenPayload(BaseModel):
-    token: str = ""
 
 
 class AutoStartPayload(BaseModel):
@@ -464,44 +461,18 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
     # ------------------------------------------------------------------ news
     @router.get("/api/news")
     def news(symbol: str = "", limit: int = 20) -> dict[str, Any]:
-        """Headlines for one pair from CryptoPanic, with its token state.
+        """Headlines for one pair from the keyless public feeds.
 
-        Never raises for a missing token or an upstream failure: the panel
-        renders the message instead of an empty feed that looks like "no news".
+        Never raises for an upstream failure: the panel renders the message
+        instead of an empty feed that looks like "no news".
         """
         ctx = get_state().ctx
         return ctx.news.snapshot(symbol, limit=limit)
 
-    @router.get("/api/news/token")
-    def news_token() -> dict[str, Any]:
-        ctx = get_state().ctx
-        token = ctx.credentials.load_news()
-        masked = ""
-        if token:
-            masked = f"{token[:4]}...{token[-4:]}" if len(token) > 8 else "*" * len(token)
-        return {"configured": bool(token), "masked": masked, "source": "CryptoPanic"}
-
-    @router.post("/api/news/token")
-    def save_news_token(payload: NewsTokenPayload) -> dict[str, Any]:
-        state = get_state()
-        ctx = state.ctx
-        token = payload.token.strip()
-        if not token:
-            raise HTTPException(status_code=400, detail="Token 不能为空")
-        if not ctx.credentials.save_news(token):
-            raise HTTPException(
-                status_code=500,
-                detail="无法写入系统凭据库（keyring），请检查系统钥匙串是否可用",
-            )
-        ctx.news.clear_cache()
-        return {"ok": True, "configured": True}
-
-    @router.delete("/api/news/token")
-    def delete_news_token() -> dict[str, Any]:
-        ctx = get_state().ctx
-        ctx.credentials.delete_news()
-        ctx.news.clear_cache()
-        return {"ok": True, "configured": False}
+    @router.get("/api/news/sources")
+    def news_sources() -> dict[str, Any]:
+        """What the panel is reading, so the UI never has to hardcode it."""
+        return {"sources": NewsService.sources()}
 
     # ---------------------------------------------------------- credentials
     @router.get("/api/credentials")

@@ -1,129 +1,234 @@
-"""CryptoPanic feed: parsing, token gating and caching.
+"""News feed: parsing the two source shapes, filtering and caching.
 
-The panel polls this endpoint, so the two things worth pinning down are that a
-malformed upstream payload degrades instead of raising, and that a configured
-token never hits the network more than once per TTL.
+The panel polls this endpoint, so the things worth pinning down are that a
+malformed upstream payload degrades into a reported error instead of raising,
+that a pair filter keeps unrelated headlines out, and that repeated polls hit
+the network once per TTL.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
+import json
 
-import pytest
+from btrader.news import (
+    NewsError,
+    NewsService,
+    parse_binance_announcements,
+    parse_rss,
+)
 
-from btrader.core.credentials import CredentialStore
-from btrader.news import NewsError, NewsService, parse_posts
-
-
-PAYLOAD = {
-    "results": [
-        {
-            "id": 101,
-            "title": "Bitcoin breaks 80k",
-            "url": "https://example.com/a",
-            "published_at": "2026-10-19T09:00:00Z",
-            "kind": "news",
-            "source": {"title": "Example", "domain": "example.com"},
-            "currencies": [{"code": "BTC"}],
-            "votes": {"positive": 5, "negative": 1, "important": 0},
-            "extra_field": "ignored",
-        },
-        {"id": 102, "title": "", "url": "https://example.com/b"},
-        "not-a-row",
-        {
-            "id": 103,
-            "title": "ETH upgrade scheduled",
-            "url": "https://example.com/c",
-            "currencies": [{"code": "eth"}, {}],
-        },
-    ]
+BINANCE_PAYLOAD = {
+    "success": True,
+    "data": {
+        "catalogs": [
+            {
+                "catalogId": 48,
+                "catalogName": "New Cryptocurrency Listing",
+                "articles": [
+                    {
+                        "id": 1,
+                        "code": "aaa111",
+                        "title": "Binance Will List <b>ABC</b>",
+                        "releaseDate": 1791948608368,
+                    }
+                ],
+            },
+            {
+                "catalogId": 161,
+                "catalogName": "Delisting",
+                "articles": [
+                    {"id": 2, "code": "bbb222", "title": "Binance Will Delist XYZ", "releaseDate": 1791000000000},
+                    {"id": 3, "code": "", "title": "Broken row without a code"},
+                    "not-a-row",
+                ],
+            },
+            "not-a-catalog",
+        ]
+    },
 }
 
+RSS_TEXT = """<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0">
+  <channel>
+    <item>
+      <title>Bitcoin breaks 80k as BTC inflows surge</title>
+      <link>https://example.com/btc</link>
+      <guid>https://example.com/btc</guid>
+      <pubDate>Mon, 19 Oct 2026 13:30:00 +0000</pubDate>
+      <category>Markets</category>
+    </item>
+    <item>
+      <title>Ethereum upgrade scheduled for next month</title>
+      <link>https://example.com/eth</link>
+      <guid>https://example.com/eth</guid>
+      <pubDate>Mon, 19 Oct 2026 12:00:00 +0000</pubDate>
+    </item>
+    <item>
+      <title>No link here</title>
+    </item>
+  </channel>
+</rss>
+"""
 
-def test_parse_posts_keeps_usable_rows_only() -> None:
-    items = parse_posts(PAYLOAD)
-    assert [item["id"] for item in items] == ["101", "103"]
+
+def test_binance_rows_are_normalised_and_labelled() -> None:
+    items = parse_binance_announcements(BINANCE_PAYLOAD)
+
+    assert [item["id"] for item in items] == ["binance-1", "binance-2"]
     first = items[0]
-    assert first["source"] == "Example"
-    assert first["currencies"] == ["BTC"]
-    assert first["positive"] == 5
-    # The second usable row has no votes block and a lowercase ticker.
-    assert items[1]["currencies"] == ["ETH"]
-    assert items[1]["positive"] == 0
+    assert first["source"] == "币安"
+    assert first["kind"] == "上币公告"
+    assert first["title"] == "Binance Will List ABC"
+    assert first["url"] == "https://www.binance.com/zh-CN/support/announcement/aaa111"
+    assert first["published_at"].startswith("2026-")
+    # Newest first, regardless of which catalog it came from.
+    assert items[0]["published_at"] > items[1]["published_at"]
 
 
-def test_parse_posts_survives_a_non_dict_payload() -> None:
-    assert parse_posts(None) == []
-    assert parse_posts({"results": "nope"}) == []
+def test_binance_parser_survives_a_broken_payload() -> None:
+    assert parse_binance_announcements(None) == []
+    assert parse_binance_announcements({"data": "nope"}) == []
+    assert parse_binance_announcements({"data": {"catalogs": [{}]}}) == []
 
 
-def test_service_without_a_token_does_not_call_the_network() -> None:
-    calls: list[str] = []
+def test_rss_rows_carry_source_and_timestamp() -> None:
+    items = parse_rss(RSS_TEXT, source="CoinTelegraph")
 
-    def fetch(url: str, timeout: float):
+    assert len(items) == 2  # the row without a link is dropped
+    assert items[0]["source"] == "CoinTelegraph"
+    assert items[0]["published_at"] == "2026-10-19T13:30:00+00:00"
+    assert items[1]["kind"] == ""  # no category on that row
+
+
+def test_rss_parser_reports_malformed_xml() -> None:
+    try:
+        parse_rss("<rss><channel>", source="Decrypt")
+    except NewsError as exc:
+        assert "Decrypt" in str(exc)
+    else:  # pragma: no cover - the parser must not silently return nothing
+        raise AssertionError("malformed XML should raise NewsError")
+
+
+def _fetcher(calls: list[str], *, fail_rss: bool = False):
+    def fetch(url: str, timeout: float, **_kwargs):
         calls.append(url)
-        return PAYLOAD
+        if url.startswith("https://www.binance.com"):
+            return BINANCE_PAYLOAD
+        if fail_rss:
+            raise NewsError("boom")
+        return RSS_TEXT
 
-    service = NewsService(lambda: "", fetcher=fetch)
-    result = service.snapshot("BTC/USDT")
-    assert result["configured"] is False
-    assert result["items"] == []
-    assert calls == []
+    return fetch
 
 
-def test_service_queries_the_base_asset_and_caches() -> None:
+def test_snapshot_merges_sources_and_filters_by_pair() -> None:
     calls: list[str] = []
+    service = NewsService(fetcher=_fetcher(calls))
 
-    def fetch(url: str, timeout: float):
-        calls.append(url)
-        return PAYLOAD
+    feed = service.snapshot("BTC/USDT", limit=10)
 
-    service = NewsService(lambda: "tok", fetcher=fetch)
-    first = service.snapshot("BTC/USDT", limit=10)
-    second = service.snapshot("BTC/USDT", limit=10)
+    assert len(calls) == 3  # announcements + two RSS feeds
+    titles = [item["title"] for item in feed["items"]]
+    # Announcements are not pair filtered: they are what moves the venue.
+    assert "Binance Will List ABC" in titles
+    # RSS items are: only the BTC story mentions the base asset.
+    assert "Bitcoin breaks 80k as BTC inflows surge" in titles
+    assert all("Ethereum" not in title for title in titles)
+    assert feed["error"] == ""
+    assert feed["source"] == "币安公告 · CoinTelegraph · Decrypt"
 
-    assert len(calls) == 1
-    assert "currencies=BTC" in calls[0]
-    assert "auth_token=tok" in calls[0]
+
+def test_rss_matches_the_asset_name_not_just_the_ticker() -> None:
+    """Headlines say "Bitcoin", never "BTC" — both must match."""
+    calls: list[str] = []
+    service = NewsService(fetcher=_fetcher(calls))
+
+    feed = service.snapshot("BTC/USDT", limit=10)
+
+    assert any(item["source"] == "CoinTelegraph" for item in feed["items"])
+
+
+def test_an_asset_without_a_headline_gets_no_rss_rows() -> None:
+    calls: list[str] = []
+    service = NewsService(fetcher=_fetcher(calls))
+
+    feed = service.snapshot("ETH/USDT", limit=10)
+
+    titles = [item["title"] for item in feed["items"]]
+    assert "Bitcoin breaks 80k as BTC inflows surge" not in titles
+    assert any("Ethereum" in title for title in titles)
+
+
+def test_announcements_cannot_starve_the_market_sources() -> None:
+    """Announcements are always newest; the quota keeps room for RSS."""
+    many = {
+        "success": True,
+        "data": {
+            "catalogs": [
+                {
+                    "catalogId": 49,
+                    "catalogName": "Latest Binance News",
+                    "articles": [
+                        {
+                            "id": index,
+                            "code": f"code{index}",
+                            "title": f"Announcement {index}",
+                            "releaseDate": 1791948608368 - index,
+                        }
+                        for index in range(50)
+                    ],
+                }
+            ]
+        },
+    }
+
+    def fetch(url: str, timeout: float, **_kwargs):
+        if url.startswith("https://www.binance.com"):
+            return many
+        return RSS_TEXT
+
+    feed = NewsService(fetcher=fetch).snapshot("BTC/USDT", limit=20)
+
+    assert any(item["source"] == "币安" for item in feed["items"])
+    assert any(item["source"] == "CoinTelegraph" for item in feed["items"])
+    assert len(feed["items"]) <= 20
+
+
+def test_snapshot_caches_for_the_ttl() -> None:
+    calls: list[str] = []
+    service = NewsService(fetcher=_fetcher(calls))
+
+    first = service.snapshot("BTC/USDT")
+    second = service.snapshot("BTC/USDT")
+
+    assert len(calls) == 3
     assert first["cached"] is False
     assert second["cached"] is True
-    assert len(first["items"]) == 2
 
 
-def test_upstream_failure_reports_error_and_keeps_last_good_items() -> None:
-    state = {"fail": False}
+def test_one_failing_source_does_not_hide_the_others() -> None:
+    calls: list[str] = []
+    service = NewsService(fetcher=_fetcher(calls, fail_rss=True))
 
-    def fetch(url: str, timeout: float):
-        if state["fail"]:
-            raise NewsError("boom")
-        return PAYLOAD
+    feed = service.snapshot("BTC/USDT")
 
-    service = NewsService(lambda: "tok", ttl=0, fetcher=fetch)
-    service.snapshot("BTC/USDT")
-    state["fail"] = True
-    result = service.snapshot("BTC/USDT")
-    assert result["error"] == "boom"
-    assert result["cached"] is True
-    assert len(result["items"]) == 2
+    # Announcements still arrive, and the failure is reported next to them.
+    assert any(item["source"] == "币安" for item in feed["items"])
+    assert "CoinTelegraph" in feed["error"]
+    assert "Decrypt" in feed["error"]
 
 
-def test_news_token_round_trips_through_the_keyring(tmp_path: Path) -> None:
-    class FakeKeyring:
-        def __init__(self) -> None:
-            self.store: dict[tuple[str, str], str] = {}
+def test_service_reports_a_total_outage_without_raising() -> None:
+    def fetch(url: str, timeout: float, **_kwargs):
+        raise NewsError("offline")
 
-        def get_password(self, service: str, name: str) -> str | None:
-            return self.store.get((service, name))
+    service = NewsService(fetcher=fetch)
+    feed = service.snapshot("ETH/USDT")
 
-        def set_password(self, service: str, name: str, value: str) -> None:
-            self.store[(service, name)] = value
+    assert feed["items"] == []
+    assert "offline" in feed["error"]
+    assert feed["source"].startswith("币安公告")
 
-        def delete_password(self, service: str, name: str) -> None:
-            self.store.pop((service, name), None)
 
-    store = CredentialStore(backend=FakeKeyring())
-    assert store.load_news() == ""
-    assert store.save_news("abc123") is True
-    assert store.load_news() == "abc123"
-    store.delete_news()
-    assert store.load_news() == ""
+def test_sources_are_listed_for_the_settings_copy() -> None:
+    assert NewsService.sources() == ["币安公告", "CoinTelegraph", "Decrypt"]

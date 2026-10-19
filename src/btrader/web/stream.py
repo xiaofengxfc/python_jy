@@ -47,6 +47,22 @@ class StreamHub:
     # can push a frame; without this the load goes to api.binance.com, which
     # times out on such networks and leaves the socket silent.
     PUBLIC_SPOT_REST = "https://data-api.binance.vision/api/v3"
+    # Futures publishes no separate mirror, but its mainnet hosts answer where
+    # the spot trading host does not. Charting must read these: a testnet
+    # futures session otherwise shows simulated prices hundreds of dollars
+    # away from the venue the user compares against.
+    PUBLIC_FUTURES_WS: dict[MarketType, tuple[str, str]] = {
+        MarketType.USDM: ("wss://fstream.binance.com/ws", "future"),
+        MarketType.COINM: ("wss://dstream.binance.com/ws", "inverse"),
+    }
+    PUBLIC_FUTURES_REST: dict[MarketType, tuple[str, ...]] = {
+        MarketType.USDM: (
+            "https://fapi.binance.com/fapi/v1",
+            "https://fapi.binance.com/fapi/v2",
+            "https://fapi.binance.com/fapi/v3",
+        ),
+        MarketType.COINM: ("https://dapi.binance.com/dapi/v1",),
+    }
 
     def __init__(self, network: Network) -> None:
         self.network = network
@@ -79,6 +95,8 @@ class StreamHub:
                 log.warning("WebSocket 测试网不可用，退回实盘行情: %s", exc)
         if market is MarketType.SPOT:
             self._use_public_spot_stream(exchange)
+        else:
+            self._use_public_futures_stream(exchange, market)
         self._exchanges[market] = exchange
         return exchange
 
@@ -111,6 +129,49 @@ class StreamHub:
                 fetch["types"] = ["spot"]
             else:
                 options["fetchMarkets"] = ["spot"]
+
+    def _use_public_futures_stream(self, exchange: Any, market: MarketType) -> None:
+        """Chart futures from the mainnet feed while orders go to the testnet.
+
+        Futures has no separate read-only mirror, but its mainnet hosts are
+        reachable and serve exactly the public data the chart needs. Leaving a
+        testnet session on the sandbox feed would show simulated prices that
+        drift from the venue the user compares against, which reads as "the
+        chart is wrong" rather than "you are on the testnet".
+
+        Applied after ``set_sandbox_mode`` for the same reason as spot: the
+        sandbox switch rewrites the whole ``api`` block, and this has to win.
+        Only public endpoints are touched, so the charting client still cannot
+        sign anything.
+        """
+        entry = self.PUBLIC_FUTURES_WS.get(market)
+        if entry is None:
+            return
+        ws_host, ws_key = entry
+        rest_hosts = self.PUBLIC_FUTURES_REST.get(market, ())
+        api = exchange.urls.get("api")
+        if isinstance(api, dict):
+            ws = api.get("ws")
+            if isinstance(ws, dict):
+                ws[ws_key] = ws_host
+            # USD-M splits its public endpoints across v1/v2/v3; COIN-M uses
+            # dapi only. Rewrite whichever keys this venue actually has.
+            for index, key in enumerate(("fapiPublic", "fapiPublicV2", "fapiPublicV3")):
+                if key in api and index < len(rest_hosts):
+                    api[key] = rest_hosts[index]
+            if "dapiPublic" in api and rest_hosts:
+                api["dapiPublic"] = rest_hosts[0]
+        # Load only this venue's markets. The default probes spot, linear and
+        # inverse together; the spot probes go to hosts that may time out and
+        # cost the socket its first frame.
+        options = getattr(exchange, "options", None)
+        if isinstance(options, dict):
+            wanted = "inverse" if market is MarketType.COINM else "linear"
+            fetch = options.get("fetchMarkets")
+            if isinstance(fetch, dict):
+                fetch["types"] = [wanted]
+            else:
+                options["fetchMarkets"] = [wanted]
 
     # ---------------------------------------------------------- subscribers
     async def subscribe(

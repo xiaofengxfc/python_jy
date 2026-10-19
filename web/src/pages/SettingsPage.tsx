@@ -16,11 +16,7 @@ interface Draft {
 
 const EMPTY_DRAFT: Draft = { apiKey: "", apiSecret: "", verify: true };
 
-interface NewsTokenState {
-  configured: boolean;
-  masked: string;
-  source: string;
-}
+const NEWS_SOURCES = ["币安公告", "CoinTelegraph", "Decrypt"];
 
 const NETWORKS: [string, string][] = [
   ["testnet", "测试网"],
@@ -51,9 +47,6 @@ export default function SettingsPage({ settings, onSaved }: Props) {
   const [credBusy, setCredBusy] = useState<string>("");
   const [risk, setRisk] = useState<RiskState | null>(null);
   const [riskBusy, setRiskBusy] = useState(false);
-  const [newsToken, setNewsToken] = useState<NewsTokenState | null>(null);
-  const [newsDraft, setNewsDraft] = useState("");
-  const [newsBusy, setNewsBusy] = useState(false);
 
   const loadRisk = useCallback(async () => {
     try {
@@ -88,51 +81,6 @@ export default function SettingsPage({ settings, onSaved }: Props) {
       setNetwork(settings.network);
     }
   }, [settings]);
-
-  const loadNewsToken = useCallback(async () => {
-    try {
-      setNewsToken(await api<NewsTokenState>("/api/news/token"));
-    } catch {
-      // The card simply stays unknown; saving still works.
-    }
-  }, []);
-
-  useEffect(() => {
-    void loadNewsToken();
-  }, [loadNewsToken]);
-
-  const saveNewsToken = async () => {
-    if (!newsDraft.trim()) return;
-    setNewsBusy(true);
-    setFlash(null);
-    try {
-      await api("/api/news/token", {
-        method: "POST",
-        body: JSON.stringify({ token: newsDraft.trim() }),
-      });
-      setNewsDraft("");
-      setFlash({ tone: "ok", text: "CryptoPanic Token 已保存。" });
-      await loadNewsToken();
-    } catch (error) {
-      setFlash({ tone: "err", text: error instanceof Error ? error.message : String(error) });
-    } finally {
-      setNewsBusy(false);
-    }
-  };
-
-  const deleteNewsToken = async () => {
-    setNewsBusy(true);
-    setFlash(null);
-    try {
-      await api("/api/news/token", { method: "DELETE" });
-      setFlash({ tone: "ok", text: "CryptoPanic Token 已删除。" });
-      await loadNewsToken();
-    } catch (error) {
-      setFlash({ tone: "err", text: error instanceof Error ? error.message : String(error) });
-    } finally {
-      setNewsBusy(false);
-    }
-  };
 
   const loadCredentials = useCallback(async () => {
     try {
@@ -358,45 +306,21 @@ export default function SettingsPage({ settings, onSaved }: Props) {
             <span className="card-title">新闻来源</span>
             <span className="spacer" />
             <span className="faint" style={{ fontSize: 11 }}>
-              {newsToken
-                ? newsToken.configured
-                  ? `CryptoPanic 已配置 · ${newsToken.masked}`
-                  : "CryptoPanic 未配置"
-                : "读取中…"}
+              免费公开源 · 无需配置
             </span>
           </div>
           <div className="card-body">
-            <div className="news-token-row">
-              <input
-                className="input"
-                type="password"
-                autoComplete="off"
-                placeholder="CryptoPanic API Token"
-                value={newsDraft}
-                onChange={(event) => setNewsDraft(event.target.value)}
-              />
-              <button
-                type="button"
-                className="btn-sm primary"
-                disabled={newsBusy || !newsDraft.trim()}
-                onClick={() => void saveNewsToken()}
-              >
-                {newsBusy ? "处理中…" : "保存"}
-              </button>
-              {newsToken?.configured && (
-                <button
-                  type="button"
-                  className="btn-sm"
-                  disabled={newsBusy}
-                  onClick={() => void deleteNewsToken()}
-                >
-                  删除
-                </button>
-              )}
+            <div className="hint">
+              新闻面板聚合以下无需密钥的公开来源，交易对相关度按币种过滤：
+              <ul style={{ margin: "8px 0 0 18px", padding: 0 }}>
+                {NEWS_SOURCES.map((source) => (
+                  <li key={source}>{source}</li>
+                ))}
+              </ul>
             </div>
             <div className="hint" style={{ marginTop: 8 }}>
-              在 cryptopanic.com/developers/api/keys 免费申请 Token。Token 与交易所密钥一样
-              保存在系统凭据库，不会写入配置文件；未配置时交易页的「新闻」标签会给出提示。
+              币安公告不会按币种过滤（上币、下架、维护都会影响交易），
+              CoinTelegraph 与 Decrypt 只保留标题提及当前币种的内容。不再需要任何 Token。
             </div>
           </div>
         </div>

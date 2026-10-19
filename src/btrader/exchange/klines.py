@@ -15,6 +15,11 @@ log = logging.getLogger(__name__)
 
 COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
 
+# A REST snapshot is reused only this briefly. The tail candle is still
+# forming, so any longer window leaves the chart showing a stale close while
+# the ticker has already moved on.
+CACHE_TTL_MS = 3_000
+
 
 class KlineStore:
     """Loads OHLCV data from the Binance REST API and caches it as Parquet.
@@ -37,6 +42,10 @@ class KlineStore:
         # candles into the real series (and vice versa), producing exactly the
         # sort of 30%-wide bars that make a chart unreadable.
         self._source = source or rest.network.value
+        # Last network refresh per (market, symbol, timeframe), so a burst of
+        # identical requests shares one download without letting the tail
+        # candle go stale.
+        self._refreshed: dict[tuple[str, str, str], float] = {}
 
     def _path(self, market: MarketType, symbol: str, timeframe: str) -> Path:
         safe = symbol.replace("/", "_").replace(":", "-")
@@ -97,10 +106,14 @@ class KlineStore:
         if since is not None:
             return self._fetch_range(market, symbol, timeframe, since, limit, step_ms, path, cache)
 
-        if use_cache and len(cache) >= limit:
-            last_ts = int(cache["timestamp"].iloc[-1])
-            # Cache is fresh when its last candle is at most 2 steps old.
-            if time.time() * 1000 - last_ts < 2 * step_ms:
+        key = (market.value, symbol, timeframe)
+        if use_cache and not cache.empty:
+            age = time.monotonic() - self._refreshed.get(key, 0.0)
+            # The cache holds the *closed* bars. Reusing it is safe only while
+            # a forming candle cannot have advanced past the stored tail;
+            # otherwise the newest bar is missing and the chart trails the
+            # ticker by a whole interval.
+            if age * 1000 < CACHE_TTL_MS and len(cache) >= limit:
                 return cache.tail(limit).reset_index(drop=True)
 
         from_ts = int(time.time() * 1000) - limit * step_ms
@@ -109,6 +122,7 @@ class KlineStore:
         merged = self._merge(cache, fresh)
         if not merged.empty:
             self._write_cache(path, merged)
+        self._refreshed[key] = time.monotonic()
         return merged.tail(limit).reset_index(drop=True)
 
     def _fetch_range(

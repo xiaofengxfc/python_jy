@@ -26,6 +26,20 @@ class ExchangeError(RuntimeError):
 # sending a single order to the exchange. Candles, tickers and the book are
 # the same feed the trading host serves.
 PUBLIC_SPOT_HOST = "https://data-api.binance.vision/api/v3"
+# Futures has no separate read-only mirror, but fapi/dapi themselves answer on
+# networks where api.binance.com does not. A charting client must read these,
+# otherwise a testnet trading session shows simulated futures prices that are
+# hundreds of dollars away from the venue the user compares against.
+PUBLIC_FUTURES_HOSTS: dict[MarketType, dict[str, str]] = {
+    MarketType.USDM: {
+        "fapiPublic": "https://fapi.binance.com/fapi/v1",
+        "fapiPublicV2": "https://fapi.binance.com/fapi/v2",
+        "fapiPublicV3": "https://fapi.binance.com/fapi/v3",
+    },
+    MarketType.COINM: {
+        "dapiPublic": "https://dapi.binance.com/dapi/v1",
+    },
+}
 
 
 class BinanceREST:
@@ -87,23 +101,26 @@ class BinanceREST:
 
     @staticmethod
     def _prefer_public_data(client: ccxt.Exchange, market: MarketType) -> None:
-        """Point a charting client at the read-only market-data host.
+        """Point a charting client at real market data, never at a sandbox.
 
-        Only spot has a separate public host. Futures market data lives on the
-        same host as its trading API, so a testnet futures session keeps
-        reading the testnet feed — those candles are simulated, but there is no
-        mainnet futures mirror to fall back to.
+        Spot goes to Binance's public mirror. Futures has no mirror, but its
+        public endpoints are served by fapi/dapi directly, so the sandbox
+        rewrite from ``set_sandbox_mode`` is undone for them. Only public keys
+        are touched: a charting client must stay unable to sign a request.
         """
-        if market is not MarketType.SPOT:
-            return
         urls = client.urls.get("api")
         if not isinstance(urls, dict):
             return
-        urls["public"] = PUBLIC_SPOT_HOST
-        # ccxt asks "private" for some public endpoints; keeping it on the
-        # public host guarantees a charting client can never send a signed
-        # request even if a caller slips through.
-        urls["private"] = PUBLIC_SPOT_HOST
+        if market is MarketType.SPOT:
+            urls["public"] = PUBLIC_SPOT_HOST
+            # ccxt asks "private" for some public endpoints; keeping it on the
+            # public host guarantees a charting client can never send a signed
+            # request even if a caller slips through.
+            urls["private"] = PUBLIC_SPOT_HOST
+            return
+        for key, host in PUBLIC_FUTURES_HOSTS.get(market, {}).items():
+            if key in urls:
+                urls[key] = host
 
     def contract_spec(
         self, market: MarketType, symbol: str, allow_network: bool = True

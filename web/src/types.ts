@@ -204,17 +204,13 @@ export interface NewsItem {
   url: string;
   source: string;
   published_at: string;
-  currencies: string[];
+  /** Binance catalog label ("上币公告") or an RSS category. */
   kind: string;
-  positive: number;
-  negative: number;
-  important: number;
 }
 
-/** CryptoPanic feed. `configured` is false until a token is saved; the panel
- * shows that as a setup hint rather than an empty list. */
+/** Keyless public feed. `error` carries per-source failures without hiding
+ * the headlines that did load. */
 export interface NewsFeed {
-  configured: boolean;
   items: NewsItem[];
   cached: boolean;
   error: string;

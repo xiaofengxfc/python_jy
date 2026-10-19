@@ -20,11 +20,12 @@ function when(iso: string): string {
   return `${Math.round(minutes / (60 * 24))} 天前`;
 }
 
-/** CryptoPanic headlines for the pair being traded.
+/** Headlines for the pair being traded, from Binance announcements plus two
+ * public RSS outlets.
  *
- * A missing token and an upstream failure are both rendered in place: an empty
- * list would otherwise read as "nothing is happening", which is a different
- * claim from "the feed could not be read". */
+ * A failing source is reported in place: an empty list would otherwise read as
+ * "nothing is happening", which is a different claim from "the feed could not
+ * be read". */
 export default function NewsPanel({ symbol }: Props) {
   const [feed, setFeed] = useState<NewsFeed | null>(null);
   const [loading, setLoading] = useState(false);
@@ -36,11 +37,10 @@ export default function NewsPanel({ symbol }: Props) {
       setFeed(await api<NewsFeed>(`/api/news?${query({ symbol, limit: 20 })}`));
     } catch (error) {
       setFeed({
-        configured: true,
         items: [],
         cached: false,
         error: error instanceof Error ? error.message : String(error),
-        source: "CryptoPanic",
+        source: "币安公告 · CoinTelegraph · Decrypt",
       });
     } finally {
       setLoading(false);
@@ -52,15 +52,6 @@ export default function NewsPanel({ symbol }: Props) {
     const timer = window.setInterval(() => void load(), REFRESH_MS);
     return () => window.clearInterval(timer);
   }, [load]);
-
-  if (feed && !feed.configured) {
-    return (
-      <div className="news-empty">
-        <span>未配置 CryptoPanic Token，新闻暂不可用。</span>
-        <span className="faint">在「设置 → 新闻来源」填入免费 Token 后即可显示。</span>
-      </div>
-    );
-  }
 
   return (
     <div className="news-wrap">
@@ -74,13 +65,8 @@ export default function NewsPanel({ symbol }: Props) {
               </a>
               <div className="news-meta">
                 {item.source && <span>{item.source}</span>}
+                {item.kind && <span className="news-tag">{item.kind}</span>}
                 {item.published_at && <span>{when(item.published_at)}</span>}
-                {item.currencies.slice(0, 3).map((code) => (
-                  <span key={code} className="news-tag">
-                    {code}
-                  </span>
-                ))}
-                {item.important > 0 && <span className="news-tag hot">重要</span>}
               </div>
             </li>
           ))}
@@ -91,7 +77,7 @@ export default function NewsPanel({ symbol }: Props) {
         </div>
       )}
       <div className="news-foot faint">
-        来源 CryptoPanic · 每 2 分钟刷新
+        来源 {feed?.source || "币安公告 · CoinTelegraph · Decrypt"} · 每 2 分钟刷新
         {feed?.cached ? " · 当前为缓存结果" : ""}
       </div>
     </div>
