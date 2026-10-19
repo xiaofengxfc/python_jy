@@ -27,11 +27,14 @@ from dataclasses import dataclass, field
 
 log = logging.getLogger(__name__)
 
-# The gateway itself and the WeChat channel plugin. The plugin is a separate
-# npm package: installing only the gateway leaves ``--channel openclaw-weixin``
-# unresolvable at send time, which is the failure this button exists to avoid.
-GATEWAY_PACKAGE = "@openclaw/openclaw"
-WECHAT_PACKAGE = "@tencent-weixin/openclaw-weixin-cli"
+# Verified against the npm registry: the gateway is published unscoped as
+# ``openclaw``; the WeChat channel is a separate Tencent package, and
+# ``openclaw-weixin-cli`` is only its installer (bin: ``weixin-installer``).
+# Installing the gateway under a guessed scope is a 404, which is what this
+# pointer looked like before it was checked.
+GATEWAY_PACKAGE = "openclaw"
+WECHAT_PACKAGE = "@tencent-weixin/openclaw-weixin"
+WECHAT_INSTALLER = "@tencent-weixin/openclaw-weixin-cli"
 NPM_REGISTRIES = ("https://registry.npmjs.org", "https://registry.npmmirror.com")
 
 INSTALL_TIMEOUT = 900.0
@@ -111,7 +114,9 @@ class OpenClawInstaller:
             raise ValueError(f"不支持的镜像源：{registry}")
         args = [npm, "install", "--global", GATEWAY_PACKAGE]
         if options.with_wechat:
-            args.append(WECHAT_PACKAGE)
+            # Both halves are needed: the channel package is what the gateway
+            # loads, and its CLI is what registers the plugin with it.
+            args.extend([WECHAT_PACKAGE, WECHAT_INSTALLER])
         # Keep the resolved registry explicit: a user who picked npmjs must not
         # silently land on a mirror configured in .npmrc, and vice versa.
         args.append(f"--registry={registry or NPM_REGISTRIES[0]}")

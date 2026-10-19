@@ -21,6 +21,7 @@ import pytest
 from btrader.installer import (
     GATEWAY_PACKAGE,
     NPM_REGISTRIES,
+    WECHAT_INSTALLER,
     WECHAT_PACKAGE,
     InstallOptions,
     OpenClawInstaller,
@@ -93,7 +94,9 @@ def test_plan_installs_gateway_and_plugin(fake_env) -> None:
     argv = OpenClawInstaller().plan(InstallOptions(with_wechat=True))
     assert argv[0] == "/usr/bin/npm"
     assert argv[1:4] == ["install", "--global", GATEWAY_PACKAGE]
+    # The channel package is what the gateway loads; its CLI registers it.
     assert WECHAT_PACKAGE in argv
+    assert WECHAT_INSTALLER in argv
     # Pinned so a typo in the registry cannot slip through silently.
     assert f"--registry={NPM_REGISTRIES[0]}" in argv
 
@@ -101,6 +104,7 @@ def test_plan_installs_gateway_and_plugin(fake_env) -> None:
 def test_plan_can_skip_the_wechat_plugin(fake_env) -> None:
     argv = OpenClawInstaller().plan(InstallOptions(with_wechat=False))
     assert WECHAT_PACKAGE not in argv
+    assert WECHAT_INSTALLER not in argv
     assert GATEWAY_PACKAGE in argv
 
 
