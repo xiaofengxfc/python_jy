@@ -6,12 +6,15 @@ starts the gateway, every send fails with a connection error that looks like a
 misconfiguration.
 
 The gateway is therefore started here, as a child process, and stopped when the
-app shuts down. Two rules keep that from becoming a liability:
+app shuts down. Three rules keep that from becoming a liability:
 
 * Best effort, never blocking. Startup proceeds whether or not the gateway
   comes up; the settings page reports the truth and trading never waits on it.
 * Take over only what we started. A gateway the user already runs (or one
   installed as a scheduled task) is left alone, and we never kill it on exit.
+* Explain a failure. The gateway writes its bootstrap progress to stderr and
+  then exits, so its output is captured and quoted back: "exit code 78" on its
+  own is not something a user can act on.
 """
 
 from __future__ import annotations
@@ -23,16 +26,26 @@ import socket
 import subprocess
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 
 log = logging.getLogger(__name__)
 
 GATEWAY_HOST = "127.0.0.1"
 GATEWAY_PORT = 18789
-# How long to wait for the port to open before reporting a failure. OpenClaw
-# loads a lot of plugins on start; 25 s is generous without hanging shutdown.
-START_TIMEOUT = 25.0
+# How long to wait for the port to open before reporting a failure. Measured on
+# a warm profile: bootstrap phases (plugin plan, payload verification, agent and
+# workspace readiness) reach "starting HTTP server" at ~19 s, so the old 25 s
+# budget killed the gateway on anything slower than this dev box. The wait runs
+# in the startup thread and never blocks trading, so the cost of being generous
+# is only how long a genuinely broken start takes to report.
+START_TIMEOUT = 60.0
 PROBE_TIMEOUT = 0.35
+# ``openclaw config get/set`` is a Node process too, so it is not instant.
+CONFIG_TIMEOUT = 30.0
+# Child output kept for diagnosis. Bounded because the gateway logs every
+# request once it is up, and nobody wants that in memory.
+OUTPUT_LINES = 60
 
 
 @dataclass
@@ -49,9 +62,15 @@ class GatewaySupervisor:
     def __init__(self, *, port: int = GATEWAY_PORT, timeout: float = START_TIMEOUT) -> None:
         self.port = port
         self.timeout = timeout
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._info = _Gateway()
         self._process: subprocess.Popen | None = None
+        # Tail of the child's stdout+stderr, drained by a reader thread.
+        self._output: deque[str] = deque(maxlen=OUTPUT_LINES)
+        # Guards against a second click spawning a second gateway while the
+        # first is still probing for the port: the port is closed either way,
+        # so ``_reachable`` cannot tell the two attempts apart.
+        self._starting = False
 
     # ------------------------------------------------------------------ public
     def start(self) -> dict:
@@ -76,64 +95,28 @@ class GatewaySupervisor:
                 )
             return self.status()
 
-        args = [exe, "gateway", "run"]
         with self._lock:
-            self._info = _Gateway(state="starting", command=args, started_at=time.time())
-        try:
-            kwargs: dict = {
-                "stdout": subprocess.DEVNULL,
-                "stderr": subprocess.DEVNULL,
-                "stdin": subprocess.DEVNULL,
-                "shell": False,
-            }
-            if os.name == "nt":
-                # A new group lets ``stop`` take the whole tree down; the gateway
-                # is a Node process that may spawn workers of its own.
-                kwargs["creationflags"] = getattr(
-                    subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200
-                )
-            else:
-                kwargs["start_new_session"] = True
-            process = subprocess.Popen(_wrap(exe, args), **kwargs)
-        except Exception as exc:
-            with self._lock:
-                self._info.state = "failed"
-                self._info.error = f"启动 OpenClaw 网关失败：{exc}"
-            log.warning("启动 OpenClaw 网关失败", exc_info=True)
+            busy = self._starting
+            self._starting = not busy
+        if busy:
+            log.info("网关启动已在进行中，忽略重复请求")
             return self.status()
-
-        with self._lock:
-            self._process = process
-
-        deadline = time.time() + self.timeout
-        while time.time() < deadline:
-            if self._reachable():
-                with self._lock:
-                    self._info.state = "running"
-                log.info("OpenClaw 网关已就绪：%s:%s", GATEWAY_HOST, self.port)
-                return self.status()
-            if process.poll() is not None:
-                break
-            time.sleep(0.25)
-
-        code = process.poll()
-        with self._lock:
-            self._info.state = "failed"
-            self._info.error = (
-                f"OpenClaw 网关在 {self.timeout:g} 秒内没有就绪"
-                + (f"（进程已退出，退出码 {code}）" if code is not None else "")
-                + "。可在终端手动运行一次 openclaw gateway run 查看原因。"
-            )
-        # Do not leave a half-started gateway behind for the next launch to fight.
-        self.stop()
-        return self.status()
+        try:
+            return self._spawn(exe, retried=False)
+        finally:
+            with self._lock:
+                self._starting = False
 
     def stop(self) -> None:
         """Stop the gateway, but only the one we started."""
         with self._lock:
             process = self._process
             self._process = None
-            owned = self._info.state == "running"
+            owned = self._info.state in {"running", "starting"}
+            # A gateway that died on its own must not keep reporting "running":
+            # the settings page reads that flag to decide whether push works.
+            if owned and (process is None or process.poll() is not None):
+                self._info = _Gateway(state="idle")
         if process is None or process.poll() is not None:
             return
         try:
@@ -167,7 +150,195 @@ class GatewaySupervisor:
                 "command": list(info.command) if info.command else [],
                 "error": info.error,
                 "started_at": info.started_at,
+                "output": list(self._output),
             }
+
+    def output(self) -> list[str]:
+        """Recent child output, oldest first. Survives a failed attempt."""
+        with self._lock:
+            return list(self._output)
+
+    # ----------------------------------------------------------------- spawn
+    def _spawn(self, exe: str, *, retried: bool) -> dict:
+        args = [exe, "gateway", "run"]
+        with self._lock:
+            self._output.clear()
+            self._info = _Gateway(state="starting", command=args, started_at=time.time())
+
+        process = self._launch(args)
+        if process is None:
+            return self.status()
+        with self._lock:
+            self._process = process
+
+        if self._await_ready(process):
+            return self.status()
+
+        code = process.poll()
+        # A refusal to start because ``gateway.mode`` was never authored is the
+        # one failure this app can fix by itself: it already installs OpenClaw
+        # and registers the WeChat plugin, and ``openclaw doctor`` prescribes
+        # exactly this value. Only an explicit "unset" is acted on — a mode the
+        # user did author (e.g. remote) is never overwritten.
+        if not retried and code is not None and self._mode_configured(exe) is False:
+            log.info("gateway.mode 未配置，写入 local 后重试启动网关")
+            self._note("[biTrader] gateway.mode 未配置，已设为 local 并重试启动")
+            if self._set_mode_local(exe):
+                return self._spawn(exe, retried=True)
+
+        return self._report_failure(process, code, args)
+
+    def _launch(self, args: list[str]) -> subprocess.Popen | None:
+        """Spawn ``openclaw gateway run`` with its output captured."""
+        kwargs: dict = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "stdin": subprocess.DEVNULL,
+            # Decoding here, not in the reader: a non-UTF-8 byte from Node's
+            # diagnostics must not turn into a UnicodeDecodeError later.
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "bufsize": 1,
+            "shell": False,
+        }
+        if os.name == "nt":
+            # A new group lets ``stop`` take the whole tree down; the gateway
+            # is a Node process that may spawn workers of its own.
+            kwargs["creationflags"] = getattr(
+                subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200
+            )
+        else:
+            kwargs["start_new_session"] = True
+        try:
+            process = subprocess.Popen(_wrap(args[0], args), **kwargs)
+        except Exception as exc:
+            with self._lock:
+                self._info = _Gateway(
+                    state="failed",
+                    command=list(args),
+                    error=f"启动 OpenClaw 网关失败：{exc}",
+                )
+            log.warning("启动 OpenClaw 网关失败", exc_info=True)
+            return None
+        # Unconditional: a full pipe would block the gateway mid-bootstrap, and
+        # the reader is what makes the failure message readable.
+        threading.Thread(
+            target=self._pump, args=(process,), name="openclaw-gateway", daemon=True
+        ).start()
+        return process
+
+    def _pump(self, process: subprocess.Popen) -> None:
+        """Drain the child's output into the bounded buffer until it closes."""
+        stream = process.stdout
+        if stream is None:
+            return
+        try:
+            for line in stream:
+                self._note(line)
+        except Exception:  # pragma: no cover - a closed pipe during shutdown
+            log.debug("读取网关输出失败", exc_info=True)
+        finally:
+            try:
+                stream.close()
+            except Exception:  # pragma: no cover - already closed
+                pass
+
+    def _await_ready(self, process: subprocess.Popen) -> bool:
+        deadline = time.time() + self.timeout
+        while time.time() < deadline:
+            if self._reachable():
+                with self._lock:
+                    self._info.state = "running"
+                log.info("OpenClaw 网关已就绪：%s:%s", GATEWAY_HOST, self.port)
+                return True
+            if process.poll() is not None:
+                return False
+            time.sleep(0.25)
+        return False
+
+    def _report_failure(
+        self, process: subprocess.Popen, code: int | None, args: list[str]
+    ) -> dict:
+        """Kill a half-started gateway and say why it failed.
+
+        The tail of the child's output is the only actionable part: OpenClaw
+        reports a rejected bootstrap as a phase name and an exit code.
+        """
+        # Do not leave a half-started gateway behind for the next launch to fight.
+        self.stop()
+        if code is not None:
+            message = f"OpenClaw 网关启动失败（退出码 {code}）"
+        else:
+            message = f"OpenClaw 网关在 {self.timeout:g} 秒内没有就绪"
+        tail = " | ".join(self.output()[-5:])
+        message += f"：{tail[:400]}" if tail else "，且没有任何输出"
+        message += "。可在终端手动运行一次 openclaw gateway run 查看原因。"
+        with self._lock:
+            self._info = _Gateway(state="failed", command=list(args), error=message)
+        log.warning("OpenClaw 网关启动失败：%s", message)
+        return self.status()
+
+    def _note(self, line: str) -> None:
+        text = (line or "").strip()
+        if not text:
+            return
+        with self._lock:
+            self._output.append(text)
+
+    # ----------------------------------------------------------- config repair
+    @staticmethod
+    def _mode_configured(exe: str) -> bool | None:
+        """Whether ``gateway.mode`` is authored in OpenClaw's config.
+
+        ``openclaw config get`` exits non-zero and prints "unset" when the key
+        was never written; ``gateway run`` then refuses to start. ``None``
+        means the check itself failed, and a guess must not touch the user's
+        configuration.
+        """
+        try:
+            completed = subprocess.run(
+                _wrap(exe, [exe, "config", "get", "gateway.mode"]),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=CONFIG_TIMEOUT,
+                shell=False,
+                stdin=subprocess.DEVNULL,
+            )
+            text = ((completed.stdout or "") + (completed.stderr or "")).strip()
+            code = completed.returncode
+        except Exception:
+            log.debug("检查 gateway.mode 失败", exc_info=True)
+            return None
+        if code != 0 or "unset" in text.lower():
+            return False
+        return bool(text)
+
+    @staticmethod
+    def _set_mode_local(exe: str) -> bool:
+        """Author ``gateway.mode=local``. Never called for a user-set mode."""
+        try:
+            completed = subprocess.run(
+                _wrap(exe, [exe, "config", "set", "gateway.mode", "local"]),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=CONFIG_TIMEOUT,
+                shell=False,
+                stdin=subprocess.DEVNULL,
+            )
+            code = completed.returncode
+            output = ((completed.stderr or "") + (completed.stdout or "")).strip()
+        except Exception:
+            log.warning("写入 gateway.mode 失败", exc_info=True)
+            return False
+        if code != 0:
+            log.warning("写入 gateway.mode 失败：%s", output[:200])
+            return False
+        return True
 
     # ---------------------------------------------------------------- internals
     def _reachable(self) -> bool:
