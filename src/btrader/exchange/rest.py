@@ -20,12 +20,33 @@ class ExchangeError(RuntimeError):
     """Raised for normalized, user-facing exchange errors."""
 
 
-class BinanceREST:
-    """One ccxt client per market type, created lazily."""
+# Binance publishes read-only spot market data on its own host. Unlike
+# api.binance.com it is reachable from networks where the trading host refuses
+# connections, which is what lets a paper account chart real candles without
+# sending a single order to the exchange. Candles, tickers and the book are
+# the same feed the trading host serves.
+PUBLIC_SPOT_HOST = "https://data-api.binance.vision/api/v3"
 
-    def __init__(self, network: Network, credentials: Credentials | None = None) -> None:
+
+class BinanceREST:
+    """One ccxt client per market type, created lazily.
+
+    ``market_data=True`` builds clients for charting only: spot is pointed at
+    Binance's public read-only host and no credentials are used. Orders and
+    balances always go through a client built without that flag, so the
+    trading network and the charting source can differ.
+    """
+
+    def __init__(
+        self,
+        network: Network,
+        credentials: Credentials | None = None,
+        *,
+        market_data: bool = False,
+    ) -> None:
         self.network = network
         self.credentials = credentials or Credentials()
+        self.market_data = market_data
         self._clients: dict[MarketType, ccxt.Exchange] = {}
         self._specs: dict[tuple[MarketType, str], ContractSpec] = {}
         self._lock = threading.RLock()
@@ -51,6 +72,8 @@ class BinanceREST:
                         client.set_sandbox_mode(True)
                     except Exception as exc:
                         log.warning("无法启用 %s 测试网: %s", market.ccxt_id, exc)
+            if self.market_data:
+                self._prefer_public_data(client, market)
             if self.credentials.is_set:
                 client.apiKey = self.credentials.api_key
                 client.secret = self.credentials.api_secret
@@ -61,6 +84,26 @@ class BinanceREST:
         with self._lock:
             self._clients.clear()
             self._specs.clear()
+
+    @staticmethod
+    def _prefer_public_data(client: ccxt.Exchange, market: MarketType) -> None:
+        """Point a charting client at the read-only market-data host.
+
+        Only spot has a separate public host. Futures market data lives on the
+        same host as its trading API, so a testnet futures session keeps
+        reading the testnet feed — those candles are simulated, but there is no
+        mainnet futures mirror to fall back to.
+        """
+        if market is not MarketType.SPOT:
+            return
+        urls = client.urls.get("api")
+        if not isinstance(urls, dict):
+            return
+        urls["public"] = PUBLIC_SPOT_HOST
+        # ccxt asks "private" for some public endpoints; keeping it on the
+        # public host guarantees a charting client can never send a signed
+        # request even if a caller slips through.
+        urls["private"] = PUBLIC_SPOT_HOST
 
     def contract_spec(
         self, market: MarketType, symbol: str, allow_network: bool = True

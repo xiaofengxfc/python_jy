@@ -36,6 +36,10 @@ class AppContext:
         self.creds: Credentials = self.credentials.load(self.network, self.market_type)
 
         self.rest = BinanceREST(self.network, self.creds)
+        # Charting reads Binance's read-only public feed so candles look like
+        # the real market even while orders go to the test network. Credentials
+        # are deliberately withheld: a charting client can never sign anything.
+        self.market_rest = BinanceREST(self.network, Credentials(), market_data=True)
         self.paper = PaperBroker(starting_balance=10_000.0)
         # Resume the simulated account instead of handing out a fresh 10,000
         # every launch: cash, positions, resting orders and SL/TP guards.
@@ -49,12 +53,13 @@ class AppContext:
         # token saved from the settings page applies without a restart.
         self.news = NewsService(self.credentials.load_news)
 
-        self.klines = KlineStore(self.rest, paths.kline_cache_dir())
+        self.klines = KlineStore(self.market_rest, paths.kline_cache_dir(), source="mainnet")
 
         self.strategies = StrategyRegistry()
         self.strategies.discover([paths.user_strategies_dir()])
 
         self._market_rest: dict[MarketType, BinanceREST] = {self.market_type: self.rest}
+        self._data_rest: dict[MarketType, BinanceREST] = {self.market_type: self.market_rest}
 
     # ------------------------------------------------------------------ market
     def rest_for(self, market: MarketType) -> BinanceREST:
@@ -68,6 +73,30 @@ class AppContext:
             self._market_rest[market] = BinanceREST(self.network, creds)
         return self._market_rest[market]
 
+    def market_rest_for(self, market: MarketType) -> BinanceREST:
+        """The charting client: read-only candles, tickers and order books.
+
+        Spot goes to Binance's public mirror, so a testnet session still charts
+        real prices. Futures has no such mirror; it stays on the session's
+        network (see ``BinanceREST._prefer_public_data``).
+        """
+        if market not in self._data_rest:
+            base = self._market_rest.get(market) or self.rest_for(market)
+            self._data_rest[market] = BinanceREST(
+                base.network, Credentials(), market_data=True
+            )
+        return self._data_rest[market]
+
+    def quote_rest(self, market: MarketType, *, paper: bool) -> BinanceREST:
+        """Where a fill price comes from.
+
+        A paper fill is simulated, so quoting it from the same feed the chart
+        draws keeps the chart, the fills and the P/L consistent. A live order
+        must be priced against the venue that will execute it, otherwise a
+        testnet order would be sent with a mainnet-only price.
+        """
+        return self.market_rest_for(market) if paper else self.rest_for(market)
+
     def set_network(self, network: Network) -> None:
         self.network = network
         self.settings.network = network.value
@@ -75,7 +104,10 @@ class AppContext:
         self.rest.network = network
         self.rest.credentials = self.creds
         self.rest.reset()
+        self.market_rest.network = network
+        self.market_rest.reset()
         self._market_rest = {self.market_type: self.rest}
+        self._data_rest = {self.market_type: self.market_rest}
         self.config.save()
 
     def set_market_type(self, market: MarketType) -> None:
@@ -89,6 +121,7 @@ class AppContext:
         self.rest.credentials = creds
         self.rest.reset()
         self._market_rest = {}
+        self._data_rest = {self.market_type: self.market_rest}
         self.config.save()
 
     def save_credentials(self, api_key: str, api_secret: str) -> bool:

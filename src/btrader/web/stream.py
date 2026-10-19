@@ -27,7 +27,8 @@ log = logging.getLogger(__name__)
 # One queued frame per client is rarely enough for a charting UI; sixteen keeps
 # a short burst without letting a stalled tab grow unbounded.
 QUEUE_SIZE = 16
-BOOK_DEPTH = 12
+# Binance accepts these depth limits only; 12 is rejected with -4021.
+BOOK_DEPTH = 10
 _RETRY_SECONDS = 3.0
 # Trades arrive per fill; folding a short window into one frame keeps the
 # bounded client queue from being flushed by a busy market.
@@ -36,6 +37,16 @@ TRADE_FLUSH_SECONDS = 0.25
 
 class StreamHub:
     """Owns the exchange websockets and the subscriber queues."""
+
+    # Binance's public market-data websocket. It serves the same trades and
+    # books as the trading host but stays reachable from networks that block
+    # stream.binance.com, so a testnet trading session can still chart real
+    # prices instead of simulated ones.
+    PUBLIC_SPOT_WS = "wss://data-stream.binance.vision/ws"
+    # The matching read-only REST host. ccxt loads the market list before it
+    # can push a frame; without this the load goes to api.binance.com, which
+    # times out on such networks and leaves the socket silent.
+    PUBLIC_SPOT_REST = "https://data-api.binance.vision/api/v3"
 
     def __init__(self, network: Network) -> None:
         self.network = network
@@ -66,8 +77,40 @@ class StreamHub:
                 exchange.set_sandbox_mode(True)
             except Exception as exc:  # not every venue supports sandbox websockets
                 log.warning("WebSocket 测试网不可用，退回实盘行情: %s", exc)
+        if market is MarketType.SPOT:
+            self._use_public_spot_stream(exchange)
         self._exchanges[market] = exchange
         return exchange
+
+    def _use_public_spot_stream(self, exchange: Any) -> None:
+        """Chart spot from the public feed while orders go to the testnet.
+
+        Futures has no separate public host, so it keeps the session's
+        network. This is applied after ``set_sandbox_mode`` on purpose: the
+        sandbox switch rewrites the whole ``api`` block, and this override has
+        to win.
+
+        The REST host matters as much as the socket: ccxt loads the market
+        list before it can push a frame, and its default fetch probes spot,
+        linear and inverse — one timeout there and no ticker ever arrives.
+        Restricting it to spot and serving that from the public mirror keeps
+        the socket working on networks that block the trading hosts.
+        """
+        api = exchange.urls.get("api")
+        if isinstance(api, dict):
+            api["public"] = self.PUBLIC_SPOT_REST
+            api["private"] = self.PUBLIC_SPOT_REST
+            ws = api.get("ws")
+            if isinstance(ws, dict):
+                ws["spot"] = self.PUBLIC_SPOT_WS
+                ws["margin"] = self.PUBLIC_SPOT_WS
+        options = getattr(exchange, "options", None)
+        if isinstance(options, dict):
+            fetch = options.get("fetchMarkets")
+            if isinstance(fetch, dict):
+                fetch["types"] = ["spot"]
+            else:
+                options["fetchMarkets"] = ["spot"]
 
     # ---------------------------------------------------------- subscribers
     async def subscribe(

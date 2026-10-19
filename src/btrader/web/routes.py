@@ -633,7 +633,7 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
 def _last_price(state, market: MarketType, symbol: str) -> float | None:
     try:
         with state.locks[market]:
-            raw = state.ctx.rest_for(market).fetch_ticker(market, symbol)
+            raw = state.ctx.market_rest_for(market).fetch_ticker(market, symbol)
         price = float(raw.get("last") or 0.0)
         return price or None
     except Exception:

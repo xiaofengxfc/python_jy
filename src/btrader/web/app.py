@@ -145,7 +145,7 @@ def _symbols_for(state: _State, market: MarketType) -> tuple[list[dict[str, Any]
             return cached, None
         try:
             with state.locks[market]:
-                infos = load_symbols(state.ctx.rest_for(market), market)
+                infos = load_symbols(state.ctx.market_rest_for(market), market)
             items = [_symbol_payload(info) for info in infos]
             if not items:
                 raise RuntimeError("交易所返回了空的交易对列表")
@@ -525,7 +525,7 @@ def create_app() -> FastAPI:
         mt = _market(market)
         try:
             with state.locks[mt]:
-                raw = state.ctx.rest_for(mt).fetch_ticker(mt, symbol)
+                raw = state.ctx.market_rest_for(mt).fetch_ticker(mt, symbol)
         except Exception as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         return {
@@ -550,7 +550,7 @@ def create_app() -> FastAPI:
         limit = max(5, min(int(limit), 50))
         try:
             with state.locks[mt]:
-                book = state.ctx.rest_for(mt).fetch_order_book(mt, symbol, limit)
+                book = state.ctx.market_rest_for(mt).fetch_order_book(mt, symbol, limit)
         except Exception as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         return {
@@ -708,11 +708,14 @@ def create_app() -> FastAPI:
         mt = _market(payload.market)
         reference = payload.price if payload.order_type == "limit" else None
         if reference is None:
+            # A preview is an estimate for the ticket; quoting it from the
+            # charting feed keeps it consistent with the chart beside it. The
+            # real order re-reads the price from its own venue.
+            quote = state.ctx.market_rest_for(mt)
             try:
                 with state.locks[mt]:
                     reference = float(
-                        state.ctx.rest_for(mt).fetch_ticker(mt, payload.symbol).get("last")
-                        or 0.0
+                        quote.fetch_ticker(mt, payload.symbol).get("last") or 0.0
                     )
             except Exception as exc:
                 raise HTTPException(
@@ -815,13 +818,15 @@ def create_app() -> FastAPI:
                 take_profit=payload.take_profit,
             )
 
+        # A paper fill is simulated against the charting feed; a live order must
+        # be priced by the venue that will actually execute it.
+        quote = state.ctx.quote_rest(mt, paper=mode is RunMode.PAPER)
         reference = payload.price if payload.order_type == "limit" else None
         if reference is None:
             try:
                 with state.locks[mt]:
                     reference = float(
-                        state.ctx.rest_for(mt).fetch_ticker(mt, payload.symbol).get("last")
-                        or 0.0
+                        quote.fetch_ticker(mt, payload.symbol).get("last") or 0.0
                     )
             except Exception as exc:
                 raise HTTPException(
@@ -1038,10 +1043,10 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail="当前没有该交易对的持仓")
         size = abs(held) if payload.size is None else min(abs(payload.size), abs(held))
         try:
+            quote = state.ctx.quote_rest(mt, paper=mode is RunMode.PAPER)
             with state.locks[mt]:
                 reference = float(
-                    state.ctx.rest_for(mt).fetch_ticker(mt, payload.symbol).get("last")
-                    or 0.0
+                    quote.fetch_ticker(mt, payload.symbol).get("last") or 0.0
                 )
         except Exception as exc:
             raise HTTPException(status_code=503, detail=f"无法获取最新价：{exc}") from exc
@@ -1094,7 +1099,9 @@ def create_app() -> FastAPI:
                 market = _market_for_symbol(payload.symbol)
                 with state.locks[market]:
                     reference = float(
-                        state.ctx.rest_for(market).fetch_ticker(market, payload.symbol).get("last")
+                        state.ctx.market_rest_for(market)
+                        .fetch_ticker(market, payload.symbol)
+                        .get("last")
                         or 0.0
                     )
             except Exception as exc:
@@ -1312,7 +1319,7 @@ def _reconcile_paper_orders(state: _State) -> None:
                     continue
                 try:
                     with state.locks[market]:
-                        raw = state.ctx.rest_for(market).fetch_ticker(market, symbol)
+                        raw = state.ctx.market_rest_for(market).fetch_ticker(market, symbol)
                     price = float(raw.get("last") or 0.0)
                 except Exception as exc:
                     log.debug("纸面撮合取价失败 %s: %s", symbol, exc)

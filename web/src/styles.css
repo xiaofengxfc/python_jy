@@ -954,7 +954,7 @@ input[type="range"].input:focus {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .trading-main > .card:nth-child(2) {
+  .trading .trading-main > .card:nth-child(2) {
     min-height: 320px;
   }
 

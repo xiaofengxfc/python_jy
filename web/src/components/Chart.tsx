@@ -216,10 +216,13 @@ const MAX_BAR_BODY = 15;
  * sensible, but too low a cap makes trackpads feel unresponsive. */
 const MAX_WHEEL_STEPS = 6;
 const MIN_WHEEL_STEPS = 0.5;
-/** Wicks are treated as spikes worth clipping once the full high/low range is
- * this many times wider than the range of candle bodies. Below it the real
- * price action still sets the scale. */
-const SPIKE_RATIO = 1.8;
+/** Wicks are only clipped once the full high/low range is this many times
+ * wider than the range of candle bodies. Ordinary markets routinely run 2–3×
+ * (one doji among a tight cluster of bodies), so the threshold sits well above
+ * that: real data keeps its true scale, and only a simulated or corrupted
+ * series (where a single bar spans 30% around a body of a few hundred USDT)
+ * gets its axis narrowed. */
+const SPIKE_RATIO = 4;
 
 export default function Chart({
   candles,
@@ -530,9 +533,10 @@ function draw(
   const rect = wrap.getBoundingClientRect();
   // Never inflate the canvas past its container: a hard 240px floor made the
   // canvas wider than the chart panel on narrow windows, so it overflowed and
-  // was clipped by the card. Measure what we actually have.
-  const width = Math.max(160, Math.floor(rect.width) - 16);
-  const height = Math.max(160, Math.floor(rect.height) - 8);
+  // was clipped by the card. Measure what we actually have — even a short
+  // panel gets a short canvas that fits, instead of a 160px one that is cut.
+  const width = Math.max(140, Math.floor(rect.width) - 16);
+  const height = Math.max(80, Math.floor(rect.height) - 8);
   const dpr = window.devicePixelRatio || 1;
 
   canvas.width = width * dpr;

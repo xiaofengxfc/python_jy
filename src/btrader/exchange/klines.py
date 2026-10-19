@@ -19,17 +19,28 @@ COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
 class KlineStore:
     """Loads OHLCV data from the Binance REST API and caches it as Parquet.
 
-    Cache files are partitioned by market type and symbol:
-        <cache>/klines/usdm/BTC_USDT/15m.parquet
+    Cache files are partitioned by data source, market type and symbol:
+        <cache>/klines/mainnet/usdm/BTC_USDT/15m.parquet
+
+    The source partition is what keeps a testnet session from reading candles
+    that a live session downloaded (or the other way round): simulated candles
+    and real ones share a timestamp grid but not a price scale.
     """
 
-    def __init__(self, rest: BinanceREST, cache_root: Path) -> None:
+    def __init__(
+        self, rest: BinanceREST, cache_root: Path, source: str | None = None
+    ) -> None:
         self._rest = rest
         self._root = cache_root
+        # Candles are cached per data source. Without this, a session that
+        # switches between testnet and mainnet data would merge simulated
+        # candles into the real series (and vice versa), producing exactly the
+        # sort of 30%-wide bars that make a chart unreadable.
+        self._source = source or rest.network.value
 
     def _path(self, market: MarketType, symbol: str, timeframe: str) -> Path:
         safe = symbol.replace("/", "_").replace(":", "-")
-        folder = self._root / market.value / safe
+        folder = self._root / self._source / market.value / safe
         folder.mkdir(parents=True, exist_ok=True)
         return folder / f"{timeframe}.parquet"
 
