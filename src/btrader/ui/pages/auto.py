@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -43,13 +44,21 @@ class AutoPage(QWidget):
 
     # -------------------------------------------------------------------- ui
     def _build_ui(self) -> None:
+        # The page scrolls: the config group, control group and log easily
+        # exceed a short window, and a plain layout clips them with no way to
+        # reach the start/stop buttons.
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(*theme.PAGE_MARGIN)
-        outer.setSpacing(theme.PAGE_GAP)
-        outer.addWidget(PageHeader("自动交易", "策略信号自动执行，所有订单都会经过风控检查"))
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        content = QWidget()
+        body = QVBoxLayout(content)
+        body.setContentsMargins(*theme.PAGE_MARGIN)
+        body.setSpacing(theme.PAGE_GAP)
+        body.addWidget(PageHeader("自动交易", "策略信号自动执行，所有订单都会经过风控检查"))
 
         # The run state spans the page: it is the first thing to check.
-        outer.addWidget(self._build_state_card())
+        body.addWidget(self._build_state_card())
 
         root = QHBoxLayout()
         root.setSpacing(theme.PAGE_GAP)
@@ -88,7 +97,14 @@ class AutoPage(QWidget):
         orders_card.body().addWidget(self.orders_table)
         right.addWidget(orders_card)
         root.addLayout(right, 1)
-        outer.addLayout(root, 1)
+        body.addLayout(root, 1)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
 
     def _build_state_card(self) -> QWidget:
         card = Card()

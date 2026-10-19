@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import logging
 
-from PySide6.QtCore import QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
@@ -41,7 +42,15 @@ class PortfolioPage(QWidget):
         QTimer.singleShot(200, self.refresh)
 
     def _build_ui(self) -> None:
-        root = QVBoxLayout(self)
+        # The page scrolls: at small window heights the tables and metric
+        # cards no longer fit, and a plain layout would clip the bottom rows
+        # with no way to reach them.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        content = QWidget()
+        root = QVBoxLayout(content)
         root.setContentsMargins(*theme.PAGE_MARGIN)
         root.setSpacing(theme.PAGE_GAP)
 
@@ -121,6 +130,13 @@ class PortfolioPage(QWidget):
         tables.addWidget(positions_card, 3)
 
         root.addLayout(tables, 1)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
 
     # ------------------------------------------------------------------ data
     def refresh(self) -> None:

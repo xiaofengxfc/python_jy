@@ -68,6 +68,33 @@ def test_theme_supports_dark_and_light(app):
     theme.apply_theme(app, "dark")  # leave the shared app on the default
 
 
+def test_number_inputs_keep_a_full_width_editor(app, ctx):
+    """Number fields must show and accept text.
+
+    Regression guard: calling ``setButtonSymbols(NoButtons)`` on a spin box
+    that also has a custom QSS border makes Qt shrink the inner QLineEdit to
+    1px. The value then looks empty and the field cannot be clicked into.
+    """
+    window = MainWindow(ctx)
+    window.resize(1440, 900)
+    window.show()
+    app.processEvents()
+
+    page = window.trading_page
+    for name, spin in (
+        ("price", page.price_spin),
+        ("amount", page.amount_spin),
+        ("leverage", page.leverage_spin),
+    ):
+        editor = spin.lineEdit()
+        assert editor is not None, f"{name} 没有内部编辑框"
+        width = editor.geometry().width()
+        assert width > 50, f"{name} 编辑区塌陷为 {width}px: {editor.geometry()}"
+        assert width >= spin.width() - 4, f"{name} 编辑区未占满输入框"
+
+    window.close()
+
+
 def test_paper_limit_order_fills_when_price_crosses(app, ctx):
     """A resting paper limit order fills on the next ticker that crosses it."""
     from btrader.core.types import MarketType, RunMode

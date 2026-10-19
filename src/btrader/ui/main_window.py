@@ -24,12 +24,14 @@ from PySide6.QtWidgets import (
 from .. import APP_NAME, __version__
 from ..context import AppContext
 from ..core.types import Network, RunMode
+from ..logging_setup import error_buffer
 from . import theme
 from .pages.auto import AutoPage
 from .pages.backtest import BacktestPage
 from .pages.portfolio import PortfolioPage
 from .pages.settings import SettingsPage
 from .pages.trading import TradingPage
+from .widgets.log_view import LogViewDialog
 
 log = logging.getLogger(__name__)
 
@@ -385,6 +387,17 @@ class MainWindow(QMainWindow):
         self.risk_label.setObjectName("StatusLabel")
         layout.addWidget(self.risk_label)
 
+        # Global error-log entry point: always reachable regardless of which
+        # page is open. The count follows the in-memory buffer.
+        self.error_btn = QPushButton("日志")
+        self.error_btn.setObjectName("StatusButton")
+        self.error_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.error_btn.clicked.connect(self.show_error_log)
+        self.error_btn.setProperty("alert", "false")
+        layout.addWidget(self.error_btn)
+
+        self._log_dialog: LogViewDialog | None = None
+
         grip = QSizeGrip(strip)
         grip.setFixedSize(12, 12)
         layout.addWidget(grip, 0, Qt.AlignmentFlag.AlignRight)
@@ -432,6 +445,42 @@ class MainWindow(QMainWindow):
             api_text,
             api_ok,
         )
+        self._refresh_error_count()
+
+    def _refresh_error_count(self) -> None:
+        """Status-strip badge mirroring the in-memory error buffer."""
+        errors, warnings = error_buffer().counts()
+        if errors:
+            self.error_btn.setText(f"日志 · {errors}")
+            self.error_btn.setProperty("alert", "true")
+            self.error_btn.setToolTip(f"{errors} 个错误、{warnings} 条警告，点击查看")
+        elif warnings:
+            self.error_btn.setText(f"日志 · {warnings}")
+            self.error_btn.setProperty("alert", "false")
+            self.error_btn.setToolTip(f"{warnings} 条警告，点击查看")
+        else:
+            self.error_btn.setText("日志")
+            self.error_btn.setProperty("alert", "false")
+            self.error_btn.setToolTip("查看运行时的警告与错误")
+        # A property change only reaches the stylesheet after a re-polish.
+        self.error_btn.style().unpolish(self.error_btn)
+        self.error_btn.style().polish(self.error_btn)
+
+    def show_error_log(self) -> None:
+        """Open (or raise) the global error-log viewer."""
+        if self._log_dialog is None:
+            self._log_dialog = LogViewDialog(self)
+            self._log_dialog.finished.connect(self._on_log_dialog_closed)
+            # Clearing empties the shared buffer, so the strip badge must be
+            # recomputed even though the dialog stays open.
+            self._log_dialog.cleared.connect(self._refresh_error_count)
+        self._log_dialog.show()
+        self._log_dialog.raise_()
+        self._log_dialog.activateWindow()
+
+    def _on_log_dialog_closed(self, _result: int = 0) -> None:
+        # The dialog can be cleared while open; resync the badge afterwards.
+        self._refresh_error_count()
 
     def _paper_equity_text(self) -> str:
         """Sidebar snapshot: paper equity, since the strip reports paper mode."""
@@ -537,6 +586,8 @@ class MainWindow(QMainWindow):
         self.sidebar.refresh_theme()
         self.title_bar.refresh_theme()
         self._refresh_status()
+        if self._log_dialog is not None:
+            self._log_dialog.refresh_theme()
 
     # ---------------------------------------------------------------- routing
     def _promote_backtest(self, result, params: dict) -> None:

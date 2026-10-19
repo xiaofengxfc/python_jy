@@ -11,9 +11,15 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QPalette
-from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtWidgets import (
+    QAbstractScrollArea,
+    QAbstractSpinBox,
+    QApplication,
+    QComboBox,
+    QWidget,
+)
 
 
 @dataclass(frozen=True)
@@ -211,6 +217,52 @@ def set_theme(name: str) -> Palette:
 def _rgba(color: str, alpha: float) -> str:
     c = QColor(color)
     return f"rgba({c.red()}, {c.green()}, {c.blue()}, {alpha:.3f})"
+
+
+class _WheelGuard(QObject):
+    """Route wheel gestures over inputs to the surrounding scroll area.
+
+    Without this, spinning the page while the pointer happens to sit over a
+    number field silently edits the order size, and a combo box flips to the
+    neighbouring symbol. Qt gives such widgets wheel behaviour even when they
+    are not focused, which turns accidental scrolling into accidental orders.
+    A focused input keeps its normal wheel/step behaviour.
+    """
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: ANN001 - Qt signature
+        if event.type() != QEvent.Type.Wheel:
+            return False
+        if not isinstance(obj, (QAbstractSpinBox, QComboBox)):
+            return False
+        if obj.hasFocus():
+            return False
+
+        area = obj.parentWidget()
+        while area is not None and not isinstance(area, QAbstractScrollArea):
+            area = area.parentWidget()
+        if area is None:
+            return True  # nowhere to scroll: swallow, never mutate the value
+
+        bar = area.verticalScrollBar()
+        if bar.maximum() <= 0:
+            return True
+        delta = event.angleDelta().y() or event.angleDelta().x()
+        steps = delta / 120.0
+        bar.setValue(bar.value() - int(round(steps * bar.singleStep() * 3)))
+        return True
+
+
+_wheel_guard: _WheelGuard | None = None
+
+
+def install_wheel_guard(app: QApplication) -> None:
+    """Install the global input-wheel guard exactly once per application."""
+    global _wheel_guard
+    if _wheel_guard is not None:
+        return
+    _wheel_guard = _WheelGuard(app)
+    app.installEventFilter(_wheel_guard)
+
 
 
 def set_role(widget: QWidget, role: str | None) -> None:
@@ -446,6 +498,26 @@ QPushButton#Flat {{
     background: transparent; border: 1px solid {p.border}; color: {p.text};
 }}
 QPushButton#Flat:hover {{ background: {p.bg_hover}; border-color: {p.border}; }}
+/* Status-strip button: the strip is 30px tall while the generic button rule
+   reserves 34px of min-height, which would stretch it past the strip. The
+   alert state is a property so the colour follows the active theme. */
+QPushButton#StatusButton {{
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    padding: 0 8px;
+    min-height: 22px;
+    max-height: 22px;
+    color: {p.text_dim};
+    font-size: 11px;
+}}
+QPushButton#StatusButton:hover {{ background: {p.bg_hover}; color: {p.text}; }}
+QPushButton#StatusButton[alert="true"] {{
+    color: {p.down}; font-weight: 600;
+}}
+QPushButton#StatusButton[alert="true"]:hover {{
+    background: {sell_soft}; color: {p.down};
+}}
 
 /* ---------------------------------------------------- segmented controls */
 QPushButton#SegmentLeft, QPushButton#SegmentRight {{
@@ -556,9 +628,14 @@ QComboBox QAbstractItemView {{
     selection-background-color: {p.bg_hover};
     outline: none;
 }}
+/* Spin boxes: hide the step buttons through CSS. Setting
+   ``setButtonSymbols(NoButtons)`` in code is *not* equivalent: combined with
+   a custom border it makes Qt shrink the inner QLineEdit to 1px, so the
+   field shows no text and cannot be clicked into. Keeping the buttons
+   enabled and giving them zero width keeps the editor full-width. */
 QSpinBox::up-button, QSpinBox::down-button,
 QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
-    background: transparent; border: none; width: 14px;
+    background: transparent; border: none; width: 0px;
 }}
 
 /* ---------------------------------------------------------- tables */
@@ -724,6 +801,7 @@ def apply_theme(app: QApplication, name: str | None = None) -> Palette:
     app.setStyle("Fusion")
     app.setPalette(_build_palette(palette))
     app.setStyleSheet(stylesheet(palette))
+    install_wheel_guard(app)
     bus().changed.emit(palette)
     return palette
 
