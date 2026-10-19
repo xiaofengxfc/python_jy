@@ -35,6 +35,9 @@ log = logging.getLogger(__name__)
 GATEWAY_PACKAGE = "openclaw"
 WECHAT_PACKAGE = "@tencent-weixin/openclaw-weixin"
 WECHAT_INSTALLER = "@tencent-weixin/openclaw-weixin-cli"
+# The channel id the gateway knows the plugin by. Sending with any other
+# ``--channel`` value fails, and so does login.
+WECHAT_CHANNEL = "openclaw-weixin"
 NPM_REGISTRIES = ("https://registry.npmjs.org", "https://registry.npmmirror.com")
 
 INSTALL_TIMEOUT = 900.0
@@ -122,6 +125,105 @@ class OpenClawInstaller:
         args.append(f"--registry={registry or NPM_REGISTRIES[0]}")
         args.extend(["--no-fund", "--no-audit"])
         return args
+
+    def channel_plan(self) -> list[str]:
+        """The argv that registers the WeChat plugin with the gateway.
+
+        ``npm install -g`` only puts files on disk. The gateway has its own
+        plugin ledger, and a channel it has never heard of makes both sending
+        and ``channels login`` fail — so this step is what turns "npm is done"
+        into "the gateway knows about WeChat".
+        """
+        exe = _openclaw_executable()
+        if not exe:
+            raise ValueError("未找到 openclaw，请先完成上面的自动安装。")
+        return [
+            exe,
+            "plugins",
+            "install",
+            WECHAT_PACKAGE,
+            "--force",
+            "--accept-capabilities",
+        ]
+
+    def register_channel(self) -> dict:
+        """Background-run the plugin registration, streamed like an install."""
+        args = self.channel_plan()
+        with self._lock:
+            if self._run is not None and self._run.state == "running":
+                raise ValueError("已有安装任务在进行中，请等待它结束。")
+            run = _Run(command=args)
+            self._run = run
+            self._thread = threading.Thread(
+                target=self._work_channel, args=(run,), name="openclaw-channel", daemon=True
+            )
+        self._thread.start()
+        return self.status()
+
+    def login_plan(self) -> list[str]:
+        """The argv a terminal needs to run so the user can scan a QR code.
+
+        Login is an interactive wizard: it asks whether to download the plugin
+        and then waits for a QR scan. That cannot be driven from a log stream,
+        so the page opens a real terminal instead of pretending to automate it.
+        """
+        exe = _openclaw_executable()
+        if not exe:
+            raise ValueError("未找到 openclaw，请先完成自动安装与插件注册。")
+        return [exe, "channels", "login", "--channel", WECHAT_CHANNEL]
+
+    def open_login_terminal(self) -> dict:
+        """Spawn a visible terminal running the login wizard.
+
+        Returned, not automated: the scan happens between the user and WeChat,
+        and a process we cannot see would just hang. Failure to open a window is
+        reported with the command so it can be pasted into a shell by hand.
+        """
+        args = self.login_plan()
+        try:
+            _spawn_terminal(args)
+        except Exception as exc:
+            raise ValueError(f"无法打开终端窗口（{exc}）。请手动执行：{' '.join(args)}") from exc
+        return {"command": args, "channel": WECHAT_CHANNEL}
+
+    def channel_status(self) -> dict:
+        """Whether the gateway knows the WeChat channel and has an account.
+
+        Read from ``openclaw channels list --all`` rather than inferred from
+        files on disk: a plugin can be installed and still be disabled or
+        unconfigured, and the difference decides which button the page shows.
+        """
+        exe = _openclaw_executable()
+        info = {
+            "channel": WECHAT_CHANNEL,
+            "cli": bool(exe),
+            "plugin": False,
+            "configured": False,
+            "state": "unknown",
+            "detail": "",
+        }
+        if not exe:
+            info["state"] = "missing"
+            info["detail"] = "未安装 openclaw"
+            return info
+        text = _run_capture([exe, "channels", "list", "--all"])
+        info["detail"] = text.strip()[:400]
+        for line in text.splitlines():
+            stripped = line.strip().lstrip("-* ").strip()
+            if not stripped.lower().startswith(WECHAT_CHANNEL):
+                continue
+            info["plugin"] = True
+            lowered = stripped.lower()
+            # e.g. "- openclaw-weixin: installed, not configured, disabled"
+            info["configured"] = (
+                "not configured" not in lowered and "unconfigured" not in lowered
+            )
+            info["state"] = "ready" if info["configured"] else "installed"
+            break
+        if not info["plugin"]:
+            info["state"] = "missing"
+            info["detail"] = info["detail"] or "网关中未找到微信渠道"
+        return info
 
     def start(self, options: InstallOptions) -> dict:
         """Begin an install. Raises ``ValueError`` when it cannot start."""
@@ -261,6 +363,60 @@ class OpenClawInstaller:
         with self._lock:
             run.lines.append(text)
 
+    def _work_channel(self, run: _Run) -> None:
+        """Register the channel, retrying with an explicit version on a pin.
+
+        ``plugins install`` can land an older pinned build that the running
+        gateway refuses to load (its peer SDK export may have moved). The
+        gateway's own advice is ``plugins update <package>@latest``, so that is
+        the second attempt — done here rather than by the user.
+        """
+        try:
+            self._append(run, "$ " + " ".join(run.command))
+            code = _stream_process(run, self._set_process, run.command)
+            if run.cancel.is_set():
+                run.state = "canceled"
+                run.error = "插件注册已取消。"
+                return
+            if code != 0:
+                run.state = "failed"
+                run.error = f"openclaw 返回退出码 {code}，详见下方日志。"
+                return
+            status = self.channel_status()
+            if status["state"] == "missing":
+                # Installed but the gateway still cannot see it: usually a pinned
+                # build that fails to load. Upgrade once, then re-check.
+                exe = _openclaw_executable()
+                retry = [exe, "plugins", "update", f"{WECHAT_PACKAGE}@latest", "--accept-capabilities"]
+                self._append(run, "$ " + " ".join(retry))
+                code = _stream_process(run, self._set_process, retry)
+                if code == 0:
+                    status = self.channel_status()
+            if status["state"] == "missing":
+                run.state = "failed"
+                run.error = (
+                    "插件已下载，但网关未能加载它。请查看日志中的加载错误；"
+                    "通常是插件版本与 OpenClaw 版本不兼容。"
+                )
+                return
+            run.state = "done"
+            log.info("微信插件已注册：%s", WECHAT_CHANNEL)
+        except FileNotFoundError as exc:
+            run.state = "failed"
+            run.error = f"无法启动 openclaw：{exc}"
+        except Exception as exc:  # pragma: no cover - defensive
+            run.state = "failed"
+            run.error = f"插件注册出错：{exc}"
+            log.warning("注册微信插件失败", exc_info=True)
+        finally:
+            with self._lock:
+                self._process = None
+                run.finished_at = time.time()
+
+    def _set_process(self, process: subprocess.Popen | None) -> None:
+        with self._lock:
+            self._process = process
+
 
 def _which(name: str) -> str | None:
     """Locate an executable, honouring PATHEXT so Windows ``.cmd`` shims work."""
@@ -311,3 +467,93 @@ def _version(executable: str) -> str:
         return ""
     text = (completed.stdout or completed.stderr or "").strip()
     return text.splitlines()[0][:80] if text else ""
+
+
+def _openclaw_executable() -> str:
+    """Full path of the gateway CLI, or ``""``. A bare name breaks on Windows."""
+    return _which("openclaw") or ""
+
+
+def _run_capture(args: list[str], timeout: float = 30.0) -> str:
+    """Run a short read-only command and return its combined output."""
+    try:
+        completed = subprocess.run(
+            _wrap_launcher(args),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            shell=False,
+            stdin=subprocess.DEVNULL,
+        )
+    except Exception:
+        log.debug("执行 %s 失败", args, exc_info=True)
+        return ""
+    return (completed.stdout or "") + (completed.stderr or "")
+
+
+def _stream_process(
+    run: _Run, store, args: list[str], timeout: float = INSTALL_TIMEOUT
+) -> int:
+    """Run a command, appending its output to ``run`` until it exits.
+
+    Shared by every step that reports progress to the page, so cancel and the
+    log behave the same whether we are installing or registering a plugin.
+    """
+    kwargs: dict = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "stdin": subprocess.DEVNULL,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "shell": False,
+        "bufsize": 1,
+    }
+    if os.name == "nt":
+        # A new process group is what lets ``_terminate`` kill the whole tree.
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+    else:
+        kwargs["start_new_session"] = True
+    process = subprocess.Popen(_wrap_launcher(args), **kwargs)
+    store(process)
+    deadline = time.time() + timeout
+    try:
+        assert process.stdout is not None
+        for line in process.stdout:
+            if run.cancel.is_set() or time.time() > deadline:
+                break
+            text = (line or "").rstrip()
+            if text:
+                run.lines.append(text)
+        if run.cancel.is_set():
+            _terminate(process)
+            process.wait(timeout=5)
+            return -1
+        if time.time() > deadline:
+            _terminate(process)
+            process.wait(timeout=5)
+            return -1
+        return process.wait(timeout=30)
+    finally:
+        store(None)
+
+
+def _spawn_terminal(args: list[str]) -> None:
+    """Open a visible terminal window and run ``args`` in it.
+
+    The login wizard draws a QR code and waits for a scan. That only works in a
+    real console, so this deliberately detaches: the window outlives the server
+    request, and the user finishes the flow there.
+    """
+    if os.name == "nt":
+        # ``start`` needs a title argument first, otherwise it eats the command.
+        subprocess.Popen(
+            ["cmd", "/c", "start", "OpenClaw 微信扫码登录", "cmd", "/k", *args],
+            shell=False,
+            close_fds=True,
+        )
+        return
+    subprocess.Popen(args, shell=False, start_new_session=True)
+

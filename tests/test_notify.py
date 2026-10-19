@@ -52,8 +52,13 @@ def test_disabled_notifier_queues_nothing() -> None:
 
 def test_events_can_be_switched_off_individually() -> None:
     notifier = _notifier(on_fill=False)
-    assert notifier.notify("filled", kind="fill") is False
-    assert notifier.notify("halted", kind="risk") is True
+    try:
+        assert notifier.notify("filled", kind="fill") is False
+        assert notifier.notify("halted", kind="risk") is True
+    finally:
+        # Without this the worker outlives the test and its send lands in the
+        # next test's ``captured`` dict, which reads as a wrong-message bug.
+        notifier.stop()
 
 
 def test_empty_message_is_ignored() -> None:

@@ -592,6 +592,35 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
         """Stop the running install and the npm tree it spawned."""
         return get_state().ctx.installer.cancel()
 
+    @router.get("/api/install/openclaw/channel")
+    def channel_status() -> dict[str, Any]:
+        """Whether the gateway knows the WeChat channel and has an account.
+
+        Read from the gateway rather than inferred from files on disk, because a
+        plugin can be installed and still be disabled or unconfigured.
+        """
+        return get_state().ctx.installer.channel_status()
+
+    @router.post("/api/install/openclaw/channel")
+    def channel_register() -> dict[str, Any]:
+        """Register the WeChat plugin with the gateway, streamed to the log."""
+        try:
+            return get_state().ctx.installer.register_channel()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.post("/api/install/openclaw/login")
+    def channel_login() -> dict[str, Any]:
+        """Open a terminal for the interactive WeChat QR scan.
+
+        The login wizard asks questions and draws a QR code, so it cannot be
+        driven from a log stream; the returned command is what the window runs.
+        """
+        try:
+            return get_state().ctx.installer.open_login_terminal()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
 
     # ------------------------------------------------------------------ news
     @router.get("/api/news")

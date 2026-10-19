@@ -21,6 +21,7 @@ import pytest
 from btrader.installer import (
     GATEWAY_PACKAGE,
     NPM_REGISTRIES,
+    WECHAT_CHANNEL,
     WECHAT_INSTALLER,
     WECHAT_PACKAGE,
     InstallOptions,
@@ -244,3 +245,98 @@ def test_status_is_idle_before_anything_runs(fake_env) -> None:
     assert status["running"] is False
     assert status["log"] == []
     assert set(NPM_REGISTRIES) == set(status["registries"])
+
+
+def test_channel_plan_registers_the_plugin_with_the_gateway(fake_env) -> None:
+    """npm only writes files; the gateway keeps its own plugin ledger."""
+    fake_env["which"]["openclaw"] = "/usr/local/bin/openclaw"
+    argv = OpenClawInstaller().channel_plan()
+    assert argv[:3] == ["/usr/local/bin/openclaw", "plugins", "install"]
+    assert WECHAT_PACKAGE in argv
+    # Both flags are needed for a non-interactive run, otherwise it prompts.
+    assert "--force" in argv and "--accept-capabilities" in argv
+
+
+def test_channel_plan_needs_the_cli(fake_env) -> None:
+    with pytest.raises(ValueError, match="openclaw"):
+        OpenClawInstaller().channel_plan()
+
+
+def test_login_plan_uses_the_channel_id_the_gateway_knows(fake_env) -> None:
+    fake_env["which"]["openclaw"] = "/usr/local/bin/openclaw"
+    argv = OpenClawInstaller().login_plan()
+    assert argv[1:] == ["channels", "login", "--channel", WECHAT_CHANNEL]
+
+
+def test_channel_status_reads_the_gateway_catalog(fake_env, monkeypatch) -> None:
+    fake_env["which"]["openclaw"] = "/usr/local/bin/openclaw"
+    output = (
+        "Chat channels:\n"
+        "- openclaw-weixin: installed, not configured, disabled\n"
+    )
+    monkeypatch.setattr("btrader.installer._run_capture", lambda args, timeout=30.0: output)
+    status = OpenClawInstaller().channel_status()
+    assert status["plugin"] is True
+    # Installed but never scanned: the page must offer the QR code, not "done".
+    assert status["configured"] is False
+    assert status["state"] == "installed"
+
+
+def test_channel_status_reports_a_missing_channel(fake_env, monkeypatch) -> None:
+    fake_env["which"]["openclaw"] = "/usr/local/bin/openclaw"
+    monkeypatch.setattr(
+        "btrader.installer._run_capture", lambda args, timeout=30.0: "Chat channels:\n"
+    )
+    status = OpenClawInstaller().channel_status()
+    assert status["plugin"] is False
+    assert status["state"] == "missing"
+
+
+def test_channel_status_without_the_cli_does_not_shell_out(fake_env, monkeypatch) -> None:
+    called = []
+    monkeypatch.setattr(
+        "btrader.installer._run_capture", lambda args, timeout=30.0: called.append(args) or ""
+    )
+    status = OpenClawInstaller().channel_status()
+    assert status["state"] == "missing" and status["cli"] is False
+    assert called == []
+
+
+def test_register_channel_streams_the_log(fake_env, monkeypatch) -> None:
+    fake_env["which"]["openclaw"] = "/usr/local/bin/openclaw"
+    monkeypatch.setattr(
+        "btrader.installer.subprocess.Popen",
+        lambda argv, **kw: FakeProcess(["Installed plugin: openclaw-weixin"], argv=argv),
+    )
+    monkeypatch.setattr(
+        "btrader.installer._run_capture",
+        lambda args, timeout=30.0: "- openclaw-weixin: installed, not configured\n",
+    )
+    installer = OpenClawInstaller()
+    installer.register_channel()
+    status = _wait(installer)
+    assert status["state"] == "done"
+    assert any("openclaw-weixin" in line for line in status["log"])
+
+
+def test_register_channel_fails_when_the_gateway_still_cannot_see_it(
+    fake_env, monkeypatch
+) -> None:
+    """A plugin that downloads but never loads must not read as success."""
+    fake_env["which"]["openclaw"] = "/usr/local/bin/openclaw"
+    runs = []
+
+    def fake_popen(argv, **kw):
+        runs.append(argv)
+        return FakeProcess(["failed during load"], argv=argv)
+
+    monkeypatch.setattr("btrader.installer.subprocess.Popen", fake_popen)
+    monkeypatch.setattr(
+        "btrader.installer._run_capture", lambda args, timeout=30.0: "Chat channels:\n"
+    )
+    installer = OpenClawInstaller()
+    installer.register_channel()
+    status = _wait(installer)
+    assert status["state"] == "failed"
+    # It retried once with an explicit version before giving up.
+    assert any("plugins" in run and "update" in run for run in runs[1:])

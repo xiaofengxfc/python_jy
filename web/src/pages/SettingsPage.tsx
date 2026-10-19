@@ -3,6 +3,7 @@ import { api } from "../api";
 import { TIMEFRAMES } from "../format";
 import type {
   AppSettings,
+  ChannelStatus,
   CredentialItem,
   InstallStatus,
   NotifyStatus,
@@ -63,6 +64,61 @@ export default function SettingsPage({ settings, onSaved }: Props) {
   const [installRegistry, setInstallRegistry] = useState("");
   const [installNpmPath, setInstallNpmPath] = useState("");
   const [installPlan, setInstallPlan] = useState<string[]>([]);
+  const [channel, setChannel] = useState<ChannelStatus | null>(null);
+  const [channelBusy, setChannelBusy] = useState(false);
+  const [channelNote, setChannelNote] = useState("");
+
+  const loadChannel = useCallback(async () => {
+    try {
+      const next = await api<ChannelStatus>("/api/install/openclaw/channel");
+      setChannel(next);
+      return next;
+    } catch {
+      return null;
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadChannel();
+  }, [loadChannel]);
+
+  // Re-read the channel state whenever a step finishes: registering the plugin
+  // and scanning the code both change what the page should offer next.
+  useEffect(() => {
+    if (install?.running) return;
+    if (install?.state === "running") return;
+    void loadChannel();
+  }, [install?.state, install?.running, loadChannel]);
+
+  const registerChannel = async () => {
+    setChannelBusy(true);
+    setChannelNote("");
+    try {
+      setInstall(await api<InstallStatus>("/api/install/openclaw/channel", { method: "POST" }));
+    } catch (error) {
+      setChannelNote(error instanceof Error ? error.message : String(error));
+    } finally {
+      setChannelBusy(false);
+    }
+  };
+
+  const openLogin = async () => {
+    setChannelBusy(true);
+    setChannelNote("");
+    try {
+      const result = await api<{ command: string[] }>("/api/install/openclaw/login", {
+        method: "POST",
+      });
+      setChannelNote(
+        "已打开终端窗口，请在窗口里扫码完成授权；完成后回到本页点“刷新状态”。" +
+          `若没有弹出窗口，请手动执行：${result.command.join(" ")}`,
+      );
+    } catch (error) {
+      setChannelNote(error instanceof Error ? error.message : String(error));
+    } finally {
+      setChannelBusy(false);
+    }
+  };
 
   const loadInstall = useCallback(async () => {
     try {
@@ -845,6 +901,63 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                     )}
                   </>
                 )}
+                {/* Registration and login are separate from installing: npm only
+                    puts files on disk, the gateway keeps its own plugin ledger,
+                    and the scan happens between the user and WeChat. */}
+                <div className="install-head" style={{ marginTop: 10 }}>
+                  <span className="card-title" style={{ fontSize: 12 }}>
+                    微信通道
+                  </span>
+                  <span className="faint" style={{ fontSize: 11 }}>
+                    {!channel
+                      ? "检测中…"
+                      : channel.state === "ready"
+                        ? "已绑定，可直接推送"
+                        : channel.state === "installed"
+                          ? "插件已注册，尚未扫码绑定"
+                          : channel.state === "missing"
+                            ? channel.cli
+                              ? "插件未注册到网关"
+                              : "未检测到 openclaw"
+                            : "状态未知"}
+                  </span>
+                  <span className="spacer" />
+                  <button
+                    type="button"
+                    className="btn-sm"
+                    disabled={channelBusy}
+                    onClick={() => void loadChannel()}
+                  >
+                    刷新状态
+                  </button>
+                </div>
+                {channel?.state === "missing" && channel.cli && (
+                  <div className="verdict bad">
+                    npm 装好了，但网关还不认识微信渠道。请先点“注册插件”。
+                  </div>
+                )}
+                <div className="install-head">
+                  <button
+                    type="button"
+                    className="btn-sm"
+                    disabled={channelBusy || install?.running || !install?.available}
+                    onClick={() => void registerChannel()}
+                  >
+                    注册微信插件
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-sm primary"
+                    disabled={channelBusy || channel?.plugin === false}
+                    onClick={() => void openLogin()}
+                  >
+                    扫码授权
+                  </button>
+                  <span className="faint" style={{ fontSize: 11 }}>
+                    扫码会打开一个终端窗口，二维码在窗口里。
+                  </span>
+                </div>
+                {channelNote && <div className="hint">{channelNote}</div>}
               </div>
               {notifyStatus?.last_error && (
                 <div className="verdict bad">

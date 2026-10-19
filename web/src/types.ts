@@ -244,6 +244,21 @@ export interface InstallStatus {
   log: string[];
 }
 
+/** What the gateway says about the WeChat channel itself. */
+export interface ChannelStatus {
+  channel: string;
+  /** The `openclaw` CLI exists. */
+  cli: boolean;
+  /** The gateway has the plugin in its catalog (even if not configured). */
+  plugin: boolean;
+  /** An account is linked, i.e. the QR scan has been done. */
+  configured: boolean;
+  /** missing | installed | ready | unknown */
+  state: string;
+  /** Raw `channels list --all` excerpt, for the "what went wrong" case. */
+  detail: string;
+}
+
 export interface CredentialItem {
   market: string;
   label: string;
