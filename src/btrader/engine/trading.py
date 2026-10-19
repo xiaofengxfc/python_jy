@@ -8,8 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
-import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ..core.config import AppSettings
 from ..core.models import now_ms
@@ -36,6 +35,26 @@ class OrderRejected(RuntimeError):
     pass
 
 
+def _is_filled(order: dict) -> bool:
+    """Whether an order already has exposure to protect.
+
+    ccxt reports ``status == "closed"`` for a filled order and also mirrors the
+    raw ``filled``/``amount`` pair. Both are checked: some venues answer ACK
+    with no status, and a filled market entry must still get its stop.
+    """
+    status = str(order.get("status") or "").lower()
+    if status == "closed":
+        return True
+    if status in ("open", "new", "partially_filled", "canceled", "rejected", "expired"):
+        return status == "partially_filled"
+    filled = order.get("filled")
+    amount = order.get("amount")
+    try:
+        return filled is not None and amount is not None and float(filled) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 @dataclass
 class OrderRequest:
     symbol: str
@@ -60,6 +79,10 @@ class OrderResult:
     quote_notional: float
     amount_base: float = 0.0
     amount_exchange: float = 0.0
+    # Venue-side protective orders created alongside a live entry.
+    protection: list[dict] = field(default_factory=list)
+    # Non-fatal problems the caller must surface (a stop that did not arm).
+    warnings: list[str] = field(default_factory=list)
 
 
 class TradingService:
@@ -77,6 +100,9 @@ class TradingService:
         self.paper = paper
         self.db = db
         self.network = Network(settings.network)
+        # Leverage already pushed to the venue, keyed by (market, symbol).
+        # Setting it on every order would burn a signed request each time.
+        self._leverage_applied: dict[tuple[MarketType, str], float] = {}
 
     # ------------------------------------------------------------------ sizing
     def amount_from_quote(self, market_type: MarketType, symbol: str, quote: float, price: float) -> float:
@@ -147,7 +173,14 @@ class TradingService:
         if notional <= 0:
             return RiskDecision(False, "无法确定订单金额（缺少价格）。")
         if current_position_quote is None:
-            current_position_quote = self._current_position_quote(req, price)
+            resolved = self._current_position_quote(req, price)
+            if resolved is None:
+                # Reading the venue failed. Refuse to open, but never block a
+                # reduce-only exit: being unable to close is the worse risk.
+                if not req.reduce_only:
+                    return RiskDecision(False, "无法读取当前持仓，为避免重复开仓已拒绝本次下单。")
+                resolved = 0.0
+            current_position_quote = resolved
         decision = self.risk.check_market(req.market_type)
         if not decision:
             return decision
@@ -163,9 +196,14 @@ class TradingService:
     def _equity(self, req: OrderRequest, price: float) -> float:
         """Account equity used by the percentage-based per-order cap.
 
-        Paper mode is exact. Live mode reports the quote balance; when it is
-        unavailable the percentage cap simply does not apply (the fixed
+        Paper mode is exact. Live mode reports the venue's total balance; when
+        it is unavailable the percentage cap simply does not apply (the fixed
         ceiling still does).
+
+        ccxt groups balances as ``{"total": {"USDT": 1234.5}}`` — the inner
+        value, not the mapping, is the number. Reading ``balance["total"]``
+        directly always yielded zero, so in live mode ``max_order_pct`` never
+        took effect.
         """
         if req.mode is RunMode.PAPER:
             return self.paper.account.cash
@@ -175,25 +213,32 @@ class TradingService:
             balance = self.rest.fetch_balance(req.market_type)
         except Exception:
             return 0.0
-        for key in ("USDT", "total"):
-            value = balance.get(key)
-            if isinstance(value, dict):
-                value = value.get("free") or value.get("total")
-            try:
-                number = float(value or 0.0)
-            except (TypeError, ValueError):
-                continue
-            if number > 0:
-                return number
-        return 0.0
+        # Coin-margined wallets hold the margin coin, so their total is marked
+        # to USD before it can be compared with a quote-denominated cap.
+        if req.market_type is MarketType.COINM:
+            asset = "BTC"
+            mark = price
+        else:
+            asset = "USDT"
+            mark = 1.0
+        totals = balance.get("total")
+        value = totals.get(asset) if isinstance(totals, dict) else None
+        if value is None:
+            entry = balance.get(asset)  # older ccxt shapes
+            value = entry.get("total") if isinstance(entry, dict) else entry
+        try:
+            return max(0.0, float(value or 0.0)) * mark
+        except (TypeError, ValueError):
+            return 0.0
 
-    def _current_position_quote(self, req: OrderRequest, price: float) -> float:
-        """Best-effort current exposure used by the position limit.
+    def _current_position_quote(self, req: OrderRequest, price: float) -> float | None:
+        """Current exposure used by the position limit, or ``None`` if unknown.
 
-        Paper mode is exact; live mode queries the exchange and falls back to 0
-        (i.e. only the new order is checked) if the query fails. Coin-margined
-        positions are reported in contracts, so they go through the contract
-        spec to produce a USD notional.
+        Paper mode is exact. Live mode queries the exchange; a failed query
+        returns ``None`` rather than zero, because zero silently disables the
+        position cap — the order would be checked as if nothing were held.
+        Coin-margined positions are reported in contracts, so they go through
+        the contract spec to produce a USD notional.
         """
         if req.mode is RunMode.PAPER:
             held = self.paper.account.positions.get(req.symbol)
@@ -203,7 +248,8 @@ class TradingService:
         try:
             positions = self.rest.fetch_positions(req.market_type, [req.symbol])
         except Exception:
-            return 0.0
+            log.warning("读取实盘持仓失败，无法校验持仓上限", exc_info=True)
+            return None
         spec = self.rest.contract_spec(req.market_type, req.symbol)
         total = 0.0
         for position in positions:
@@ -298,9 +344,26 @@ class TradingService:
         if self.network is Network.MAINNET and not self.rest.has_credentials:
             raise OrderRejected("实盘下单需要先配置 API Key。")
 
+        if req.market_type.is_futures and req.leverage > 0 and not req.reduce_only:
+            # The venue sizes a position with its own leverage, not the one in
+            # our risk payload. Without this call the panel's choice was only
+            # validated locally and the exchange kept its account default.
+            # Exits skip it on purpose: being unable to close is worse than
+            # closing at a stale leverage.
+            self._ensure_leverage(req.market_type, req.symbol, req.leverage)
+
         params: dict = {}
         if req.reduce_only and req.market_type.is_futures:
             params["reduceOnly"] = True
+            # A resting reduceOnly stop would be re-triggered by this exit and
+            # flip the position instead of flattening it. Clearing the symbol
+            # first is what makes "close" mean close.
+            try:
+                canceled = self.rest.cancel_symbol_orders(req.market_type, req.symbol)
+                if canceled:
+                    log.info("平仓前撤销 %s 的 %d 笔挂单", req.symbol, canceled)
+            except ExchangeError as exc:
+                log.warning("平仓前撤单失败 %s：%s", req.symbol, exc)
         if req.order_type == OrderType.MARKET.value:
             order = self.rest.create_order(
                 req.market_type, req.symbol, "market", req.side, exchange_amount, None, params
@@ -318,12 +381,74 @@ class TradingService:
         quote = abs(base_qty) * price
         self.risk.record_order()
         self.db.save_order(self._account_id(), req.market_type.value, order, req.mode.value)
+
+        protection: list[dict] = []
+        warnings: list[str] = []
+        if not req.reduce_only:
+            protection, warnings = self._arm_live_protection(req, order, exchange_amount)
         log.info(
             "实盘下单 %s %s %s %s @ %s -> %s",
             req.symbol, req.side, format_amount(base_qty), req.order_type, price,
             order.get("id"),
         )
-        return OrderResult(order, req.mode, quote, base_qty, exchange_amount)
+        return OrderResult(
+            order, req.mode, quote, base_qty, exchange_amount, protection, warnings
+        )
+
+    def _arm_live_protection(
+        self, req: OrderRequest, order: dict, exchange_amount: float
+    ) -> tuple[list[dict], list[str]]:
+        """Place venue-side stops for a live entry.
+
+        Paper mode keeps its guards inside the app; a live position needs them
+        at the exchange, otherwise closing the app leaves it naked. A failure
+        here must not undo the entry that already filled, so each order is
+        attempted separately and reported back as a warning.
+        """
+        if not (req.stop_loss or req.take_profit):
+            return [], []
+        if not req.market_type.is_futures:
+            return [], [
+                "现货暂不支持交易所侧止损/止盈，本单仅在合约市场自动挂保护单。"
+            ]
+        # A limit order that has not filled yet has no position to protect;
+        # the exchange would reject a reduceOnly stop against zero exposure.
+        if not _is_filled(order):
+            return [], ["挂单尚未成交，成交后可再次设置止损/止盈。"]
+
+        exit_side = "sell" if req.side == OrderSide.BUY.value else "buy"
+        placed: list[dict] = []
+        warnings: list[str] = []
+        for price, take_profit, label in (
+            (req.stop_loss, False, "止损"),
+            (req.take_profit, True, "止盈"),
+        ):
+            if not price:
+                continue
+            try:
+                if take_profit:
+                    placed.append(
+                        self.rest.create_take_profit_market(
+                            req.market_type, req.symbol, exit_side, exchange_amount, price
+                        )
+                    )
+                else:
+                    placed.append(
+                        self.rest.create_stop_market(
+                            req.market_type, req.symbol, exit_side, exchange_amount, price
+                        )
+                    )
+            except ExchangeError as exc:
+                warnings.append(f"{label}单挂单失败：{exc}")
+                log.warning("%s单挂单失败 %s：%s", label, req.symbol, exc)
+        for item in placed:
+            try:
+                self.db.save_order(
+                    self._account_id(), req.market_type.value, item, req.mode.value
+                )
+            except Exception:  # pragma: no cover - history is best effort
+                log.warning("保护单写库失败", exc_info=True)
+        return placed, warnings
 
     # ------------------------------------------------------------------ cancel
     def cancel(
@@ -613,15 +738,34 @@ class TradingService:
         return orders
 
     # --------------------------------------------------------------- hierarchy
+    def _ensure_leverage(
+        self, market_type: MarketType, symbol: str, leverage: float
+    ) -> None:
+        """Push the requested leverage to the venue, once per pair.
+
+        The exchange sizes a position with its own leverage setting; the value
+        in the order payload is only validated locally. Skipping this call left
+        live orders running at the account default regardless of what the panel
+        showed. A failure is fatal for an entry: trading at an unknown leverage
+        is exactly the surprise this is meant to prevent.
+        """
+        key = (market_type, symbol)
+        if abs(self._leverage_applied.get(key, 0.0) - leverage) < 1e-9:
+            return
+        try:
+            self.rest.set_leverage(symbol, leverage, market_type)
+        except ExchangeError as exc:
+            raise OrderRejected(f"设置杠杆 {leverage:g}x 失败：{exc}") from exc
+        self._leverage_applied[key] = leverage
+
     def change_network(self, network: Network, credentials) -> None:
         self.network = network
         self.settings.network = network.value
         self.rest.network = network
         self.rest.credentials = credentials
         self.rest.reset()
+        # A new venue means the leverage stored there is unknown again.
+        self._leverage_applied.clear()
 
     def _account_id(self) -> str:
         return f"binance:{self.network.value}"
-
-    def new_client_order_id(self) -> str:
-        return f"bt{uuid.uuid4().hex[:16]}"

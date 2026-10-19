@@ -27,7 +27,6 @@ from ..core.credentials import Credentials
 from ..core.types import TIMEFRAME_SECONDS, MarketType, Network, RunMode
 from ..engine.auto import AutoTrader, AutoTraderConfig
 from ..exchange.rest import BinanceREST
-from ..news import NewsService
 from .. import paths
 
 log = logging.getLogger(__name__)
@@ -469,13 +468,7 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
         ctx = get_state().ctx
         return ctx.news.snapshot(symbol, limit=limit)
 
-    @router.get("/api/news/sources")
-    def news_sources() -> dict[str, Any]:
-        """What the panel is reading, so the UI never has to hardcode it."""
-        return {"sources": NewsService.sources()}
-
-    # ---------------------------------------------------------- credentials
-    @router.get("/api/credentials")
+    # ---------------------------------------------------------- credentials    @router.get("/api/credentials")
     def credentials() -> dict[str, Any]:
         ctx = get_state().ctx
         network = _network(None) or ctx.network

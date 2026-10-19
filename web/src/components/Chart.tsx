@@ -198,8 +198,10 @@ const MIN_ZOOM_BARS = 3;
 /** Ceiling for zooming out. The chart asks for more history once the oldest
  * loaded bar comes into view, so this is a comfort limit, not a data limit. */
 const MAX_ZOOM_BARS = 1000;
-/** One wheel notch (deltaY ~100) changes the visible range by this factor. */
-const ZOOM_FACTOR = 1.6;
+/** One wheel notch (deltaY ~100) changes the visible range by this factor.
+ * 1.6 felt sluggish — reaching a useful zoom-out took many flicks — so a
+ * notch now roughly doubles or halves the window, like Binance's chart. */
+const ZOOM_FACTOR = 2.0;
 /** Narrowest a single candle may become. Zooming out stops here: below ~4px
  * per bar the series collapses into a dark smear and stops conveying shape. */
 const MIN_BAR_PX = 4;

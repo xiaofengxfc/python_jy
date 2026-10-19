@@ -222,6 +222,10 @@ class AutoTrader:
             current_qty = position.contracts if position else 0.0
         else:
             current_qty = self._live_position_qty(price)
+            if current_qty is None:
+                # Unknown exposure: sizing against an assumed flat position is
+                # how a transient read failure turns into a doubled order.
+                return
 
         delta = desired_qty - current_qty
         if abs(delta) * price < 10.0:  # ignore dust
@@ -256,8 +260,14 @@ class AutoTrader:
             f"(目标仓位 {target:+.0%}) → {result.order.get('status', '')}",
         )
 
-    def _live_position_qty(self, price: float) -> float:
-        """Current live position expressed in base coins."""
+    def _live_position_qty(self, price: float) -> float | None:
+        """Current live position expressed in base coins, or ``None``.
+
+        ``None`` means "unknown", and callers must skip the rebalance. Returning
+        zero here used to be indistinguishable from "flat", so one failed read
+        made ``_rebalance`` treat the whole target as missing and buy it again —
+        a transient network error could double a live position.
+        """
         spec = self.trading.rest.contract_spec(self.config.market_type, self.config.symbol)
         if self.config.market_type is MarketType.SPOT:
             return self._live_spot_balance(spec)
@@ -265,8 +275,9 @@ class AutoTrader:
             positions = self.trading.rest.fetch_positions(
                 self.config.market_type, [self.config.symbol]
             )
-        except Exception:
-            return 0.0
+        except Exception as exc:
+            self._emit_log("WARN", f"读取实盘持仓失败，本轮跳过调仓：{exc}")
+            return None
         total = 0.0
         for position in positions:
             contracts = float(position.get("contracts") or 0)
@@ -276,10 +287,11 @@ class AutoTrader:
             total += spec.contracts_to_base(contracts, mark)
         return total
 
-    def _live_spot_balance(self, spec) -> float:
+    def _live_spot_balance(self, spec) -> float | None:
         try:
             balance = self.trading.rest.fetch_balance(self.config.market_type)
-        except Exception:
-            return 0.0
+        except Exception as exc:
+            self._emit_log("WARN", f"读取实盘余额失败，本轮跳过调仓：{exc}")
+            return None
         asset = spec.base or self.config.symbol.split("/")[0]
         return float((balance.get("total") or {}).get(asset) or 0.0)

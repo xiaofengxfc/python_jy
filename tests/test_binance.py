@@ -118,3 +118,91 @@ def test_invalid_key_message_explains_ip_whitelist_and_permissions() -> None:
 def test_unknown_code_falls_back_to_generic_authentication_text() -> None:
     exc = ccxt.AuthenticationError('binance {"code":-99999,"msg":"mystery"}')
     assert _message(exc).startswith("认证失败")
+
+
+class _RecordingClient:
+    """A ccxt stand-in that records what the wrapper sends."""
+
+    def __init__(self, open_orders=None) -> None:
+        self.calls: list[tuple] = []
+        self.open_orders = open_orders if open_orders is not None else []
+        self.canceled: list[str] = []
+
+    def load_markets(self):
+        return {}
+
+    def price_to_precision(self, symbol, price):
+        return f"{price:.2f}"
+
+    def create_order(self, symbol, type, side, amount, price, params=None):
+        self.calls.append((symbol, type, side, amount, price, params))
+        return {"id": "order-1", "status": "open"}
+
+    def fetch_open_orders(self, symbol):
+        return self.open_orders
+
+    def cancel_order(self, order_id, symbol, params=None):
+        self.canceled.append(order_id)
+        return {"id": order_id}
+
+
+def _rest_with(client) -> BinanceREST:
+    from btrader.exchange.rest import BinanceREST
+
+    rest = BinanceREST(Network.MAINNET, Credentials("key", "secret"))
+    rest._clients[MarketType.USDM] = client
+    rest._clients[MarketType.SPOT] = client
+    return rest
+
+
+def test_stop_market_uses_stop_loss_price_and_reduce_only() -> None:
+    """`triggerPrice` alone stays a MARKET order; `stopLossPrice` sets the type."""
+    client = _RecordingClient()
+    rest = _rest_with(client)
+    rest.create_stop_market(MarketType.USDM, "BTC/USDT:USDT", "sell", 0.5, 80_000.0)
+
+    _symbol, order_type, side, amount, price, params = client.calls[0]
+    assert order_type == "market"
+    assert side == "sell"
+    assert amount == 0.5
+    assert price is None, "a stop-market order must not carry a limit price"
+    assert params["stopLossPrice"] == pytest.approx(80_000.0)
+    assert params["reduceOnly"] is True
+    assert "takeProfitPrice" not in params
+
+
+def test_take_profit_market_sends_only_the_target_price() -> None:
+    client = _RecordingClient()
+    rest = _rest_with(client)
+    rest.create_take_profit_market(
+        MarketType.USDM, "BTC/USDT:USDT", "sell", 0.5, 90_000.0
+    )
+
+    _symbol, _type, _side, _amount, _price, params = client.calls[0]
+    assert params["takeProfitPrice"] == pytest.approx(90_000.0)
+    assert "stopLossPrice" not in params, "a second trigger would make it a stop"
+    assert params["reduceOnly"] is True
+
+
+def test_spot_has_no_venue_side_conditional_orders() -> None:
+    from btrader.exchange.rest import ExchangeError
+
+    rest = _rest_with(_RecordingClient())
+    with pytest.raises(ExchangeError, match="现货"):
+        rest.create_stop_market(MarketType.SPOT, "BTC/USDT", "sell", 0.5, 80_000.0)
+
+
+def test_cancel_symbol_orders_survives_a_vanished_order() -> None:
+    """A stop already filled must not block closing the rest of the symbol."""
+
+    class _Flaky(_RecordingClient):
+        def cancel_order(self, order_id, symbol, params=None):
+            self.canceled.append(order_id)
+            if order_id == "gone":
+                raise RuntimeError("Unknown order sent")
+            return {"id": order_id}
+
+    client = _Flaky([{"id": "live"}, {"id": "gone"}, {"id": "live-2"}])
+    rest = _rest_with(client)
+    assert rest.cancel_symbol_orders(MarketType.USDM, "BTC/USDT:USDT") == 2
+    assert client.canceled == ["live", "gone", "live-2"]

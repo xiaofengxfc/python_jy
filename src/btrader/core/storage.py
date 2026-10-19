@@ -83,11 +83,20 @@ class Database:
 
     @contextmanager
     def cursor(self):
+        """Run a statement block in one transaction.
+
+        A failure rolls the transaction back before re-raising. Without this,
+        the connection kept the partially applied writes open and the *next*
+        ``commit()`` — from an unrelated save — flushed them to disk.
+        """
         with self._lock:
             cur = self._conn.cursor()
             try:
                 yield cur
                 self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
             finally:
                 cur.close()
 

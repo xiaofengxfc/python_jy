@@ -274,6 +274,93 @@ class BinanceREST:
         except Exception as exc:
             raise ExchangeError(_message(exc)) from exc
 
+    # ---------------------------------------------------- protection orders
+    def create_stop_market(
+        self,
+        market: MarketType,
+        symbol: str,
+        side: str,
+        amount: float,
+        stop_price: float,
+    ) -> dict:
+        """Place a venue-side ``STOP_MARKET`` exit.
+
+        The exchange keeps this order, so it fires even when the app is closed
+        — which is the whole point of a protective stop. ``stopLossPrice`` is
+        the ccxt field that maps onto ``STOP_MARKET`` for contracts; a bare
+        ``triggerPrice`` would leave the type at ``MARKET`` on the algo
+        endpoint instead.
+        """
+        return self._create_conditional(
+            market, symbol, side, amount, stop_price, take_profit=False
+        )
+
+    def create_take_profit_market(
+        self,
+        market: MarketType,
+        symbol: str,
+        side: str,
+        amount: float,
+        target_price: float,
+    ) -> dict:
+        """Place a venue-side ``TAKE_PROFIT_MARKET`` exit.
+
+        ccxt maps ``takeProfitPrice`` onto ``TAKE_PROFIT_MARKET`` for contracts
+        and requires it to be the only trigger field: supplying ``stopPrice``
+        as well makes the request a stop-loss order instead.
+        """
+        return self._create_conditional(
+            market, symbol, side, amount, target_price, take_profit=True
+        )
+
+    def _create_conditional(
+        self,
+        market: MarketType,
+        symbol: str,
+        side: str,
+        amount: float,
+        trigger_price: float,
+        *,
+        take_profit: bool,
+    ) -> dict:
+        self._require_auth()
+        if not market.is_futures:
+            raise ExchangeError("现货暂不支持交易所侧条件单，请使用合约或手动盯盘。")
+        price = self.price_to_precision(market, symbol, trigger_price)
+        params: dict = {
+            "reduceOnly": True,
+            "takeProfitPrice" if take_profit else "stopLossPrice": price,
+        }
+        try:
+            return self.client(market).create_order(
+                symbol, "market", side, amount, None, params
+            )
+        except Exception as exc:
+            raise ExchangeError(_message(exc)) from exc
+
+    def cancel_symbol_orders(self, market: MarketType, symbol: str) -> int:
+        """Cancel every resting order on a symbol, returning how many went.
+
+        Used before a close: a leftover ``reduceOnly`` stop would otherwise be
+        re-triggered by the exit and flip the position instead of flattening
+        it. Individual failures are logged and skipped so one stale order
+        cannot block the close itself.
+        """
+        self._require_auth()
+        client = self.client(market)
+        try:
+            resting = client.fetch_open_orders(symbol)
+        except Exception as exc:
+            raise ExchangeError(_message(exc)) from exc
+        canceled = 0
+        for order in resting or []:
+            try:
+                client.cancel_order(order.get("id"), symbol, order.get("params") or {})
+                canceled += 1
+            except Exception:  # already filled or canceled by the venue
+                log.debug("撤销保护单失败 %s", order.get("id"), exc_info=True)
+        return canceled
+
     # ---------------------------------------------------------------- helpers
     def _require_auth(self) -> None:
         if not self.credentials.is_set:

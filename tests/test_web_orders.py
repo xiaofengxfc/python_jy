@@ -11,6 +11,7 @@ from __future__ import annotations
 import pytest
 from fastapi import HTTPException
 
+from btrader.core.types import MarketType
 from btrader.web.app import _require_live_ready
 
 
@@ -42,18 +43,30 @@ def test_live_order_needs_explicit_confirmation():
     assert "二次确认" in _detail(caught.value)
 
 
-def test_live_order_refuses_unenforceable_protection():
-    """Silently dropping a stop would leave the user unhedged."""
+def test_live_futures_order_accepts_protection():
+    """Futures stops are placed venue-side, so they no longer block an entry."""
+    _require_live_ready(
+        signed=True,
+        confirm_live=True,
+        market=MarketType.USDM,
+        stop_loss=90.0,
+        take_profit=110.0,
+    )
+
+
+def test_live_spot_order_refuses_protection():
+    """Binance spot has no reduce-only stop; arming nothing would be worse."""
     for kwargs in ({"stop_loss": 90.0}, {"take_profit": 110.0}):
         with pytest.raises(HTTPException) as caught:
             _require_live_ready(
                 signed=True,
                 confirm_live=True,
+                market=MarketType.SPOT,
                 stop_loss=kwargs.get("stop_loss"),
                 take_profit=kwargs.get("take_profit"),
             )
         assert caught.value.status_code == 400
-        assert "止损/止盈" in _detail(caught.value)
+        assert "现货" in _detail(caught.value)
 
 
 def test_live_order_passes_when_signed_and_confirmed():

@@ -29,7 +29,7 @@ interface Props {
 }
 
 interface Flash {
-  tone: "ok" | "err";
+  tone: "ok" | "err" | "warn";
   text: string;
 }
 
@@ -254,7 +254,10 @@ export default function OrderTicket({
     setBusy(true);
     setFlash(null);
     try {
-      const result = await api<{ order: Record<string, unknown> }>("/api/orders", {
+      const result = await api<{
+        order: Record<string, unknown>;
+        warnings?: string[];
+      }>("/api/orders", {
         method: "POST",
         body: JSON.stringify({
           market,
@@ -280,13 +283,16 @@ export default function OrderTicket({
       ]
         .filter(Boolean)
         .join(" · ");
-      setFlash({
-        tone: "ok",
-        text: `${side === "buy" ? "买入" : "卖出"}成功：${fmt(
-          Number(order.amount ?? 0),
-          6,
-        )} ${base} @ ${fmtPrice(filled)}${guard ? `（${guard}）` : ""}`,
-      });
+      const warnings = result.warnings ?? [];
+      const filledText = `${side === "buy" ? "买入" : "卖出"}成功：${fmt(
+        Number(order.amount ?? 0),
+        6,
+      )} ${base} @ ${fmtPrice(filled)}${guard ? `（${guard}）` : ""}`;
+      setFlash(
+        warnings.length
+          ? { tone: "warn", text: `${filledText}。${warnings.join("；")}` }
+          : { tone: "ok", text: filledText },
+      );
       if (sizeMode === "quote") writeLastQuote(String(amount));
       setSize("");
       setStopLoss("");

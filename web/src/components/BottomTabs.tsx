@@ -9,6 +9,9 @@ interface Props {
   account: Account | null;
   /** Pair whose headlines the news tab shows. */
   symbol?: string;
+  /** Venue the panel is showing; closes must name it, or a futures exit is
+   * looked up in the spot book and reported as "没有该交易对的持仓". */
+  market?: string;
   /** Paper cancels/closes locally; live sends them to the exchange. */
   mode?: "paper" | "live";
   /** Reload the account after a cancel or close. */
@@ -30,6 +33,7 @@ const TABS: [Tab, string][] = [
 export default function BottomTabs({
   account,
   symbol = "",
+  market = "spot",
   mode = "paper",
   onChanged,
   onError,
@@ -96,6 +100,9 @@ export default function BottomTabs({
         method: "POST",
         body: JSON.stringify({
           symbol: position.symbol,
+          // The venue must be named: the server would otherwise infer it and a
+          // futures exit could be looked up in the spot book.
+          market,
           size,
           mode,
           confirm_live: mode === "live",

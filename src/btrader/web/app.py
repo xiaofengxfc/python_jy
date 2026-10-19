@@ -187,11 +187,14 @@ class PreviewPayload(BaseModel):
 class ClosePayload(BaseModel):
     """Close (or reduce) a position with a market order.
 
-    ``size`` is in base coins; omitted means the whole position.
+    ``size`` is in base coins; omitted means the whole position. ``market`` is
+    optional: when a caller omits it the venue is inferred from the ccxt
+    symbol, because defaulting to spot made a futures position look absent
+    ("当前没有该交易对的持仓") and the exit impossible.
     """
 
     symbol: str
-    market: str = "spot"
+    market: str | None = None
     mode: str = "paper"
     size: float | None = Field(default=None, gt=0)
     confirm_live: bool = False
@@ -291,15 +294,17 @@ def _require_live_ready(
     *,
     signed: bool,
     confirm_live: bool,
-    stop_loss: float | None,
-    take_profit: float | None,
+    market: MarketType | None = None,
+    stop_loss: float | None = None,
+    take_profit: float | None = None,
 ) -> None:
-    """Gate a live order behind credentials, an explicit ack and no guard.
+    """Gate a live order behind credentials and an explicit acknowledgement.
 
-    Kept out of the route so the rules can be exercised without an HTTP
-    client. A live exchange-side stop would need its own ``STOP_MARKET``
-    order; accepting it here and dropping it would leave the user unhedged,
-    so the request is refused instead.
+    Protective exits used to be refused here because the exchange side could
+    not honour them. They are now placed as ``STOP_MARKET`` /
+    ``TAKE_PROFIT_MARKET`` orders, so a futures order may carry them. Spot
+    still cannot: Binance has no reduce-only stop for spot balances, and
+    pretending to arm one would leave the position unhedged.
     """
     if not signed:
         raise HTTPException(status_code=400, detail="实盘下单需要先配置该市场的 API Key。")
@@ -308,10 +313,10 @@ def _require_live_ready(
             status_code=400,
             detail="实盘下单需要二次确认（confirm_live=true）。",
         )
-    if stop_loss or take_profit:
+    if (stop_loss or take_profit) and market is not None and not market.is_futures:
         raise HTTPException(
             status_code=400,
-            detail="实盘暂不支持随单止损/止盈，请平仓后改用交易所的条件单。",
+            detail="实盘现货暂不支持交易所侧止损/止盈，请切换到合约市场或手动盯盘。",
         )
 
 
@@ -364,16 +369,32 @@ def _is_reducing(
     symbol: str,
     side: str,
     amount: float,
+    mode: RunMode = RunMode.PAPER,
 ) -> bool:
-    """Whether an order closes (part of) an existing paper position.
+    """Whether an order closes (part of) an existing position.
 
     A reduce order must not be judged by the entry limits (per-order notional,
-    position cap): selling 0.01 BTC is an exit, and refusing it with "单笔金额
-    超过上限" is what made a held position impossible to sell. Spot sells are
-    always exits because spot cannot go short.
+    position cap) or by the entry breakers: selling 0.01 BTC is an exit, and
+    refusing it with "单笔金额超过上限" — or with "风控熔断中" — is what made a
+    held position impossible to sell.
+
+    Paper reads the simulated book; live reads the venue, because that is
+    where the real position is. Spot sells are always exits: spot cannot
+    short, and the unheld-sell case is rejected earlier with its own message.
     """
-    position = state.ctx.paper.account.positions.get(symbol)
-    held = position.contracts if position else 0.0
+    if market is MarketType.SPOT:
+        if mode is RunMode.LIVE:
+            held = _live_spot_available(state, symbol, market)
+        else:
+            position = state.ctx.paper.account.positions.get(symbol)
+            held = position.contracts if position else 0.0
+        return side == "sell" and held > 0 and amount <= held * (1 + 1e-6) + 1e-12
+
+    if mode is RunMode.LIVE:
+        held = _live_held(state, symbol, market)
+    else:
+        position = state.ctx.paper.account.positions.get(symbol)
+        held = position.contracts if position else 0.0
     if side == "sell" and held > 0:
         return amount <= held * (1 + 1e-6) + 1e-12
     if side == "buy" and held < 0:
@@ -814,6 +835,7 @@ def create_app() -> FastAPI:
             _require_live_ready(
                 signed=signed,
                 confirm_live=payload.confirm_live,
+                market=mt,
                 stop_loss=payload.stop_loss,
                 take_profit=payload.take_profit,
             )
@@ -879,6 +901,12 @@ def create_app() -> FastAPI:
             order_type=payload.order_type,
             amount=amount,
             price=reference,
+            # A sell of coins actually held is an exit. Marking it here is
+            # what lets a halted or emergency-stopped account still flatten:
+            # the entry breakers are skipped for reduce-only orders.
+            reduce_only=_is_reducing(
+                state, mt, payload.symbol, payload.side, amount, mode
+            ),
             market_type=mt,
             mode=mode,
         )
@@ -913,7 +941,12 @@ def create_app() -> FastAPI:
             "amount_exchange": result.amount_exchange,
             "mode": result.mode.value,
             "adjusted": adjusted,
-            "protection": state.ctx.paper.protections().get(payload.symbol),
+            "protection": (
+                state.ctx.paper.protections().get(payload.symbol)
+                if mode is RunMode.PAPER
+                else result.protection
+            ),
+            "warnings": result.warnings,
         }
 
     # ---------------------------------------------------- conditional orders
@@ -1022,7 +1055,10 @@ def create_app() -> FastAPI:
         """
         if payload.mode not in ("paper", "live"):
             raise HTTPException(status_code=400, detail="模式必须是 paper 或 live")
-        mt = _market(payload.market)
+        # An omitted market is inferred from the symbol: a futures pair carries
+        # its settle currency ("BTC/USDT:USDT"), spot does not. Defaulting to
+        # spot here made every futures exit fail as "没有该交易对的持仓".
+        mt = _market(payload.market) if payload.market else _market_for_symbol(payload.symbol)
         state = get_state()
         mode = RunMode(payload.mode)
 
@@ -1280,10 +1316,11 @@ def _warm() -> None:
 # fetched and any order the market has crossed is filled.
 RECONCILE_SECONDS = 2.0
 
-# Live fills change far more slowly than a paper quote, and each poll costs a
-# signed request per symbol. Every half minute is enough to feed the daily
-# loss and losing-streak breakers without hammering the exchange.
-LIVE_SYNC_SECONDS = 30.0
+# Live fills feed the same breakers as paper ones, but each poll costs a
+# signed request per market plus one per symbol. Five seconds keeps the loss
+# breakers close to real time while staying far below Binance's request weight
+# budget (a handful of calls per interval, not per symbol per second).
+LIVE_SYNC_SECONDS = 5.0
 
 
 def _reconcile_paper_orders(state: _State) -> None:

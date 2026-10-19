@@ -494,6 +494,7 @@ export default function BacktestPage() {
                   <div className="field">
                     <label className="field-label" htmlFor="bt-lev">
                       <span>杠杆</span>
+                      <em>不模拟强平</em>
                     </label>
                     <input
                       id="bt-lev"
@@ -504,6 +505,10 @@ export default function BacktestPage() {
                       value={config.leverage}
                       onChange={(event) => patch({ leverage: Number(event.target.value) })}
                     />
+                    <div className="hint">
+                      回测按「仓位比例 × 杠杆」放大下单量，不会因保证金不足被强平，
+                      也没有资金费与维持保证金。高杠杆的收益与最大回撤都会偏乐观。
+                    </div>
                   </div>
                 )}
                 <div className="field">

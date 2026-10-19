@@ -8,9 +8,15 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from ..core.config import RiskSettings
+from ..core.storage import Database
 from ..core.types import MarketType
 
 log = logging.getLogger(__name__)
+
+# settings_kv key holding the day's risk counters. Without it a restart reset
+# the daily-loss and losing-streak breakers, which made them advisory in live
+# trading: closing the app cleared the halt.
+RISK_STATE_KEY = "risk.state.v1"
 
 
 @dataclass
@@ -49,14 +55,19 @@ class RiskManager:
     """Tracks daily PnL / trade counts and rejects unsafe orders.
 
     The manager is intentionally simple and deterministic; every rejection is
-    returned with a human readable reason so the UI can explain it.
+    returned with a human readable reason so the UI can explain it. State is
+    mirrored into ``settings_kv`` after every write so a restart cannot quietly
+    drop a halt or reset the day's loss budget.
     """
 
-    def __init__(self, settings: RiskSettings) -> None:
+    def __init__(self, settings: RiskSettings, db: "Database | None" = None) -> None:
         self.settings = settings
         self._lock = threading.RLock()
         self._state = _DayState(day=_today())
         self._loss_events: list[float] = []
+        self.db = db
+        if db is not None:
+            self.restore()
 
     # ------------------------------------------------------------- lifecycle
     @staticmethod
@@ -69,6 +80,57 @@ class RiskManager:
     def reset_day(self) -> None:
         with self._lock:
             self._state = _DayState(day=_today())
+            self._persist()
+
+    def restore(self) -> bool:
+        """Load the persisted counters, if they belong to today.
+
+        A row from an earlier day is discarded: the caps are per-day, so
+        yesterday's losses must not block today's first order.
+        """
+        if self.db is None:
+            return False
+        try:
+            data = self.db.get_json(RISK_STATE_KEY)
+        except Exception:  # pragma: no cover - a corrupt row must not block startup
+            log.warning("读取风控状态失败", exc_info=True)
+            return False
+        if not isinstance(data, dict) or data.get("day") != _today():
+            return False
+        with self._lock:
+            self._state = _DayState(
+                day=data.get("day") or _today(),
+                realized_pnl=float(data.get("realized_pnl") or 0.0),
+                trades=int(data.get("trades") or 0),
+                consecutive_losses=int(data.get("consecutive_losses") or 0),
+                halted_reason=str(data.get("halted_reason") or ""),
+                pnl_baseline=float(data.get("pnl_baseline") or 0.0),
+                trades_baseline=int(data.get("trades_baseline") or 0),
+            )
+        if self._state.halted_reason:
+            log.warning("恢复风控熔断状态：%s", self._state.halted_reason)
+        return True
+
+    def _persist(self) -> None:
+        """Mirror the current day state. Best effort: history must not throw."""
+        if self.db is None:
+            return
+        state = self._state
+        try:
+            self.db.set_json(
+                RISK_STATE_KEY,
+                {
+                    "day": state.day,
+                    "realized_pnl": state.realized_pnl,
+                    "trades": state.trades,
+                    "consecutive_losses": state.consecutive_losses,
+                    "halted_reason": state.halted_reason,
+                    "pnl_baseline": state.pnl_baseline,
+                    "trades_baseline": state.trades_baseline,
+                },
+            )
+        except Exception:  # pragma: no cover - never fail an order over history
+            log.warning("保存风控状态失败", exc_info=True)
 
     @property
     def state(self) -> _DayState:
@@ -89,14 +151,19 @@ class RiskManager:
         s = self.settings
         state = self.state
 
-        if s.kill_switch:
-            return RiskDecision(False, "全局急停已开启，请先在风控面板解除。")
-        if state.halted_reason:
-            return RiskDecision(False, f"风控熔断中：{state.halted_reason}")
-        if s.max_daily_trades and state.day_trades >= s.max_daily_trades:
-            return RiskDecision(False, f"已达当日最大交易次数（{s.max_daily_trades}）。")
-        if s.max_daily_loss and state.day_pnl <= -abs(s.max_daily_loss):
-            return RiskDecision(False, f"已达当日最大亏损（{s.max_daily_loss:.2f}）。")
+        # Every breaker below guards *new exposure*. Opening more risk while
+        # halted is what loses money; blocking a reduce-only exit would keep
+        # the user locked inside the position the breaker just complained
+        # about — strictly worse than the loss it was trying to prevent.
+        if entry:
+            if s.kill_switch:
+                return RiskDecision(False, "全局急停已开启，请先在风控面板解除。")
+            if state.halted_reason:
+                return RiskDecision(False, f"风控熔断中：{state.halted_reason}")
+            if s.max_daily_trades and state.day_trades >= s.max_daily_trades:
+                return RiskDecision(False, f"已达当日最大交易次数（{s.max_daily_trades}）。")
+            if s.max_daily_loss and state.day_pnl <= -abs(s.max_daily_loss):
+                return RiskDecision(False, f"已达当日最大亏损（{s.max_daily_loss:.2f}）。")
         if entry:
             limit, label = self._order_limit(equity)
             if limit and quote_notional > limit + 1e-9:
@@ -108,7 +175,7 @@ class RiskManager:
                 False,
                 f"持仓金额将达 {current_position_quote + added_quote:.2f}，超过上限 {s.max_position_quote:.2f}。",
             )
-        if leverage > s.max_leverage + 1e-9:
+        if entry and leverage > s.max_leverage + 1e-9:
             return RiskDecision(False, f"杠杆 {leverage:g}x 超过上限 {s.max_leverage:g}x。")
         return RiskDecision(True)
 
@@ -157,12 +224,14 @@ class RiskManager:
                 state.halted_reason = f"连续亏损 {state.consecutive_losses} 笔"
                 log.warning("风控熔断：%s", state.halted_reason)
             self._state = state
+            self._persist()
 
     def record_order(self) -> None:
         with self._lock:
             state = self._roll(self._state)
             state.trades += 1
             self._state = state
+            self._persist()
 
     def clear_halt(self) -> None:
         """Manually resume after a breaker fired.
@@ -178,6 +247,7 @@ class RiskManager:
             state.pnl_baseline = state.realized_pnl
             state.trades_baseline = state.trades
             self._state = state
+            self._persist()
 
     def snapshot(self) -> dict:
         """Current risk state for the UI.

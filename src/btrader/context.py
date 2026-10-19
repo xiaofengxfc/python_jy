@@ -47,7 +47,7 @@ class AppContext:
             self.paper.restore(self.db.get_json(PAPER_STATE_KEY))
         except Exception:  # pragma: no cover - a corrupt row must not block startup
             log.warning("恢复纸面账户失败，使用初始资金", exc_info=True)
-        self.risk = RiskManager(self.settings.risk)
+        self.risk = RiskManager(self.settings.risk, self.db)
         self.trading = TradingService(self.settings, self.rest, self.risk, self.paper, self.db)
         # Keyless feed: announcements plus two RSS outlets, no token to manage.
         self.news = NewsService()

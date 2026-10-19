@@ -649,6 +649,7 @@ export default function TradingPage({
           <BottomTabs
             account={account}
             symbol={symbol}
+            market={market}
             mode={mode}
             onChanged={() => {
               setActionError("");

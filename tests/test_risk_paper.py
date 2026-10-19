@@ -81,6 +81,37 @@ def test_kill_switch_blocks_everything():
     assert "急停" in decision.reason
 
 
+def test_kill_switch_still_allows_an_exit():
+    """Emergency stop is a gate on new risk, not a lock on the position.
+
+    Refusing the reduce-only order would trap the user inside the exposure the
+    switch was meant to stop them adding to.
+    """
+    risk = _risk(kill_switch=True)
+    assert risk.check_order(1, 0, 1, entry=False).allowed
+
+
+def test_chain_loss_halt_still_allows_an_exit():
+    risk = _risk(max_consecutive_losses=1, max_order_quote=0, max_position_quote=0)
+    risk.record_trade(-10)
+    assert not risk.check_order(1, 0, 1, entry=True).allowed
+    assert risk.check_order(1, 0, 1, entry=False).allowed
+
+
+def test_daily_loss_halt_still_allows_an_exit():
+    risk = _risk(max_daily_loss=100, max_order_quote=0, max_position_quote=0)
+    risk.record_trade(-150)
+    assert not risk.check_order(1, 0, 1, entry=True).allowed
+    assert risk.check_order(1, 0, 1, entry=False).allowed
+
+
+def test_daily_trade_cap_still_allows_an_exit():
+    risk = _risk(max_daily_trades=1, max_order_quote=0, max_position_quote=0)
+    risk.record_order()
+    assert not risk.check_order(1, 0, 1, entry=True).allowed
+    assert risk.check_order(1, 0, 1, entry=False).allowed
+
+
 def test_leverage_limit():
     risk = _risk(max_leverage=5, max_order_quote=0, max_position_quote=0)
     assert not risk.check_order(10, 0, 10, leverage=10)
@@ -439,3 +470,41 @@ def test_conditional_order_can_be_canceled():
     assert broker.open_conditional() == []
     assert broker.cancel_conditional(item["id"]) is None
     assert broker.mark("BTC/USDT", 80.0) == []
+
+
+def test_risk_halt_survives_restart(tmp_path):
+    """Closing the app used to clear a halt, making the breaker advisory."""
+    from btrader.core.storage import Database
+
+    db = Database(tmp_path / "risk.db")
+    settings = RiskSettings(max_consecutive_losses=2, max_daily_loss=0)
+    first = RiskManager(settings, db)
+    first.record_trade(-10)
+    first.record_trade(-10)
+    assert not first.check_order(10, 0, 10)
+
+    restarted = RiskManager(settings, db)
+    decision = restarted.check_order(10, 0, 10)
+    assert not decision, "a restart must not clear the halt"
+    assert "连续亏损" in decision.reason
+    db.close()
+
+
+def test_risk_state_from_an_older_day_is_discarded(tmp_path):
+    """The caps are per-day; yesterday's loss must not block this morning."""
+    from btrader.core.storage import Database
+    from btrader.engine.risk import RISK_STATE_KEY
+
+    db = Database(tmp_path / "risk2.db")
+    settings = RiskSettings(max_daily_loss=100, max_consecutive_losses=0)
+    first = RiskManager(settings, db)
+    first.record_trade(-150)
+    assert not first.check_order(10, 0, 10)
+
+    stored = db.get_json(RISK_STATE_KEY)
+    stored["day"] = "2000-01-01"
+    db.set_json(RISK_STATE_KEY, stored)
+
+    restarted = RiskManager(settings, db)
+    assert restarted.check_order(10, 0, 10).allowed
+    db.close()
