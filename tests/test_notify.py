@@ -181,3 +181,87 @@ def test_protection_format_labels_stop_loss() -> None:
         symbol="ETH/USDT", kind="stop_loss", price=3000.0, amount=1.0, mode="live"
     )
     assert "实盘止损触发" in text and "ETH/USDT" in text
+
+
+class JsonCompleted:
+    def __init__(self, stdout: str, returncode: int = 0, stderr: str = "") -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def test_ok_false_json_is_not_reported_as_success(monkeypatch) -> None:
+    """``--json`` failures can exit 0; ``ok: false`` must still surface."""
+    monkeypatch.setattr(
+        subprocess, "run", lambda args, **kw: JsonCompleted('{"ok": false, "error": "not logged in"}')
+    )
+    notifier = _notifier()
+    notifier._resolve_command = lambda: "openclaw"  # type: ignore[method-assign]
+    with pytest.raises(NotifyError, match="not logged in"):
+        notifier.send_now("hello")
+
+
+def test_json_payload_after_warnings_is_parsed(monkeypatch) -> None:
+    """The CLI may print warnings before the payload line."""
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda args, **kw: JsonCompleted('warn: slow\ngateway\n{"ok": true, "messageId": "m1"}'),
+    )
+    notifier = _notifier()
+    notifier._resolve_command = lambda: "openclaw"  # type: ignore[method-assign]
+    assert notifier.send_now("hello")["ok"] is True
+
+
+def test_send_now_overrides_target(monkeypatch, tmp_path: Path) -> None:
+    """The test button may push at a target that is not saved yet."""
+    seen: dict = {}
+
+    def fake_run(args, **kwargs):
+        seen["args"] = args
+        return FakeCompleted()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    notifier = WeChatNotifier(
+        NotifySettings(enabled=False, target="old", command="openclaw")
+    )
+    notifier._resolve_command = lambda: "openclaw"  # type: ignore[method-assign]
+    # Disabled on purpose: testing the wiring is what justifies enabling it.
+    notifier.send_now("hi")
+    assert seen["args"][seen["args"].index("--target") + 1] == "old"
+
+
+def test_long_message_is_clamped(captured) -> None:
+    notifier = _notifier()
+    notifier._resolve_command = lambda: "openclaw"  # type: ignore[method-assign]
+    notifier.send_now("x" * 5000)
+    sent = captured["args"][captured["args"].index("--message") + 1]
+    assert len(sent) == 2000 and sent.endswith("…")
+
+
+def test_failure_records_a_timestamp(monkeypatch) -> None:
+    monkeypatch.setattr(
+        subprocess, "run", lambda args, **kw: JsonCompleted("", returncode=1, stderr="boom")
+    )
+    notifier = _notifier()
+    notifier._resolve_command = lambda: "openclaw"  # type: ignore[method-assign]
+    with pytest.raises(NotifyError):
+        notifier.send_now("hello")
+    assert notifier.status()["last_error"] == "boom"
+    assert notifier.status()["last_error_at"] > 0
+
+
+def test_worker_sends_once_and_clears_the_error(captured) -> None:
+    notifier = _notifier()
+    notifier._resolve_command = lambda: "openclaw"  # type: ignore[method-assign]
+    notifier.last_error = "old"
+    try:
+        notifier.notify("后台消息")
+        for _ in range(200):
+            if captured.get("args") and notifier.last_success_at:
+                break
+            time.sleep(0.01)
+    finally:
+        notifier.stop()
+    assert notifier.last_error == ""
+    assert notifier.status()["last_success_at"] > 0

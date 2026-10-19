@@ -14,7 +14,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime
 from typing import Any, Callable
 
@@ -27,6 +27,7 @@ from ..core.credentials import Credentials
 from ..core.types import TIMEFRAME_SECONDS, MarketType, Network, RunMode
 from ..engine.auto import AutoTrader, AutoTraderConfig
 from ..exchange.rest import BinanceREST
+from ..notify import WeChatNotifier
 from .. import paths
 
 log = logging.getLogger(__name__)
@@ -78,9 +79,16 @@ class SettingsPayload(BaseModel):
 
 
 class NotifyTestPayload(BaseModel):
-    """One-off message body for the settings page's “测试” button."""
+    """One-off message body for the settings page's “测试” button.
+
+    The optional overrides let the page verify a channel/target/path before it
+    saves them; an empty field keeps the saved value.
+    """
 
     message: str = ""
+    channel: str = ""
+    target: str = ""
+    command: str = ""
 
 
 class CredentialsPayload(BaseModel):
@@ -437,7 +445,11 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
         if payload.risk is not None:
             _apply_risk(settings.risk, payload.risk)
         if payload.notify is not None:
-            _apply_notify(settings.notify, payload.notify)
+            # Validate on a scratch copy first: rejecting the request halfway
+            # through must not leave the live object half-updated.
+            candidate = replace(settings.notify)
+            _apply_notify(candidate, payload.notify)
+            settings.notify = candidate
 
         ctx.save_settings()
         return {"ok": True, "settings": settings.to_dict()}
@@ -477,18 +489,36 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
         """
         return get_state().ctx.notifier.status()
 
-    class NotifyTestPayload(BaseModel):
-        message: str = ""
-
     @router.post("/api/notify/test")
     def notify_test(payload: NotifyTestPayload) -> dict[str, Any]:
-        """Send one message synchronously so the user sees the real error."""
+        """Send one message synchronously so the user sees the real error.
+
+        The body may override channel/target/command for this single call, so
+        the user can try a value before saving it. Overrides are applied to a
+        copy — the saved settings are never mutated by a test.
+        """
         ctx = get_state().ctx
-        text = payload.message.strip() or "biTrader 微信通知测试：如果你收到这条消息，说明推送已打通。"
+        notifier = ctx.notifier
+        text = payload.message.strip() or (
+            "biTrader 微信通知测试：如果你收到这条消息，说明推送已打通。"
+        )
+        candidate = replace(
+            notifier.settings,
+            channel=(payload.channel or "").strip() or notifier.settings.channel,
+            target=(payload.target or "").strip() or notifier.settings.target,
+            command=(payload.command or "").strip() or notifier.settings.command,
+        )
+        scratch = WeChatNotifier(
+            candidate, timeout=notifier.timeout, queue_size=1
+        )
         try:
-            result = ctx.notifier.send_now(text)
+            result = scratch.send_now(text)
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # A successful test is also a success for the live notifier's status.
+        notifier.last_error = ""
+        notifier.last_error_at = 0.0
+        notifier.last_success_at = scratch.last_success_at
         return result
 
 

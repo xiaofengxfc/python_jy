@@ -71,10 +71,21 @@ export default function SettingsPage({ settings, onSaved }: Props) {
   };
 
   const testNotify = async () => {
+    if (!draft) return;
     setNotifyBusy(true);
     setFlash(null);
     try {
-      await api("/api/notify/test", { method: "POST", body: JSON.stringify({ message: "" }) });
+      // Send with the values currently in the form, not the saved ones: the
+      // button's job is to verify a target or path before the user commits it.
+      await api("/api/notify/test", {
+        method: "POST",
+        body: JSON.stringify({
+          message: "",
+          channel: draft.notify.channel,
+          target: draft.notify.target,
+          command: draft.notify.command,
+        }),
+      });
       setFlash({ tone: "ok", text: "测试消息已发送，请查看微信。" });
       await loadNotify();
     } catch (error) {
@@ -549,17 +560,29 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                   />
                 </div>
                 <div className="field">
-                  <label className="field-label" htmlFor="notify-command">
-                    <span>OpenClaw 路径</span>
-                    <em>可留空</em>
+                  <label className="field-label" htmlFor="notify-channel">
+                    <span>通道名</span>
+                    <em>默认 openclaw-weixin</em>
                   </label>
                   <input
-                    id="notify-command"
-                    value={draft.notify.command}
-                    onChange={(event) => patchNotify({ command: event.target.value })}
-                    placeholder="openclaw"
+                    id="notify-channel"
+                    value={draft.notify.channel}
+                    onChange={(event) => patchNotify({ channel: event.target.value })}
+                    placeholder="openclaw-weixin"
                   />
                 </div>
+              </div>
+              <div className="field">
+                <label className="field-label" htmlFor="notify-command">
+                  <span>OpenClaw 路径</span>
+                  <em>可留空，默认从 PATH 查找</em>
+                </label>
+                <input
+                  id="notify-command"
+                  value={draft.notify.command}
+                  onChange={(event) => patchNotify({ command: event.target.value })}
+                  placeholder="openclaw"
+                />
               </div>
               <div className="form-grid">
                 <label className="check">
@@ -601,10 +624,25 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                 </div>
               )}
               {notifyStatus?.last_error && (
-                <div className="verdict bad">{notifyStatus.last_error}</div>
+                <div className="verdict bad">
+                  {notifyStatus.last_error}
+                  {notifyStatus.last_error_at > 0 && (
+                    <span className="faint" style={{ marginLeft: 6 }}>
+                      （{new Date(notifyStatus.last_error_at * 1000).toLocaleTimeString()}）
+                    </span>
+                  )}
+                </div>
+              )}
+              {notifyStatus && notifyStatus.last_success_at > 0 && (
+                <div className="hint">
+                  最近一次成功发送：
+                  {new Date(notifyStatus.last_success_at * 1000).toLocaleString()}
+                  {notifyStatus.pending > 0 ? `，队列中还有 ${notifyStatus.pending} 条` : ""}
+                </div>
               )}
               <div className="hint">
-                推送经由本机 OpenClaw 网关转给微信。改动需要先保存设置；“发送测试”使用的是已保存的配置。
+                推送经由本机 OpenClaw 网关转给微信。先在微信「设置 → 插件 → ClawBot」中完成扫码绑定，
+                再填入通道返回的会话 ID；“发送测试”使用的就是上面填写的内容，无需先保存。
               </div>
             </div>
           </div>

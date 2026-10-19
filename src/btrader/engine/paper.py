@@ -6,6 +6,7 @@ import logging
 import threading
 import uuid
 from dataclasses import dataclass, field
+from typing import Callable
 
 from ..core.models import now_ms
 
@@ -82,6 +83,12 @@ class PaperBroker:
         self._lock = threading.RLock()
         # Last traded price per symbol, used to fill resting limit orders.
         self._marks: dict[str, float] = {}
+        # Called with every order this broker *created on its own* from a
+        # conditional order. ``TradingService`` records the handle so the
+        # background reconciler, which books and persists whatever ``mark``
+        # returns, cannot record the same fill a second time. Orders placed
+        # through ``place_order`` are not reported; their caller handles them.
+        self._on_order: Callable[[dict], None] | None = None
 
     # ------------------------------------------------------------------ order
     def place_order(
@@ -382,6 +389,29 @@ class PaperBroker:
             self.account.conditional.append(item)
             return dict(item)
 
+    def set_order_observer(self, callback: Callable[[dict], None] | None) -> None:
+        """Install (or replace) the observer for self-created fills.
+
+        Pass ``None`` to detach. Only fills created by a triggered conditional
+        order are reported; arming one notifies nobody.
+        """
+        self._on_order = callback
+
+    def _emit(self, order: dict) -> dict:
+        """Hand a self-created fill to the observer, never letting it throw.
+
+        The observer lives in another service; a bug there must not make order
+        placement fail, so it is isolated exactly like a log handler would be.
+        """
+        callback = self._on_order
+        if callback is None:
+            return order
+        try:
+            callback(dict(order))
+        except Exception:  # pragma: no cover - observation is best effort
+            log.warning("记录条件单成交失败 %s", order.get("id"), exc_info=True)
+        return order
+
     def open_conditional(self, symbol: str | None = None) -> list[dict]:
         with self._lock:
             return [
@@ -445,6 +475,7 @@ class PaperBroker:
             item["status"] = "rejected" if order.get("status") == "rejected" else "triggered"
             order["conditional"] = item["id"]
             fired.append(order)
+            self._emit(order)
             log.info("纸面条件单触发 %s %s @ %s", symbol, item["id"], price)
         return fired
 

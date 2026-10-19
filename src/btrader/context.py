@@ -52,6 +52,9 @@ class AppContext:
         # Outbound WeChat push. Constructed even when disabled so the settings
         # page can report whether the OpenClaw CLI is actually reachable.
         self.notifier = WeChatNotifier(self.settings.notify)
+        # Both services hold their nested settings by reference; bind them to
+        # the live objects now that both exist.
+        self._attach_settings()
         self.trading = TradingService(
             self.settings, self.rest, self.risk, self.paper, self.db,
             notifier=self.notifier,
@@ -142,8 +145,29 @@ class AppContext:
 
     def save_settings(self) -> None:
         self.config.save()
-        # The notifier reads this same object, so an enable/target change takes
-        # effect on the next message without rebuilding anything.
+        self._attach_settings()
+
+    def reload_settings(self) -> None:
+        """Re-read the config file into the live settings object.
+
+        The web layer edits ``self.settings`` in place and persists it, so this
+        is only needed when the file was changed by someone else — it keeps the
+        two from silently diverging rather than replacing the live object.
+        """
+        loaded = ConfigStore().settings
+        for name in AppSettings.__dataclass_fields__:
+            setattr(self.settings, name, getattr(loaded, name))
+        self._attach_settings()
+
+    def _attach_settings(self) -> None:
+        """Point every service at the *current* nested settings objects.
+
+        ``self.settings.risk`` / ``.notify`` are replaced wholesale when the
+        config is reloaded, while the services captured the old instances at
+        construction. Re-binding here is what makes a saved breaker limit or a
+        new WeChat target take effect without rebuilding the services.
+        """
+        self.risk.settings = self.settings.risk
         self.notifier.settings = self.settings.notify
 
     def shutdown(self) -> None:

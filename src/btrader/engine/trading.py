@@ -110,6 +110,50 @@ class TradingService:
         # Leverage already pushed to the venue, keyed by (market, symbol).
         # Setting it on every order would burn a signed request each time.
         self._leverage_applied: dict[tuple[MarketType, str], float] = {}
+        # Orders the paper broker created by itself (conditional orders). They
+        # are recorded and notified here, then claimed by the reconciler so
+        # ``mark`` returning them cannot double-book the fill.
+        self._paper_external: set[str] = set()
+        self._attach_paper_observer()
+
+    def _attach_paper_observer(self) -> None:
+        paper = self.paper
+        if paper is None:
+            return
+        try:
+            paper.set_order_observer(self.on_broker_order)
+        except AttributeError:  # a stand-in broker without the hook
+            log.debug("纸面 broker 不支持订单观察器")
+
+    def _claim_external(self, order: dict) -> bool:
+        """Take an order out of the "already handled" set.
+
+        Returns ``True`` when this order was created outside ``submit`` — the
+        caller must then skip the accounting it does for ordinary orders.
+        """
+        order_id = str((order or {}).get("id") or "")
+        if not order_id or order_id not in self._paper_external:
+            return False
+        self._paper_external.discard(order_id)
+        return True
+
+    def on_broker_order(self, order: dict) -> None:
+        """Handle an order the paper broker produced on its own.
+
+        A conditional order fires inside the broker's own lock, while the
+        reconciler is what normally books fills. Recording it here, at the
+        moment it happens, keeps the risk manager exact — the breaker must see
+        an exit immediately, not one poll later — and reporting it to WeChat is
+        the same message a stop-loss produces.
+        """
+        if not order:
+            return
+        order_id = str(order.get("id") or "")
+        if order_id:
+            self._paper_external.add(order_id)
+        self._record_fill(order)
+        self._notify_protection(order)
+        self.notify_risk_halt()
 
     # ------------------------------------------------------------------ sizing
     def amount_from_quote(self, market_type: MarketType, symbol: str, quote: float, price: float) -> float:
@@ -562,8 +606,16 @@ class TradingService:
         if status not in ("closed", "partially_filled"):
             return
         try:
+            # ``filled`` is the traded size, ``amount`` the requested one; the
+            # two differ on a partial fill. A paper order that a trigger closed
+            # has ``price`` 0 and only the traded level in ``triggerPrice``.
             amount = float(order.get("filled") or order.get("amount") or 0.0)
-            price = float(order.get("average") or order.get("price") or 0.0)
+            price = float(
+                order.get("average")
+                or order.get("price")
+                or order.get("triggerPrice")
+                or 0.0
+            )
         except (TypeError, ValueError):
             return
         if amount <= 0 or price <= 0:
@@ -583,15 +635,26 @@ class TradingService:
     def notify_risk_halt(self) -> None:
         """Push a breaker trip, if one is active and has not been announced yet.
 
-        ``notify_risk_halt`` is called after every recorded exit; re-sending the
-        same reason on each one would turn a breaker into a phone spammer. The
-        last announced reason is remembered, and cleared once the breaker is.
+        Called after every recorded exit; re-sending the same reason on each one
+        would turn a breaker into a phone spammer. The last announced reason is
+        remembered, and cleared once the breaker is.
+
+        Both breaker shapes are covered. A consecutive-loss trip lives in
+        ``halted_reason``; a daily-loss or daily-trade cap has no reason field
+        and only shows up as a refused entry, so it is derived from the state
+        the same way :meth:`RiskManager.precheck` derives it.
         """
         notifier = self.notifier
         if notifier is None or not notifier.settings.enabled:
             return
         state = self.risk.state
+        risk = self.risk.settings
         reason = state.halted_reason or ""
+        if not reason:
+            if risk.max_daily_loss and state.day_pnl <= -abs(risk.max_daily_loss):
+                reason = f"已达当日最大亏损（{risk.max_daily_loss:.2f} USDT）"
+            elif risk.max_daily_trades and state.day_trades >= risk.max_daily_trades:
+                reason = f"已达当日最大交易次数（{risk.max_daily_trades} 笔）"
         if not reason:
             self._halt_announced = ""
             return
@@ -648,6 +711,11 @@ class TradingService:
         seen = set(ledger["seen"])
         books = ledger["books"]
         booked: list[dict] = []
+        # One exchange order can come back as several fills (a partially
+        # executed market order, or a stop that sweeps). Pushing each slice
+        # turned one close into a burst of near-identical WeChat messages, so
+        # the slices are announced once per order, with the merged PnL.
+        announced: dict[str, dict] = {}
 
         for market in markets or list(MarketType):
             try:
@@ -679,28 +747,64 @@ class TradingService:
                             trade.get("side"),
                             result["realized"],
                         )
-                        self._notify(
-                            WeChatNotifier.format_fill(
-                                symbol=symbol,
-                                side=str(trade.get("side") or ""),
-                                amount=float(result.get("closedQty") or 0.0),
-                                price=float(result.get("price") or trade.get("price") or 0.0),
-                                mode=RunMode.LIVE.value,
-                                realized=float(result["realized"]),
-                                market=market.value,
-                            ),
-                            kind="fill",
-                        )
+                        self._merge_exit(announced, trade, result, market.value)
                     try:
                         self.db.save_trade(self._account_id(), trade, RunMode.LIVE.value)
                     except Exception:  # pragma: no cover - history is best effort
                         log.warning("实盘成交写库失败", exc_info=True)
 
+        for summary in announced.values():
+            self._notify(
+                WeChatNotifier.format_fill(
+                    symbol=summary["symbol"],
+                    side=summary["side"],
+                    amount=summary["amount"],
+                    price=summary["price"],
+                    mode=RunMode.LIVE.value,
+                    realized=summary["realized"],
+                    market=summary["market"],
+                ),
+                kind="fill",
+            )
         if booked or seen != set(ledger["seen"]):
             ledger["seen"] = list(seen)[-LIVE_TRADE_LIMIT:]
             ledger["books"] = books
             self._save_live_ledger(ledger)
         return booked
+
+    def _merge_exit(self, announced: dict, trade: dict, result: dict, market: str) -> None:
+        """Fold one closing slice into the message that will be sent for its order.
+
+        Keyed by exchange order id so the slices of one order become a single
+        message. Price is share-weighted, which is the only meaningful average
+        once several fills at different prices have been merged.
+        """
+        key = str(
+            trade.get("orderId")
+            or trade.get("order")
+            or (trade.get("info") or {}).get("orderId")
+            or trade.get("id")
+            or ""
+        )
+        qty = float(result.get("closedQty") or 0.0)
+        price = float(result.get("price") or trade.get("price") or 0.0)
+        if not key or qty <= 0 or price <= 0:
+            return
+        entry = announced.get(key)
+        if entry is None:
+            announced[key] = {
+                "symbol": str(result.get("symbol") or trade.get("symbol") or ""),
+                "side": str(trade.get("side") or ""),
+                "amount": qty,
+                "price": price,
+                "realized": float(result.get("realized") or 0.0),
+                "market": market,
+            }
+            return
+        merged = entry["amount"] + qty
+        entry["price"] = (entry["price"] * entry["amount"] + price * qty) / merged
+        entry["amount"] = merged
+        entry["realized"] = float(entry["realized"]) + float(result.get("realized") or 0.0)
 
     def _live_symbols(self, market: MarketType) -> list[str]:
         """Symbols worth polling: open orders, positions and the active pair."""
@@ -805,6 +909,12 @@ class TradingService:
         """
         filled = self.paper.mark(symbol, price)
         for order in filled:
+            # A conditional order is booked and announced the moment it fires
+            # (see ``on_broker_order``). ``mark`` still returns it — that is
+            # what the caller persists — but claiming it here is what keeps the
+            # risk manager from counting the same exit twice.
+            if self._claim_external(order):
+                continue
             self._record_fill(order)
             self.notify_fill(order, mode=RunMode.PAPER, market=order.get("market") or "spot")
             try:
@@ -847,7 +957,12 @@ class TradingService:
             return
         try:
             amount = float(order.get("filled") or order.get("amount") or 0.0)
-            price = float(order.get("average") or order.get("triggerPrice") or 0.0)
+            # A guard fires a *market* exit: the order carries price 0 and
+            # records the crossed level in ``triggerPrice``. Without the
+            # fallback such an exit was dropped as "price <= 0".
+            price = float(
+                order.get("average") or order.get("price") or order.get("triggerPrice") or 0.0
+            )
         except (TypeError, ValueError):
             return
         if amount <= 0 or price <= 0:

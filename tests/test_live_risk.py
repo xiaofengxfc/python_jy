@@ -16,6 +16,7 @@ from btrader.core.types import MarketType
 from btrader.engine.paper import PaperBroker
 from btrader.engine.risk import RiskManager
 from btrader.engine.trading import TradingService
+from btrader.notify import NotifySettings, WeChatNotifier
 
 
 class FakeREST:
@@ -154,4 +155,154 @@ def test_live_cost_book_handles_add_and_partial_exit(tmp_path):
     assert booked[0]["closedQty"] == pytest.approx(1.0)
     assert booked[0]["realized"] == pytest.approx(20.0)
     assert service.risk.state.realized_pnl == pytest.approx(20.0)
+    db.close()
+
+
+def test_slices_of_one_order_produce_a_single_message(tmp_path):
+    """A swept stop is many fills of one order, not many orders."""
+    from btrader.core.types import MarketType
+
+    class Recording(WeChatNotifier):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.sent: list[tuple[str, str]] = []
+
+        def notify(self, text, *, kind=""):
+            self.sent.append((text, kind))
+            return True
+
+    rest = FakeREST(
+        {
+            "BTC/USDT": [
+                _trade("1", "buy", 1.0, 100.0),
+                {**_trade("2", "sell", 0.4, 110.0), "orderId": "ord-1"},
+                {**_trade("3", "sell", 0.6, 120.0), "orderId": "ord-1"},
+            ]
+        }
+    )
+    notifier = Recording(NotifySettings(enabled=True, target="wxid"))
+    service, db = _service(tmp_path, rest)
+    service.notifier = notifier
+
+    booked = service.sync_live_fills([MarketType.SPOT])
+
+    assert len(booked) == 2
+    assert len(notifier.sent) == 1
+    text, kind = notifier.sent[0]
+    assert kind == "fill"
+    # merged size, share-weighted price: (0.4*110 + 0.6*120) / 1.0
+    assert "平仓" not in text and "卖出 1 @ 116.0000" in text
+    db.close()
+
+
+def test_daily_loss_breaker_is_announced_without_a_halt_reason(tmp_path):
+    """The daily-loss cap has no ``halted_reason``; the push must still fire."""
+    from btrader.core.types import MarketType
+
+    class Recording(WeChatNotifier):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.sent: list[str] = []
+
+        def notify(self, text, *, kind=""):
+            self.sent.append(kind)
+            return True
+
+    rest = FakeREST(
+        {
+            "BTC/USDT": [
+                _trade("1", "buy", 1.0, 100.0),
+                _trade("2", "sell", 1.0, 90.0),
+            ]
+        }
+    )
+    notifier = Recording(NotifySettings(enabled=True, target="wxid"))
+    service, db = _service(tmp_path, rest)
+    service.notifier = notifier
+    service.risk.settings.max_daily_loss = 5.0
+
+    service.sync_live_fills([MarketType.SPOT])
+    service.notify_risk_halt()
+    service.notify_risk_halt()
+
+    assert service.risk.state.halted_reason == ""
+    assert notifier.sent.count("risk") == 1
+    db.close()
+
+
+def _recorder() -> "Recording":
+    return Recording(NotifySettings(enabled=True, target="wxid"))
+
+
+class Recording(WeChatNotifier):
+    """Notifier that records instead of shelling out."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.sent: list[tuple[str, str]] = []
+
+    def notify(self, text, *, kind=""):
+        self.sent.append((text, kind))
+        return True
+
+
+def test_conditional_fill_is_booked_and_announced_once(tmp_path):
+    """The reconciler must not re-book what the broker already reported."""
+    from btrader.core.types import MarketType
+
+    rest = FakeREST({})
+    notifier = _recorder()
+    service, db = _service(tmp_path, rest)
+    service.notifier = notifier
+
+    service.paper.place_order("BTC/USDT", "buy", "market", 1.0, 100.0, market="spot")
+    service.paper.place_conditional(
+        "BTC/USDT",
+        "sell",
+        1.0,
+        trigger=105.0,
+        # "below" would wait for a decline; this exit is meant to fire upward.
+        direction="above",
+        order_type="market",
+        market="spot",
+    )
+    assert notifier.sent == []
+
+    # The background loop feeds the last price in; that fires the exit.
+    filled = service.settle_paper_orders("BTC/USDT", 106.0)
+
+    assert len(filled) == 1
+    # one protection-style message for the exit: fill + exit, never twice
+    assert [kind for _text, kind in notifier.sent] == ["fill"]
+    # Slippage and fees are part of the paper fill, so the PnL is close to 6
+    # rather than exactly 6; double-booking would land near 12.
+    booked_once = service.risk.state.realized_pnl
+    assert 5.0 < booked_once < 6.0
+
+    # A second poll returns nothing, and nothing more is booked.
+    assert service.settle_paper_orders("BTC/USDT", 106.0) == []
+    assert service.risk.state.realized_pnl == pytest.approx(booked_once)
+    assert len(notifier.sent) == 1
+    db.close()
+
+
+def test_guard_exit_is_announced_as_a_protection(tmp_path):
+    from btrader.core.types import MarketType  # noqa: F401 - keeps parity with peers
+
+    rest = FakeREST({})
+    notifier = _recorder()
+    service, db = _service(tmp_path, rest)
+    service.notifier = notifier
+
+    service.paper.place_order(
+        "BTC/USDT", "buy", "market", 1.0, 100.0, market="spot", stop_loss=95.0
+    )
+    service.check_protections("BTC/USDT", 90.0)
+
+    assert [kind for _text, kind in notifier.sent] == ["protection"]
+    text = notifier.sent[0][0]
+    # The message quotes the price that actually traded (90 plus slippage),
+    # not the stop level it crossed.
+    assert "止损触发" in text and "95.00" not in text
+    assert "平仓 1 @ 89.99" in text
     db.close()

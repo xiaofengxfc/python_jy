@@ -213,6 +213,8 @@ export interface NotifyStatus {
   command: string;
   available: boolean;
   last_error: string;
+  /** Unix seconds of the last failure, 0 when there has not been one. */
+  last_error_at: number;
   last_success_at: number;
   dropped: number;
   pending: number;
