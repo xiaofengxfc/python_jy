@@ -29,7 +29,7 @@ class InverseStubREST(BinanceREST):
         super().__init__(*args, **kwargs)
         self.created = []
 
-    def contract_spec(self, market_type, symbol):
+    def contract_spec(self, market_type, symbol, allow_network=True):
         if market_type is MarketType.COINM:
             return ContractSpec(
                 contract_size=100.0,
@@ -227,6 +227,8 @@ def test_unrounded_amount_is_refused_not_degraded(tmp_path):
 
     Before the fix ccxt's "below minimum" error was swallowed and the raw base
     quantity was sent as if it were a contract count, inflating the order.
+    Live orders still round through the exchange; paper orders now round
+    locally, so this guard applies to the live path.
     """
     settings = AppSettings(
         risk=RiskSettings(
@@ -252,7 +254,7 @@ def test_unrounded_amount_is_refused_not_degraded(tmp_path):
                     amount=0.05,  # 25 contracts, clears the minimum
                     price=50_000.0,
                     market_type=MarketType.COINM,
-                    mode=RunMode.PAPER,
+                    mode=RunMode.LIVE,
                 )
             )
         assert not rest.created

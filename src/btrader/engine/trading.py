@@ -7,6 +7,7 @@ applies risk checks, precision rounding and (in paper mode) the paper broker.
 from __future__ import annotations
 
 import logging
+import math
 import uuid
 from dataclasses import dataclass
 
@@ -73,7 +74,13 @@ class TradingService:
         return self.rest.amount_to_precision(market_type, symbol, raw)
 
     def exchange_amount(
-        self, market_type: MarketType, symbol: str, base_qty: float, price: float
+        self,
+        market_type: MarketType,
+        symbol: str,
+        base_qty: float,
+        price: float,
+        *,
+        offline: bool = False,
     ) -> tuple[float, float]:
         """Convert a base-coin quantity into the exchange's amount unit.
 
@@ -83,10 +90,17 @@ class TradingService:
         account and the risk checks should use. Spot and linear markets keep
         the base quantity itself as the exchange amount.
 
+        ``offline=True`` is used for paper trading: it never touches the
+        network, so a simulated order cannot be refused just because the
+        exchange is unreachable. Contract specs already fetched by the market
+        page are reused from the cache.
+
         Raises ``OrderRejected`` when the rounded size falls below the market
         minimum (e.g. less than one contract on coin-M).
         """
-        spec = self.rest.contract_spec(market_type, symbol)
+        spec = self.rest.contract_spec(
+            market_type, symbol, allow_network=not offline
+        )
         raw = spec.base_to_contracts(base_qty, price)
         if raw <= 0:
             raise OrderRejected("数量无效，无法计算下单量。")
@@ -95,14 +109,19 @@ class TradingService:
                 f"下单量 {format_amount(raw)} 低于最小下单量 "
                 f"{format_amount(spec.min_amount)}。（{spec.describe()}）"
             )
-        exchange_amount = self.rest.amount_to_precision(market_type, symbol, raw)
+        if offline:
+            # Paper fills are simulated locally: round exactly the way the
+            # venue would (inverse contracts are whole numbers, never up).
+            exchange_amount = math.floor(raw + 1e-12) if spec.inverse else raw
+        else:
+            exchange_amount = self.rest.amount_to_precision(market_type, symbol, raw)
         if exchange_amount <= 0:
             raise OrderRejected(
                 f"下单量 {format_amount(raw)} 无法满足交易所的最小下单单位。"
                 f"（{spec.describe()}）"
             )
         rounded_base = spec.contracts_to_base(exchange_amount, price)
-        return exchange_amount, rounded_base
+        return float(exchange_amount), rounded_base
 
     def estimate_cost(self, amount: float, price: float) -> float:
         return abs(amount) * price
@@ -164,8 +183,14 @@ class TradingService:
 
         # Callers always express size in base coins; convert it to whatever the
         # exchange expects (coins for spot/linear, contracts for coin-M).
+        # Paper orders are converted offline: a simulated fill must not depend
+        # on the venue being reachable.
         exchange_amount, base_qty = self.exchange_amount(
-            req.market_type, req.symbol, req.amount, price
+            req.market_type,
+            req.symbol,
+            req.amount,
+            price,
+            offline=req.mode is RunMode.PAPER,
         )
         if exchange_amount <= 0:
             spec = self.rest.contract_spec(req.market_type, req.symbol)

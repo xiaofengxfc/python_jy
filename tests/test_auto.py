@@ -50,7 +50,7 @@ class StubREST(BinanceREST):
             return float(int(amount))  # Binance coin-M trades whole contracts
         return float(amount)
 
-    def contract_spec(self, market_type, symbol):
+    def contract_spec(self, market_type, symbol, allow_network=True):
         from btrader.core.contracts import ContractSpec
 
         if market_type is MarketType.COINM:

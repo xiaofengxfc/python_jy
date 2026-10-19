@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont, QIcon, QPixmap, QPainter, QColor
@@ -15,7 +16,27 @@ from .logging_setup import setup_logging
 log = logging.getLogger(__name__)
 
 
+def _asset(*parts: str) -> Path | None:
+    """Locate a bundled resource in both source and frozen builds."""
+    roots = []
+    if getattr(sys, "frozen", False):
+        base = getattr(sys, "_MEIPASS", "")
+        if base:
+            roots.append(Path(base))
+        roots.append(Path(sys.executable).resolve().parent)
+    roots.append(Path(__file__).resolve().parents[2])
+    for root in roots:
+        candidate = root.joinpath(*parts)
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def _make_icon() -> QIcon:
+    bundled = _asset("packaging", "bitrader.ico")
+    if bundled is not None:
+        return QIcon(str(bundled))
+
     pixmap = QPixmap(64, 64)
     pixmap.fill(QColor("#0f1115"))
     painter = QPainter(pixmap)

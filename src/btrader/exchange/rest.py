@@ -62,14 +62,24 @@ class BinanceREST:
             self._clients.clear()
             self._specs.clear()
 
-    def contract_spec(self, market: MarketType, symbol: str) -> ContractSpec:
-        """Contract size / minimum amount for a symbol, cached after first use."""
+    def contract_spec(
+        self, market: MarketType, symbol: str, allow_network: bool = True
+    ) -> ContractSpec:
+        """Contract size / minimum amount for a symbol, cached after first use.
+
+        ``allow_network=False`` only reads the cache. Paper trading uses that so
+        an order never blocks on a network round trip, and so an offline session
+        can still place simulated orders.
+        """
         key = (market, symbol)
         with self._lock:
             cached = self._specs.get(key)
             if cached is not None:
                 return cached
+        if not allow_network:
+            return DEFAULT_SPEC
         spec = DEFAULT_SPEC
+        resolved = False
         try:
             client = self.client(market)
             client.load_markets()
@@ -83,10 +93,14 @@ class BinanceREST:
                 settle=raw.get("settle") or "",
                 min_amount=float(limits.get("min") or 0.0),
             )
+            resolved = True
         except Exception as exc:
             log.debug("无法读取 %s 的合约规格: %s", symbol, exc)
-        with self._lock:
-            self._specs[key] = spec
+        # Only cache a real answer: a transient failure must not pin the
+        # fallback spec (1 contract = 1 coin, no minimum) for the session.
+        if resolved:
+            with self._lock:
+                self._specs[key] = spec
         return spec
 
     @property

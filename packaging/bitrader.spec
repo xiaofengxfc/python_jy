@@ -23,6 +23,9 @@ hiddenimports += collect_submodules("btrader.strategy.builtin")
 
 datas = collect_data_files("certifi")
 datas += collect_data_files("ccxt")
+# The window icon is loaded at runtime from the bundle, not just embedded in
+# the executable's resource section.
+datas += [(str(ROOT / "packaging" / "bitrader.ico"), "packaging")]
 
 a = Analysis(
     # `run.py` is the entry point: it adds src/ to sys.path and imports the
@@ -60,7 +63,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,
+    icon=str(ROOT / "packaging" / "bitrader.ico"),
 )
 
 coll = COLLECT(
