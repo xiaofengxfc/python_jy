@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import pyqtgraph as pg
 from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QVBoxLayout, QWidget
 
 from .. import theme
@@ -39,6 +40,14 @@ class DateAxis(pg.AxisItem):
 @dataclass
 class _LastState:
     candle: pg.GraphicsObject | None = None
+
+
+def _blend(first: str, second: str, ratio: float) -> str:
+    """Mix two palette colours; ratio 0 returns ``first``, 1 returns ``second``."""
+    a = QColor(first)
+    b = QColor(second)
+    mix = lambda x, y: round(x + (y - x) * ratio)  # noqa: E731
+    return QColor(mix(a.red(), b.red()), mix(a.green(), b.green()), mix(a.blue(), b.blue())).name()
 
 
 class CandleChart(QWidget):
@@ -181,12 +190,14 @@ class CandleChart(QWidget):
         if not series or self._df.empty:
             return
         palette = theme.current()
+        # Overlay series reuse the palette so a theme switch never leaves a
+        # clashing hue behind; the accent leads and the rest stay desaturated.
         colors = [
             palette.accent,
-            "#f59e0b",
-            "#a78bfa",
-            "#2dd4bf",
-            "#fb7185",
+            _blend(palette.accent, palette.text, 0.35),
+            _blend(palette.accent, palette.bg, 0.45),
+            _blend(palette.text, palette.bg, 0.45),
+            _blend(palette.accent, palette.text, 0.65),
         ]
         for i, (name, values) in enumerate(series.items()):
             y = np.asarray(values, dtype=float)

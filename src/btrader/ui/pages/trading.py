@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QTabWidget,
     QVBoxLayout,
@@ -38,28 +39,38 @@ from ..workers import TaskRunner
 
 log = logging.getLogger(__name__)
 
+# Chart floor. The left pane is a scroll area, so the chart keeps a usable
+# height and the drawer grows below it instead of squeezing the candles.
+MIN_CHART_HEIGHT = 320
+
 
 class OrderDrawer(QFrame):
     """Bottom dock for open orders / history / fills.
 
-    Collapsed it is a single bar; clicking the bar slides the tab widget in
-    and out, so the chart keeps the vertical space by default.
+    Collapsed it is a single bar. Expanding grows the panel *downwards*: the
+    header keeps its position and the page scrolls, so an order list never
+    shoves the chart upwards under the cursor.
     """
 
-    HEADER_H = 34
+    expansionChanged = Signal(bool)
+
+    HEADER_H = theme.CONTROL_HEIGHT          # 与输入框/按钮同高
+    PADDING = 6
+    COLLAPSED_H = HEADER_H + PADDING * 2
     EXPANDED_H = 236
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("Drawer")
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 6, 10, 8)
+        # Match Card's 16px side padding so the drawer lines up with the chart.
+        layout.setContentsMargins(theme.CARD_PADDING, self.PADDING,
+                                  theme.CARD_PADDING, self.PADDING)
         layout.setSpacing(6)
 
         self.header = QPushButton()
         self.header.setObjectName("DrawerHeader")
         self.header.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.header.setFixedHeight(self.HEADER_H - 12)
         self.header.setToolTip("展开或收起委托面板")
         self.header.clicked.connect(self.toggle)
         layout.addWidget(self.header)
@@ -70,6 +81,7 @@ class OrderDrawer(QFrame):
         layout.addWidget(self.tabs, 1)
 
         self._expanded = False
+        self._initialised = False
         self.set_expanded(False)
         theme.bus().changed.connect(lambda _p: self.sync_header())
 
@@ -77,19 +89,28 @@ class OrderDrawer(QFrame):
         self.set_expanded(not self._expanded)
 
     def set_expanded(self, expanded: bool) -> None:
+        # ``isVisible()`` is False for every child of a window that has not
+        # been shown yet, so it cannot double as the state check: guard on an
+        # explicit initialisation flag instead, or the first call returns
+        # early and the drawer never receives its collapsed height.
+        if self._initialised and expanded == self._expanded:
+            return
+        self._initialised = True
         self._expanded = expanded
         self.tabs.setVisible(expanded)
-        self.setFixedHeight(self.EXPANDED_H if expanded else self.HEADER_H + 14)
+        self.setFixedHeight(self.EXPANDED_H if expanded else self.COLLAPSED_H)
         self.sync_header()
+        self.expansionChanged.emit(expanded)
 
     def sync_header(self) -> None:
         palette = theme.current()
         index = max(0, self.tabs.currentIndex())
         label = self.tabs.tabText(index) if self.tabs.count() else "委托"
-        self.header.setText(f"  {label}")
+        self.header.setText(label)
+        # A downward-opening drawer points down while expanded.
         self.header.setIcon(
             qta.icon(
-                "fa6s.chevron-up" if self._expanded else "fa6s.chevron-down",
+                "fa6s.chevron-down" if self._expanded else "fa6s.chevron-up",
                 color=palette.text_dim,
             )
         )
@@ -143,31 +164,82 @@ class TradingPage(QWidget):
         splitter.setHandleWidth(theme.PAGE_GAP)
 
         left = QWidget()
+        self._left = left
+        self._chart_restore = 16_777_215
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(theme.PAGE_GAP)
 
         # The chart owns all remaining height; orders live in the drawer bar.
         chart_card = Card(padding=8)
+        self._chart_card = chart_card
         self.chart = CandleChart()
+        self.chart.setMinimumHeight(MIN_CHART_HEIGHT)
         chart_card.body().addWidget(self.chart, 1)
         left_layout.addWidget(chart_card, 1)
         left_layout.addWidget(self.drawer)
-        splitter.addWidget(left)
+
+        # Scrolling container: expanding the drawer grows the page downwards
+        # instead of lifting the drawer header (and the chart) upwards.
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        left_scroll.setWidget(left)
+        self._left_scroll = left_scroll
+        splitter.addWidget(left_scroll)
+        self.drawer.expansionChanged.connect(self._on_drawer_expanded)
+
+        # The right rail scrolls instead of compressing: when the window is
+        # short, squeeze the ticket below its minimum height and Qt would let
+        # the rows overlap. A scroll area keeps every control at its real size.
+        # The width must clear the ticket's own 332px minimum plus the
+        # scrollbar gutter, otherwise the horizontal bar is clipped away and
+        # the widest row loses its right edge.
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        right_scroll.setMinimumWidth(348)
+        right_scroll.setMaximumWidth(372)
 
         right = QWidget()
-        right.setMinimumWidth(320)
-        right.setMaximumWidth(360)
+        right.setMinimumWidth(332)
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(theme.PAGE_GAP)
         right_layout.addWidget(self._build_book_card(), 2)
         right_layout.addWidget(self._build_order_ticket(), 3)
-        splitter.addWidget(right)
+        right_scroll.setWidget(right)
+        splitter.addWidget(right_scroll)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 0)
         splitter.setSizes([1040, 330])
         root.addWidget(splitter, 1)
+
+    def _on_drawer_expanded(self, expanded: bool) -> None:
+        """Open the drawer downwards, leaving the header where it is.
+
+        The left pane lives in a scroll area, so the header only stays put if
+        the content is *taller* than the viewport while the chart keeps its
+        height. Pinning the chart and raising the pane's minimum height does
+        that: a scroll bar appears and the extra height lands below the
+        header. The scroll position is deliberately left untouched — scrolling
+        to reveal the list would move the header, which is exactly what we are
+        avoiding; the user scrolls down when they want the orders.
+        """
+        if expanded:
+            self._chart_restore = self._chart_card.maximumHeight()
+            chart_h = max(MIN_CHART_HEIGHT, self._chart_card.height())
+            self._chart_card.setFixedHeight(chart_h)
+            self._left.setMinimumHeight(
+                chart_h + theme.PAGE_GAP + self.drawer.EXPANDED_H
+            )
+        else:
+            self._left.setMinimumHeight(0)
+            self._chart_card.setMinimumHeight(0)
+            self._chart_card.setMaximumHeight(self._chart_restore)
+            self.chart.setMinimumHeight(MIN_CHART_HEIGHT)
 
     def _stat(self, layout: QHBoxLayout, caption: str) -> QLabel:
         column = QVBoxLayout()
@@ -175,7 +247,7 @@ class TradingPage(QWidget):
         label = QLabel(caption)
         label.setObjectName("Eyebrow")
         value = QLabel("--")
-        value.setStyleSheet("font-size: 13px; font-weight: 600;")
+        value.setObjectName("StatValue")
         column.addWidget(label)
         column.addWidget(value)
         layout.addLayout(column)
@@ -213,6 +285,7 @@ class TradingPage(QWidget):
         self.price_label.setObjectName("SymbolPrice")
         price_row.addWidget(self.price_label)
         self.change_label = QLabel("")
+        self.change_label.setObjectName("ChangePct")
         price_row.addWidget(self.change_label)
         price_row.addStretch(1)
         price_column.addLayout(price_row)
@@ -360,8 +433,11 @@ class TradingPage(QWidget):
         self.amount_spin.setValue(self.ctx.settings.default_order_quote)
         card.body().addLayout(self._field_row("数量", self.amount_spin, self._size_toggle()))
 
-        # Step 3 — quick sizing by share of available balance.
+        # Step 3 — quick sizing by share of available balance. The row starts
+        # at the input's left edge (label column + gap) so it reads as part of
+        # the size field instead of hanging off the card margin.
         self.percent_row = QHBoxLayout()
+        self.percent_row.setContentsMargins(36 + theme.CONTROL_GAP, 0, 0, 0)
         self.percent_row.setSpacing(6)
         self.percent_buttons: list[QPushButton] = []
         for percent in (25, 50, 75, 100):
@@ -373,14 +449,21 @@ class TradingPage(QWidget):
             self.percent_buttons.append(button)
         card.body().addLayout(self.percent_row)
 
-        # Step 4 — read-back before committing.
+        # Step 4 — read-back before committing. The estimate sits on its own
+        # line; the contract note only appears for coin-M and wraps, because
+        # sharing one line squeezed it to a few pixels.
         self.estimate_label = QLabel("预计金额：--")
         self.estimate_label.setObjectName("Subtitle")
-        card.body().addWidget(self.estimate_label)
-
         self.unit_hint = QLabel("")
         self.unit_hint.setObjectName("Subtitle")
         self.unit_hint.setWordWrap(True)
+        self.unit_hint.setContentsMargins(36 + theme.CONTROL_GAP, 0, 0, 0)
+        self.unit_hint.hide()
+        info_row = QHBoxLayout()
+        info_row.setContentsMargins(36 + theme.CONTROL_GAP, 0, 0, 0)
+        info_row.addWidget(self.estimate_label)
+        info_row.addStretch(1)
+        card.body().addLayout(info_row)
         card.body().addWidget(self.unit_hint)
 
         self.leverage_spin = QDoubleSpinBox()
@@ -560,8 +643,7 @@ class TradingPage(QWidget):
         self._fill_paper_limits(symbol, ticker.last)
         self.price_label.setText(f"{ticker.last:,.4f}")
         self.change_label.setText(f"{ticker.change_pct:+.2f}%")
-        color = theme.current().up if ticker.change_pct >= 0 else theme.current().down
-        self.change_label.setStyleSheet(f"color: {color}; font-weight: 600;")
+        theme.set_role(self.change_label, "up" if ticker.change_pct >= 0 else "down")
         self.high_label.setText(f"{ticker.high:,.4f}")
         self.low_label.setText(f"{ticker.low:,.4f}")
         self.volume_label.setText(f"{ticker.quote_volume:,.0f}")
@@ -743,11 +825,14 @@ class TradingPage(QWidget):
             self._live_available = None
         mode = self.mode_combo.currentData()
         if mode == RunMode.LIVE.value:
+            # Only the live warning earns a permanent line; the paper-mode
+            # caption was pure noise under the primary buttons.
             self.mode_hint.setText("⚠ 实盘模式将使用真实资金下单，请确认风控设置。")
-            self.mode_hint.setStyleSheet(f"color: {theme.current().accent};")
+            theme.set_role(self.mode_hint, "accent")
+            self.mode_hint.show()
         else:
-            self.mode_hint.setText("纸面交易使用模拟资金，行情为真实行情。")
-            self.mode_hint.setStyleSheet(f"color: {theme.current().text_dim};")
+            self.mode_hint.setText("")
+            self.mode_hint.hide()
 
     def _set_futures_controls(self) -> None:
         futures = self._market().is_futures
@@ -772,7 +857,9 @@ class TradingPage(QWidget):
                 f"≈ {format_amount(contracts)} 张  |  杠杆 {leverage:g}x"
             )
         self.estimate_label.setText(text)
-        self.unit_hint.setText(self._unit_hint_text(spec))
+        hint = self._unit_hint_text(spec)
+        self.unit_hint.setText(hint)
+        self.unit_hint.setVisible(bool(hint))
 
     # --------------------------------------------------------------- ordering
     def _submit_order(self, side: str) -> None:

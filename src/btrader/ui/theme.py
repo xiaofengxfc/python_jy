@@ -13,7 +13,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QPalette
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QWidget
 
 
 @dataclass(frozen=True)
@@ -24,6 +24,7 @@ class Palette:
     bg_alt: str        # sidebar / inputs / headers
     bg_card: str       # raised surfaces
     bg_hover: str
+    bg_pressed: str
     border: str
     text: str
     text_dim: str
@@ -32,6 +33,8 @@ class Palette:
     accent_text: str
     up: str
     down: str
+    up_hover: str
+    down_hover: str
     grid: str
     sidebar: str
     shadow_alpha: int
@@ -108,6 +111,7 @@ DARK = Palette(
     bg_alt="#121316",
     bg_card="#16181b",
     bg_hover="#1e2024",
+    bg_pressed="#2a2d33",
     border="#282b30",
     text="#e8e9eb",
     text_dim="#8b9096",
@@ -116,6 +120,8 @@ DARK = Palette(
     accent_text="#14161a",
     up="#2eb86a",
     down="#e05b5b",
+    up_hover="#39c878",
+    down_hover="#ea6d6d",
     grid="#1c1f23",
     sidebar="#121316",
     shadow_alpha=0,
@@ -128,6 +134,7 @@ LIGHT = Palette(
     bg_alt="#ffffff",
     bg_card="#ffffff",
     bg_hover="#f2f3f5",
+    bg_pressed="#dcdfe3",
     border="#e4e6e9",
     text="#16181d",
     text_dim="#71767d",
@@ -136,6 +143,8 @@ LIGHT = Palette(
     accent_text="#ffffff",
     up="#1a9c5b",
     down="#d94848",
+    up_hover="#178a50",
+    down_hover="#c33e3e",
     grid="#eef0f2",
     sidebar="#ffffff",
     shadow_alpha=0,
@@ -204,10 +213,23 @@ def _rgba(color: str, alpha: float) -> str:
     return f"rgba({c.red()}, {c.green()}, {c.blue()}, {alpha:.3f})"
 
 
+def set_role(widget: QWidget, role: str | None) -> None:
+    """Apply a semantic colour role (``up`` / ``down`` / ``dim`` / ``accent``).
+
+    The colour itself lives in the stylesheet, so switching themes repaints
+    the widget instead of leaving the previous palette baked into the widget.
+    """
+    if widget.property("role") == role:
+        return
+    widget.setProperty("role", role)
+    style = widget.style()
+    style.unpolish(widget)
+    style.polish(widget)
+    widget.update()
+
+
 def stylesheet(p: Palette) -> str:
     soft = _rgba(p.accent, 0.14)
-    soft_hover = _rgba(p.accent, 0.22)
-    buy_soft = _rgba(p.up, 0.16)
     sell_soft = _rgba(p.down, 0.16)
     return f"""
 QWidget {{
@@ -231,16 +253,11 @@ QFrame#SidebarAccount {{
     border-radius: {CARD_RADIUS}px;
 }}
 QFrame#SidebarAccount:hover {{ background: {p.bg_hover}; }}
-QLabel#SidebarAccountMode {{ font-size: 11px; font-weight: 600; }}
+QLabel#SidebarAccountMode {{ font-size: 11px; font-weight: 600; color: {p.text_dim}; }}
 QLabel#SidebarAccountValue {{ font-size: 14px; font-weight: 650; color: {p.text}; }}
 QLabel#SidebarAccountHint {{ font-size: 11px; }}
 QFrame#TitleBar {{ background: transparent; border: none; }}
 QFrame#StatusStrip {{ background: {p.bg_alt}; border-top: 1px solid {p.border}; }}
-QFrame#Panel {{
-    background: {p.bg_alt};
-    border: 1px solid {p.border};
-    border-radius: {CARD_RADIUS}px;
-}}
 QFrame#Card {{
     background: {p.bg_card};
     border: 1px solid {p.border};
@@ -255,13 +272,16 @@ QFrame#Drawer {{
 QPushButton#DrawerHeader {{
     background: transparent;
     border: none;
-    color: {p.text_dim};
-    font-size: 12px;
+    border-radius: {CONTROL_RADIUS}px;
+    color: {p.text};
+    font-size: 14px;
     font-weight: 600;
     text-align: left;
-    padding: 0 4px;
+    padding: 0;
+    min-height: {CONTROL_HEIGHT}px;
+    max-height: {CONTROL_HEIGHT}px;
 }}
-QPushButton#DrawerHeader:hover {{ color: {p.text}; }}
+QPushButton#DrawerHeader:hover {{ background: {p.bg_hover}; }}
 
 QListWidget#SettingsNav {{
     background: transparent;
@@ -277,10 +297,12 @@ QListWidget#SettingsNav::item {{
     padding: 8px 10px;
 }}
 QListWidget#SettingsNav::item:hover {{ background: {p.bg_hover}; color: {p.text}; }}
+/* bg_card equals the page colour in the light palette, so a card-coloured
+   selection would be invisible; a tinted fill reads in both themes. */
 QListWidget#SettingsNav::item:selected {{
-    background: {p.bg_card};
+    background: {soft};
     color: {p.text};
-    border: 1px solid {p.border};
+    border: 1px solid transparent;
 }}
 
 QLabel {{ background: transparent; }}
@@ -290,53 +312,93 @@ QLabel#Subtitle {{ color: {p.text_dim}; font-size: 12px; }}
 QLabel#MetricValue {{ font-size: 22px; font-weight: 650; color: {p.text}; }}
 QLabel#MetricLabel {{ color: {p.text_dim}; font-size: 12px; }}
 QLabel#SymbolPrice {{ font-size: 26px; font-weight: 700; }}
-QLabel#Muted {{ color: {p.text_dim}; }}
+QLabel#ChangePct {{ font-weight: 600; }}
+QLabel#Brand {{ color: {p.text}; font-size: 15px; font-weight: 700; }}
+QLabel#StatValue {{ font-size: 13px; font-weight: 600; color: {p.text}; }}
+QLabel#StatusLabel {{ color: {p.text_dim}; font-size: 11px; }}
 QLabel#Eyebrow {{
     color: {p.text_dim}; font-size: 11px; font-weight: 600;
     letter-spacing: 0.6px;
+}}
+/* Semantic colour roles. Colours belong in the stylesheet: an inline
+   ``setStyleSheet(f"color: ...")`` freezes whichever palette was active when
+   it ran, so a theme switch would leave the old hue behind.
+   Every ID below carries a fixed ``color`` of its own; an ID selector (100)
+   outranks a bare attribute match (10), so each one is repeated here. Any new
+   label with its own colour must be added to these lists or roles silently
+   stop working on it. */
+QLabel[role="up"], QLabel#Title[role="up"], QLabel#Subtitle[role="up"],
+QLabel#StatusLabel[role="up"], QLabel#SidebarAccountHint[role="up"],
+QLabel#SidebarAccountMode[role="up"], QLabel#SidebarAccountValue[role="up"],
+QLabel#MetricValue[role="up"], QLabel#StatValue[role="up"],
+QLabel#Brand[role="up"] {{
+    color: {p.up};
+}}
+QLabel[role="down"], QLabel#Title[role="down"], QLabel#Subtitle[role="down"],
+QLabel#StatusLabel[role="down"], QLabel#SidebarAccountHint[role="down"],
+QLabel#SidebarAccountMode[role="down"], QLabel#SidebarAccountValue[role="down"],
+QLabel#MetricValue[role="down"], QLabel#StatValue[role="down"],
+QLabel#Brand[role="down"] {{
+    color: {p.down};
+}}
+QLabel[role="dim"], QLabel#Title[role="dim"], QLabel#Subtitle[role="dim"],
+QLabel#StatusLabel[role="dim"], QLabel#SidebarAccountHint[role="dim"],
+QLabel#SidebarAccountMode[role="dim"], QLabel#SidebarAccountValue[role="dim"],
+QLabel#MetricValue[role="dim"], QLabel#StatValue[role="dim"],
+QLabel#Brand[role="dim"] {{
+    color: {p.text_dim};
+}}
+QLabel[role="accent"], QLabel#Title[role="accent"], QLabel#Subtitle[role="accent"],
+QLabel#StatusLabel[role="accent"], QLabel#SidebarAccountHint[role="accent"],
+QLabel#SidebarAccountMode[role="accent"], QLabel#SidebarAccountValue[role="accent"],
+QLabel#MetricValue[role="accent"], QLabel#StatValue[role="accent"],
+QLabel#Brand[role="accent"] {{
+    color: {p.accent};
 }}
 QLabel#FieldLabel {{ color: {p.text_dim}; font-size: 12px; font-weight: 500; }}
 
 /* ---------------------------------------------------------- sidebar nav */
 QPushButton#NavItem {{
     background: transparent;
-    border: none;
+    border: 1px solid transparent;
     border-radius: 9px;
-    padding: 9px 12px;
+    padding: 0 12px;
     color: {p.text_dim};
     font-size: 13px;
     text-align: left;
+    min-height: 38px;
+    max-height: 38px;
 }}
 QPushButton#NavItem:hover {{ background: {p.bg_hover}; color: {p.text}; }}
+QPushButton#NavItem[compact="true"] {{ text-align: center; padding: 0; }}
 QPushButton#NavItem:checked {{
     background: {soft};
     color: {p.accent};
     font-weight: 600;
 }}
+/* Bare icon buttons take their size from the widget, not the 36px control
+   scale; state the height explicitly so QSS does not override setFixedSize. */
 QPushButton#IconButton {{
     background: transparent;
     border: none;
     border-radius: 7px;
     padding: 0;
     color: {p.text_dim};
+    min-height: 36px;
+    max-height: 36px;
 }}
 QPushButton#IconButton:hover {{ background: {p.bg_hover}; color: {p.text}; }}
-QPushButton#WindowButton {{
+QPushButton#WindowButton, QPushButton#CloseButton {{
     background: transparent;
     border: none;
     border-radius: 6px;
     padding: 0;
     color: {p.text_dim};
+    min-height: 26px;
+    max-height: 26px;
 }}
 QPushButton#WindowButton:hover {{ background: {p.bg_hover}; color: {p.text}; }}
-QPushButton#CloseButton {{
-    background: transparent;
-    border: none;
-    border-radius: 6px;
-    padding: 0;
-    color: {p.text_dim};
-}}
-QPushButton#CloseButton:hover {{ background: #e5484d; color: #ffffff; }}
+QPushButton#CloseButton:hover {{ background: {p.down}; color: #ffffff; }}
 
 /* ---------------------------------------------------------- buttons */
 QPushButton {{
@@ -349,38 +411,41 @@ QPushButton {{
     font-size: 13px;
 }}
 QPushButton:hover {{ background: {p.border}; }}
-QPushButton:pressed {{ background: {p.bg_hover}; }}
-QPushButton:disabled {{ color: {p.text_dim}; background: {p.bg_alt}; }}
+QPushButton:pressed {{ background: {p.bg_pressed}; }}
+QPushButton:disabled {{
+    color: {p.text_dim};
+    background: {p.bg_alt};
+    border-color: {p.border};
+}}
 QPushButton#Buy {{
-    background: {p.up}; border-color: transparent; color: #ffffff; font-weight: 600;
+    background: {p.up}; border: 1px solid transparent; color: #ffffff; font-weight: 600;
 }}
-QPushButton#Buy:hover {{ background: {p.up}; border-color: {p.up}; }}
+QPushButton#Buy:hover {{ background: {p.up_hover}; }}
 QPushButton#Sell {{
-    background: {p.down}; border-color: transparent; color: #ffffff; font-weight: 600;
+    background: {p.down}; border: 1px solid transparent; color: #ffffff; font-weight: 600;
 }}
-QPushButton#Sell:hover {{ background: {p.down}; border-color: {p.down}; }}
-QPushButton#BuySubtle {{
-    background: {buy_soft}; border: none; color: {p.up}; font-weight: 600;
-}}
-QPushButton#SellSubtle {{
-    background: {sell_soft}; border: none; color: {p.down}; font-weight: 600;
+QPushButton#Sell:hover {{ background: {p.down_hover}; }}
+/* A solid fill overrides the generic :disabled rule, so the coloured buttons
+   need their own — otherwise a disabled buy button still reads as armed. */
+QPushButton#Buy:disabled, QPushButton#Sell:disabled,
+QPushButton#Primary:disabled, QPushButton#Danger:disabled {{
+    background: {p.bg_alt};
+    border-color: {p.border};
+    color: {p.text_dim};
 }}
 QPushButton#Primary {{
-    background: {p.accent}; border-color: transparent; color: {p.accent_text};
+    background: {p.accent}; border: 1px solid transparent; color: {p.accent_text};
     font-weight: 600;
 }}
 QPushButton#Primary:hover {{ background: {p.accent_hover}; }}
 QPushButton#Danger {{
-    background: {sell_soft}; border: none; color: {p.down}; font-weight: 600;
+    background: {sell_soft}; border: 1px solid transparent; color: {p.down}; font-weight: 600;
 }}
+QPushButton#Danger:hover {{ background: {sell_soft}; border-color: {p.down}; }}
 QPushButton#Flat {{
     background: transparent; border: 1px solid {p.border}; color: {p.text};
 }}
 QPushButton#Flat:hover {{ background: {p.bg_hover}; border-color: {p.border}; }}
-QPushButton#Ghost {{
-    background: transparent; border: none; color: {p.text_dim}; padding: 0 10px;
-}}
-QPushButton#Ghost:hover {{ background: {p.bg_hover}; color: {p.text}; }}
 
 /* ---------------------------------------------------- segmented controls */
 QPushButton#SegmentLeft, QPushButton#SegmentRight {{
@@ -415,7 +480,7 @@ QPushButton#MiniSegmentLeft, QPushButton#MiniSegmentRight {{
     border: 1px solid {p.border};
     color: {p.text_dim};
     padding: 0 9px;
-    min-height: {CONTROL_HEIGHT - 4}px;
+    min-height: {CONTROL_HEIGHT - 2}px;
     font-size: 12px;
     max-width: 44px;
 }}
@@ -443,7 +508,7 @@ QPushButton#Percent {{
     border-radius: {CONTROL_RADIUS}px;
     color: {p.text_dim};
     padding: 0;
-    min-height: {CONTROL_HEIGHT - 10}px;
+    min-height: {CONTROL_HEIGHT - 2}px;
     font-size: 12px;
 }}
 QPushButton#Percent:hover {{
@@ -472,16 +537,21 @@ QDateTimeEdit:focus, QPlainTextEdit:focus, QTextEdit:focus {{
 }}
 QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled {{
     color: {p.text_dim};
+    background: {p.bg_hover};
+    border-color: {p.border};
 }}
 QComboBox::drop-down {{ border: none; width: 20px; }}
 QComboBox::down-arrow {{
     image: none; border-left: 4px solid transparent; border-right: 4px solid transparent;
     border-top: 5px solid {p.text_dim}; margin-right: 8px;
 }}
+/* Popup windows are not clipped to a rounded rect unless the window is
+   translucent, which Qt does not do for combo views (the square corner then
+   shows the border colour). Keep popups square. */
 QComboBox QAbstractItemView {{
     background: {p.bg_card};
     border: 1px solid {p.border};
-    border-radius: 8px;
+    border-radius: 0;
     padding: 4px;
     selection-background-color: {p.bg_hover};
     outline: none;
@@ -518,7 +588,8 @@ QTabWidget::pane {{ border: none; background: transparent; }}
 QTabBar::tab {{
     background: transparent;
     color: {p.text_dim};
-    padding: 8px 16px;
+    padding: 0 16px;
+    min-height: 34px;
     border: none;
     border-bottom: 2px solid transparent;
     font-size: 13px;
@@ -559,16 +630,31 @@ QGroupBox::title {{
 }}
 
 QCheckBox, QRadioButton {{ spacing: 7px; background: transparent; }}
-QCheckBox::indicator, QRadioButton::indicator {{
+QCheckBox::indicator {{
     width: 15px; height: 15px;
     border: 1px solid {p.border};
     border-radius: 4px;
     background: {p.bg_alt};
+    padding: 0;
 }}
-QCheckBox::indicator:checked, QRadioButton::indicator:checked {{
-    background: {p.accent}; border-color: {p.accent};
+QCheckBox::indicator:checked {{
+    /* The bundled tick glyph is black, so the checked box keeps a light fill:
+       painting the accent here would leave the tick at roughly 2:1 contrast. */
+    background: {p.bg_alt};
+    border-color: {p.accent};
+    image: url(:/qt-project.org/styles/commonstyle/images/standardbutton-apply-16.png);
 }}
-QRadioButton::indicator {{ border-radius: 8px; }}
+QCheckBox::indicator:disabled {{ background: {p.bg_hover}; border-color: {p.border}; }}
+QRadioButton::indicator {{
+    width: 15px; height: 15px;
+    border: 1px solid {p.border};
+    border-radius: 8px;
+    background: {p.bg_alt};
+}}
+QRadioButton::indicator:checked {{
+    background: {p.accent}; border: 4px solid {p.bg_alt};
+    outline: 1px solid {p.accent};
+}}
 
 QProgressBar {{
     background: {p.bg_hover};
@@ -583,7 +669,7 @@ QProgressBar::chunk {{ background: {p.accent}; border-radius: 3px; }}
 QMenu {{
     background: {p.bg_card};
     border: 1px solid {p.border};
-    border-radius: 8px;
+    border-radius: 0;
     padding: 6px;
 }}
 QMenu::item {{ padding: 7px 22px 7px 14px; border-radius: 6px; }}
@@ -594,7 +680,7 @@ QToolTip {{
     color: {p.text};
     border: 1px solid {p.border};
     padding: 5px 7px;
-    border-radius: 6px;
+    border-radius: 0;
 }}
 
 QStatusBar {{

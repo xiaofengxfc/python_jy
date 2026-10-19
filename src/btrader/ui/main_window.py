@@ -57,7 +57,7 @@ def _logo(size: int = 28) -> QIcon:
     painter.setPen(Qt.PenStyle.NoPen)
     painter.setBrush(QColor(palette.accent))
     painter.drawRoundedRect(0, 0, size, size, size * 0.28, size * 0.28)
-    painter.setBrush(QColor("#ffffff"))
+    painter.setBrush(QColor(theme.current().accent_text))
     bar_w = max(2.0, size * 0.10)
     for x, top, height in ((0.28, 0.46, 0.26), (0.47, 0.34, 0.40), (0.66, 0.24, 0.50)):
         painter.drawRoundedRect(
@@ -168,17 +168,11 @@ class SidebarAccount(QFrame):
         super().mouseReleaseEvent(event)
 
     def update_state(self, mode: str, network: str, equity: str, api: str, api_ok: bool) -> None:
-        palette = theme.current()
         self.mode_label.setText(f"{mode} · {network}")
-        self.mode_label.setStyleSheet(
-            f"color: {palette.accent if '实盘' in mode else palette.text_dim};"
-            "font-size: 11px; font-weight: 600;"
-        )
+        theme.set_role(self.mode_label, "accent" if "实盘" in mode else None)
         self.equity_label.setText(equity)
         self.api_label.setText(api)
-        self.api_label.setStyleSheet(
-            f"color: {palette.text_dim if api_ok else palette.down}; font-size: 11px;"
-        )
+        theme.set_role(self.api_label, None if api_ok else "down")
 
 
 class Sidebar(QFrame):
@@ -202,9 +196,7 @@ class Sidebar(QFrame):
         self.logo.setFixedSize(26, 26)
         header.addWidget(self.logo)
         self.brand = QLabel(APP_NAME)
-        self.brand.setStyleSheet(
-            f"color: {theme.current().text}; font-size: 15px; font-weight: 700;"
-        )
+        self.brand.setObjectName("Brand")
         header.addWidget(self.brand)
         header.addStretch(1)
         layout.addLayout(header)
@@ -249,9 +241,6 @@ class Sidebar(QFrame):
     def refresh_theme(self) -> None:
         palette = theme.current()
         self.logo.setPixmap(_logo(26).pixmap(26, 26))
-        self.brand.setStyleSheet(
-            f"color: {palette.text}; font-size: 15px; font-weight: 700;"
-        )
         self.collapse_btn.setIcon(
             qta.icon(
                 "fa6s.chevron-right" if self.collapsed else "fa6s.chevron-left",
@@ -270,10 +259,14 @@ class Sidebar(QFrame):
         color = palette.accent if active else palette.text_dim
         button.setIcon(qta.icon(icon_name, color=color))
         button.setText("" if self.collapsed else label)
-        button.setStyleSheet(
-            f"text-align: {'center' if self.collapsed else 'left'};"
-            f"padding: 0px {0 if self.collapsed else 10}px;"
-        )
+        # Collapsed state drives alignment through QSS, not an inline
+        # stylesheet: an inline ``padding`` would silently override the
+        # NavItem rule (12px) and drift out of sync with the rest of the UI.
+        button.setProperty("compact", self.collapsed)
+        style = button.style()
+        style.unpolish(button)
+        style.polish(button)
+        button.update()
 
     def set_collapsed(self, collapsed: bool) -> None:
         self.collapsed = collapsed
@@ -377,27 +370,19 @@ class MainWindow(QMainWindow):
         layout.setSpacing(12)
 
         self.status_label = QLabel("就绪")
-        self.status_label.setStyleSheet(
-            f"color: {theme.current().text_dim}; font-size: 11px;"
-        )
+        self.status_label.setObjectName("StatusLabel")
         layout.addWidget(self.status_label, 1)
 
         self.network_label = QLabel("")
-        self.network_label.setStyleSheet(
-            f"color: {theme.current().text_dim}; font-size: 11px;"
-        )
+        self.network_label.setObjectName("StatusLabel")
         layout.addWidget(self.network_label)
 
         self.api_label = QLabel("")
-        self.api_label.setStyleSheet(
-            f"color: {theme.current().text_dim}; font-size: 11px;"
-        )
+        self.api_label.setObjectName("StatusLabel")
         layout.addWidget(self.api_label)
 
         self.risk_label = QLabel("")
-        self.risk_label.setStyleSheet(
-            f"color: {theme.current().text_dim}; font-size: 11px;"
-        )
+        self.risk_label.setObjectName("StatusLabel")
         layout.addWidget(self.risk_label)
 
         grip = QSizeGrip(strip)
@@ -410,7 +395,6 @@ class MainWindow(QMainWindow):
         self.status_strip = strip
 
     def _refresh_status(self) -> None:
-        palette = theme.current()
         state = self.ctx.risk.state
         settings = self.ctx.settings.risk
         parts = []
@@ -423,27 +407,22 @@ class MainWindow(QMainWindow):
             parts.append(f"今日盈亏 {state.realized_pnl:+.2f}")
         self.risk_label.setText(" · ".join(parts))
         danger = bool(settings.kill_switch or state.halted_reason)
-        self.risk_label.setStyleSheet(
-            f"color: {palette.down if danger else palette.text_dim}; font-size: 11px;"
-        )
+        theme.set_role(self.risk_label, "down" if danger else None)
 
         network = self.ctx.network
         self.network_label.setText(
             f"{network.label} · {RunMode.PAPER.label}"
         )
-        self.network_label.setStyleSheet(
-            f"color: {palette.accent if network is Network.MAINNET else palette.text_dim};"
-            "font-size: 11px;"
+        theme.set_role(
+            self.network_label, "accent" if network is Network.MAINNET else None
         )
         if self.ctx.rest.has_credentials:
             self.api_label.setText(self.ctx.creds.masked_key)
-            self.api_label.setStyleSheet(
-                f"color: {palette.text_dim}; font-size: 11px;"
-            )
+            theme.set_role(self.api_label, None)
             api_text, api_ok = self.ctx.creds.masked_key, True
         else:
             self.api_label.setText("未配置 API")
-            self.api_label.setStyleSheet(f"color: {palette.down}; font-size: 11px;")
+            theme.set_role(self.api_label, "down")
             api_text, api_ok = "未配置 API", False
 
         self.sidebar.account.update_state(
@@ -553,9 +532,8 @@ class MainWindow(QMainWindow):
         self.ctx.save_settings()
 
     def _on_theme_changed(self, *_args) -> None:
-        palette = theme.current()
         for label in (self.status_label, self.api_label):
-            label.setStyleSheet(f"color: {palette.text_dim}; font-size: 11px;")
+            theme.set_role(label, None)
         self.sidebar.refresh_theme()
         self.title_bar.refresh_theme()
         self._refresh_status()

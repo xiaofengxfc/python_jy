@@ -341,11 +341,10 @@ class AutoPage(QWidget):
         )
 
     def _on_signal(self, target: float, reason: str) -> None:
-        palette = theme.current()
         text = {1.0: "做多", -1.0: "做空", 0.0: "空仓"}.get(target, f"{target:+.2f}")
-        color = palette.up if target > 0 else palette.down if target < 0 else palette.text_dim
+        role = "up" if target > 0 else "down" if target < 0 else "dim"
         self.signal_label.setText(f"目标仓位：{text}　（{reason}）")
-        self.signal_label.setStyleSheet(f"color: {color};")
+        theme.set_role(self.signal_label, role)
         self._append("SIGNAL", f"信号变化 → {text}（{reason}）")
         if self.ctx.settings.notification_sound:
             from PySide6.QtWidgets import QApplication
@@ -353,11 +352,8 @@ class AutoPage(QWidget):
             QApplication.beep()
 
     def _on_state(self, running: bool) -> None:
-        palette = theme.current()
         self.state_label.setText("运行中" if running else "已停止")
-        self.state_label.setStyleSheet(
-            f"color: {palette.up if running else palette.text_dim};"
-        )
+        theme.set_role(self.state_label, "up" if running else "dim")
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
         if self._trader:

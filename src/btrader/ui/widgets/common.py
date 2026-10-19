@@ -51,7 +51,13 @@ class MetricCard(Card):
     def set_value(self, text: str, color: str | None = None) -> None:
         self.value.setText(text)
         self._color = color
-        self.value.setStyleSheet(f"color: {color};" if color else "")
+        # Callers pass a palette colour; map it back to a semantic role so the
+        # colour survives a theme switch instead of freezing the old hue.
+        palette = theme.current()
+        role = None
+        if color is not None:
+            role = {palette.up: "up", palette.down: "down"}.get(color, "dim")
+        theme.set_role(self.value, role)
 
     def set_title(self, text: str) -> None:
         self.label.setText(text)

@@ -359,10 +359,10 @@ class SettingsPage(QWidget):
         creds = self.ctx.credentials.load(self.ctx.network, self.ctx.market_type)
         if creds.is_set:
             self.status_label.setText(f"已配置（{creds.masked_key}）· {self.ctx.network.label}")
-            self.status_label.setStyleSheet(f"color: {theme.current().up};")
+            theme.set_role(self.status_label, "up")
         else:
             self.status_label.setText("未配置")
-            self.status_label.setStyleSheet(f"color: {theme.current().text_dim};")
+            theme.set_role(self.status_label, None)
 
     def _fill_strategy_table(self) -> None:
         metas = self.ctx.strategies.meta_list()
@@ -407,11 +407,13 @@ class SettingsPage(QWidget):
                 f"连接成功，账户资产 {len(funded)} 项；USDT 余额 "
                 f"{float(assets.get('USDT') or 0):,.2f}"
             )
-            self.api_result.setStyleSheet(f"color: {theme.current().up};")
+            self.api_result.setStyleSheet("")
+            theme.set_role(self.api_result, "up")
 
         def failed(message: str) -> None:
             self.api_result.setText(f"连接失败：{message}")
-            self.api_result.setStyleSheet(f"color: {theme.current().down};")
+            self.api_result.setStyleSheet("")
+            theme.set_role(self.api_result, "down")
 
         self.runner.run(check, done, failed)
 
