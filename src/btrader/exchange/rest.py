@@ -240,8 +240,59 @@ class BinanceREST:
             return float(price)
 
 
+# Binance returns its own numeric codes. ccxt maps some of them to a generic
+# exception, and the text alone ("Invalid API-key, IP, or permissions for
+# action") does not tell a user which of the three is wrong. Translate the
+# codes that matter for account access into an actionable sentence.
+_BINANCE_CODES: dict[str, str] = {
+    "-2008": "API Key 无效（可能复制时多了空格，或该 Key 已被删除）。",
+    "-2014": "API Key 格式不正确（位数不对，或混入了其它字符）。",
+    "-2015": (
+        "API Key 无效、IP 未加入白名单，或该 Key 没有这个市场的权限。"
+        "请到币安「API 管理」核对：①该 Key 是否勾选了当前市场的读取权限；"
+        "②若设置了 IP 白名单，当前公网 IP 是否在其中。"
+    ),
+    "-2019": "保证金不足。",
+    "-2021": "订单会被立即触发，已被拒绝。",
+    "-1013": "下单数量或金额不满足交易所的最小单位 / 步进要求。",
+    "-1021": "本机时间与服务器相差过大，请校准系统时间后重试。",
+    "-1022": "请求签名不匹配，通常是 API Secret 填错。",
+    "-1100": "请求参数有误（交易所拒绝了该参数组合）。",
+    "-1121": "下单价格超出交易所允许的偏离范围。",
+    "-4131": "价格偏离市场太多，被交易所的价格保护规则拒绝。",
+    "-4164": "下单金额低于交易所的最小名义价值（通常 5 USDT）。",
+}
+
+
+def _binance_code(exc: Exception) -> str | None:
+    text = str(exc)
+    marker = '"code":'
+    index = text.find(marker)
+    if index < 0:
+        marker = "'code':"
+        index = text.find(marker)
+    if index < 0:
+        return None
+    start = index + len(marker)
+    while start < len(text) and text[start].isspace():
+        start += 1
+    end = start
+    if end < len(text) and text[end] == "-":
+        end += 1
+    while end < len(text) and text[end].isdigit():
+        end += 1
+    code = text[start:end].strip()
+    return code or None
+
+
 def _message(exc: Exception) -> str:
     text = str(exc) or exc.__class__.__name__
+    code = _binance_code(exc)
+    hint = _BINANCE_CODES.get(code or "")
+    if hint:
+        return f"{hint}（{text}）"
+    if isinstance(exc, ccxt.PermissionDenied):
+        return f"权限不足：{text}"
     if isinstance(exc, ccxt.AuthenticationError):
         return f"认证失败，请检查 API Key 与权限：{text}"
     if isinstance(exc, ccxt.InsufficientFunds):

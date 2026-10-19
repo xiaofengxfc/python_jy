@@ -47,7 +47,12 @@ class AppContext:
     def rest_for(self, market: MarketType) -> BinanceREST:
         """A REST client for any market type (public data works unauthenticated)."""
         if market not in self._market_rest:
-            self._market_rest[market] = BinanceREST(self.network, self.creds)
+            # Each market authorises against its own key slot: sending a spot
+            # key to fapi/dapi makes Binance answer -2015.
+            creds = self.creds if market == self.market_type else self.credentials.load(
+                self.network, market
+            )
+            self._market_rest[market] = BinanceREST(self.network, creds)
         return self._market_rest[market]
 
     def set_network(self, network: Network) -> None:
@@ -63,9 +68,12 @@ class AppContext:
     def set_market_type(self, market: MarketType) -> None:
         self.market_type = market
         self.settings.market_type = market.value
+        # Credentials are stored per margined type: a spot key cannot authorise
+        # a futures endpoint (Binance answers -2015). Load the slot that belongs
+        # to this market instead of carrying the previous key across.
         creds = self.credentials.load(self.network, market)
-        # Futures keys may be the same key; fall back to whatever is stored.
-        self.rest.credentials = creds if creds.is_set else self.creds
+        self.creds = creds
+        self.rest.credentials = creds
         self.rest.reset()
         self._market_rest = {}
         self.config.save()
