@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from typing import Any
 
 import ccxt.pro as ccxtpro
@@ -28,6 +29,9 @@ log = logging.getLogger(__name__)
 QUEUE_SIZE = 16
 BOOK_DEPTH = 12
 _RETRY_SECONDS = 3.0
+# Trades arrive per fill; folding a short window into one frame keeps the
+# bounded client queue from being flushed by a busy market.
+TRADE_FLUSH_SECONDS = 0.25
 
 
 class StreamHub:
@@ -116,6 +120,7 @@ class StreamHub:
             await asyncio.gather(
                 self._watch_ticker(exchange, key, symbol),
                 self._watch_book(exchange, key, symbol),
+                self._watch_trades(exchange, key, symbol),
             )
         except asyncio.CancelledError:
             raise
@@ -178,6 +183,57 @@ class StreamHub:
                 raise
             except Exception as exc:
                 log.warning("盘口推送中断 %s: %s", symbol, exc)
+                await asyncio.sleep(_RETRY_SECONDS)
+
+    async def _watch_trades(self, exchange: Any, key, symbol: str) -> None:
+        """Fold public trades into short frames.
+
+        A ticker carries the 24h volume, never the increment for the current
+        bar, so the chart could not accumulate volume on its own. Public trades
+        carry the traded size of every fill; a quarter-second budget keeps a
+        busy pair from pushing the small client queue out.
+        """
+        started = int(time.time() * 1000)
+        while True:
+            try:
+                trades = await exchange.watch_trades(symbol)
+                volume = 0.0
+                last_price = 0.0
+                last_time = 0
+                now_ms = int(time.time() * 1000)
+                for trade in trades:
+                    # The first watch replays recent fills. The REST snapshot
+                    # the chart loaded already contains them, so only trades
+                    # that happen after this subscription may add volume.
+                    stamp = int(trade.get("timestamp") or now_ms)
+                    if stamp < started:
+                        continue
+                    amount = _num(trade.get("amount"))
+                    price = _num(trade.get("price"))
+                    volume += amount
+                    if price > 0:
+                        last_price = price
+                    last_time = max(last_time, stamp)
+                if volume <= 0:
+                    await asyncio.sleep(TRADE_FLUSH_SECONDS)
+                    continue
+                self._publish(
+                    key,
+                    {
+                        "type": "trades",
+                        "symbol": symbol,
+                        "volume": volume,
+                        "last": last_price,
+                        "timestamp": last_time or int(time.time() * 1000),
+                    },
+                )
+                # Binance pushes one message per fill; a short pause batches
+                # them into the frame above instead of one frame each.
+                await asyncio.sleep(TRADE_FLUSH_SECONDS)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("成交推送中断 %s: %s", symbol, exc)
                 await asyncio.sleep(_RETRY_SECONDS)
 
     # --------------------------------------------------------------- teardown

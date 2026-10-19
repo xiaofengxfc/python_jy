@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api";
 import { TIMEFRAMES } from "../format";
-import type { AppSettings, CredentialItem } from "../types";
+import type { AppSettings, CredentialItem, RiskState } from "../types";
 
 interface Props {
   settings: AppSettings | null;
@@ -15,6 +15,12 @@ interface Draft {
 }
 
 const EMPTY_DRAFT: Draft = { apiKey: "", apiSecret: "", verify: true };
+
+interface NewsTokenState {
+  configured: boolean;
+  masked: string;
+  source: string;
+}
 
 const NETWORKS: [string, string][] = [
   ["testnet", "测试网"],
@@ -30,6 +36,10 @@ const RISK_FIELDS: [keyof AppSettings["risk"], string, string][] = [
   ["max_consecutive_losses", "连续亏损熔断", "次"],
 ];
 
+const PCT_FIELDS: [keyof AppSettings["risk"], string, string][] = [
+  ["max_order_pct", "单笔上限比例", "% 本金"],
+];
+
 export default function SettingsPage({ settings, onSaved }: Props) {
   const [draft, setDraft] = useState<AppSettings | null>(settings);
   const [credentials, setCredentials] = useState<CredentialItem[]>([]);
@@ -39,6 +49,38 @@ export default function SettingsPage({ settings, onSaved }: Props) {
   const [network, setNetwork] = useState(settings?.network ?? "testnet");
   const [credDrafts, setCredDrafts] = useState<Record<string, Draft>>({});
   const [credBusy, setCredBusy] = useState<string>("");
+  const [risk, setRisk] = useState<RiskState | null>(null);
+  const [riskBusy, setRiskBusy] = useState(false);
+  const [newsToken, setNewsToken] = useState<NewsTokenState | null>(null);
+  const [newsDraft, setNewsDraft] = useState("");
+  const [newsBusy, setNewsBusy] = useState(false);
+
+  const loadRisk = useCallback(async () => {
+    try {
+      setRisk(await api<RiskState>("/api/risk"));
+    } catch {
+      // The panel is informational; a failed poll must not disturb the form.
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadRisk();
+    const timer = window.setInterval(() => void loadRisk(), 5000);
+    return () => window.clearInterval(timer);
+  }, [loadRisk]);
+
+  const resumeRisk = async () => {
+    setRiskBusy(true);
+    setFlash(null);
+    try {
+      setRisk(await api<RiskState>("/api/risk/resume", { method: "POST" }));
+      setFlash({ tone: "ok", text: "已解除熔断，日内额度已重置。" });
+    } catch (error) {
+      setFlash({ tone: "err", text: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setRiskBusy(false);
+    }
+  };
 
   useEffect(() => {
     if (settings) {
@@ -46,6 +88,51 @@ export default function SettingsPage({ settings, onSaved }: Props) {
       setNetwork(settings.network);
     }
   }, [settings]);
+
+  const loadNewsToken = useCallback(async () => {
+    try {
+      setNewsToken(await api<NewsTokenState>("/api/news/token"));
+    } catch {
+      // The card simply stays unknown; saving still works.
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadNewsToken();
+  }, [loadNewsToken]);
+
+  const saveNewsToken = async () => {
+    if (!newsDraft.trim()) return;
+    setNewsBusy(true);
+    setFlash(null);
+    try {
+      await api("/api/news/token", {
+        method: "POST",
+        body: JSON.stringify({ token: newsDraft.trim() }),
+      });
+      setNewsDraft("");
+      setFlash({ tone: "ok", text: "CryptoPanic Token 已保存。" });
+      await loadNewsToken();
+    } catch (error) {
+      setFlash({ tone: "err", text: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setNewsBusy(false);
+    }
+  };
+
+  const deleteNewsToken = async () => {
+    setNewsBusy(true);
+    setFlash(null);
+    try {
+      await api("/api/news/token", { method: "DELETE" });
+      setFlash({ tone: "ok", text: "CryptoPanic Token 已删除。" });
+      await loadNewsToken();
+    } catch (error) {
+      setFlash({ tone: "err", text: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setNewsBusy(false);
+    }
+  };
 
   const loadCredentials = useCallback(async () => {
     try {
@@ -266,6 +353,54 @@ export default function SettingsPage({ settings, onSaved }: Props) {
           </div>
         </div>
 
+        <div className="card">
+          <div className="card-head">
+            <span className="card-title">新闻来源</span>
+            <span className="spacer" />
+            <span className="faint" style={{ fontSize: 11 }}>
+              {newsToken
+                ? newsToken.configured
+                  ? `CryptoPanic 已配置 · ${newsToken.masked}`
+                  : "CryptoPanic 未配置"
+                : "读取中…"}
+            </span>
+          </div>
+          <div className="card-body">
+            <div className="news-token-row">
+              <input
+                className="input"
+                type="password"
+                autoComplete="off"
+                placeholder="CryptoPanic API Token"
+                value={newsDraft}
+                onChange={(event) => setNewsDraft(event.target.value)}
+              />
+              <button
+                type="button"
+                className="btn-sm primary"
+                disabled={newsBusy || !newsDraft.trim()}
+                onClick={() => void saveNewsToken()}
+              >
+                {newsBusy ? "处理中…" : "保存"}
+              </button>
+              {newsToken?.configured && (
+                <button
+                  type="button"
+                  className="btn-sm"
+                  disabled={newsBusy}
+                  onClick={() => void deleteNewsToken()}
+                >
+                  删除
+                </button>
+              )}
+            </div>
+            <div className="hint" style={{ marginTop: 8 }}>
+              在 cryptopanic.com/developers/api/keys 免费申请 Token。Token 与交易所密钥一样
+              保存在系统凭据库，不会写入配置文件；未配置时交易页的「新闻」标签会给出提示。
+            </div>
+          </div>
+        </div>
+
         <div className="stack">
           <div className="card">
             <div className="card-head">
@@ -415,12 +550,107 @@ export default function SettingsPage({ settings, onSaved }: Props) {
 
         <div className="card">
           <div className="card-head">
+            <span className="card-title">风控状态</span>
+            <span className="spacer" />
+            {risk?.halted ? (
+              <button
+                type="button"
+                className="btn-sm primary"
+                disabled={riskBusy || risk.kill_switch}
+                onClick={() => void resumeRisk()}
+              >
+                {riskBusy ? "处理中…" : "解除熔断"}
+              </button>
+            ) : (
+              <span className="faint" style={{ fontSize: 11 }}>正常</span>
+            )}
+          </div>
+          <div className="card-body stack">
+            {risk ? (
+              <>
+                <div className={`verdict ${risk.halted ? "bad" : "ok"}`}>
+                  {risk.halted
+                    ? `已熔断：${risk.halted_reason}`
+                    : "风控正常，未触发任何熔断"}
+                </div>
+                <div className="form-grid">
+                  <div className="field">
+                    <span className="field-label">
+                      <span>本轮盈亏</span>
+                      <em>USDT</em>
+                    </span>
+                    <strong className={`num ${risk.day_pnl < 0 ? "down" : "up"}`}>
+                      {risk.day_pnl.toFixed(2)}
+                    </strong>
+                  </div>
+                  <div className="field">
+                    <span className="field-label">
+                      <span>本轮成交</span>
+                      <em>笔</em>
+                    </span>
+                    <strong className="num">
+                      {risk.day_trades} / {risk.limits.max_daily_trades || "∞"}
+                    </strong>
+                  </div>
+                  <div className="field">
+                    <span className="field-label">
+                      <span>连续亏损</span>
+                      <em>次</em>
+                    </span>
+                    <strong className="num">
+                      {risk.consecutive_losses} /{" "}
+                      {risk.limits.max_consecutive_losses || "∞"}
+                    </strong>
+                  </div>
+                  <div className="field">
+                    <span className="field-label">
+                      <span>当日累计</span>
+                      <em>USDT</em>
+                    </span>
+                    <strong className={`num ${risk.realized_pnl < 0 ? "down" : "up"}`}>
+                      {risk.realized_pnl.toFixed(2)}
+                    </strong>
+                  </div>
+                </div>
+                <div className="hint">
+                  解除熔断只恢复下单权限，当日已发生的亏损仍会计入统计；
+                  额度按解除时刻重新起算。全局急停需在上方风控参数中关闭。
+                </div>
+              </>
+            ) : (
+              <div className="hint">正在读取风控状态…</div>
+            )}
+          </div>
+        </div>
+
+        <div className="card">
+          <div className="card-head">
             <span className="card-title">风控参数</span>
             <span className="spacer" />
             <span className="faint" style={{ fontSize: 11 }}>填 0 表示不限制</span>
           </div>
           <div className="card-body stack">
             <div className="form-grid">
+              {PCT_FIELDS.map(([key, label, unit]) => (
+                <div key={key} className="field">
+                  <label className="field-label" htmlFor={`risk-${key}`}>
+                    <span>{label}</span>
+                    <em>{unit}</em>
+                  </label>
+                  <input
+                    id={`risk-${key}`}
+                    className="input"
+                    type="number"
+                    min={0}
+                    max={100}
+                    step={1}
+                    value={Math.round(Number(draft.risk[key]) * 100)}
+                    onChange={(event) =>
+                      patchRisk(key, Number(event.target.value) / 100)
+                    }
+                  />
+                </div>
+              ))}
               {RISK_FIELDS.map(([key, label, unit]) => (
                 <div key={key} className="field">
                   <label className="field-label" htmlFor={`risk-${key}`}>

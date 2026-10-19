@@ -5,6 +5,12 @@ interface Stream {
   ticker: Ticker | null;
   book: Book;
   connected: boolean;
+  /** Public-trade volume folded into short frames; drives bar volume. */
+  tradeVolume: number;
+  tradeWhen: number;
+  tradePrice: number;
+  /** Bumps once per trade frame so a consumer can fold each exactly once. */
+  tradeSeq: number;
 }
 
 const EMPTY_BOOK: Book = { bids: [], asks: [] };
@@ -18,12 +24,19 @@ export function useMarketStream(market: string, symbol: string): Stream {
   const [ticker, setTicker] = useState<Ticker | null>(null);
   const [book, setBook] = useState<Book>(EMPTY_BOOK);
   const [connected, setConnected] = useState(false);
+  const [tradeVolume, setTradeVolume] = useState(0);
+  const [tradeWhen, setTradeWhen] = useState(0);
+  const [tradePrice, setTradePrice] = useState(0);
+  const [tradeSeq, setTradeSeq] = useState(0);
   const retry = useRef<number | undefined>(undefined);
 
   useEffect(() => {
     if (!symbol) return;
     setTicker(null);
     setBook(EMPTY_BOOK);
+    setTradeVolume(0);
+    setTradeWhen(0);
+    setTradePrice(0);
 
     let socket: WebSocket | null = null;
     let disposed = false;
@@ -57,6 +70,13 @@ export function useMarketStream(market: string, symbol: string): Stream {
             bids: (message.bids as [number, number][]) ?? [],
             asks: (message.asks as [number, number][]) ?? [],
           });
+        } else if (message.type === "trades" && message.symbol === symbol) {
+          const volume = Number(message.volume);
+          setTradeVolume(Number.isFinite(volume) && volume > 0 ? volume : 0);
+          setTradeWhen(Number(message.timestamp) || Date.now());
+          const price = Number(message.last);
+          if (Number.isFinite(price) && price > 0) setTradePrice(price);
+          setTradeSeq((n) => n + 1);
         }
       };
 
@@ -76,5 +96,5 @@ export function useMarketStream(market: string, symbol: string): Stream {
     };
   }, [market, symbol]);
 
-  return { ticker, book, connected };
+  return { ticker, book, connected, tradeVolume, tradeWhen, tradePrice, tradeSeq };
 }

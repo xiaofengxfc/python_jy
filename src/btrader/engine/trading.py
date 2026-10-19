@@ -22,6 +22,15 @@ from .risk import RiskDecision, RiskManager
 
 log = logging.getLogger(__name__)
 
+# settings_kv key holding the serialized simulated account.
+PAPER_STATE_KEY = "paper.account.v1"
+
+# Live fills already folded into the risk manager, plus the per-symbol cost
+# ledger used to derive closing PnL. Kept in SQLite so a restart does not
+# charge the same exit twice.
+LIVE_LEDGER_KEY = "live.ledger.v1"
+LIVE_TRADE_LIMIT = 800
+
 
 class OrderRejected(RuntimeError):
     pass
@@ -39,6 +48,9 @@ class OrderRequest:
     leverage: float = 1.0
     market_type: MarketType = MarketType.SPOT
     mode: RunMode = RunMode.PAPER
+    # Protective exits, only meaningful for paper entries.
+    stop_loss: float | None = None
+    take_profit: float | None = None
 
 
 @dataclass
@@ -145,7 +157,35 @@ class TradingService:
             added_quote=notional,
             leverage=req.leverage,
             entry=not req.reduce_only,
+            equity=self._equity(req, price),
         )
+
+    def _equity(self, req: OrderRequest, price: float) -> float:
+        """Account equity used by the percentage-based per-order cap.
+
+        Paper mode is exact. Live mode reports the quote balance; when it is
+        unavailable the percentage cap simply does not apply (the fixed
+        ceiling still does).
+        """
+        if req.mode is RunMode.PAPER:
+            return self.paper.account.cash
+        if not self.rest.has_credentials:
+            return 0.0
+        try:
+            balance = self.rest.fetch_balance(req.market_type)
+        except Exception:
+            return 0.0
+        for key in ("USDT", "total"):
+            value = balance.get(key)
+            if isinstance(value, dict):
+                value = value.get("free") or value.get("total")
+            try:
+                number = float(value or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if number > 0:
+                return number
+        return 0.0
 
     def _current_position_quote(self, req: OrderRequest, price: float) -> float:
         """Best-effort current exposure used by the position limit.
@@ -237,10 +277,18 @@ class TradingService:
                 reduce_only=req.reduce_only,
                 allow_short=req.market_type.is_futures,
                 market=req.market_type.value,
+                stop_loss=req.stop_loss,
+                take_profit=req.take_profit,
             )
             quote = abs(base_qty) * price
             self.risk.record_order()
+            # A market order (and a marketable exit in particular) closes
+            # immediately, so its realized PnL never reaches the background
+            # reconciler. Recording it here is what lets the daily-loss and
+            # consecutive-loss breakers see exits at all.
+            self._record_fill(order)
             self.db.save_order("paper", req.market_type.value, order, req.mode.value)
+            self.save_paper_state()
             log.info(
                 "纸面下单 %s %s %s %s @ %s",
                 req.symbol, req.side, format_amount(base_qty), req.order_type, price,
@@ -302,6 +350,7 @@ class TradingService:
                 order,
                 mode.value,
             )
+            self.save_paper_state()
             log.info("纸面撤单 %s %s", symbol, order_id)
             return order
         order = self.rest.cancel_order(market_type, order_id, symbol)
@@ -315,6 +364,220 @@ class TradingService:
         return order
 
     # ------------------------------------------------------- paper execution
+    def save_paper_state(self) -> None:
+        """Persist the simulated account (cash, positions, resting orders, SL/TP).
+
+        Best effort: a failed write must never roll back a fill that already
+        happened in memory.
+        """
+        try:
+            self.db.set_json(PAPER_STATE_KEY, self.paper.snapshot())
+        except Exception:  # pragma: no cover - storage is best effort
+            log.warning("保存纸面账户失败", exc_info=True)
+
+    def _record_fill(self, order: dict) -> None:
+        """Feed a paper fill's realized PnL into the risk manager.
+
+        ``record_order`` already counted the order itself; this is the other
+        half — the daily-loss and consecutive-loss circuit breakers only ever
+        see exits, which is why they used to be dead code.
+        """
+        if not order or order.get("status") != "closed":
+            return
+        closed = float(order.get("closedQty") or 0.0)
+        if closed <= 0:
+            return
+        realized = float(order.get("realized") or 0.0)
+        self.risk.record_trade(realized)
+        log.info(
+            "纸面平仓 %s %s %s 已实现 %.4f",
+            order.get("symbol"),
+            order.get("side"),
+            format_amount(closed),
+            realized,
+        )
+
+    # -------------------------------------------------------- live accounting
+    def _live_ledger(self) -> dict:
+        data = self.db.get_json(LIVE_LEDGER_KEY)
+        if not isinstance(data, dict):
+            data = {}
+        return {
+            "seen": [str(item) for item in data.get("seen", [])][-LIVE_TRADE_LIMIT:],
+            "books": dict(data.get("books") or {}),
+        }
+
+    def _save_live_ledger(self, ledger: dict) -> None:
+        try:
+            self.db.set_json(
+                LIVE_LEDGER_KEY,
+                {
+                    "seen": ledger["seen"][-LIVE_TRADE_LIMIT:],
+                    "books": ledger["books"],
+                },
+            )
+        except Exception:  # pragma: no cover - storage is best effort
+            log.warning("保存实盘成交账本失败", exc_info=True)
+
+    def sync_live_fills(self, markets: list[MarketType] | None = None) -> list[dict]:
+        """Pull recent live fills and feed closing PnL into the risk manager.
+
+        Paper fills are accounted where they happen, but a live exit comes
+        back from the exchange long after the order was submitted. Without
+        this the daily-loss and losing-streak breakers stayed silent in live
+        mode — they looked configurable but could never fire.
+
+        Spot trades carry no realized PnL, so a weighted-average cost book per
+        symbol is kept here: the first fill that reduces a position turns the
+        difference against the average entry into a realized result. Contracts
+        that already report ``realizedPnl`` use that figure instead of guessing.
+
+        Everything is persisted and de-duplicated by trade id, so repeated
+        polling (and restarts) never charge the same exit twice.
+        """
+        if not self.rest.has_credentials:
+            return []
+        ledger = self._live_ledger()
+        seen = set(ledger["seen"])
+        books = ledger["books"]
+        booked: list[dict] = []
+
+        for market in markets or list(MarketType):
+            try:
+                symbols = self._live_symbols(market)
+            except Exception as exc:
+                log.debug("实盘成交同步跳过 %s：%s", market.value, exc)
+                continue
+            for symbol in symbols:
+                try:
+                    trades = self.rest.fetch_my_trades(market, symbol, limit=50)
+                except ExchangeError as exc:
+                    log.debug("拉取成交失败 %s %s：%s", market.value, symbol, exc)
+                    continue
+                except Exception:  # network hiccup: try again next round
+                    log.debug("拉取成交异常 %s %s", market.value, symbol, exc_info=True)
+                    continue
+                for trade in sorted(trades, key=lambda item: item.get("timestamp") or 0):
+                    trade_id = str(trade.get("id") or "")
+                    if not trade_id or trade_id in seen:
+                        continue
+                    seen.add(trade_id)
+                    result = self._book_live_trade(trade, books)
+                    if result is not None:
+                        booked.append(result)
+                        self.risk.record_trade(result["realized"])
+                        log.info(
+                            "实盘平仓 %s %s 已实现 %.4f",
+                            symbol,
+                            trade.get("side"),
+                            result["realized"],
+                        )
+                    try:
+                        self.db.save_trade(self._account_id(), trade, RunMode.LIVE.value)
+                    except Exception:  # pragma: no cover - history is best effort
+                        log.warning("实盘成交写库失败", exc_info=True)
+
+        if booked or seen != set(ledger["seen"]):
+            ledger["seen"] = list(seen)[-LIVE_TRADE_LIMIT:]
+            ledger["books"] = books
+            self._save_live_ledger(ledger)
+        return booked
+
+    def _live_symbols(self, market: MarketType) -> list[str]:
+        """Symbols worth polling: open orders, positions and the active pair."""
+        symbols: set[str] = set()
+        try:
+            for order in self.rest.fetch_open_orders(market):
+                symbol = order.get("symbol")
+                if symbol:
+                    symbols.add(str(symbol))
+        except Exception:
+            log.debug("读取实盘挂单失败 %s", market.value, exc_info=True)
+        if market.is_futures:
+            try:
+                for position in self.rest.fetch_positions(market):
+                    contracts = abs(float(position.get("contracts") or 0.0))
+                    if contracts > 0 and position.get("symbol"):
+                        symbols.add(str(position["symbol"]))
+            except Exception:
+                log.debug("读取实盘持仓失败 %s", market.value, exc_info=True)
+        if market is self.settings_market_type():
+            symbols.add(self.settings.last_symbol)
+        return sorted(symbols)
+
+    def settings_market_type(self) -> MarketType:
+        try:
+            return MarketType(self.settings.market_type)
+        except ValueError:
+            return MarketType.SPOT
+
+    @staticmethod
+    def _book_live_trade(trade: dict, books: dict) -> dict | None:
+        """Fold one fill into the symbol's cost book.
+
+        Returns a summary when the fill closed (or reduced) a position, else
+        ``None``. Leaving a book at exactly zero drops it, so a flat symbol
+        starts clean the next time it is traded.
+        """
+        symbol = str(trade.get("symbol") or "")
+        try:
+            amount = abs(float(trade.get("amount") or 0.0))
+            price = float(trade.get("price") or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if not symbol or amount <= 0 or price <= 0:
+            return None
+        side = str(trade.get("side") or "").lower()
+        if side not in ("buy", "sell"):
+            return None
+
+        fee_info = trade.get("fee")
+        if isinstance(fee_info, dict):
+            fee = abs(float(fee_info.get("cost") or 0.0))
+        else:
+            fee = abs(float(trade.get("fee") or 0.0))
+
+        book = books.get(symbol) or {"contracts": 0.0, "entry": 0.0}
+        old = float(book.get("contracts") or 0.0)
+        entry = float(book.get("entry") or 0.0)
+        signed = amount if side == "buy" else -amount
+        new = old + signed
+
+        realized = 0.0
+        closed = 0.0
+        if old != 0 and (old > 0) != (signed > 0):
+            closed = min(abs(signed), abs(old))
+            direction = 1.0 if old > 0 else -1.0
+            reported = trade.get("realizedPnl")
+            if reported is None and isinstance(trade.get("info"), dict):
+                reported = trade["info"].get("realizedPnl")
+            try:
+                realized = float(reported) - fee if reported is not None else (
+                    (price - entry) * closed * direction - fee
+                )
+            except (TypeError, ValueError):
+                realized = (price - entry) * closed * direction - fee
+
+        if abs(new) < 1e-12:
+            books.pop(symbol, None)
+        elif old == 0 or (old > 0) != (new > 0):
+            books[symbol] = {"contracts": new, "entry": price}
+        else:
+            books[symbol] = {
+                "contracts": new,
+                "entry": (entry * old + price * signed) / new,
+            }
+
+        if closed <= 0:
+            return None
+        return {
+            "symbol": symbol,
+            "side": side,
+            "closedQty": closed,
+            "price": price,
+            "realized": realized,
+        }
+
     def settle_paper_orders(self, symbol: str, price: float) -> list[dict]:
         """Fill paper limit orders against a fresh last price.
 
@@ -323,13 +586,31 @@ class TradingService:
         """
         filled = self.paper.mark(symbol, price)
         for order in filled:
+            self._record_fill(order)
             try:
                 self.db.save_order(
                     "paper", order.get("market") or "spot", order, RunMode.PAPER.value
                 )
             except Exception:  # pragma: no cover - history is best effort
                 log.warning("纸面成交写库失败", exc_info=True)
+        if filled:
+            self.save_paper_state()
         return filled
+
+    def check_protections(self, symbol: str, price: float) -> list[dict]:
+        """Trigger stop-loss / take-profit exits for one symbol."""
+        orders = self.paper.check_protections(symbol, price)
+        for order in orders:
+            self._record_fill(order)
+            try:
+                self.db.save_order(
+                    "paper", order.get("market") or "spot", order, RunMode.PAPER.value
+                )
+            except Exception:  # pragma: no cover - history is best effort
+                log.warning("保护单写库失败", exc_info=True)
+        if orders:
+            self.save_paper_state()
+        return orders
 
     # --------------------------------------------------------------- hierarchy
     def change_network(self, network: Network, credentials) -> None:

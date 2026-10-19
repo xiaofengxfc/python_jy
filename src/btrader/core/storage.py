@@ -187,6 +187,36 @@ class Database:
             "SELECT * FROM backtest_runs ORDER BY created_at DESC LIMIT ?", (limit,)
         )
 
+    # ------------------------------------------------------------- key/value
+    def get_value(self, key: str) -> str | None:
+        rows = self.query("SELECT value FROM settings_kv WHERE key = ?", (key,))
+        return rows[0]["value"] if rows else None
+
+    def set_value(self, key: str, value: str) -> None:
+        with self.cursor() as cur:
+            cur.execute(
+                "INSERT INTO settings_kv (key, value) VALUES (?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )
+
+    def delete_value(self, key: str) -> None:
+        with self.cursor() as cur:
+            cur.execute("DELETE FROM settings_kv WHERE key = ?", (key,))
+
+    def get_json(self, key: str) -> Any:
+        raw = self.get_value(key)
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError):
+            log.warning("设置项 %s 不是合法 JSON，已忽略", key)
+            return None
+
+    def set_json(self, key: str, value: Any) -> None:
+        self.set_value(key, json.dumps(value, ensure_ascii=False, default=str))
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()

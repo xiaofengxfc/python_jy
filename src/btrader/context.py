@@ -14,9 +14,13 @@ from .engine.risk import RiskManager
 from .engine.trading import TradingService
 from .exchange.klines import KlineStore
 from .exchange.rest import BinanceREST
+from .news import NewsService
 from .strategy.registry import StrategyRegistry
 
 log = logging.getLogger(__name__)
+
+# Where the simulated account is persisted between runs.
+PAPER_STATE_KEY = "paper.account.v1"
 
 
 class AppContext:
@@ -33,8 +37,17 @@ class AppContext:
 
         self.rest = BinanceREST(self.network, self.creds)
         self.paper = PaperBroker(starting_balance=10_000.0)
+        # Resume the simulated account instead of handing out a fresh 10,000
+        # every launch: cash, positions, resting orders and SL/TP guards.
+        try:
+            self.paper.restore(self.db.get_json(PAPER_STATE_KEY))
+        except Exception:  # pragma: no cover - a corrupt row must not block startup
+            log.warning("恢复纸面账户失败，使用初始资金", exc_info=True)
         self.risk = RiskManager(self.settings.risk)
         self.trading = TradingService(self.settings, self.rest, self.risk, self.paper, self.db)
+        # The token lives in the keyring; the service reads it per request so a
+        # token saved from the settings page applies without a restart.
+        self.news = NewsService(self.credentials.load_news)
 
         self.klines = KlineStore(self.rest, paths.kline_cache_dir())
 

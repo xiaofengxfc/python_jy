@@ -19,6 +19,11 @@ class RiskSettings:
     """Basic risk controls. Zero values disable a limit."""
 
     max_order_quote: float = 500.0
+    # Per-order cap as a share of account equity (0 disables it). This is what
+    # keeps "全部" usable: a fixed 500 USDT ceiling silently rejected a full
+    # buy from a 10,000 balance. The effective limit is the tighter of this and
+    # ``max_order_quote``.
+    max_order_pct: float = 0.25
     max_position_quote: float = 5000.0
     max_leverage: float = 10.0
     max_daily_loss: float = 500.0

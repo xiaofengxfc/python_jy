@@ -1,7 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api";
 import { fmt, fmtPrice, parseNumber } from "../format";
-import type { OrderPreview, OrderType, Side, SizeMode } from "../types";
+import type {
+  OrderPreview,
+  OrderType,
+  PaperProtection,
+  Side,
+  SizeMode,
+} from "../types";
 
 interface Props {
   market: string;
@@ -14,6 +20,9 @@ interface Props {
   realizedPnl: number;
   feeRate: number;
   pickedPrice: number | null;
+  protection?: PaperProtection | null;
+  /** Paper is the default; live routes the order to the exchange. */
+  mode: "paper" | "live";
   onPickedPriceConsumed: () => void;
   onFilled: () => void;
   onResetPaper: () => void | Promise<void>;
@@ -57,6 +66,8 @@ export default function OrderTicket({
   realizedPnl,
   feeRate,
   pickedPrice,
+  protection,
+  mode,
   onPickedPriceConsumed,
   onFilled,
   onResetPaper,
@@ -66,6 +77,11 @@ export default function OrderTicket({
   const [sizeMode, setSizeMode] = useState<SizeMode>("quote");
   const [price, setPrice] = useState("");
   const [size, setSize] = useState("");
+  const [stopLoss, setStopLoss] = useState("");
+  const [takeProfit, setTakeProfit] = useState("");
+  const [trigger, setTrigger] = useState("");
+  const [triggerDirection, setTriggerDirection] = useState<"below" | "above">("below");
+  const [conditionalBusy, setConditionalBusy] = useState(false);
   const [preview, setPreview] = useState<OrderPreview | null>(null);
   const [previewError, setPreviewError] = useState("");
   const [flash, setFlash] = useState<Flash | null>(null);
@@ -89,6 +105,8 @@ export default function OrderTicket({
     priceSeeded.current = false;
     setPrice("");
     setSize(sizeMode === "quote" ? readLastQuote() : "");
+    setStopLoss("");
+    setTakeProfit("");
     setPreview(null);
     setPreviewError("");
     setFlash(null);
@@ -96,6 +114,18 @@ export default function OrderTicket({
     // would wipe the form every time the user flips the unit.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [symbol, market]);
+
+  // Flipping side must not leave a limit price from the other direction: a buy
+  // parked at 60,000 becomes a market-crossing sell once the user switches, and
+  // silently fills far from the quote. Re-seed from the live price instead.
+  const sideSeeded = useRef<Side>("buy");
+  useEffect(() => {
+    if (sideSeeded.current === side) return;
+    sideSeeded.current = side;
+    setPreview(null);
+    setPreviewError("");
+    if (lastPrice > 0) setPrice(String(lastPrice));
+  }, [side, lastPrice]);
 
   // Seed the limit price once the new symbol's first quote arrives.
   useEffect(() => {
@@ -109,6 +139,28 @@ export default function OrderTicket({
     if (typed > 0) return typed;
     return lastPrice;
   }, [price, lastPrice]);
+
+  // A spot sell is an exit; only a buy (or a futures sell) opens a position
+  // and can therefore carry a guard. A held spot position can still be
+  // protected — but through the explicit "apply to position" action.
+  const opening = side === "buy" || market !== "spot";
+  const short = side === "sell" && market !== "spot";
+  const hasPosition = Math.abs(positionQty) > 1e-12;
+  const positionLong = positionQty > 0;
+
+  const riskyPrices = (forShort: boolean) => {
+    const stop = parseNumber(stopLoss);
+    const target = parseNumber(takeProfit);
+    if (referencePrice <= 0) return "";
+    if (forShort) {
+      if (stop > 0 && stop <= referencePrice) return "空单止损价必须高于开仓价。";
+      if (target > 0 && target >= referencePrice) return "空单止盈价必须低于开仓价。";
+      return "";
+    }
+    if (stop > 0 && stop >= referencePrice) return "止损价必须低于开仓价。";
+    if (target > 0 && target <= referencePrice) return "止盈价必须高于开仓价。";
+    return "";
+  }
 
   const estimated = useMemo(() => {
     const amount = parseNumber(size);
@@ -192,6 +244,12 @@ export default function OrderTicket({
     if (orderType === "limit" && referencePrice <= 0) {
       return setFlash({ tone: "err", text: "限价单需要填写价格。" });
     }
+    const stop = parseNumber(stopLoss);
+    const target = parseNumber(takeProfit);
+    if (opening) {
+      const problem = riskyPrices(short);
+      if (problem) return setFlash({ tone: "err", text: problem });
+    }
 
     setBusy(true);
     setFlash(null);
@@ -206,20 +264,123 @@ export default function OrderTicket({
           size_mode: sizeMode,
           size: amount,
           price: orderType === "limit" ? referencePrice : null,
+          stop_loss: opening && stop > 0 ? stop : null,
+          take_profit: opening && target > 0 ? target : null,
+          mode,
+          // The server refuses a live order without this flag; the panel has
+          // already asked the user before it gets this far.
+          confirm_live: mode === "live",
         }),
       });
       const order = result.order ?? {};
       const filled = Number(order.average ?? order.price ?? referencePrice);
+      const guard = [
+        opening && stop > 0 ? `止损 ${fmtPrice(stop)}` : "",
+        opening && target > 0 ? `止盈 ${fmtPrice(target)}` : "",
+      ]
+        .filter(Boolean)
+        .join(" · ");
       setFlash({
         tone: "ok",
         text: `${side === "buy" ? "买入" : "卖出"}成功：${fmt(
           Number(order.amount ?? 0),
           6,
-        )} ${base} @ ${fmtPrice(filled)}`,
+        )} ${base} @ ${fmtPrice(filled)}${guard ? `（${guard}）` : ""}`,
       });
       if (sizeMode === "quote") writeLastQuote(String(amount));
       setSize("");
+      setStopLoss("");
+      setTakeProfit("");
       setPreview(null);
+      onFilled();
+    } catch (error) {
+      setFlash({ tone: "err", text: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** Arm a standalone trigger order: it waits for the market to cross the
+   * trigger price and only then becomes a real order. */
+  const submitConditional = async () => {
+    const amount = parseNumber(size);
+    const level = parseNumber(trigger);
+    if (amount <= 0) return setFlash({ tone: "err", text: "请填写数量或金额。" });
+    if (level <= 0) return setFlash({ tone: "err", text: "请填写触发价。" });
+    if (orderType === "limit" && referencePrice <= 0) {
+      return setFlash({ tone: "err", text: "限价条件单需要填写委托价。" });
+    }
+    setConditionalBusy(true);
+    setFlash(null);
+    try {
+      const result = await api<{ conditional: { trigger: number }; amount_base: number }>(
+        "/api/orders/conditional",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            market,
+            symbol,
+            side,
+            order_type: orderType,
+            size_mode: sizeMode,
+            size: amount,
+            trigger: level,
+            direction: triggerDirection,
+            price: orderType === "limit" ? referencePrice : null,
+            reduce_only: side === "sell" && !opening,
+          }),
+        },
+      );
+      setFlash({
+        tone: "ok",
+        text: `条件单已挂出：${triggerDirection === "below" ? "跌破" : "涨破"} ${fmtPrice(
+          result.conditional.trigger,
+        )} 后${side === "buy" ? "买入" : "卖出"} ${fmt(result.amount_base, 6)} ${base}`,
+      });
+      setTrigger("");
+      onFilled();
+    } catch (error) {
+      setFlash({ tone: "err", text: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setConditionalBusy(false);
+    }
+  };
+
+  const clearProtection = async () => {
+    try {
+      await api(`/api/positions/protection?${new URLSearchParams({ symbol })}`, {
+        method: "DELETE",
+      });
+      setFlash({ tone: "ok", text: "已撤销止损/止盈设置。" });
+      onFilled();
+    } catch (error) {
+      setFlash({ tone: "err", text: error instanceof Error ? error.message : String(error) });
+    }
+  };
+
+  /** Arm or update the guard of the position that is already open. */
+  const applyProtection = async () => {
+    const stop = parseNumber(stopLoss);
+    const target = parseNumber(takeProfit);
+    if (!hasPosition) return setFlash({ tone: "err", text: "当前没有持仓。" });
+    if (!stop && !target) return setFlash({ tone: "err", text: "请填写止损或止盈价。" });
+    const problem = riskyPrices(!positionLong);
+    if (problem) return setFlash({ tone: "err", text: problem });
+    setBusy(true);
+    try {
+      await api("/api/positions/protection", {
+        method: "PUT",
+        body: JSON.stringify({ symbol, stop_loss: stop, take_profit: target }),
+      });
+      setFlash({
+        tone: "ok",
+        text: `已应用到持仓：${[
+          stop > 0 ? `止损 ${fmtPrice(stop)}` : "",
+          target > 0 ? `止盈 ${fmtPrice(target)}` : "",
+        ]
+          .filter(Boolean)
+          .join(" · ")}`,
+      });
       onFilled();
     } catch (error) {
       setFlash({ tone: "err", text: error instanceof Error ? error.message : String(error) });
@@ -371,6 +532,155 @@ export default function OrderTicket({
           </div>
         </div>
 
+        {/* Step 3.5 — protective exits. Spot can only open long, so a sell
+            there is an exit and carries no guard; futures may open a short
+            with a sell and its stop/target sit on the opposite side. */}
+        {(side === "buy" || market !== "spot" || hasPosition) && (
+          <div className="field">
+            <label className="field-label" htmlFor="stop-input">
+              <span>止损 / 止盈</span>
+              <em>
+                {opening ? "可选，成交后自动平仓" : "该持仓已存在的保护"}
+              </em>
+            </label>
+            <div className="protect-row">
+              <input
+                id="stop-input"
+                className="input"
+                type="text"
+                inputMode="decimal"
+                autoComplete="off"
+                placeholder={short ? "止损价（高于开仓）" : "止损价"}
+                value={stopLoss}
+                onChange={(event) => setStopLoss(event.target.value)}
+              />
+              <input
+                id="target-input"
+                className="input"
+                type="text"
+                inputMode="decimal"
+                autoComplete="off"
+                placeholder={short ? "止盈价（低于开仓）" : "止盈价"}
+                value={takeProfit}
+                onChange={(event) => setTakeProfit(event.target.value)}
+              />
+            </div>
+            <div className="protect-hint">
+              <span>
+                距开仓价{" "}
+                <b className="num down">
+                  {parseNumber(stopLoss) > 0 && referencePrice > 0
+                    ? `${short ? "+" : "-"}${(
+                        (Math.abs(referencePrice - parseNumber(stopLoss)) /
+                          referencePrice) *
+                        100
+                      ).toFixed(2)}%`
+                    : "—"}
+                </b>{" "}
+                /{" "}
+                <b className="num up">
+                  {parseNumber(takeProfit) > 0 && referencePrice > 0
+                    ? `${short ? "-" : "+"}${(
+                        (Math.abs(parseNumber(takeProfit) - referencePrice) /
+                          referencePrice) *
+                        100
+                      ).toFixed(2)}%`
+                    : "—"}
+                </b>
+              </span>
+              <span className="faint">按最新成交价触发</span>
+            </div>
+            {hasPosition && (
+              <div className="protect-hint">
+                <span className="faint">
+                  {opening
+                    ? "也可直接应用到当前持仓"
+                    : "填写后应用到当前持仓"}
+                </span>
+                <button
+                  type="button"
+                  className="link-btn"
+                  disabled={!parseNumber(stopLoss) && !parseNumber(takeProfit)}
+                  onClick={() => void applyProtection()}
+                >
+                  应用到持仓
+                </button>
+              </div>
+            )}
+            {protection && (protection.stopLoss > 0 || protection.takeProfit > 0) && (
+              <div className="protect-hint">
+                <span>
+                  当前已生效：
+                  {protection.stopLoss > 0 ? (
+                    <b className="num down"> 止损 {fmtPrice(protection.stopLoss)}</b>
+                  ) : null}
+                  {protection.takeProfit > 0 ? (
+                    <b className="num up"> 止盈 {fmtPrice(protection.takeProfit)}</b>
+                  ) : null}
+                </span>
+                <button type="button" className="link-btn" onClick={() => void clearProtection()}>
+                  撤销
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Step 3.6 — a standalone trigger order. Unlike the SL/TP guard above
+            it is not tied to a position: it can wait for a pullback entry or
+            protect a limit order that has not filled yet. */}
+        <div className="field">
+          <label className="field-label" htmlFor="trigger-input">
+            <span>条件单</span>
+            <em>触发后按{orderType === "market" ? "市价" : "限价"}成交</em>
+          </label>
+          <div className="protect-row">
+            <div className="segmented">
+              <button
+                type="button"
+                aria-pressed={triggerDirection === "below"}
+                onClick={() => setTriggerDirection("below")}
+              >
+                跌破
+              </button>
+              <button
+                type="button"
+                aria-pressed={triggerDirection === "above"}
+                onClick={() => setTriggerDirection("above")}
+              >
+                涨破
+              </button>
+            </div>
+            <input
+              id="trigger-input"
+              className="input"
+              type="text"
+              inputMode="decimal"
+              autoComplete="off"
+              placeholder="触发价"
+              value={trigger}
+              onChange={(event) => setTrigger(event.target.value)}
+            />
+          </div>
+          <div className="protect-hint">
+            <span className="faint">
+              {mode === "live"
+                ? "实盘条件单暂未开放，请使用交易所自带的条件单"
+                : `数量沿用上方填写值${
+                    triggerDirection === "below" ? "（价格跌到触发价）" : "（价格涨到触发价）"
+                  }`}
+            </span>
+            <button
+              type="button"
+              className="link-btn"
+              disabled={conditionalBusy || mode === "live"}
+              onClick={() => void submitConditional()}
+            >
+              {conditionalBusy ? "挂出中…" : "挂条件单"}
+            </button>
+          </div>
+        </div>
+
         {/* Step 4 — fees and the risk verdict. */}
         <div className="preview">
           <div className="preview-row">
@@ -418,7 +728,8 @@ export default function OrderTicket({
       <div className="ticket-note">
         <div className="paper-line">
           <span>
-            纸面余额 <b className="num">{fmt(cash, 2)}</b> {quote}
+            {mode === "live" ? "可用余额" : "纸面余额"}{" "}
+            <b className="num">{fmt(cash, 2)}</b> {quote}
           </span>
           <span>
             已实现{" "}
@@ -426,11 +737,17 @@ export default function OrderTicket({
               {fmt(realizedPnl, 2)}
             </b>
           </span>
-          <button type="button" className="link-btn" onClick={() => void onResetPaper()}>
-            重置
-          </button>
+          {mode === "paper" ? (
+            <button type="button" className="link-btn" onClick={() => void onResetPaper()}>
+              重置
+            </button>
+          ) : (
+            <span className="faint">实盘 · 余额来自交易所</span>
+          )}
         </div>
-        纸面交易：使用本地模拟资金撮合，不会向交易所发送订单。
+        {mode === "live"
+          ? "实盘交易：委托会发送到交易所，成交与盈亏由交易所结算。"
+          : "纸面交易：使用本地模拟资金撮合，不会向交易所发送订单。"}
       </div>
     </div>
   );

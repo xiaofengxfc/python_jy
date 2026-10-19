@@ -120,3 +120,32 @@ class CredentialStore:
                     self._backend.delete_password(service, name)
                 except Exception:
                     pass
+
+    # ------------------------------------------------------------------- news
+    def load_news(self) -> str:
+        """CryptoPanic token; a single account-wide key, not per market."""
+        if self._backend is None:
+            return ""
+        try:
+            return self._backend.get_password(f"{SERVICE_NAME}:news", "token") or ""
+        except Exception as exc:
+            log.warning("读取新闻 Token 失败: %s", exc)
+            return ""
+
+    def save_news(self, token: str) -> bool:
+        if self._backend is None:
+            return False
+        try:
+            self._backend.set_password(f"{SERVICE_NAME}:news", "token", token)
+            return True
+        except Exception as exc:
+            log.warning("写入新闻 Token 失败: %s", exc)
+            return False
+
+    def delete_news(self) -> None:
+        if self._backend is None:
+            return
+        try:
+            self._backend.delete_password(f"{SERVICE_NAME}:news", "token")
+        except Exception:
+            pass

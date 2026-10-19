@@ -77,6 +77,29 @@ export interface PaperTrade {
   timestamp: number;
 }
 
+/** A stop-loss / take-profit guard currently armed for one symbol. */
+export interface PaperProtection {
+  symbol: string;
+  stopLoss: number;
+  takeProfit: number;
+  createdAt?: number;
+  order?: string;
+}
+
+export interface PaperConditional {
+  id: string;
+  symbol: string;
+  market: string;
+  side: Side;
+  type: OrderType;
+  amount: number;
+  price: number;
+  trigger: number;
+  direction: "below" | "above";
+  status: string;
+  createdAt: number;
+}
+
 export interface Account {
   quote_asset: string;
   cash: number;
@@ -85,6 +108,10 @@ export interface Account {
   positions: PaperPosition[];
   orders: PaperOrder[];
   trades: PaperTrade[];
+  protections?: PaperProtection[];
+  conditional?: PaperConditional[];
+  /** True when the snapshot came from the exchange, not the paper account. */
+  live?: boolean;
 }
 
 export interface OrderPreview {
@@ -150,6 +177,7 @@ export interface AppSettings {
   kline_limit: number;
   risk: {
     max_order_quote: number;
+    max_order_pct: number;
     max_position_quote: number;
     max_leverage: number;
     max_daily_loss: number;
@@ -168,6 +196,51 @@ export interface CredentialItem {
   configured: boolean;
   masked: string;
   current: boolean;
+}
+
+export interface NewsItem {
+  id: string;
+  title: string;
+  url: string;
+  source: string;
+  published_at: string;
+  currencies: string[];
+  kind: string;
+  positive: number;
+  negative: number;
+  important: number;
+}
+
+/** CryptoPanic feed. `configured` is false until a token is saved; the panel
+ * shows that as a setup hint rather than an empty list. */
+export interface NewsFeed {
+  configured: boolean;
+  items: NewsItem[];
+  cached: boolean;
+  error: string;
+  source: string;
+}
+
+/** Live breaker state. `halted` covers the kill switch and every cap, so the
+ * panel can explain a refusal without guessing from the order flow. */
+export interface RiskState {
+  day: string;
+  realized_pnl: number;
+  day_pnl: number;
+  trades: number;
+  day_trades: number;
+  consecutive_losses: number;
+  halted: boolean;
+  halted_reason: string;
+  kill_switch: boolean;
+  limits: {
+    max_daily_loss: number;
+    max_daily_trades: number;
+    max_consecutive_losses: number;
+    max_order_quote: number;
+    max_order_pct: number;
+    max_position_quote: number;
+  };
 }
 
 export interface AutoStatus {

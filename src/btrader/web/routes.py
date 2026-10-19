@@ -84,6 +84,10 @@ class CredentialsPayload(BaseModel):
     verify: bool = True
 
 
+class NewsTokenPayload(BaseModel):
+    token: str = ""
+
+
 class AutoStartPayload(BaseModel):
     symbol: str
     market: str = "spot"
@@ -432,6 +436,72 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
 
         ctx.save_settings()
         return {"ok": True, "settings": settings.to_dict()}
+
+    # ---------------------------------------------------------------- risk
+    @router.get("/api/risk")
+    def risk_state() -> dict[str, Any]:
+        """Live breaker state, so the UI can show why orders are refused."""
+        ctx = get_state().ctx
+        return ctx.trading.risk.snapshot()
+
+    @router.post("/api/risk/resume")
+    def risk_resume() -> dict[str, Any]:
+        """Acknowledge a halt and resume with a fresh daily allowance.
+
+        Rejected while the global kill switch is on: that switch has its own
+        off button and mixing the two would hide which one was the cause.
+        """
+        ctx = get_state().ctx
+        risk = ctx.trading.risk
+        if risk.settings.kill_switch:
+            raise HTTPException(
+                status_code=400, detail="全局急停已开启，请先在设置中关闭急停。"
+            )
+        risk.clear_halt()
+        log.warning("风控熔断已手动解除，日内基准重置")
+        return risk.snapshot()
+
+    # ------------------------------------------------------------------ news
+    @router.get("/api/news")
+    def news(symbol: str = "", limit: int = 20) -> dict[str, Any]:
+        """Headlines for one pair from CryptoPanic, with its token state.
+
+        Never raises for a missing token or an upstream failure: the panel
+        renders the message instead of an empty feed that looks like "no news".
+        """
+        ctx = get_state().ctx
+        return ctx.news.snapshot(symbol, limit=limit)
+
+    @router.get("/api/news/token")
+    def news_token() -> dict[str, Any]:
+        ctx = get_state().ctx
+        token = ctx.credentials.load_news()
+        masked = ""
+        if token:
+            masked = f"{token[:4]}...{token[-4:]}" if len(token) > 8 else "*" * len(token)
+        return {"configured": bool(token), "masked": masked, "source": "CryptoPanic"}
+
+    @router.post("/api/news/token")
+    def save_news_token(payload: NewsTokenPayload) -> dict[str, Any]:
+        state = get_state()
+        ctx = state.ctx
+        token = payload.token.strip()
+        if not token:
+            raise HTTPException(status_code=400, detail="Token 不能为空")
+        if not ctx.credentials.save_news(token):
+            raise HTTPException(
+                status_code=500,
+                detail="无法写入系统凭据库（keyring），请检查系统钥匙串是否可用",
+            )
+        ctx.news.clear_cache()
+        return {"ok": True, "configured": True}
+
+    @router.delete("/api/news/token")
+    def delete_news_token() -> dict[str, Any]:
+        ctx = get_state().ctx
+        ctx.credentials.delete_news()
+        ctx.news.clear_cache()
+        return {"ok": True, "configured": False}
 
     # ---------------------------------------------------------- credentials
     @router.get("/api/credentials")

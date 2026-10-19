@@ -8,11 +8,19 @@ export type Indicator = "none" | "boll" | "macd" | "rsi";
 
 interface Props {
   candles: Candle[];
+  /** Identifies the series (market + symbol) so a live tail update does not
+   * look like a new instrument and reset the user's zoom/scroll. */
+  seriesKey: string;
   timeframe: string;
   lastPrice: number;
   loading: boolean;
   error: string;
   indicator: Indicator;
+  /** Asks for the window before the oldest candle. Called once the view is
+   * scrolled all the way to the left edge. */
+  onLoadOlder?: () => void;
+  /** A history request is in flight; shown as a hint and used to rate-limit. */
+  olderLoading?: boolean;
 }
 
 /** Colours are read from the active theme's tokens at paint time, so switching
@@ -38,12 +46,29 @@ function colors() {
 }
 
 const MIN_BARS = 40;
-/** Hard floor for zooming in: about one candle per ~60px. */
-const MIN_ZOOM_BARS = 8;
+/** Hard floor for zooming in: a handful of candles fill the plot. */
+const MIN_ZOOM_BARS = 3;
+/** Ceiling for zooming out. The chart asks for more history once the oldest
+ * loaded bar comes into view, so this is a comfort limit, not a data limit. */
+const MAX_ZOOM_BARS = 1000;
 /** One wheel notch (deltaY ~100) changes the visible range by this factor. */
-const ZOOM_FACTOR = 1.5;
+const ZOOM_FACTOR = 1.6;
+/** How far one wheel event may travel: a fast flick must still land somewhere
+ * sensible, but too low a cap makes trackpads feel unresponsive. */
+const MAX_WHEEL_STEPS = 6;
+const MIN_WHEEL_STEPS = 0.5;
 
-export default function Chart({ candles, timeframe, lastPrice, loading, error, indicator }: Props) {
+export default function Chart({
+  candles,
+  seriesKey,
+  timeframe,
+  lastPrice,
+  loading,
+  error,
+  indicator,
+  onLoadOlder,
+  olderLoading = false,
+}: Props) {
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const themeRevision = useThemeRevision();
@@ -53,13 +78,31 @@ export default function Chart({ candles, timeframe, lastPrice, loading, error, i
   const [zoomBars, setZoomBars] = useState<number | null>(null);
   const [hover, setHover] = useState<{ x: number; y: number } | null>(null);
   const drag = useRef<{ x: number; start: number } | null>(null);
+  // The oldest bar and series seen so far, used to tell a prepended history
+  // block apart from a new bar at the tail.
+  const seenHead = useRef<{ key: string; firstT: number }>({ key: "", firstT: 0 });
+  const olderAsk = useRef(0);
 
   // A new symbol/timeframe must not inherit a scroll position from the old one.
+  // Deliberately keyed on the instrument, not on `candles`: the last bar is
+  // rewritten on every tick, and resetting there would fight the user's zoom.
   useEffect(() => {
     setOffset(0);
     setHover(null);
     setZoomBars(null);
-  }, [candles, timeframe]);
+  }, [seriesKey, timeframe]);
+
+  // Prepending older candles grows the series at the front, so the scroll
+  // offset must grow by the same amount or the view would jump forward.
+  useEffect(() => {
+    const firstT = candles[0]?.t ?? 0;
+    const previous = seenHead.current;
+    if (previous.key === seriesKey && previous.firstT && firstT && firstT < previous.firstT) {
+      const added = candles.findIndex((bar) => bar.t >= previous.firstT);
+      if (added > 0) setOffset((value) => value + added);
+    }
+    seenHead.current = { key: seriesKey, firstT };
+  }, [candles, seriesKey]);
 
   const autoBars = useCallback(() => {
     const width = wrapRef.current?.clientWidth ?? 640;
@@ -119,7 +162,16 @@ export default function Chart({ candles, timeframe, lastPrice, loading, error, i
     const step = Math.max(2, (rect.width - 86) / visibleBars);
     const shift = Math.round((event.clientX - drag.current.x) / step);
     const maxOffset = Math.max(0, candles.length - visibleBars);
-    setOffset(Math.min(maxOffset, Math.max(0, drag.current.start + shift)));
+    const wanted = drag.current.start + shift;
+    if (wanted > maxOffset && onLoadOlder) {
+      // Dragging past the oldest bar: keep the view pinned and fetch the
+      // previous window instead of letting the user pull against a wall.
+      if (!olderLoading && Date.now() - olderAsk.current > 800) {
+        olderAsk.current = Date.now();
+        onLoadOlder();
+      }
+    }
+    setOffset(Math.min(maxOffset, Math.max(0, wanted)));
   };
 
   const endDrag = (event: ReactPointerEvent<HTMLCanvasElement>) => {
@@ -134,18 +186,39 @@ export default function Chart({ candles, timeframe, lastPrice, loading, error, i
     (event: WheelEvent) => {
       if (!candles.length) return;
       event.preventDefault();
-      const unit = event.deltaMode === 1 ? event.deltaY * 16 : event.deltaY;
+      // deltaMode 1 is lines (Firefox), 2 is pages; normalise both to pixels so
+      // one notch means the same thing on every browser.
+      const unit =
+        event.deltaMode === 1
+          ? event.deltaY * 16
+          : event.deltaMode === 2
+            ? event.deltaY * 400
+            : event.deltaY;
       if (!unit) return;
       const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
       const plot = Math.max(1, rect.width - 86);
       const fraction = Math.min(1, Math.max(0, (event.clientX - rect.left - 8) / plot));
-      // One notch (~100px) is a 1.5x change, capped at 4 steps per event so a
-      // fast flick still lands somewhere sensible.
-      const steps = Math.min(4, Math.max(0.4, Math.abs(unit) / 100));
+      // One notch (~100px) is a 1.6x change. Sub-notch trackpad deltas still
+      // register (0.5 floor) so a slow scroll is not swallowed.
+      const steps = Math.min(MAX_WHEEL_STEPS, Math.max(MIN_WHEEL_STEPS, Math.abs(unit) / 100));
       const factor = Math.pow(ZOOM_FACTOR, steps);
-      const next = Math.round(unit < 0 ? visibleBars / factor : visibleBars * factor);
-      const nextBars = Math.min(maxBars, Math.max(MIN_ZOOM_BARS, next));
-      if (nextBars === visibleBars) return;
+      const desired = Math.round(unit < 0 ? visibleBars / factor : visibleBars * factor);
+      const capped = Math.min(MAX_ZOOM_BARS, Math.max(MIN_ZOOM_BARS, desired));
+
+      // Zooming out past the loaded window keeps working: fetch the previous
+      // page and remember the wider intent, so the chart expands as soon as
+      // the history lands instead of stopping at the data edge.
+      const wantsMore = unit > 0 && capped > candles.length;
+      if (wantsMore && onLoadOlder && !olderLoading && Date.now() - olderAsk.current > 300) {
+        olderAsk.current = Date.now();
+        onLoadOlder();
+      }
+
+      const nextBars = Math.min(maxBars, capped);
+      if (nextBars === visibleBars) {
+        if (wantsMore) setZoomBars(capped);
+        return;
+      }
 
       const total = candles.length;
       const end = Math.max(visibleBars, total - offset);
@@ -156,7 +229,7 @@ export default function Chart({ candles, timeframe, lastPrice, loading, error, i
       setZoomBars(nextBars);
       setOffset(Math.max(0, total - nextEnd));
     },
-    [candles.length, visibleBars, offset, maxBars],
+    [candles.length, visibleBars, offset, maxBars, onLoadOlder, olderLoading],
   );
 
   useEffect(() => {
@@ -168,6 +241,7 @@ export default function Chart({ candles, timeframe, lastPrice, loading, error, i
   }, [onWheel]);
 
   const empty = candles.length === 0;
+  const tail = candles[candles.length - 1];
 
   return (
     <div className="chart-wrap" ref={wrapRef}>
@@ -175,6 +249,8 @@ export default function Chart({ candles, timeframe, lastPrice, loading, error, i
         ref={canvasRef}
         className="chart-canvas"
         data-bars={visibleBars}
+        data-last-close={tail ? tail.c : ""}
+        data-last-open={tail ? tail.t : ""}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={endDrag}

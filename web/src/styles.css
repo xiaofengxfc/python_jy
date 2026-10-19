@@ -625,6 +625,15 @@ p {
   color: var(--text-3);
 }
 
+/* Inline numeric field for a table row (e.g. a partial-close size). */
+.input-xs {
+  width: 96px;
+  height: 26px;
+  padding: 0 6px;
+  font-size: 12px;
+  text-align: right;
+}
+
 .input:hover,
 .select:hover {
   border-color: var(--border-strong);
@@ -1295,6 +1304,31 @@ input[type="range"].input:focus {
   align-items: center;
 }
 
+/* Stop-loss / take-profit row: two equal inputs, no labels fighting for
+   space in the narrow ticket column. */
+.protect-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.protect-hint {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.protect-hint .up {
+  color: var(--up);
+}
+
+.protect-hint .down {
+  color: var(--down);
+}
+
 .ratio-row {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1898,3 +1932,145 @@ input[type="range"].input:focus {
   border-bottom: 1px solid var(--border);
 }
 
+
+/* ------------------------------------------------- paper / live switch */
+/* A live session is the exception, so the page says so once, plainly, and
+   the confirmation asks before the first order leaves the machine. */
+.mode-flag {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  margin-bottom: 8px;
+  border: 1px solid color-mix(in srgb, var(--warn) 30%, var(--border));
+  border-radius: var(--radius-sm);
+  background: var(--warn-weak);
+  color: var(--warn);
+  font-size: 12px;
+}
+
+.modal-mask {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.32);
+  z-index: 90;
+}
+
+.modal {
+  width: min(420px, 100%);
+  padding: 20px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.18);
+}
+
+.modal-title {
+  font-size: 15px;
+  font-weight: 600;
+  margin-bottom: 10px;
+}
+
+.modal-text {
+  margin: 0 0 10px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-2);
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+/* ------------------------------------------------------------ news feed */
+.news-wrap {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+}
+
+.news-list {
+  flex: 1 1 auto;
+  margin: 0;
+  padding: 4px 0;
+  list-style: none;
+}
+
+.news-item {
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.news-item:last-child {
+  border-bottom: 0;
+}
+
+.news-title {
+  display: block;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.5;
+  text-decoration: none;
+}
+
+.news-title:hover {
+  color: var(--ink);
+  text-decoration: underline;
+}
+
+.news-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 3px;
+  color: var(--text-3);
+  font-size: 11px;
+}
+
+.news-tag {
+  padding: 0 5px;
+  border-radius: 3px;
+  background: var(--bg-hover);
+  color: var(--text-2);
+  font-family: var(--mono);
+  font-size: 10px;
+}
+
+.news-tag.hot {
+  background: var(--warn-weak);
+  color: var(--warn);
+}
+
+.news-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  flex: 1 1 auto;
+  min-height: 120px;
+  padding: 16px;
+  color: var(--text-3);
+  font-size: 12px;
+  text-align: center;
+}
+
+.news-foot {
+  padding: 6px 12px 8px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+}
+
+.news-token-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+}
