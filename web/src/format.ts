@@ -23,13 +23,18 @@ export function fmtCompact(value: number | null | undefined): string {
   return n.toFixed(2);
 }
 
-export function shortTime(ms: number, daily = false): string {
+/** Axis label for a bar. Long bars print the date, intraday bars the clock,
+ * and a weekly bar also gets the year so January is never ambiguous. */
+export function shortTime(ms: number, timeframe = "15m"): string {
   const date = new Date(ms);
   const mm = String(date.getMonth() + 1).padStart(2, "0");
   const dd = String(date.getDate()).padStart(2, "0");
   const hh = String(date.getHours()).padStart(2, "0");
   const mi = String(date.getMinutes()).padStart(2, "0");
-  return daily ? `${mm}/${dd}` : `${hh}:${mi}`;
+  if (timeframe === "1w") {
+    return `${String(date.getFullYear()).slice(2)}/${mm}/${dd}`;
+  }  if (timeframe === "1d" || timeframe === "3d") return `${mm}/${dd}`;
+  return `${hh}:${mi}`;
 }
 
 export function parseNumber(text: string): number {
@@ -41,9 +46,11 @@ export const TIMEFRAMES: [string, string][] = [
   ["1m", "1分"],
   ["5m", "5分"],
   ["15m", "15分"],
+  ["30m", "30分"],
   ["1h", "1时"],
   ["4h", "4时"],
   ["1d", "1日"],
+  ["1w", "1周"],
 ];
 
 /** Bar duration per timeframe, used to fold live ticks into the last candle. */

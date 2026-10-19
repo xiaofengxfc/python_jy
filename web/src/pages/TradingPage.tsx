@@ -38,6 +38,10 @@ export default function TradingPage({
   const [timeframe, setTimeframe] = useState("15m");
   const [indicator, setIndicator] = useState<Indicator>("none");
   const [candles, setCandles] = useState<Candle[]>([]);
+  /** Timeframe the series in `candles` was loaded for. While a switch is in
+   * flight the old series is still on screen; folding it with the new bar
+   * duration would merge bars of different lengths into one. */
+  const [candlesFor, setCandlesFor] = useState("");
   const [chartError, setChartError] = useState("");
   const [chartLoading, setChartLoading] = useState(true);
   const [symbolError, setSymbolError] = useState("");
@@ -103,10 +107,12 @@ export default function TradingPage({
       );
       if (id !== requestId.current) return;
       setCandles(data.candles ?? []);
+      setCandlesFor(timeframe);
       setChartError("");
     } catch (error) {
       if (id !== requestId.current) return;
       setCandles([]);
+      setCandlesFor(timeframe);
       setChartError(error instanceof Error ? error.message : String(error));
     } finally {
       if (id === requestId.current) setChartLoading(false);
@@ -155,6 +161,9 @@ export default function TradingPage({
   const tickWhen = ticker?.timestamp || 0;
   useEffect(() => {
     if (!(tickPrice > 0) || !(barMs > 0)) return;
+    // Ignore frames while a timeframe switch is still loading: the series on
+    // screen still belongs to the old timeframe.
+    if (candlesFor !== timeframe) return;
     let gap = false;
     setCandles((previous) => {
       if (!previous.length) return previous;
@@ -169,7 +178,7 @@ export default function TradingPage({
         void loadKlines();
       }
     }
-  }, [tickPrice, tickWhen, barMs, loadKlines]);
+  }, [tickPrice, tickWhen, barMs, loadKlines, candlesFor, timeframe]);
 
   // Public trades carry the traded size a ticker lacks, so they are the only
   // source for the tail bar's volume. The frame sequence guards against React
@@ -180,6 +189,7 @@ export default function TradingPage({
     tradeSeen.current = tradeSeq;
     const price = tradePrice || tickPrice;
     if (!(price > 0) || !(barMs > 0) || !(tradeVolume > 0)) return;
+    if (candlesFor !== timeframe) return;
     let gap = false;
     setCandles((previous) => {
       if (!previous.length) return previous;
@@ -452,6 +462,7 @@ export default function TradingPage({
             <Chart
               candles={candles}
               seriesKey={`${market}:${symbol}`}
+              dataKey={`${market}:${symbol}:${candlesFor || timeframe}`}
               timeframe={timeframe}
               lastPrice={lastPrice}
               loading={chartLoading}

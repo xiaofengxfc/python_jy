@@ -43,18 +43,20 @@ export function foldTick(
     };
   }
 
-  const barStart = Math.floor(whenMs / barMs) * barMs;
+  // A new bar starts exactly N intervals after the last loaded bar. Deriving
+  // it from the previous bar instead of epoch modulo keeps weekly candles
+  // aligned with the exchange: epoch 0 was a Thursday, so flooring a
+  // timestamp into 7-day buckets puts Binance's Monday weeks one day off.
+  const elapsed = Math.max(0, whenMs - last.t);
+  const steps = Math.floor(elapsed / barMs);
+  const barStart = last.t + steps * barMs;
   const next = candles.slice();
 
   if (barStart > last.t) {
     // A fresh bar starts with this tick. If more than one interval elapsed the
     // socket slept through history we never saw, so ask for a real snapshot.
     next.push({ t: barStart, o: price, h: price, l: price, c: price, v: gain });
-    return { candles: next, appended: true, gap: barStart - last.t > barMs };
-  }
-  if (barStart < last.t) {
-    // A late frame from the previous bar; the tail is already ahead of it.
-    return { candles, appended: false, gap: false };
+    return { candles: next, appended: true, gap: steps > 1 };
   }
 
   const high = Math.max(last.h, price);

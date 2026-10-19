@@ -466,8 +466,6 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                         {label}
                       </option>
                     ))}
-                    <option value="30m">30分</option>
-                    <option value="1w">1周</option>
                   </select>
                 </div>
                 <div className="field">

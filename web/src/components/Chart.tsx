@@ -11,6 +11,11 @@ interface Props {
   /** Identifies the series (market + symbol) so a live tail update does not
    * look like a new instrument and reset the user's zoom/scroll. */
   seriesKey: string;
+  /** Identifies the *data* on screen: series plus the timeframe it was loaded
+   * for. While a timeframe switch is in flight the old candles are still
+   * passed down, so keying history detection on `seriesKey` alone would label
+   * minutes-old bars as the new period's oldest bar. */
+  dataKey?: string;
   timeframe: string;
   lastPrice: number;
   loading: boolean;
@@ -57,10 +62,15 @@ const ZOOM_FACTOR = 1.6;
  * sensible, but too low a cap makes trackpads feel unresponsive. */
 const MAX_WHEEL_STEPS = 6;
 const MIN_WHEEL_STEPS = 0.5;
+/** Wicks are treated as spikes worth clipping once the full high/low range is
+ * this many times wider than the range of candle bodies. Below it the real
+ * price action still sets the scale. */
+const SPIKE_RATIO = 1.8;
 
 export default function Chart({
   candles,
   seriesKey,
+  dataKey,
   timeframe,
   lastPrice,
   loading,
@@ -79,7 +89,11 @@ export default function Chart({
   const [hover, setHover] = useState<{ x: number; y: number } | null>(null);
   const drag = useRef<{ x: number; start: number } | null>(null);
   // The oldest bar and series seen so far, used to tell a prepended history
-  // block apart from a new bar at the tail.
+  // block apart from a new bar at the tail. Keyed on the *loaded data*, not on
+  // the requested timeframe: during a switch the old candles are still on
+  // screen, and labelling them as the new period would make the arriving
+  // series look like prepended history and scroll the view hours back.
+  const dataId = dataKey ?? seriesKey;
   const seenHead = useRef<{ key: string; firstT: number }>({ key: "", firstT: 0 });
   const olderAsk = useRef(0);
 
@@ -90,26 +104,27 @@ export default function Chart({
     setOffset(0);
     setHover(null);
     setZoomBars(null);
-  }, [seriesKey, timeframe]);
+  }, [dataId, timeframe]);
 
   // Prepending older candles grows the series at the front, so the scroll
   // offset must grow by the same amount or the view would jump forward.
   useEffect(() => {
     const firstT = candles[0]?.t ?? 0;
     const previous = seenHead.current;
-    if (previous.key === seriesKey && previous.firstT && firstT && firstT < previous.firstT) {
+    if (previous.key === dataId && previous.firstT && firstT && firstT < previous.firstT) {
       const added = candles.findIndex((bar) => bar.t >= previous.firstT);
       if (added > 0) setOffset((value) => value + added);
     }
-    seenHead.current = { key: seriesKey, firstT };
-  }, [candles, seriesKey]);
+    seenHead.current = { key: dataId, firstT };
+  }, [candles, dataId]);
 
   const autoBars = useCallback(() => {
     const width = wrapRef.current?.clientWidth ?? 640;
-    return Math.min(
-      Math.max(MIN_BARS, Math.floor(width / 8)),
-      Math.max(candles.length, MIN_BARS),
-    );
+    const fit = Math.max(MIN_BARS, Math.floor(width / 8));
+    // Never ask for more bars than the series holds: a week-old symbol on a
+    // long timeframe may only have a dozen candles, and drawing 40 slots from
+    // 13 bars leaves bars piled in the left corner.
+    return Math.max(MIN_ZOOM_BARS, Math.min(fit, Math.max(candles.length, MIN_ZOOM_BARS)));
   }, [candles.length]);
 
   const maxBars = Math.max(candles.length, MIN_ZOOM_BARS);
@@ -117,6 +132,9 @@ export default function Chart({
     zoomBars === null
       ? autoBars()
       : Math.min(maxBars, Math.max(MIN_ZOOM_BARS, Math.round(zoomBars)));
+  /** Bars actually on screen: the plot is drawn from this, so pointer maths
+   * (and therefore dragging) must use it too, not the zoom intent. */
+  const shownBars = Math.min(candles.length, visibleBars);
 
   // Zooming in can leave the scroll offset past the end of the data.
   useEffect(() => {
@@ -159,9 +177,12 @@ export default function Chart({
     setHover({ x: event.clientX - rect.left, y: event.clientY - rect.top });
     if (!drag.current) return;
     // Match the plot width used by draw(): 8px left pad + 62px price axis.
-    const step = Math.max(2, (rect.width - 86) / visibleBars);
+    // Use the bars actually on screen, not the zoom intent: when the series is
+    // shorter than the requested window, dragging would otherwise move several
+    // bars per pixel.
+    const step = Math.max(2, (rect.width - 86) / Math.max(1, shownBars));
     const shift = Math.round((event.clientX - drag.current.x) / step);
-    const maxOffset = Math.max(0, candles.length - visibleBars);
+    const maxOffset = Math.max(0, candles.length - shownBars);
     const wanted = drag.current.start + shift;
     if (wanted > maxOffset && onLoadOlder) {
       // Dragging past the oldest bar: keep the view pinned and fetch the
@@ -203,12 +224,17 @@ export default function Chart({
       const steps = Math.min(MAX_WHEEL_STEPS, Math.max(MIN_WHEEL_STEPS, Math.abs(unit) / 100));
       const factor = Math.pow(ZOOM_FACTOR, steps);
       const desired = Math.round(unit < 0 ? visibleBars / factor : visibleBars * factor);
-      const capped = Math.min(MAX_ZOOM_BARS, Math.max(MIN_ZOOM_BARS, desired));
+      // Zooming out is capped by the data actually held (a wider window would
+      // stretch a handful of bars across the plot) and by the comfort ceiling.
+      const ceiling = Math.min(maxBars, MAX_ZOOM_BARS);
+      const capped = Math.min(ceiling, Math.max(MIN_ZOOM_BARS, desired));
 
       // Zooming out past the loaded window keeps working: fetch the previous
       // page and remember the wider intent, so the chart expands as soon as
-      // the history lands instead of stopping at the data edge.
-      const wantsMore = unit > 0 && capped > candles.length;
+      // the history lands instead of stopping at the data edge. This tests the
+      // *intent*, not the drawn width: the drawn width is capped by the data
+      // already held, so capping first would make this never true.
+      const wantsMore = unit > 0 && desired > candles.length;
       if (wantsMore && onLoadOlder && !olderLoading && Date.now() - olderAsk.current > 300) {
         olderAsk.current = Date.now();
         onLoadOlder();
@@ -373,6 +399,7 @@ function draw(
   let min = Math.min(...lows);
 
   const closes = candles.map((candle) => candle.c);
+  const referencePrice = lastPrice || slice[slice.length - 1]!.c;
   const boll = indicator === "boll" ? bands(closes, 20) : null;
   if (boll) {
     for (let i = start; i < end; i += 1) {
@@ -386,6 +413,30 @@ function draw(
   const pad = (max - min) * 0.08 || max * 0.001 || 1;
   max += pad;
   min -= pad;
+
+  // Testnet candles carry deep wicks (a daily bar can span 30% around a body
+  // of a few hundred USDT). Scaling to the full high/low range then squashes
+  // every body into a one-pixel line on the longer timeframes, which reads as
+  // "the candles got tiny". When the wicks dwarf the bodies, narrow the axis
+  // to the bodies and clip the overhanging wicks at the plot edge.
+  const bodyMax = Math.max(...slice.map((candle) => Math.max(candle.o, candle.c)));
+  const bodyMin = Math.min(...slice.map((candle) => Math.min(candle.o, candle.c)));
+  const bodyRange = bodyMax - bodyMin;
+  if (bodyRange > 0 && max - min > bodyRange * SPIKE_RATIO) {
+    const margin = Math.max(bodyRange * 0.35, (max - min) * 0.02);
+    max = bodyMax + margin;
+    min = bodyMin - margin;
+    // Keep the live price and any visible BOLL band in frame even when they
+    // sit outside the body range.
+    if (referencePrice > max) max = referencePrice + margin;
+    if (referencePrice < min) min = referencePrice - margin;
+    for (let i = start; i < end; i += 1) {
+      const upper = boll?.upper[i];
+      const lower = boll?.lower[i];
+      if (upper != null && upper > max) max = upper + margin;
+      if (lower != null && lower < min) min = lower - margin;
+    }
+  }
   const range = max - min || 1;
   const yOf = (price: number) => padding.top + priceH * (1 - (price - min) / range);
 
@@ -417,6 +468,13 @@ function draw(
     ctx.fillRect(x - bodyW / 2, volTop + volumeH - barH, bodyW, barH);
   });
 
+  // Clip the candles to the price panel: after the wick squeeze above, a spike
+  // would otherwise be drawn straight through the volume panel.
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(left, padding.top, plotW, priceH + 1);
+  ctx.clip();
+
   slice.forEach((candle, index) => {
     const x = left + index * step + step / 2;
     const color = candle.c >= candle.o ? COLORS.up : COLORS.down;
@@ -441,8 +499,9 @@ function draw(
     drawLine(ctx, boll.middle, start, end, slice.length, step, left, yOf, COLORS.boll, 1, [3, 3]);
     drawLine(ctx, boll.lower, start, end, slice.length, step, left, yOf, COLORS.boll, 1);
   }
+  ctx.restore();
 
-  const reference = lastPrice || slice[slice.length - 1]!.c;
+  const reference = referencePrice;
   const refY = yOf(reference);
   ctx.strokeStyle = COLORS.crosshair;
   ctx.setLineDash([4, 3]);
@@ -468,7 +527,7 @@ function draw(
     const candle = slice[index]!;
     const x = left + index * step + step / 2;
     ctx.fillText(
-      shortTime(candle.t, timeframe === "1d"),
+      shortTime(candle.t, timeframe),
       Math.min(right - 20, Math.max(left + 20, x)),
       height - 8,
     );
@@ -515,7 +574,7 @@ function draw(
     ctx.textAlign = "left";
     ctx.fillText(priceText, right + 9, hover.y);
 
-    const timeText = shortTime(candle.t, timeframe === "1d");
+    const timeText = shortTime(candle.t, timeframe);
     const tw = ctx.measureText(timeText).width + 10;
     ctx.fillStyle = COLORS.tagBg;
     ctx.fillRect(snapX - tw / 2, height - 18, tw, 15);
