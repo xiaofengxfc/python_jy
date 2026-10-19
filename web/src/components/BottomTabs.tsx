@@ -1,10 +1,14 @@
 import { useState } from "react";
+import { api, query } from "../api";
 import { fmt, fmtPrice } from "../format";
-import type { Account } from "../types";
+import type { Account, PaperOrder, PaperPosition } from "../types";
 import Table from "./Table";
 
 interface Props {
   account: Account | null;
+  /** Reload the account after a cancel or close. */
+  onChanged?: () => void;
+  onError?: (message: string) => void;
 }
 
 type Tab = "open" | "trades" | "positions";
@@ -17,15 +21,49 @@ const TABS: [Tab, string][] = [
 
 /** Fixed-height panel under the chart. Always visible: the tabs switch the
  * table, but the height never changes, so the chart above never jumps. */
-export default function BottomTabs({ account }: Props) {
+export default function BottomTabs({ account, onChanged, onError }: Props) {
   const [tab, setTab] = useState<Tab>("open");
   const [collapsed, setCollapsed] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
 
   const orders = (account?.orders ?? []).filter((order) => order.status === "open");
   const trades = account?.trades ?? [];
   const positions = account?.positions ?? [];
   const count =
     tab === "open" ? orders.length : tab === "trades" ? trades.length : positions.length;
+
+  const run = async (key: string, action: () => Promise<unknown>) => {
+    if (busy) return;
+    setBusy(key);
+    try {
+      await action();
+      onChanged?.();
+    } catch (error) {
+      onError?.(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const cancel = (order: PaperOrder) =>
+    run(`cancel:${order.id}`, () =>
+      api(
+        `/api/orders/${encodeURIComponent(order.id)}?${query({
+          symbol: order.symbol,
+          market: order.market,
+          mode: "paper",
+        })}`,
+        { method: "DELETE" },
+      ),
+    );
+
+  const close = (position: PaperPosition) =>
+    run(`close:${position.symbol}`, () =>
+      api("/api/positions/close", {
+        method: "POST",
+        body: JSON.stringify({ symbol: position.symbol }),
+      }),
+    );
 
   return (
     <div className={`panel${collapsed ? " collapsed" : ""}`}>
@@ -50,6 +88,26 @@ export default function BottomTabs({ account }: Props) {
           </button>
         ))}
         <span className="spacer" />
+        {tab === "positions" && positions.length > 1 && (
+          <button
+            type="button"
+            className="link-btn"
+            style={{ marginRight: 12, alignSelf: "center" }}
+            disabled={busy !== null}
+            onClick={() =>
+              run("close:all", async () => {
+                for (const position of positions) {
+                  await api("/api/positions/close", {
+                    method: "POST",
+                    body: JSON.stringify({ symbol: position.symbol }),
+                  });
+                }
+              })
+            }
+          >
+            全部平仓
+          </button>
+        )}
         <span className="faint num" style={{ fontSize: 11, alignSelf: "center" }}>
           {count} 条
         </span>
@@ -81,7 +139,7 @@ export default function BottomTabs({ account }: Props) {
       <div className="panel-body" hidden={collapsed}>
         {tab === "open" && (
           <Table
-            headers={["交易对", "方向", "类型", "数量", "价格", "状态", "时间"]}
+            headers={["交易对", "方向", "类型", "数量", "价格", "状态", "时间", "操作"]}
             rightFrom={3}
             rows={orders.map((order) => [
               order.symbol,
@@ -91,8 +149,16 @@ export default function BottomTabs({ account }: Props) {
               order.type === "limit" ? "限价" : "市价",
               fmt(order.amount, 6),
               order.price ? fmtPrice(order.price) : "市价",
-              order.status === "open" ? "未成交" : order.status,
+              "未成交",
               new Date(order.timestamp).toLocaleTimeString("zh-CN", { hour12: false }),
+              <button
+                type="button"
+                className="btn-sm"
+                disabled={busy !== null}
+                onClick={() => cancel(order)}
+              >
+                {busy === `cancel:${order.id}` ? "撤销中…" : "撤单"}
+              </button>,
             ])}
             empty="没有未成交的委托"
           />
@@ -118,7 +184,7 @@ export default function BottomTabs({ account }: Props) {
 
         {tab === "positions" && (
           <Table
-            headers={["交易对", "方向", "数量", "开仓价", "已实现盈亏"]}
+            headers={["交易对", "方向", "数量", "开仓价", "已实现盈亏", "操作"]}
             rightFrom={2}
             rows={positions.map((position) => [
               position.symbol,
@@ -134,6 +200,14 @@ export default function BottomTabs({ account }: Props) {
               <span className={position.realized_pnl >= 0 ? "up" : "down"}>
                 {fmt(position.realized_pnl, 2)}
               </span>,
+              <button
+                type="button"
+                className="btn-sm"
+                disabled={busy !== null}
+                onClick={() => close(position)}
+              >
+                {busy === `close:${position.symbol}` ? "平仓中…" : "平仓"}
+              </button>,
             ])}
             empty="当前没有持仓"
           />

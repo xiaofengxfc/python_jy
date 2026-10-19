@@ -236,6 +236,7 @@ class TradingService:
                 price=price,
                 reduce_only=req.reduce_only,
                 allow_short=req.market_type.is_futures,
+                market=req.market_type.value,
             )
             quote = abs(base_qty) * price
             self.risk.record_order()
@@ -277,11 +278,58 @@ class TradingService:
         return OrderResult(order, req.mode, quote, base_qty, exchange_amount)
 
     # ------------------------------------------------------------------ cancel
-    def cancel(self, market_type: MarketType, symbol: str, order_id: str, mode: RunMode) -> None:
+    def cancel(
+        self,
+        market_type: MarketType,
+        symbol: str,
+        order_id: str,
+        mode: RunMode,
+        market: str | None = None,
+    ) -> dict:
+        """Cancel a resting order and return its final state.
+
+        Paper orders are cancelled locally; live orders go to the exchange.
+        The order row is written back to SQLite either way so the UI and the
+        history agree on the state.
+        """
         if mode is RunMode.PAPER:
-            self.paper.cancel(order_id)
-            return
-        self.rest.cancel_order(market_type, order_id, symbol)
+            order = self.paper.cancel(order_id)
+            if order is None:
+                raise OrderRejected("未找到可撤销的委托（可能已成交或已撤销）。")
+            self.db.save_order(
+                "paper",
+                market or market_type.value,
+                order,
+                mode.value,
+            )
+            log.info("纸面撤单 %s %s", symbol, order_id)
+            return order
+        order = self.rest.cancel_order(market_type, order_id, symbol)
+        try:
+            self.db.save_order(
+                self._account_id(), market or market_type.value, order, mode.value
+            )
+        except Exception:  # a failed history write must not lose the cancel
+            log.warning("撤单状态写库失败", exc_info=True)
+        log.info("实盘撤单 %s %s", symbol, order_id)
+        return order
+
+    # ------------------------------------------------------- paper execution
+    def settle_paper_orders(self, symbol: str, price: float) -> list[dict]:
+        """Fill paper limit orders against a fresh last price.
+
+        Called by the backend's background reconciler. Returns the orders that
+        filled so the caller can persist them.
+        """
+        filled = self.paper.mark(symbol, price)
+        for order in filled:
+            try:
+                self.db.save_order(
+                    "paper", order.get("market") or "spot", order, RunMode.PAPER.value
+                )
+            except Exception:  # pragma: no cover - history is best effort
+                log.warning("纸面成交写库失败", exc_info=True)
+        return filled
 
     # --------------------------------------------------------------- hierarchy
     def change_network(self, network: Network, credentials) -> None:

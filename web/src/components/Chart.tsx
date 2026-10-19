@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { PointerEvent as ReactPointerEvent, WheelEvent as ReactWheelEvent } from "react";
+import type { PointerEvent as ReactPointerEvent } from "react";
 import type { Candle } from "../types";
 import { fmtPrice, shortTime } from "../format";
 import { cssVar, useThemeRevision } from "../hooks/useThemeRevision";
@@ -38,12 +38,19 @@ function colors() {
 }
 
 const MIN_BARS = 40;
+/** Hard floor for zooming in: about one candle per ~60px. */
+const MIN_ZOOM_BARS = 8;
+/** One wheel notch (deltaY ~100) changes the visible range by this factor. */
+const ZOOM_FACTOR = 1.5;
 
 export default function Chart({ candles, timeframe, lastPrice, loading, error, indicator }: Props) {
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const themeRevision = useThemeRevision();
   const [offset, setOffset] = useState(0);
+  // null means "as many bars as the width comfortably fits"; a number is the
+  // user's zoom level. Kept across quote updates so zooming does not reset.
+  const [zoomBars, setZoomBars] = useState<number | null>(null);
   const [hover, setHover] = useState<{ x: number; y: number } | null>(null);
   const drag = useRef<{ x: number; start: number } | null>(null);
 
@@ -51,7 +58,27 @@ export default function Chart({ candles, timeframe, lastPrice, loading, error, i
   useEffect(() => {
     setOffset(0);
     setHover(null);
+    setZoomBars(null);
   }, [candles, timeframe]);
+
+  const autoBars = useCallback(() => {
+    const width = wrapRef.current?.clientWidth ?? 640;
+    return Math.min(
+      Math.max(MIN_BARS, Math.floor(width / 8)),
+      Math.max(candles.length, MIN_BARS),
+    );
+  }, [candles.length]);
+
+  const maxBars = Math.max(candles.length, MIN_ZOOM_BARS);
+  const visibleBars =
+    zoomBars === null
+      ? autoBars()
+      : Math.min(maxBars, Math.max(MIN_ZOOM_BARS, Math.round(zoomBars)));
+
+  // Zooming in can leave the scroll offset past the end of the data.
+  useEffect(() => {
+    setOffset((value) => Math.min(value, Math.max(0, candles.length - visibleBars)));
+  }, [visibleBars, candles.length]);
 
   useEffect(() => {
     const wrap = wrapRef.current;
@@ -59,18 +86,24 @@ export default function Chart({ candles, timeframe, lastPrice, loading, error, i
     if (!wrap || !canvas) return;
 
     const paint = () =>
-      draw(canvas, wrap, candles, timeframe, lastPrice, offset, hover, indicator, colors());
+      draw(
+        canvas,
+        wrap,
+        candles,
+        timeframe,
+        lastPrice,
+        offset,
+        visibleBars,
+        hover,
+        indicator,
+        colors(),
+      );
     paint();
 
     const observer = new ResizeObserver(paint);
     observer.observe(wrap);
     return () => observer.disconnect();
-  }, [candles, timeframe, lastPrice, offset, hover, indicator, themeRevision]);
-
-  const barsInView = useCallback(() => {
-    const width = wrapRef.current?.clientWidth ?? 640;
-    return Math.min(Math.max(MIN_BARS, Math.floor(width / 8)), Math.max(candles.length, MIN_BARS));
-  }, [candles.length]);
+  }, [candles, timeframe, lastPrice, offset, visibleBars, hover, indicator, themeRevision]);
 
   const onPointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     if (event.button !== 0) return;
@@ -82,9 +115,10 @@ export default function Chart({ candles, timeframe, lastPrice, loading, error, i
     const rect = event.currentTarget.getBoundingClientRect();
     setHover({ x: event.clientX - rect.left, y: event.clientY - rect.top });
     if (!drag.current) return;
-    const step = Math.max(4, (rect.width - 70) / barsInView());
+    // Match the plot width used by draw(): 8px left pad + 62px price axis.
+    const step = Math.max(2, (rect.width - 86) / visibleBars);
     const shift = Math.round((event.clientX - drag.current.x) / step);
-    const maxOffset = Math.max(0, candles.length - MIN_BARS);
+    const maxOffset = Math.max(0, candles.length - visibleBars);
     setOffset(Math.min(maxOffset, Math.max(0, drag.current.start + shift)));
   };
 
@@ -93,11 +127,45 @@ export default function Chart({ candles, timeframe, lastPrice, loading, error, i
     drag.current = null;
   };
 
-  const onWheel = (event: ReactWheelEvent<HTMLCanvasElement>) => {
-    // Scroll up walks back in time, which is what a chart should do.
-    const maxOffset = Math.max(0, candles.length - MIN_BARS);
-    setOffset((value) => Math.min(maxOffset, Math.max(0, value + Math.sign(event.deltaY) * 3)));
-  };
+  /** Wheel zooms around the pointer. Registered natively below so the page
+   * behind the chart does not scroll at the same time (React's onWheel is a
+   * passive listener and cannot call preventDefault). */
+  const onWheel = useCallback(
+    (event: WheelEvent) => {
+      if (!candles.length) return;
+      event.preventDefault();
+      const unit = event.deltaMode === 1 ? event.deltaY * 16 : event.deltaY;
+      if (!unit) return;
+      const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
+      const plot = Math.max(1, rect.width - 86);
+      const fraction = Math.min(1, Math.max(0, (event.clientX - rect.left - 8) / plot));
+      // One notch (~100px) is a 1.5x change, capped at 4 steps per event so a
+      // fast flick still lands somewhere sensible.
+      const steps = Math.min(4, Math.max(0.4, Math.abs(unit) / 100));
+      const factor = Math.pow(ZOOM_FACTOR, steps);
+      const next = Math.round(unit < 0 ? visibleBars / factor : visibleBars * factor);
+      const nextBars = Math.min(maxBars, Math.max(MIN_ZOOM_BARS, next));
+      if (nextBars === visibleBars) return;
+
+      const total = candles.length;
+      const end = Math.max(visibleBars, total - offset);
+      const start = Math.max(0, end - visibleBars);
+      const anchor = start + fraction * Math.max(0, visibleBars - 1);
+      let nextEnd = Math.round(anchor + (1 - fraction) * Math.max(0, nextBars - 1));
+      nextEnd = Math.min(total, Math.max(nextBars, nextEnd));
+      setZoomBars(nextBars);
+      setOffset(Math.max(0, total - nextEnd));
+    },
+    [candles.length, visibleBars, offset, maxBars],
+  );
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const handler = (event: WheelEvent) => onWheel(event);
+    canvas.addEventListener("wheel", handler, { passive: false });
+    return () => canvas.removeEventListener("wheel", handler);
+  }, [onWheel]);
 
   const empty = candles.length === 0;
 
@@ -106,6 +174,7 @@ export default function Chart({ candles, timeframe, lastPrice, loading, error, i
       <canvas
         ref={canvasRef}
         className="chart-canvas"
+        data-bars={visibleBars}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={endDrag}
@@ -114,7 +183,6 @@ export default function Chart({ candles, timeframe, lastPrice, loading, error, i
           setHover(null);
           drag.current = null;
         }}
-        onWheel={onWheel}
       />
       {!empty && (
         <div className="chart-legend">
@@ -189,6 +257,7 @@ function draw(
   timeframe: string,
   lastPrice: number,
   offset: number,
+  visibleBars: number,
   hover: { x: number; y: number } | null,
   indicator: Indicator,
   COLORS: ReturnType<typeof colors>,
@@ -209,7 +278,7 @@ function draw(
   ctx.clearRect(0, 0, width, height);
   if (!candles.length) return;
 
-  const visible = Math.min(candles.length, Math.max(MIN_BARS, Math.floor(width / 8)));
+  const visible = Math.min(candles.length, Math.max(MIN_ZOOM_BARS, visibleBars));
   const end = Math.max(visible, candles.length - offset);
   const start = Math.max(0, end - visible);
   const slice = candles.slice(start, end);

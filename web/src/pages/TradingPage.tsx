@@ -43,6 +43,7 @@ export default function TradingPage({
   const [account, setAccount] = useState<Account | null>(null);
   const [pickedPrice, setPickedPrice] = useState<number | null>(null);
   const [restTicker, setRestTicker] = useState<{ high: number; low: number } | null>(null);
+  const [actionError, setActionError] = useState("");
 
   const { ticker, book, connected } = useMarketStream(market, symbol);
   const requestId = useRef(0);
@@ -177,7 +178,7 @@ export default function TradingPage({
     setPickedPrice(null);
   };
 
-  const banner = healthError || symbolError;
+  const banner = actionError || healthError || symbolError;
 
   return (
     <>
@@ -285,7 +286,14 @@ export default function TradingPage({
             />
           </div>
 
-          <BottomTabs account={account} />
+          <BottomTabs
+            account={account}
+            onChanged={() => {
+              setActionError("");
+              void refreshAccount();
+            }}
+            onError={(message) => setActionError(message)}
+          />
         </div>
 
         <div className="trading-rail">

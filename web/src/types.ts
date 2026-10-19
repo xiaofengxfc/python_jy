@@ -54,12 +54,17 @@ export interface PaperPosition {
 export interface PaperOrder {
   id: string;
   symbol: string;
+  market?: string;
   side: Side;
   type: OrderType;
   amount: number;
   price?: number | null;
+  filled?: number;
+  remaining?: number;
+  average?: number;
   status: string;
   timestamp: number;
+  reduceOnly?: boolean;
 }
 
 export interface PaperTrade {

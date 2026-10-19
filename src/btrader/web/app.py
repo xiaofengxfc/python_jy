@@ -26,7 +26,7 @@ from pydantic import BaseModel, Field
 from ..context import AppContext
 from ..core.types import TIMEFRAME_SECONDS, MarketType, RunMode
 from ..engine.trading import OrderRejected, OrderRequest
-from ..exchange.symbols import load_symbols
+from ..exchange.symbols import format_amount, load_symbols
 from ..logging_setup import error_buffer
 from .routes import build_router
 from .stream import StreamHub
@@ -66,6 +66,7 @@ class _State:
         self.equity_history: list[dict[str, Any]] = []
         self.equity_stamp = 0.0
         self.stream: StreamHub | None = None
+        self.stop_reconcile = threading.Event()
 
 
 _state: _State | None = None
@@ -176,6 +177,53 @@ class PreviewPayload(BaseModel):
     price: float | None = None
 
 
+class ClosePayload(BaseModel):
+    """Close (or reduce) a position with a market order.
+
+    ``size`` is in base coins; omitted means the whole position.
+    """
+
+    symbol: str
+    market: str = "spot"
+    mode: str = "paper"
+    size: float | None = Field(default=None, gt=0)
+
+
+def _market_for_symbol(symbol: str) -> MarketType:
+    """Infer the market from a ccxt symbol when the caller did not say.
+
+    ``BTC/USDT`` -> spot, ``BTC/USDT:USDT`` -> USDT-margined,
+    ``BTC/USD:BTC`` -> coin-margined.
+    """
+    if ":" not in symbol:
+        return MarketType.SPOT
+    settle = symbol.rsplit(":", 1)[1]
+    return MarketType.USDM if settle.upper() in ("USDT", "USDC") else MarketType.COINM
+
+
+def _is_reducing(
+    state: _State,
+    market: MarketType,
+    symbol: str,
+    side: str,
+    amount: float,
+) -> bool:
+    """Whether an order closes (part of) an existing paper position.
+
+    A reduce order must not be judged by the entry limits (per-order notional,
+    position cap): selling 0.01 BTC is an exit, and refusing it with "单笔金额
+    超过上限" is what made a held position impossible to sell. Spot sells are
+    always exits because spot cannot go short.
+    """
+    position = state.ctx.paper.account.positions.get(symbol)
+    held = position.contracts if position else 0.0
+    if side == "sell" and held > 0:
+        return amount <= held * (1 + 1e-6) + 1e-12
+    if side == "buy" and held < 0:
+        return amount <= -held * (1 + 1e-6) + 1e-12
+    return False
+
+
 # ----------------------------------------------------------------------- app
 def create_app() -> FastAPI:
     @asynccontextmanager
@@ -185,9 +233,14 @@ def create_app() -> FastAPI:
         # Warm the symbol list in the background: the first paint must not wait
         # on a multi-second load_markets() call.
         threading.Thread(target=_warm, daemon=True).start()
+        state.stop_reconcile.clear()
+        threading.Thread(
+            target=_reconcile_paper_orders, args=(state,), name="paper-reconciler", daemon=True
+        ).start()
         try:
             yield
         finally:
+            state.stop_reconcile.set()
             if state.stream is not None:
                 await state.stream.close()
             try:
@@ -403,6 +456,9 @@ def create_app() -> FastAPI:
                 order_type=payload.order_type,
                 amount=base_qty,
                 price=reference,
+                reduce_only=_is_reducing(
+                    state, mt, payload.symbol, payload.side, base_qty
+                ),
                 market_type=mt,
                 mode=RunMode.PAPER,
             )
@@ -453,6 +509,32 @@ def create_app() -> FastAPI:
         if state.ctx.market_type is not mt:
             state.ctx.set_market_type(mt)
 
+        # Spot sells are capped by the coins actually held. "100%" is budgeted
+        # from a price that ticks between render and submit, so the quantity
+        # derived from it can exceed the balance by a fraction of a percent;
+        # clamp that instead of rejecting what is clearly a full exit.
+        adjusted = False
+        if mt is MarketType.SPOT and payload.side == "sell":
+            held = state.ctx.paper.account.positions.get(payload.symbol)
+            available = held.contracts if held else 0.0
+            if available <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"当前没有 {payload.symbol} 持仓，现货无法做空。",
+                )
+            if amount > available:
+                if amount <= available * 1.005:
+                    amount = available
+                    adjusted = True
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"现货不能做空：当前持有 {available:.8f}，"
+                            f"无法卖出 {amount:.8f}。"
+                        ),
+                    )
+
         request = OrderRequest(
             symbol=payload.symbol,
             side=payload.side,
@@ -478,6 +560,7 @@ def create_app() -> FastAPI:
             "amount_base": result.amount_base,
             "amount_exchange": result.amount_exchange,
             "mode": result.mode.value,
+            "adjusted": adjusted,
         }
 
     @app.post("/api/paper/reset")
@@ -486,6 +569,91 @@ def create_app() -> FastAPI:
         with state.account_lock:
             state.ctx.paper.reset(balance)
         return {"ok": True, "cash": state.ctx.paper.account.cash}
+
+    # ---------------------------------------------------------------- cancel
+    @app.delete("/api/orders/{order_id}")
+    def api_cancel_order(
+        order_id: str,
+        symbol: str,
+        market: str | None = None,
+        mode: str = "paper",
+    ) -> dict[str, Any]:
+        """Cancel a resting order.
+
+        Paper and live orders share the same route; ``mode`` decides where it
+        goes. The response carries the final order state so the UI can update
+        the row without a refetch.
+        """
+        if mode not in ("paper", "live"):
+            raise HTTPException(status_code=400, detail="模式必须是 paper 或 live")
+        if not symbol:
+            raise HTTPException(status_code=400, detail="缺少交易对")
+        state = get_state()
+        mt = _market(market) if market else _market_for_symbol(symbol)
+        try:
+            with state.account_lock:
+                order = state.ctx.trading.cancel(
+                    mt, symbol, order_id, RunMode(mode), market=mt.value
+                )
+        except OrderRejected as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return {"ok": True, "order": order}
+
+    # ---------------------------------------------------------------- closing
+    @app.post("/api/positions/close")
+    def api_close_position(payload: ClosePayload) -> dict[str, Any]:
+        """Market-close a paper position (optionally a partial size).
+
+        Kept separate from ``/api/orders`` so the caller does not have to know
+        the signed size or the direction: the server reads the position and
+        sends the opposite side with ``reduceOnly``.
+        """
+        mt = _market(payload.market)
+        state = get_state()
+        position = state.ctx.paper.account.positions.get(payload.symbol)
+        held = position.contracts if position else 0.0
+        if abs(held) <= 1e-12:
+            raise HTTPException(status_code=400, detail="当前没有该交易对的持仓")
+        size = abs(held) if payload.size is None else min(abs(payload.size), abs(held))
+        try:
+            with state.locks[mt]:
+                reference = float(
+                    state.ctx.rest_for(mt).fetch_ticker(mt, payload.symbol).get("last")
+                    or 0.0
+                )
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=f"无法获取最新价：{exc}") from exc
+        if reference <= 0:
+            raise HTTPException(status_code=400, detail="无法获取有效的参考价格")
+
+        side = "sell" if held > 0 else "buy"
+        request = OrderRequest(
+            symbol=payload.symbol,
+            side=side,
+            order_type="market",
+            amount=size,
+            price=reference,
+            reduce_only=True,
+            market_type=mt,
+            mode=RunMode.PAPER,
+        )
+        try:
+            with state.account_lock:
+                result = state.ctx.trading.submit(request)
+        except OrderRejected as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            log.exception("平仓失败")
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return {
+            "ok": True,
+            "order": result.order,
+            "price": reference,
+            "size": size,
+            "side": side,
+        }
 
     # -------------------------------------------------------------- logs
     @app.get("/api/logs")
@@ -616,3 +784,39 @@ def _warm() -> None:
         _symbols_for(state, state.ctx.market_type)
     except Exception:  # pragma: no cover - warm-up is best effort
         log.debug("预热交易对失败", exc_info=True)
+
+
+# Paper limit orders have no exchange to match them, so a light poll does it:
+# every couple of seconds the last price of each symbol with a resting order is
+# fetched and any order the market has crossed is filled.
+RECONCILE_SECONDS = 2.0
+
+
+def _reconcile_paper_orders(state: _State) -> None:
+    while not state.stop_reconcile.wait(RECONCILE_SECONDS):
+        try:
+            resting = state.ctx.paper.open_orders()
+            if not resting:
+                continue
+            wanted = {(order.get("market") or "spot", order["symbol"]) for order in resting}
+            for market_value, symbol in sorted(wanted):
+                try:
+                    market = MarketType(market_value)
+                except ValueError:
+                    continue
+                try:
+                    with state.locks[market]:
+                        raw = state.ctx.rest_for(market).fetch_ticker(market, symbol)
+                    price = float(raw.get("last") or 0.0)
+                except Exception as exc:
+                    log.debug("纸面撮合取价失败 %s: %s", symbol, exc)
+                    continue
+                if price <= 0:
+                    continue
+                for order in state.ctx.trading.settle_paper_orders(symbol, price):
+                    log.info(
+                        "纸面限价成交 %s %s %s @ %s",
+                        symbol, order["side"], format_amount(order["amount"]), order["price"],
+                    )
+        except Exception:  # keep the loop alive whatever one cycle does
+            log.exception("纸面撮合循环异常")

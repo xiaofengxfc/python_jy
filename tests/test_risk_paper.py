@@ -103,3 +103,45 @@ def test_paper_reset():
     broker.reset()
     assert broker.account.cash == 500
     assert broker.account.positions == {}
+
+
+def test_paper_mark_fills_limit_against_last_price():
+    broker = PaperBroker(starting_balance=1_000, fee_rate=0.0, slippage_bps=0)
+    broker.place_order("BTC/USDT", "buy", "limit", 1.0, price=99.0)
+    assert broker.mark("BTC/USDT", 100.0) == []
+    filled = broker.mark("BTC/USDT", 99.0)
+    assert len(filled) == 1
+    assert filled[0]["status"] == "closed"
+    assert broker.open_orders() == []
+
+
+def test_paper_mark_fills_sell_after_buy():
+    broker = PaperBroker(starting_balance=1_000, fee_rate=0.0, slippage_bps=0)
+    broker.place_order("BTC/USDT", "buy", "market", 1.0, price=100.0)
+    broker.place_order("BTC/USDT", "sell", "limit", 1.0, price=110.0)
+    assert broker.mark("BTC/USDT", 109.0) == []
+    assert len(broker.mark("BTC/USDT", 110.0)) == 1
+    assert broker.account.position_for("BTC/USDT").contracts == 0.0
+    assert broker.account.cash == 1_010.0
+    assert broker.account.orders[-1]["status"] == "closed"
+
+
+def test_paper_cancel_returns_final_state():
+    broker = PaperBroker(starting_balance=1_000)
+    order = broker.place_order("BTC/USDT", "buy", "limit", 1.0, price=99.0)
+    canceled = broker.cancel(order["id"])
+    assert canceled is not None and canceled["status"] == "canceled"
+    assert broker.cancel(order["id"]) is None
+    assert broker.mark("BTC/USDT", 98.0) == []
+    assert broker.account.position_for("BTC/USDT").contracts == 0.0
+
+
+def test_paper_spot_sell_limit_beyond_holdings_stays_open():
+    """A resting sell must not drive a spot balance negative when filled."""
+    broker = PaperBroker(starting_balance=1_000, fee_rate=0.0, slippage_bps=0)
+    broker.place_order("BTC/USDT", "buy", "market", 1.0, price=100.0)
+    broker.place_order(
+        "BTC/USDT", "sell", "limit", 2.0, price=120.0, allow_short=False
+    )
+    assert broker.mark("BTC/USDT", 121.0) == []
+    assert broker.account.position_for("BTC/USDT").contracts == 1.0

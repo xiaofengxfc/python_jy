@@ -71,6 +71,8 @@ class PaperBroker:
             cash=starting_balance,
         )
         self._lock = threading.RLock()
+        # Last traded price per symbol, used to fill resting limit orders.
+        self._marks: dict[str, float] = {}
 
     # ------------------------------------------------------------------ order
     def place_order(
@@ -82,6 +84,7 @@ class PaperBroker:
         price: float | None = None,
         reduce_only: bool = False,
         allow_short: bool = True,
+        market: str = "spot",
     ) -> dict:
         with self._lock:
             order_id = f"paper-{uuid.uuid4().hex[:12]}"
@@ -89,6 +92,7 @@ class PaperBroker:
             order = {
                 "id": order_id,
                 "symbol": symbol,
+                "market": market,
                 "side": side,
                 "type": order_type,
                 "amount": float(amount),
@@ -99,6 +103,7 @@ class PaperBroker:
                 "status": "open",
                 "timestamp": ts,
                 "reduceOnly": reduce_only,
+                "allowShort": bool(allow_short),
                 "paper": True,
             }
             if order_type == "market" and price and price > 0:
@@ -122,20 +127,81 @@ class PaperBroker:
                     continue
                 limit = order["price"]
                 if order["side"] == "buy" and low <= limit:
-                    self._fill(order, limit)
-                    filled.append(dict(order))
+                    if self._can_fill(order, limit):
+                        self._fill(order, limit)
+                        filled.append(dict(order))
                 elif order["side"] == "sell" and high >= limit:
+                    if self._can_fill(order, limit):
+                        self._fill(order, limit)
+                        filled.append(dict(order))
+        return filled
+
+    def mark(self, symbol: str, price: float) -> list[dict]:
+        """Fill resting limit orders against the latest traded price.
+
+        The web UI has no candle feed of its own, so a background poll feeds
+        the last price in here: a buy fills once the market trades at or below
+        its limit, a sell once it trades at or above. Without this a resting
+        order could never fill and the only exit was to cancel it.
+        """
+        if price <= 0:
+            return []
+        filled: list[dict] = []
+        with self._lock:
+            self._marks[symbol] = price
+            for order in self.account.orders:
+                if order["status"] != "open" or order["symbol"] != symbol:
+                    continue
+                limit = order["price"]
+                if limit <= 0:
+                    continue
+                touched = (
+                    price <= limit if order["side"] == "buy" else price >= limit
+                )
+                if touched and self._can_fill(order, limit):
                     self._fill(order, limit)
                     filled.append(dict(order))
         return filled
 
-    def cancel(self, order_id: str) -> bool:
+    def mark_price(self, symbol: str) -> float:
+        with self._lock:
+            return self._marks.get(symbol, 0.0)
+
+    def open_orders(self, symbol: str | None = None) -> list[dict]:
+        with self._lock:
+            return [
+                dict(order)
+                for order in self.account.orders
+                if order["status"] == "open"
+                and (symbol is None or order["symbol"] == symbol)
+            ]
+
+    def _can_fill(self, order: dict, price: float) -> bool:
+        """Reject a resting order that can no longer be honoured.
+
+        Spot sells are capped by the coin actually held (a resting sell does
+        not reserve inventory), buys by the cash on hand. Leaving the order
+        open instead of driving the balance negative matches what an exchange
+        would do when the funds were spent elsewhere.
+        """
+        qty = order["amount"]
+        account = self.account
+        if order["side"] == "buy":
+            return account.cash + 1e-9 >= qty * price
+        if order.get("allowShort"):
+            return True
+        held = account.positions.get(order["symbol"])
+        return (held.contracts if held else 0.0) + 1e-12 >= qty
+
+    def cancel(self, order_id: str) -> dict | None:
+        """Cancel a resting order; return its final state, or None if unknown."""
         with self._lock:
             for order in self.account.orders:
                 if order["id"] == order_id and order["status"] == "open":
                     order["status"] = "canceled"
-                    return True
-        return False
+                    order["canceledAt"] = now_ms()
+                    return dict(order)
+        return None
 
     def _fill(self, order: dict, price: float) -> None:
         qty = order["amount"]
@@ -215,3 +281,4 @@ class PaperBroker:
                 starting_balance=balance,
                 cash=balance,
             )
+            self._marks.clear()
