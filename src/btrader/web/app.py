@@ -4,19 +4,21 @@ The desktop app and this server share one engine: everything under
 ``core`` / ``exchange`` / ``engine`` is Qt-free, so this module is a thin HTTP
 adapter over :class:`btrader.context.AppContext`.
 
-This is a development tool for iterating on the interface quickly. It binds to
-localhost, trades paper money only, and is not a deployment target.
+The server binds to localhost only. It is started by the Electron shell as a
+child process (see ``btrader.web.__main__``) and also runs standalone through
+``run_web.py`` for frontend development.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -25,6 +27,9 @@ from ..context import AppContext
 from ..core.types import TIMEFRAME_SECONDS, MarketType, RunMode
 from ..engine.trading import OrderRejected, OrderRequest
 from ..exchange.symbols import load_symbols
+from ..logging_setup import error_buffer
+from .routes import build_router
+from .stream import StreamHub
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +63,9 @@ class _State:
         self.loading = {market: threading.Lock() for market in MarketType}
         self.symbols: dict[str, list[dict[str, Any]]] = {}
         self.account_lock = threading.RLock()
+        self.equity_history: list[dict[str, Any]] = []
+        self.equity_stamp = 0.0
+        self.stream: StreamHub | None = None
 
 
 _state: _State | None = None
@@ -158,22 +166,37 @@ class OrderPayload(BaseModel):
     price: float | None = None
 
 
+class PreviewPayload(BaseModel):
+    market: str = "spot"
+    symbol: str
+    side: str = "buy"
+    order_type: str = "limit"
+    size_mode: str = "amount"
+    size: float = Field(gt=0)
+    price: float | None = None
+
+
 # ----------------------------------------------------------------------- app
 def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        state = get_state()
+        state.stream = StreamHub(state.ctx.network)
         # Warm the symbol list in the background: the first paint must not wait
         # on a multi-second load_markets() call.
         threading.Thread(target=_warm, daemon=True).start()
         try:
             yield
         finally:
+            if state.stream is not None:
+                await state.stream.close()
             try:
-                get_state().ctx.shutdown()
+                state.ctx.shutdown()
             except Exception:  # pragma: no cover - best effort on exit
                 log.debug("关闭上下文失败", exc_info=True)
 
     app = FastAPI(title="biTrader Web", lifespan=lifespan)
+    app.include_router(build_router(get_state))
 
     if STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -306,6 +329,94 @@ def create_app() -> FastAPI:
                 "trades": trades,
             }
 
+    @app.post("/api/orders/preview")
+    def api_preview_order(payload: PreviewPayload) -> dict[str, Any]:
+        """Dry-run an order: sizing, fees and the risk verdict, nothing sent.
+
+        Sizing is rounded offline so the panel still works without network
+        access to the contract spec endpoint; a market order falls back to the
+        last trade price as its reference.
+        """
+        state = get_state()
+        mt = _market(payload.market)
+        reference = payload.price if payload.order_type == "limit" else None
+        if reference is None:
+            try:
+                with state.locks[mt]:
+                    reference = float(
+                        state.ctx.rest_for(mt).fetch_ticker(mt, payload.symbol).get("last")
+                        or 0.0
+                    )
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=503, detail=f"无法获取最新价：{exc}"
+                ) from exc
+        if not reference or reference <= 0:
+            raise HTTPException(status_code=400, detail="缺少有效的参考价格")
+
+        amount = (
+            payload.size / reference if payload.size_mode == "quote" else payload.size
+        )
+        if amount <= 0:
+            raise HTTPException(status_code=400, detail="下单数量必须大于 0")
+
+        trading = state.ctx.trading
+        paper = state.ctx.paper
+        notional = abs(amount) * reference
+        base = {
+            "symbol": payload.symbol,
+            "market": mt.value,
+            "side": payload.side,
+            "order_type": payload.order_type,
+            "price": reference,
+            "amount_base": amount,
+            "quote_notional": notional,
+            "fee_rate": paper.fee_rate,
+            "slippage_bps": paper.slippage_bps,
+        }
+
+        try:
+            exchange_amount, base_qty = trading.exchange_amount(
+                mt, payload.symbol, amount, reference, offline=True
+            )
+        except OrderRejected as exc:
+            return {
+                **base,
+                "allowed": False,
+                "reason": str(exc),
+                "exchange_amount": 0.0,
+                "fee_estimate": 0.0,
+            }
+        except Exception as exc:
+            return {
+                **base,
+                "allowed": False,
+                "reason": f"无法校验下单量：{exc}",
+                "exchange_amount": 0.0,
+                "fee_estimate": 0.0,
+            }
+
+        decision = trading.precheck(
+            OrderRequest(
+                symbol=payload.symbol,
+                side=payload.side,
+                order_type=payload.order_type,
+                amount=base_qty,
+                price=reference,
+                market_type=mt,
+                mode=RunMode.PAPER,
+            )
+        )
+        return {
+            **base,
+            "allowed": bool(decision),
+            "reason": decision.reason,
+            "amount_base": base_qty,
+            "exchange_amount": exchange_amount,
+            "quote_notional": abs(base_qty) * reference,
+            "fee_estimate": abs(base_qty) * reference * paper.fee_rate,
+        }
+
     @app.post("/api/orders")
     def api_place_order(payload: OrderPayload) -> dict[str, Any]:
         if payload.side not in ("buy", "sell"):
@@ -376,7 +487,127 @@ def create_app() -> FastAPI:
             state.ctx.paper.reset(balance)
         return {"ok": True, "cash": state.ctx.paper.account.cash}
 
+    # -------------------------------------------------------------- logs
+    @app.get("/api/logs")
+    def api_logs(limit: int = 200) -> dict[str, Any]:
+        """Recent warnings/errors for the in-app log viewer."""
+        buffer = error_buffer()
+        records = buffer.records()
+        limit = max(1, min(int(limit), buffer.capacity))
+        errors, warnings = buffer.counts()
+        return {
+            "revision": buffer.revision,
+            "errors": errors,
+            "warnings": warnings,
+            "items": [
+                {
+                    "level": item.level_name,
+                    "logger": item.logger,
+                    "message": item.message,
+                    "detail": item.detail,
+                    "when": item.when,
+                    "text": item.as_text(),
+                }
+                for item in records[-limit:][::-1]
+            ],
+        }
+
+    @app.post("/api/logs/clear")
+    def api_logs_clear() -> dict[str, Any]:
+        error_buffer().clear()
+        return {"ok": True}
+
+    # ---------------------------------------------------------- websocket
+    @app.websocket("/ws/market")
+    async def ws_market(ws: WebSocket) -> None:
+        await ws.accept()
+        state = get_state()
+        hub = state.stream
+        if hub is None:  # pragma: no cover - only if lifespan did not run
+            await ws.close(code=1011)
+            return
+
+        queue: asyncio.Queue | None = None
+        key: tuple[str, str] | None = None
+        try:
+            command = await ws.receive_json()
+            while True:
+                action = str(command.get("action", "subscribe"))
+                if action == "ping":
+                    await ws.send_json({"type": "pong"})
+                    command = await ws.receive_json()
+                    continue
+                if action != "subscribe":
+                    command = await ws.receive_json()
+                    continue
+
+                try:
+                    market = _market(str(command.get("market", "spot")))
+                except HTTPException as exc:
+                    await ws.send_json({"type": "error", "message": exc.detail})
+                    command = await ws.receive_json()
+                    continue
+
+                symbol = str(command.get("symbol") or "")
+                if not symbol:
+                    await ws.send_json({"type": "error", "message": "缺少交易对"})
+                    command = await ws.receive_json()
+                    continue
+
+                # Switching symbol cancels the old watchers: they are refcounted
+                # per (market, symbol), so another client keeps them alive.
+                if queue is not None and key is not None:
+                    await hub.unsubscribe(key, queue)
+                    queue = None
+                    key = None
+                queue, key = await hub.subscribe(market, symbol)
+                await ws.send_json(
+                    {"type": "subscribed", "market": market.value, "symbol": symbol}
+                )
+
+                nxt = await _stream_until_command(ws, queue)
+                if nxt is None:  # client disconnected mid-stream
+                    return
+                command = nxt
+        except WebSocketDisconnect:
+            pass
+        except Exception as exc:  # a broken socket must not take the app down
+            log.debug("行情 WebSocket 关闭: %s", exc)
+        finally:
+            if queue is not None and key is not None:
+                await hub.unsubscribe(key, queue)
+
     return app
+
+
+async def _stream_until_command(ws: WebSocket, queue) -> dict[str, Any] | None:
+    """Forward market frames until the client sends another command.
+
+    Returns the parsed command, or ``None`` when the socket closed. The receive
+    task outlives each queue read, so a command that arrives while frames are
+    flowing is still seen instead of being buffered until the next tick.
+    """
+    receiver = asyncio.create_task(ws.receive_json())
+    try:
+        while True:
+            getter = asyncio.create_task(queue.get())
+            done, _pending = await asyncio.wait(
+                {receiver, getter}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if receiver in done:
+                getter.cancel()
+                with suppress(asyncio.CancelledError):
+                    await getter
+                try:
+                    return receiver.result()
+                except WebSocketDisconnect:
+                    return None
+            frame = getter.result()
+            await ws.send_json(frame)
+    finally:
+        receiver.cancel()
+        with suppress(asyncio.CancelledError):
+            await receiver
 
 
 def _warm() -> None:

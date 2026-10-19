@@ -3,6 +3,12 @@
 The runner polls closed candles, evaluates the strategy and rebalances toward
 the target position. It runs in its own thread so the UI stays responsive and
 all orders go through ``TradingService`` (risk checks included).
+
+The runner is deliberately free of any UI toolkit: callers subscribe with plain
+callbacks via :meth:`AutoTrader.on_log` / ``on_signal`` / ``on_state``. The Qt
+build wrapped those same callbacks in a ``QObject``; the web backend turns them
+into a broadcast queue. Keeping this module dependency-free is what lets the
+engine run headless in the desktop shell.
 """
 
 from __future__ import annotations
@@ -11,16 +17,19 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
-from PySide6.QtCore import QObject, Signal
 
 from ..core.types import MarketType, RunMode, timeframe_seconds
 from ..strategy.base import Strategy, clamp_target
 from .trading import OrderRejected, OrderRequest, TradingService
 
 log = logging.getLogger(__name__)
+
+LogListener = Callable[[str, str], None]
+SignalListener = Callable[[float, str], None]
+StateListener = Callable[[bool], None]
 
 
 @dataclass
@@ -37,12 +46,12 @@ class AutoTraderConfig:
     kline_limit: int = 500
 
 
-class AutoTrader(QObject):
-    """Signal-emitting wrapper around a background polling thread."""
+class AutoTrader:
+    """Background polling thread that exposes plain-callback hooks.
 
-    log_event = Signal(str, str)          # level, message
-    signal_changed = Signal(float, str)   # target, reason
-    state_changed = Signal(bool)          # running
+    Listeners are invoked from the worker thread. A listener that raises is
+    logged and skipped: a broken consumer must never stop trading.
+    """
 
     def __init__(
         self,
@@ -50,9 +59,7 @@ class AutoTrader(QObject):
         strategy: Strategy,
         trading: TradingService,
         klines,
-        parent: QObject | None = None,
     ) -> None:
-        super().__init__(parent)
         self.config = config
         self.strategy = strategy
         self.trading = trading
@@ -63,6 +70,43 @@ class AutoTrader(QObject):
         self._last_candle_ts = 0
         self._position_quote = 0.0
         self._equity = 10_000.0
+
+        self._listener_lock = threading.RLock()
+        self._log_listeners: list[LogListener] = []
+        self._signal_listeners: list[SignalListener] = []
+        self._state_listeners: list[StateListener] = []
+
+    # ------------------------------------------------------------- listeners
+    def on_log(self, callback: LogListener) -> None:
+        with self._listener_lock:
+            self._log_listeners.append(callback)
+
+    def on_signal(self, callback: SignalListener) -> None:
+        with self._listener_lock:
+            self._signal_listeners.append(callback)
+
+    def on_state(self, callback: StateListener) -> None:
+        with self._listener_lock:
+            self._state_listeners.append(callback)
+
+    def _emit(self, listeners, *args) -> None:
+        with self._listener_lock:
+            targets = list(listeners)
+        for callback in targets:
+            try:
+                callback(*args)
+            except Exception:  # a broken consumer must not break trading
+                log.exception("自动交易回调异常")
+
+    def _emit_log(self, level: str, message: str) -> None:
+        log.debug("%s %s", level, message)
+        self._emit(self._log_listeners, level, message)
+
+    def _emit_signal(self, target: float, reason: str) -> None:
+        self._emit(self._signal_listeners, target, reason)
+
+    def _emit_state(self, running: bool) -> None:
+        self._emit(self._state_listeners, running)
 
     # ------------------------------------------------------------- lifecycle
     @property
@@ -75,8 +119,8 @@ class AutoTrader(QObject):
         self._stop.clear()
         self._thread = threading.Thread(target=self._loop, name="auto-trader", daemon=True)
         self._thread.start()
-        self.state_changed.emit(True)
-        self.log_event.emit("INFO", f"自动交易已启动（{self.config.mode.label}）")
+        self._emit_state(True)
+        self._emit_log("INFO", f"自动交易已启动（{self.config.mode.label}）")
 
     def stop(self) -> None:
         if not self.running:
@@ -84,8 +128,8 @@ class AutoTrader(QObject):
         self._stop.set()
         self._thread.join(timeout=5)
         self._thread = None
-        self.state_changed.emit(False)
-        self.log_event.emit("INFO", "自动交易已停止")
+        self._emit_state(False)
+        self._emit_log("INFO", "自动交易已停止")
 
     # ------------------------------------------------------------------ loop
     def _loop(self) -> None:
@@ -94,7 +138,7 @@ class AutoTrader(QObject):
                 self._tick()
             except Exception as exc:  # never let the loop die silently
                 log.exception("自动交易循环异常")
-                self.log_event.emit("ERROR", f"循环异常：{exc}")
+                self._emit_log("ERROR", f"循环异常：{exc}")
             self._stop.wait(self.config.poll_seconds)
 
     def _tick(self) -> None:
@@ -128,7 +172,7 @@ class AutoTrader(QObject):
         price = float(closed["close"].iloc[-1])
 
         self._refresh_equity(price)
-        self.log_event.emit(
+        self._emit_log(
             "INFO",
             f"新收盘 K 线 {pd.Timestamp(last_ts, unit='ms'):%m-%d %H:%M} "
             f"策略目标 {target:+.0%}（当前 {self._current_target:+.0%}）",
@@ -136,7 +180,7 @@ class AutoTrader(QObject):
         if target == self._current_target:
             return
         self._current_target = target
-        self.signal_changed.emit(target, f"收盘价 {price:,.4f}")
+        self._emit_signal(target, f"收盘价 {price:,.4f}")
 
         self._rebalance(target, price)
 
@@ -199,14 +243,14 @@ class AutoTrader(QObject):
         try:
             result = self.trading.submit(request)
         except OrderRejected as exc:
-            self.log_event.emit("WARN", f"下单被拒绝：{exc}")
+            self._emit_log("WARN", f"下单被拒绝：{exc}")
             return
         except Exception as exc:
-            self.log_event.emit("ERROR", f"下单失败：{exc}")
+            self._emit_log("ERROR", f"下单失败：{exc}")
             return
 
         action = "买入" if side == "buy" else "卖出"
-        self.log_event.emit(
+        self._emit_log(
             "TRADE",
             f"{action} {abs(delta):.6f} {self.config.symbol} @ {price:,.4f} "
             f"(目标仓位 {target:+.0%}) → {result.order.get('status', '')}",

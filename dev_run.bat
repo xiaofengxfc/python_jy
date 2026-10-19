@@ -1,11 +1,12 @@
 @echo off
 REM Run straight from source — the fastest iteration loop.
-REM Edit a file, close the window, run this again. No build step at all.
 REM
 REM   dev_run.bat
 REM
-REM The console stays attached on purpose so logging output and tracebacks
-REM are visible while testing.
+REM Starts the local backend and opens the interface in the default browser.
+REM The console stays attached on purpose so logging output and tracebacks are
+REM visible while testing. Editing frontend files only needs a browser refresh;
+REM editing Python needs this script to be restarted.
 setlocal
 cd /d "%~dp0"
 

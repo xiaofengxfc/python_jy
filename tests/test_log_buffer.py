@@ -6,8 +6,6 @@ import logging
 
 import pytest
 
-pytest.importorskip("PySide6")
-
 from btrader.logging_setup import ErrorLogBuffer  # noqa: E402
 
 

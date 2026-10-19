@@ -1,11 +1,15 @@
-PySide6>=6.6
-pyqtgraph>=0.13
+# Runtime
 ccxt>=4.4
 pandas>=2.0
 numpy>=1.26
 pyarrow>=14
 keyring>=24
 python-dateutil>=2.8
+
+# Local backend (FastAPI + WebSocket market stream)
+fastapi>=0.115
+uvicorn[standard]>=0.30
+websockets>=12
 
 # dev / packaging
 pytest>=8

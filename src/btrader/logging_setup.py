@@ -16,6 +16,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
+from typing import TextIO
 
 from . import paths
 
@@ -144,7 +145,14 @@ def install_excepthook() -> None:
     sys.excepthook = _hook
 
 
-def setup_logging(level: int = logging.INFO) -> None:
+def setup_logging(
+    level: int = logging.INFO, console_stream: TextIO | None = None
+) -> None:
+    """Configure file + console logging once.
+
+    ``console_stream`` lets a launcher keep stdout machine-readable: the web
+    backend announces its port there and must not interleave log lines.
+    """
     global _CONFIGURED
     if _CONFIGURED:
         return
@@ -167,7 +175,7 @@ def setup_logging(level: int = logging.INFO) -> None:
     file_handler.setFormatter(fmt)
     root.addHandler(file_handler)
 
-    console = logging.StreamHandler(sys.stdout)
+    console = logging.StreamHandler(console_stream or sys.stdout)
     console.setFormatter(fmt)
     root.addHandler(console)
 

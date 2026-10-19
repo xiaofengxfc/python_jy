@@ -4,21 +4,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bitrader"
-version = "0.4.1"
+version = "0.5.0"
 description = "Binance desktop trading workstation with backtesting"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "biTrader" }]
 dependencies = [
-    "PySide6>=6.6",
-    "pyqtgraph>=0.13",
     "ccxt>=4.4",
     "pandas>=2.0",
     "numpy>=1.26",
     "pyarrow>=14",
     "keyring>=24",
     "python-dateutil>=2.8",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "websockets>=12",
 ]
 
 [project.optional-dependencies]

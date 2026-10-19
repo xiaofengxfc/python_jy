@@ -18,3 +18,10 @@ cache/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Electron
+node_modules/
+dist-electron/
+
+# Screenshots
+.shotz/

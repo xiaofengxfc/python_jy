@@ -1,6 +1,6 @@
 # biTrader · 币安桌面交易工作台
 
-基于 Python + PySide6 的加密货币桌面交易软件，首期适配 **币安**（现货、U 本位合约、币本位合约）。
+基于 Python + FastAPI 的加密货币桌面交易软件，首期适配 **币安**（现货、U 本位合约、币本位合约）。
 集行情看盘、手动下单、事件驱动回测、参数优化、纸面交易与自动交易于一体。
 
 > ⚠️ **风险提示**：加密资产交易风险极高。本项目默认使用纸面交易；切换到实盘前请先完成回测与纸面验证，
@@ -12,7 +12,7 @@
 
 | 模块 | 说明 |
 | --- | --- |
-| 交易 | K 线图（pyqtgraph）、指标叠加、订单簿、成交价、手动市价/限价下单 |
+| 交易 | K 线图（Canvas）、指标叠加、订单簿、成交价、手动市价/限价下单 |
 | 资产 | 实盘余额与合约持仓、纸面账户权益/盈亏 |
 | 回测 | 事件驱动回测（信号收盘产生、下一根开盘成交）、手续费/滑点/杠杆/止损止盈 |
 | 参数优化 | 参数网格搜索，按夏普/收益/回撤等排序 |
@@ -40,6 +40,12 @@ python -m venv .venv
 .venv\Scripts\activate            # Windows
 pip install -r requirements.txt
 python run.py
+```
+
+也可以只启动后端、自己用浏览器打开（前端改动刷新即可，无需重启）：
+
+```bash
+python run_web.py
 ```
 
 或安装为包后使用命令：
@@ -110,15 +116,17 @@ class MyStrategy(Strategy):
 - 当日最大亏损、当日最大交易次数、连续亏损熔断
 - 实盘下单二次确认、全局急停开关
 
-风控状态显示在窗口底部状态栏。命中限制的订单会被拒绝并在界面提示原因。
+风控状态显示在界面顶部/设置页。命中限制的订单会被拒绝并在界面提示原因。
 
-## 打包 Windows exe
+## 打包 Windows 后端
 
 ```bat
-packaging\build_windows.bat
+packaging\build_dev.bat
 ```
 
-产物：`dist\biTrader\biTrader.exe`（目录形式，含 Qt 运行库）。
+产物：`dist\biTrader-backend\biTrader-backend.exe`（后端进程，由 Electron 外壳拉起）。
+
+前端资源由后端从 `src/btrader/web/static` 提供，打包时一并复制进产物。
 
 ## 项目结构
 
@@ -129,7 +137,7 @@ src/btrader/
 ├─ strategy/      策略基类、插件加载、内置策略
 ├─ backtest/      事件驱动回测引擎、参数网格搜索
 ├─ engine/        风控、纸面撮合、下单服务、自动交易线程
-└─ ui/            PySide6 主窗口、页面、图表与通用控件
+└─ web/           FastAPI 后端、行情 WebSocket、前端静态资源
 ```
 
 ## 测试

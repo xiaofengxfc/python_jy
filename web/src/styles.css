@@ -1,0 +1,1900 @@
+/* ============================================================
+   biTrader design tokens
+   One rule above all: white surfaces, hairline borders, black as the
+   primary action colour. Green/red are reserved for trade direction and
+   price change only — never for decoration.
+   ============================================================ */
+:root {
+  color-scheme: light;
+
+  --bg: #ffffff;
+  /* The page sits a hair below the cards, so white cards read as surfaces
+     without needing heavy borders or shadows. */
+  --page: #f7f7f8;
+  --bg-subtle: #fafafa;
+  --bg-hover: #f4f4f4;
+  --bg-active: #ededed;
+
+  --border: #e8e8e8;
+  --border-strong: #d6d6d6;
+
+  --text: #121212;
+  --text-2: #5b5b5b;
+  --text-3: #8b8b8b;
+
+  /* Primary = ink. Buttons, selected states and focus rings use this. */
+  --ink: #141414;
+  --ink-hover: #000000;
+  --ink-weak: #f2f2f2;
+
+  /* Direction colours: the only saturated colours in the interface. */
+  --up: #0f9d58;
+  --up-weak: #eaf7ef;
+  --down: #e5484d;
+  --down-weak: #fdeeee;
+
+  --warn: #b45309;
+  --warn-weak: #fef7e9;
+
+  --radius: 8px;
+  --radius-sm: 6px;
+  --gap: 16px;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+
+  --font: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI",
+    "Microsoft YaHei", sans-serif;
+  --font-size: 13px;
+  --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+
+/* Optional dark theme keeps the same token names, so no component has to
+   know which theme is active. */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #17181b;
+  --page: #101114;
+  --bg-subtle: #1d1e22;
+  --bg-hover: #26272c;
+  --bg-active: #303137;
+
+  --border: #2a2b30;
+  --border-strong: #3d3e45;
+
+  --text: #f2f2f4;
+  --text-2: #a5a6ae;
+  --text-3: #74757e;
+
+  --ink: #f2f2f4;
+  --ink-hover: #ffffff;
+  --ink-weak: #26272c;
+
+  --up: #3fb96b;
+  --up-weak: #17291f;
+  --down: #f0546a;
+  --down-weak: #2e1a1e;
+
+  --warn: #d9a441;
+  --warn-weak: #2b2416;
+
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+}
+
+@font-face {
+  font-family: "Inter";
+  src: url("/fonts/Inter-Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Inter";
+  src: url("/fonts/Inter-Medium.ttf") format("truetype");
+  font-weight: 500;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Inter";
+  src: url("/fonts/Inter-SemiBold.ttf") format("truetype");
+  font-weight: 600;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Inter";
+  src: url("/fonts/Inter-Bold.ttf") format("truetype");
+  font-weight: 700;
+  font-display: swap;
+}
+
+/* ------------------------------------------------------------ reset */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: var(--font-size);
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+
+:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 1px;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 999px;
+  border: 3px solid var(--bg);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-3);
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* -------------------------------------------------------- utilities */
+.num {
+  font-variant-numeric: tabular-nums;
+}
+
+.up {
+  color: var(--up);
+}
+.down {
+  color: var(--down);
+}
+.dim {
+  color: var(--text-2);
+}
+.faint {
+  color: var(--text-3);
+}
+
+.spacer {
+  flex: 1 1 auto;
+}
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+  min-width: 0;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.grid-2 {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: var(--gap);
+  align-items: start;
+}
+
+.section-title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  margin-bottom: 8px;
+}
+
+.hint {
+  color: var(--text-3);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+/* ------------------------------------------------------- app shell */
+.app {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr);
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* Desktop build: the OS frame is gone, so the app reserves a row for its own
+   title bar and the sidebar/main pair moves down one row. */
+.app.desktop {
+  grid-template-rows: 32px minmax(0, 1fr);
+}
+
+.titlebar {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 32px;
+  padding-left: 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+  -webkit-app-region: drag;
+  user-select: none;
+}
+
+.titlebar-brand {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--text-2);
+}
+
+.titlebar-controls {
+  display: flex;
+  height: 100%;
+  margin-left: auto;
+  -webkit-app-region: no-drag;
+}
+
+.titlebar-controls button {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 100%;
+  border: 0;
+  background: transparent;
+  color: var(--text-2);
+  cursor: default;
+}
+
+.titlebar-controls button svg {
+  width: 14px;
+  height: 14px;
+}
+
+.titlebar-controls button:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.titlebar-controls button.danger:hover {
+  background: var(--down);
+  color: #ffffff;
+}
+
+/* The log drawer belongs to the content area, not the title bar. */
+.desktop .log-mask,
+.desktop .log-panel {
+  top: 32px;
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+  padding: 14px 0 12px;
+  border-right: 1px solid var(--border);
+  background: var(--bg);
+  min-height: 0;
+}
+
+.brand {
+  display: grid;
+  place-items: center;
+}
+
+.brand-mark {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  background: var(--ink);
+  color: var(--bg);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+/* The rail is 64px wide, so labels live in hover tooltips instead of
+   taking permanent horizontal space. */
+.brand-name,
+.brand-sub {
+  display: none;
+}
+
+.nav {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  min-height: 0;
+}
+
+.nav-item {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-2);
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.nav-item:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.nav-item[aria-current="page"] {
+  background: var(--bg-active);
+  color: var(--text);
+}
+
+.nav-icon {
+  width: 18px;
+  height: 18px;
+  flex: none;
+}
+
+/* One tooltip rule for everything in the rail. */
+.tip {
+  position: relative;
+}
+
+.tip::after {
+  content: attr(data-tip);
+  position: absolute;
+  left: calc(100% + 10px);
+  top: 50%;
+  transform: translateY(-50%) translateX(-4px);
+  padding: 5px 9px;
+  border-radius: 5px;
+  background: var(--ink);
+  color: var(--bg);
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: pre;
+  text-align: left;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.1s ease, transform 0.1s ease;
+  z-index: 60;
+}
+
+.tip:hover::after {
+  opacity: 1;
+  transform: translateY(-50%);
+}
+
+.sidebar-foot {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  width: 40px;
+  margin-top: auto;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.icon-btn {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-2);
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.icon-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.badge {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: var(--down);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 15px;
+  text-align: center;
+}
+
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-3);
+  flex: none;
+}
+
+.dot.live {
+  background: var(--up);
+}
+
+.dot.off {
+  background: var(--warn);
+}
+
+/* ---------------------------------------------------------- content */
+.main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+  min-width: 0;
+  min-height: 0;
+  padding: 0 22px 20px;
+  overflow-y: auto;
+}
+
+/* Every page except the trading screen is a centred column, so wide monitors
+   do not stretch forms and tables into unreadable ribbons. The sticky title
+   bar is exempt because it bleeds over the page padding. */
+.main > *:not(.trading):not(.page-head) {
+  width: 100%;
+  max-width: 1080px;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+/* The title row is the one thing that stays put while a long page scrolls.
+   It uses a negative margin to bleed over the content padding, so the
+   hairline under it spans the full window. */
+.page-head {
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+  height: 40px;
+  min-height: 40px;
+  margin: 0 -22px;
+  padding: 0 22px;
+  background: var(--page);
+  border-bottom: 1px solid var(--border);
+}
+
+.page-title {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0;
+  line-height: 1.3;
+}
+
+.page-sub {
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+/* ------------------------------------------------------------ cards */
+/* Surfaces are white on a page that is a hair darker, so no border is
+   needed. A single hairline inside the card head keeps tables readable. */
+.card {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  background: var(--bg);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  height: 38px;
+  padding: 0 13px;
+  border-bottom: 1px solid var(--border);
+}
+
+.card-title {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px 13px;
+  min-width: 0;
+}
+
+/* --------------------------------------------------------- segmented */
+.segmented {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-hover);
+}
+
+.segmented button {
+  height: 24px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12px;
+  white-space: nowrap;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.segmented button:hover {
+  color: var(--text);
+}
+
+.segmented button[aria-pressed="true"] {
+  background: var(--bg);
+  color: var(--text);
+  font-weight: 500;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+}
+
+/* ------------------------------------------------------------ forms */
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.field-label {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.field-label em {
+  font-style: normal;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.input,
+.select {
+  width: 100%;
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+  transition: border-color 0.12s ease, box-shadow 0.12s ease;
+}
+
+.input::placeholder {
+  color: var(--text-3);
+}
+
+.input:hover,
+.select:hover {
+  border-color: var(--border-strong);
+}
+
+.input:focus,
+.select:focus {
+  outline: none;
+  border-color: var(--ink);
+  box-shadow: 0 0 0 3px rgba(20, 20, 20, 0.08);
+}
+
+.input:disabled,
+.select:disabled {
+  background: var(--bg-subtle);
+  color: var(--text-3);
+  cursor: not-allowed;
+}
+
+input[type="range"].input {
+  padding: 0;
+  height: 28px;
+  border: 0;
+  box-shadow: none;
+  accent-color: var(--ink);
+}
+
+input[type="range"].input:focus {
+  box-shadow: none;
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-2);
+  cursor: pointer;
+}
+
+.check input {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--ink);
+}
+
+/* ---------------------------------------------------------- buttons */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 38px;
+  padding: 0 16px;
+  border: 1px solid var(--ink);
+  border-radius: var(--radius-sm);
+  background: var(--ink);
+  color: var(--bg);
+  font-size: 13px;
+  font-weight: 500;
+  transition: background 0.12s ease, border-color 0.12s ease, opacity 0.12s ease;
+}
+
+.btn:not(:disabled):hover {
+  background: var(--ink-hover);
+  border-color: var(--ink-hover);
+}
+
+.btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.btn.ghost {
+  background: var(--bg);
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+.btn.ghost:not(:disabled):hover {
+  background: var(--bg-hover);
+  border-color: var(--text-3);
+}
+
+/* Direction is the one place colour is allowed. */
+.btn.buy {
+  background: var(--up);
+  border-color: var(--up);
+  color: #ffffff;
+}
+
+.btn.buy:not(:disabled):hover {
+  filter: brightness(0.94);
+}
+
+.btn.sell {
+  background: var(--down);
+  border-color: var(--down);
+  color: #ffffff;
+}
+
+.btn.sell:not(:disabled):hover {
+  filter: brightness(0.94);
+}
+
+.btn-sm {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 28px;
+  padding: 0 11px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 12px;
+  white-space: nowrap;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+
+.btn-sm:not(:disabled):hover {
+  background: var(--bg-hover);
+  border-color: var(--text-3);
+}
+
+.btn-sm.primary {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: var(--bg);
+}
+
+.btn-sm.primary:not(:disabled):hover {
+  background: var(--ink-hover);
+  border-color: var(--ink-hover);
+}
+
+.btn-sm:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* ----------------------------------------------------------- tables */
+.table-wrap {
+  width: 100%;
+  overflow: auto;
+  min-height: 0;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  height: 30px;
+  padding: 0 13px;
+  background: var(--bg-subtle);
+  color: var(--text-3);
+  font-size: 11px;
+  font-weight: 500;
+  text-align: left;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--border);
+}
+
+.table td {
+  height: 34px;
+  padding: 0 13px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.table tbody tr:hover td {
+  background: var(--bg-subtle);
+}
+
+.table .right {
+  text-align: right;
+}
+
+.empty {
+  display: grid;
+  place-items: center;
+  padding: 40px 16px;
+  color: var(--text-3);
+  font-size: 12px;
+}
+
+/* ------------------------------------------------------------ banner */
+.banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle);
+  color: var(--text-2);
+  font-size: 12px;
+}
+
+.banner.error {
+  border-color: color-mix(in srgb, var(--down) 35%, var(--border));
+  background: var(--down-weak);
+  color: var(--down);
+}
+
+.progress {
+  height: 3px;
+  border-radius: 999px;
+  background: var(--bg-active);
+  overflow: hidden;
+}
+
+.progress > div {
+  height: 100%;
+  background: var(--ink);
+  transition: width 0.3s ease;
+}
+
+.placeholder {
+  display: grid;
+  place-items: center;
+  min-height: 320px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius);
+  color: var(--text-3);
+  font-size: 12px;
+  text-align: center;
+}
+
+.placeholder strong {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--text-2);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+/* ============================================================ trading
+   Left: toolbar + chart + fixed-height tabs.
+   Right: order book on top, order ticket below.
+   ============================================================ */
+.trading {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 312px;
+  gap: var(--gap);
+  flex: 1 1 auto;
+  min-height: 0;
+  /* The trading screen has no title bar, so it needs its own breathing room
+     at the top to line up with the other pages. */
+  margin-top: 12px;
+}
+
+.trading-main,
+.trading-rail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+  min-width: 0;
+  min-height: 0;
+}
+
+.trading-main > .card:nth-child(2) {
+  flex: 1 1 auto;
+  min-height: 220px;
+}
+
+.trading-rail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* The ladder absorbs the leftover space and scrolls inside itself; the order
+   form below keeps its full height so the primary button is always visible. */
+.trading-rail > .card:first-child {
+  flex: 1 1 auto;
+  min-height: 160px;
+}
+
+.trading-rail > .card:not(:first-child) {
+  flex: 0 0 auto;
+}
+
+.trading-rail .book {
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* ------------------------------------------------------ symbol strip */
+.symbol-strip {
+  display: flex;
+  align-items: center;
+  gap: 22px;
+  flex: none;
+  min-width: 0;
+  padding: 11px 14px;
+  border-radius: var(--radius);
+  background: var(--bg);
+}
+
+.symbol-name {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+}
+
+/* ------------------------------------------------------ pair picker */
+.picker {
+  position: relative;
+  flex: none;
+}
+
+.picker-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 30px;
+  padding: 0 9px 0 11px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.picker-btn:hover {
+  background: var(--bg-hover);
+}
+
+.picker-btn[aria-expanded="true"] {
+  background: var(--bg-hover);
+}
+
+.picker-symbol {
+  white-space: nowrap;
+}
+
+.picker-pop {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  width: 288px;
+  max-height: 372px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.12);
+}
+
+.picker-search {
+  height: 32px;
+  flex: none;
+}
+
+.picker-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  flex: none;
+  padding: 8px 0 2px;
+}
+
+.picker-chips button {
+  height: 24px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--bg-hover);
+  color: var(--text-2);
+  font-size: 11px;
+}
+
+.picker-chips button:hover {
+  background: var(--bg-active);
+  color: var(--text);
+}
+
+.picker-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  margin-top: 6px;
+  overflow-y: auto;
+}
+
+.picker-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  height: 32px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  text-align: left;
+}
+
+.picker-option:hover {
+  background: var(--bg-hover);
+}
+
+.picker-option[aria-selected="true"] {
+  background: var(--bg-active);
+  font-weight: 500;
+}
+
+.picker-empty {
+  padding: 20px 8px;
+  color: var(--text-3);
+  font-size: 12px;
+  text-align: center;
+}
+
+.price-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.price {
+  font-size: 19px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+}
+
+.change {
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.stats {
+  display: flex;
+  gap: 24px;
+  margin-left: auto;
+}
+
+.stat {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.stat-label {
+  color: var(--text-3);
+  font-size: 11px;
+}
+
+.stat-value {
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+/* ------------------------------------------------------------ chart */
+.chart-wrap {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 4px 6px 2px;
+}
+
+.chart-wrap canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.chart-legend {
+  position: absolute;
+  top: 8px;
+  left: 12px;
+  display: flex;
+  gap: 12px;
+  color: var(--text-3);
+  font-size: 11px;
+  pointer-events: none;
+}
+
+.chart-legend b {
+  color: var(--text-2);
+  font-weight: 500;
+}
+
+.chart-empty {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: var(--text-3);
+  font-size: 12px;
+  pointer-events: none;
+}
+
+/* -------------------------------------------------------- order book */
+.book {
+  display: flex;
+  flex-direction: column;
+  padding: 4px 0;
+  font-size: 12px;
+}
+
+.book-side {
+  display: flex;
+  flex-direction: column;
+}
+
+.book-row {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  align-items: center;
+  height: 21px;
+  padding: 0 13px;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  font-variant-numeric: tabular-nums;
+}
+
+.book-row:hover {
+  background: var(--bg-hover);
+}
+
+.book-bar {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  opacity: 0.55;
+  pointer-events: none;
+}
+
+.book-bar.bid {
+  background: var(--up-weak);
+}
+
+.book-bar.ask {
+  background: var(--down-weak);
+}
+
+.book-price,
+.book-qty {
+  position: relative;
+  z-index: 1;
+}
+
+.book-price {
+  font-weight: 500;
+}
+
+.book-price.bid {
+  color: var(--up);
+}
+
+.book-price.ask {
+  color: var(--down);
+}
+
+.book-qty {
+  text-align: right;
+  color: var(--text-2);
+}
+
+.book-head {
+  display: flex;
+  justify-content: space-between;
+  padding: 4px 13px;
+  color: var(--text-3);
+  font-size: 11px;
+}
+
+.spread {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 26px;
+  margin: 3px 0;
+  padding: 0 13px;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  color: var(--text-3);
+  font-size: 11px;
+}
+
+/* ------------------------------------------------------------ ticket */
+.ticket-body {
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+  padding: 12px 13px 13px;
+}
+
+/* Side switch: the first decision in the ticket, so it gets the top slot. */
+.side-switch {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.side-switch button {
+  height: 34px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--text-3);
+  font-size: 13px;
+  font-weight: 500;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+
+.side-switch button:hover {
+  color: var(--text);
+  border-color: var(--text-3);
+}
+
+.side-switch button[aria-pressed="true"] {
+  border-color: var(--ink);
+  background: var(--ink-weak);
+  color: var(--text);
+}
+
+.side-switch button[data-side="buy"][aria-pressed="true"] {
+  border-color: var(--up);
+  background: var(--up-weak);
+  color: var(--up);
+}
+
+.side-switch button[data-side="sell"][aria-pressed="true"] {
+  border-color: var(--down);
+  background: var(--down-weak);
+  color: var(--down);
+}
+
+.ticket-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px;
+  align-items: center;
+}
+
+.ratio-row {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.ratio {
+  height: 26px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--bg);
+  color: var(--text-2);
+  font-size: 11px;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+
+.ratio:hover {
+  border-color: var(--border-strong);
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.quick-price {
+  display: flex;
+  gap: 6px;
+}
+
+.quick-price button {
+  flex: 1 1 0;
+  height: 24px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--bg);
+  color: var(--text-3);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  transition: border-color 0.12s ease, color 0.12s ease;
+}
+
+.quick-price button:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+/* The amount the user typed, answered on the spot: "≈ 0.0121 BTC · 1,000 USDT".
+   It sits under the size input, not in the preview block, because it is the
+   direct conversion of what was just entered. */
+.ticket-summary {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-top: -2px;
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.ticket-summary-sep {
+  color: var(--text-3);
+}
+
+.unit {
+  color: var(--text-3);
+  font-size: 11px;
+}
+
+.preview {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 10px 11px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle);
+  font-size: 12px;
+}
+
+.preview-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--text-3);
+}
+
+.preview-row strong {
+  color: var(--text);
+  font-weight: 500;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.verdict {
+  margin-top: 3px;
+  padding-top: 7px;
+  border-top: 1px solid var(--border);
+  color: var(--text-3);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.verdict.ok {
+  color: var(--up);
+}
+
+.verdict.bad {
+  color: var(--down);
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+  padding: 0 13px 12px;
+}
+
+.actions .btn {
+  flex: 1 1 0;
+}
+
+.ticket-note {
+  padding: 0 13px 12px;
+  color: var(--text-3);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.paper-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 5px;
+  color: var(--text-3);
+  font-size: 11px;
+}
+
+.paper-line b {
+  color: var(--text-2);
+  font-weight: 500;
+}
+
+.link-btn {
+  margin-left: auto;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--text-3);
+  font-size: 11px;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.link-btn:hover {
+  color: var(--text);
+}
+
+.flash {
+  margin: 0 13px 10px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+}
+
+.flash.ok {
+  background: var(--up-weak);
+  color: var(--up);
+}
+
+.flash.err {
+  background: var(--down-weak);
+  color: var(--down);
+}
+
+/* ------------------------------------------------- tabs / drawer */
+.drawer-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: 38px;
+  padding: 0 13px;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+  text-align: left;
+}
+
+.drawer-head:hover {
+  background: var(--bg-subtle);
+}
+
+.count {
+  display: inline-grid;
+  place-items: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--bg-active);
+  color: var(--text-2);
+  font-size: 11px;
+}
+
+.chevron {
+  width: 14px;
+  height: 14px;
+  color: var(--text-3);
+  transition: transform 0.15s ease;
+}
+
+.chevron[data-open="true"] {
+  transform: rotate(180deg);
+}
+
+.drawer-body {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+}
+
+.tabs {
+  display: flex;
+  gap: 2px;
+  flex: none;
+  padding: 6px 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.tab {
+  height: 30px;
+  padding: 0 10px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 12px;
+  transition: color 0.12s ease, border-color 0.12s ease;
+}
+
+.tab:hover {
+  color: var(--text-2);
+}
+
+.tab[aria-selected="true"] {
+  color: var(--text);
+  border-bottom-color: var(--ink);
+  font-weight: 500;
+}
+
+/* Bottom panel of the trading page: fixed height, own scroll. The header
+   collapses it to a single row so the chart can take the whole height. */
+.panel {
+  display: flex;
+  flex-direction: column;
+  flex: 0 0 208px;
+  min-height: 0;
+  border-radius: var(--radius);
+  background: var(--bg);
+  overflow: hidden;
+}
+
+.panel.collapsed {
+  flex-basis: 40px;
+}
+
+.panel-toggle {
+  display: grid;
+  place-items: center;
+  align-self: center;
+  width: 24px;
+  height: 24px;
+  margin-left: 4px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-3);
+}
+
+.panel-toggle:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.panel-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+
+/* --------------------------------------------------------- metrics */
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 1px;
+  border-radius: var(--radius);
+  background: var(--border);
+  overflow: hidden;
+}
+
+.metric {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 12px 13px;
+  background: var(--bg);
+}
+
+.metric-label {
+  color: var(--text-3);
+  font-size: 11px;
+}
+
+.metric-value {
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.25;
+}
+
+.metric-value.small {
+  font-size: 13px;
+}
+
+/* ---------------------------------------------------- legend / alloc */
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  font-size: 11px;
+  color: var(--text-2);
+}
+
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.legend-item i {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+}
+
+.allocation {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.alloc-row {
+  display: grid;
+  grid-template-columns: 84px minmax(0, 1fr) 52px;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+}
+
+.alloc-bar {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--bg-active);
+  overflow: hidden;
+}
+
+.alloc-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--ink);
+}
+
+.alloc-value {
+  text-align: right;
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ------------------------------------------------------ event feed */
+.feed {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  font-size: 12px;
+}
+
+.feed-row {
+  display: grid;
+  grid-template-columns: 62px 46px minmax(0, 1fr);
+  gap: 10px;
+  padding: 7px 13px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-2);
+  line-height: 1.5;
+}
+
+.feed-row:hover {
+  background: var(--bg-subtle);
+}
+
+.feed-when {
+  color: var(--text-3);
+  font-size: 11px;
+}
+
+.feed-kind {
+  color: var(--text-3);
+  font-size: 11px;
+}
+
+.feed-kind.signal {
+  color: var(--up);
+}
+
+.feed-kind.error,
+.feed-kind.warn {
+  color: var(--down);
+}
+
+.feed-kind.state {
+  color: var(--text-2);
+}
+
+.live-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-2);
+  font-size: 11px;
+}
+
+.live-badge.idle {
+  color: var(--text-3);
+}
+
+/* ------------------------------------------------------- credentials */
+.cred-row {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 13px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.cred-row:first-child {
+  padding-top: 0;
+}
+
+.cred-row:last-child {
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+.cred-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.cred-state {
+  color: var(--text-3);
+  font-size: 11px;
+  font-weight: 400;
+}
+
+.cred-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.cred-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+/* ------------------------------------------------------- log panel */
+.log-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.18);
+  z-index: 80;
+}
+
+.log-panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  flex-direction: column;
+  width: min(460px, 92vw);
+  background: var(--bg);
+  border-left: 1px solid var(--border);
+  box-shadow: -8px 0 24px rgba(0, 0, 0, 0.08);
+  z-index: 81;
+}
+
+.log-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+  height: 46px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.log-head strong {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.log-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.log-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 6px 0;
+}
+
+.log-empty {
+  padding: 32px 12px;
+  color: var(--text-3);
+  font-size: 12px;
+  text-align: center;
+}
+
+.log-item {
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.log-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 3px;
+  font-size: 11px;
+}
+
+.log-level {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+}
+
+.log-item.err .log-level {
+  color: var(--down);
+}
+
+.log-item.warn .log-level {
+  color: var(--warn);
+}
+
+.log-message {
+  font-size: 12px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.log-detail {
+  margin: 6px 0 0;
+  padding: 8px;
+  border-radius: 5px;
+  background: var(--bg-subtle);
+  color: var(--text-2);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 220px;
+  overflow: auto;
+}
+
+/* Bottom panel: a fixed slice of height that the user can collapse.
+   Collapsing keeps the very top of the chart from jumping. */
+.panel-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  height: 34px;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--border);
+}
+

@@ -38,7 +38,7 @@ class AppSettings:
     kline_limit: int = 1000
     risk: RiskSettings = field(default_factory=RiskSettings)
     notification_sound: bool = True
-    theme: str = "dark"
+    theme: str = "light"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

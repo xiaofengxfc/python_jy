@@ -1,16 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller spec for the local test build.
+"""PyInstaller spec for the local test build of the backend.
 
-Differences from ``bitrader.spec`` (the release build):
-
-* ``console=True`` — the process keeps a console attached, so a Python
-  traceback, a Qt plugin warning or a failed DLL load is visible on screen
-  instead of only reaching the log file.
-* Its own name and folder — a test build can never overwrite the release
-  build in ``dist\\biTrader``.
-
-The output is a folder, not an installer: run ``dist\\biTrader-dev\\biTrader-dev.exe``
-directly. Nothing is registered, no shortcuts are written.
+Identical to ``bitrader.spec`` except for the output name, so a test build can
+never overwrite the release build in ``dist\\biTrader-backend``.
 
 Build with:
     .venv\\Scripts\\python.exe -m PyInstaller packaging\\bitrader_dev.spec --noconfirm
@@ -31,17 +23,20 @@ hiddenimports = [
 ]
 hiddenimports += collect_submodules("ccxt")
 hiddenimports += collect_submodules("btrader.strategy.builtin")
+hiddenimports += collect_submodules("uvicorn")
 
 datas = collect_data_files("certifi")
 datas += collect_data_files("ccxt")
-datas += [(str(ROOT / "packaging" / "bitrader.ico"), "packaging")]
+datas += [
+    (str(ROOT / "src" / "btrader" / "web" / "static"), "btrader/web/static"),
+]
 datas += [
     (str(path), "btrader/assets/fonts")
     for path in (ROOT / "src" / "btrader" / "assets" / "fonts").glob("*.ttf")
 ]
 
 a = Analysis(
-    [str(ROOT / "run.py")],
+    [str(ROOT / "run_backend.py")],
     pathex=[str(ROOT / "src")],
     binaries=[],
     datas=datas,
@@ -49,7 +44,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["tkinter", "test", "unittest", "pydoc_data"],
+    excludes=["tkinter", "test", "unittest", "pydoc_data", "PySide6", "pyqtgraph"],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
@@ -63,9 +58,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="biTrader-dev",
-    # Test builds keep the console: an exception must be readable right where
-    # it happened, without opening the error-log window after the fact.
+    name="biTrader-backend-dev",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -87,5 +80,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name="biTrader-dev",
+    name="biTrader-backend-dev",
 )
