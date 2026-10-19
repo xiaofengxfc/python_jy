@@ -17,6 +17,7 @@ follow from it:
 from __future__ import annotations
 
 import io
+import json
 import logging
 import os
 import re
@@ -26,6 +27,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 
 log = logging.getLogger(__name__)
 
@@ -46,7 +48,7 @@ INSTALL_TIMEOUT = 900.0
 LOG_LINES = 400
 # A login QR is short-lived: WeChat invalidates it after a couple of minutes.
 # The child is stopped at this point instead of waiting forever on a dead code.
-LOGIN_TIMEOUT = 240.0
+LOGIN_TIMEOUT = 480.0
 # The CLI prints the very string its QR encodes as a fallback link, so the app
 # can lift it out and draw a real QR instead of relying on terminal art.
 # Verified by decoding the printed half-block QR: the payload and this link are
@@ -90,6 +92,9 @@ class _Login:
     started_at: float = field(default_factory=time.time)
     state: str = "starting"  # starting | waiting | done | failed | canceled | expired
     url: str = ""
+    # Bumped every time a new link is printed. The page keys the <img> on it so
+    # a refreshed code replaces the stale one instead of showing the old SVG.
+    revision: int = 0
     error: str = ""
     lines: deque[str] = field(default_factory=lambda: deque(maxlen=LOG_LINES))
     process: subprocess.Popen | None = None
@@ -199,7 +204,7 @@ class OpenClawInstaller:
             raise ValueError("未找到 openclaw，请先完成自动安装与插件注册。")
         return [exe, "channels", "login", "--channel", WECHAT_CHANNEL]
 
-    def start_login(self) -> dict:
+    def start_login(self, *, force: bool = False) -> dict:
         """Run ``channels login`` and capture the link its QR encodes.
 
         The wizard draws the code with half-block characters, which only scan
@@ -207,14 +212,25 @@ class OpenClawInstaller:
         raster font, so the code came out distorted and unscannable. The same
         link is printed underneath as a fallback, so the page renders that as a
         real image instead of asking the user to squint at a terminal.
+
+        ``force`` is the page's "重新生成" button: the pending code is spent or
+        rejected, so it is cancelled and a fresh session started. Without it a
+        second click reuses the live code, which is what stops two wizards from
+        invalidating each other.
         """
         args = self.login_plan()
         with self._lock:
             current = self._login
-            if current is not None and current.state in ("starting", "waiting"):
+            if (
+                not force
+                and current is not None
+                and current.state in ("starting", "waiting")
+                and not current.cancel.is_set()
+            ):
                 # Reuse the pending code: a second login would invalidate the
                 # one the user is already looking at.
                 return self._login_payload(current)
+            stale = current
             login = _Login(command=args)
             # Mark the session pending *before* the thread starts. The worker
             # used to set this, so two clicks in the same tick both saw
@@ -222,6 +238,9 @@ class OpenClawInstaller:
             # the one the user was already scanning.
             login.state = "waiting"
             self._login = login
+        if stale is not None and stale.state in ("starting", "waiting"):
+            stale.cancel.set()
+            _terminate(stale.process)
         threading.Thread(
             target=self._work_login, args=(login,), name="openclaw-login", daemon=True
         ).start()
@@ -296,9 +315,12 @@ class OpenClawInstaller:
     def channel_status(self) -> dict:
         """Whether the gateway knows the WeChat channel and has an account.
 
-        Read from ``openclaw channels list --all`` rather than inferred from
-        files on disk: a plugin can be installed and still be disabled or
-        unconfigured, and the difference decides which button the page shows.
+        Read from ``channels status --json`` rather than from the human-readable
+        ``channels list``: the table spells a bound account as "configured"
+        while this parser only looked for the absence of "not configured", so a
+        completed scan still came back as ``installed`` and the page fell back
+        to "未绑定" on every refresh. The JSON also carries the live account id,
+        whether the monitor is running, and the recipient ids we can push to.
         """
         exe = _openclaw_executable()
         info = {
@@ -306,6 +328,12 @@ class OpenClawInstaller:
             "cli": bool(exe),
             "plugin": False,
             "configured": False,
+            "running": False,
+            "enabled": True,
+            "lifecycle": "",
+            "account": "",
+            "accounts": [],
+            "targets": [],
             "state": "unknown",
             "detail": "",
         }
@@ -313,6 +341,26 @@ class OpenClawInstaller:
             info["state"] = "missing"
             info["detail"] = "未安装 openclaw"
             return info
+
+        live = _channels_status_json(exe, WECHAT_CHANNEL)
+        if live is not None:
+            info.update(live)
+            # Bindable recipients come from the plugin's own credential files:
+            # the QR scanner's user id is exactly what ``--target`` wants, and
+            # guessing it by hand is what made "无法通知" so hard to clear.
+            info["accounts"] = wechat_accounts()
+            info["targets"] = wechat_targets()
+            if info["configured"]:
+                info["state"] = "ready"
+            elif info["plugin"]:
+                info["state"] = "installed"
+            else:
+                info["state"] = "missing"
+            info["detail"] = _channel_detail(info)
+            return info
+
+        # Older CLIs have no JSON status; keep the text path as a fallback so
+        # the page still says something truthful instead of "unknown".
         text = _run_capture([exe, "channels", "list", "--all"])
         info["detail"] = text.strip()[:400]
         for line in text.splitlines():
@@ -321,15 +369,18 @@ class OpenClawInstaller:
                 continue
             info["plugin"] = True
             lowered = stripped.lower()
-            # e.g. "- openclaw-weixin: installed, not configured, disabled"
+            # e.g. "- openclaw-weixin: installed, configured, enabled"
             info["configured"] = (
                 "not configured" not in lowered and "unconfigured" not in lowered
             )
+            info["enabled"] = "disabled" not in lowered
             info["state"] = "ready" if info["configured"] else "installed"
             break
         if not info["plugin"]:
             info["state"] = "missing"
             info["detail"] = info["detail"] or "网关中未找到微信渠道"
+        info["accounts"] = wechat_accounts()
+        info["targets"] = wechat_targets()
         return info
 
     def start(self, options: InstallOptions) -> dict:
@@ -476,6 +527,7 @@ class OpenClawInstaller:
             "state": login.state,
             "url": login.url,
             "has_qr": bool(login.url),
+            "revision": login.revision,
             "error": login.error,
             "command": list(login.command),
             "started_at": login.started_at,
@@ -524,9 +576,15 @@ class OpenClawInstaller:
                 match = _LOGIN_URL_RE.search(text)
                 with self._lock:
                     login.lines.append(text)
-                    if match and not login.url:
-                        login.url = match.group(0)
-                        log.info("已获取微信扫码链接（二维码已在页面渲染）")
+                    if match:
+                        # The wizard refreshes an expiring code on its own and
+                        # prints the new link. Keeping the first one meant the
+                        # page kept showing a dead code while the CLI waited on
+                        # a live one — the scan then failed as "已失效".
+                        if match.group(0) != login.url:
+                            login.url = match.group(0)
+                            login.revision += 1
+                            log.info("已获取微信扫码链接（第 %s 版）", login.revision)
             if login.cancel.is_set():
                 _terminate(process)
                 process.wait(timeout=5)
@@ -585,6 +643,15 @@ class OpenClawInstaller:
                 run.error = f"openclaw 返回退出码 {code}，详见下方日志。"
                 return
             status = self.channel_status()
+            if status["plugin"] and not status.get("enabled", True):
+                # Docs' manual install is two steps: ``plugins install`` then
+                # ``plugins enable``. A plugin that is on disk but disabled is
+                # the state where login and send both fail with a bare error.
+                exe = _openclaw_executable()
+                enable = [exe, "plugins", "enable", WECHAT_CHANNEL]
+                self._append(run, "$ " + " ".join(enable))
+                _stream_process(run, self._set_process, enable)
+                status = self.channel_status()
             if status["state"] == "missing":
                 # Installed but the gateway still cannot see it: usually a pinned
                 # build that fails to load. Upgrade once, then re-check.
@@ -693,6 +760,161 @@ def _run_capture(args: list[str], timeout: float = 30.0) -> str:
         log.debug("执行 %s 失败", args, exc_info=True)
         return ""
     return (completed.stdout or "") + (completed.stderr or "")
+
+
+# --------------------------------------------------------------------- wechat
+def _state_dir() -> Path:
+    """Where the gateway keeps its per-user state.
+
+    Mirrors the plugin's own resolution (``OPENCLAW_STATE_DIR``, then the legacy
+    ``CLAWDBOT_STATE_DIR``, then ``~/.openclaw``) so a machine that relocated the
+    state directory still finds its bound accounts.
+    """
+    for name in ("OPENCLAW_STATE_DIR", "CLAWDBOT_STATE_DIR"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return Path(value).expanduser()
+    return Path.home() / ".openclaw"
+
+
+def wechat_accounts() -> list[dict]:
+    """Bound WeChat accounts, as ``{account, user, base_url}``.
+
+    The plugin writes one JSON file per account under
+    ``<state>/openclaw-weixin/accounts``. ``userId`` is the WeChat account that
+    scanned the QR code, and it is also the recipient id outbound messages need,
+    which is why it is worth surfacing instead of asking the user to dig for it.
+    """
+    folder = _state_dir() / "openclaw-weixin" / "accounts"
+    try:
+        files = sorted(folder.glob("*.json"))
+    except OSError:
+        return []
+    items: list[dict] = []
+    for path in files:
+        # ``*.context-tokens.json`` and ``*.sync.json`` live beside the account
+        # files; only the plain ``<accountId>.json`` holds credentials.
+        if path.name.endswith(".context-tokens.json") or path.name.endswith(".sync.json"):
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict) or not data.get("token"):
+            continue
+        items.append(
+            {
+                "account": path.stem,
+                "user": str(data.get("userId") or "").strip(),
+                "base_url": str(data.get("baseUrl") or "").strip(),
+            }
+        )
+    return items
+
+
+def wechat_targets() -> list[dict]:
+    """Recipient ids a push can be addressed to, best first.
+
+    Two sources, both written by the plugin itself: the scanning account's
+    ``userId`` (always present once bound) and the peers that have messaged the
+    bot (each key in ``<accountId>.context-tokens.json``). A peer that has
+    already sent a message carries a context token, which is what the outbound
+    path prefers, so those sort first.
+    """
+    folder = _state_dir() / "openclaw-weixin" / "accounts"
+    targets: list[dict] = []
+    seen: set[str] = set()
+    for account in wechat_accounts():
+        account_id = account["account"]
+        try:
+            raw = (folder / f"{account_id}.context-tokens.json").read_text(encoding="utf-8")
+            peers = json.loads(raw)
+        except (OSError, ValueError):
+            peers = {}
+        if isinstance(peers, dict):
+            for peer in peers:
+                peer = str(peer).strip()
+                if peer and peer not in seen:
+                    seen.add(peer)
+                    targets.append({"target": peer, "account": account_id, "source": "peer"})
+        user = account.get("user") or ""
+        if user and user not in seen:
+            seen.add(user)
+            targets.append({"target": user, "account": account_id, "source": "account"})
+    return targets
+
+
+def _channels_status_json(exe: str, channel: str) -> dict | None:
+    """Live channel state from ``channels status --json``, or ``None``.
+
+    Returns the subset the settings page needs, or ``None`` when the CLI is too
+    old to answer in JSON (the caller then falls back to parsing the table).
+    """
+    text = _run_capture([exe, "channels", "status", "--json"])
+    payload = _last_json_object(text)
+    if payload is None:
+        return None
+    channels = payload.get("channels")
+    entry: dict = {}
+    if isinstance(channels, dict):
+        candidate = channels.get(channel)
+        if isinstance(candidate, dict):
+            entry = candidate
+    elif isinstance(channels, list):
+        for candidate in channels:
+            if isinstance(candidate, dict) and candidate.get("channel") == channel:
+                entry = candidate
+                break
+    if not entry:
+        # The channel is known to the gateway only when it appears at all; an
+        # absent entry is still authoritative ("not installed").
+        order = payload.get("channelOrder") or []
+        if channel in order:
+            return {"plugin": True, "configured": False, "running": False}
+        return {"plugin": False, "configured": False, "running": False}
+    return {
+        "plugin": True,
+        "configured": bool(entry.get("configured")),
+        "running": bool(entry.get("running")),
+        "enabled": bool(entry.get("enabled", True)),
+        "lifecycle": str(entry.get("lifecycle") or ""),
+        "account": str(entry.get("accountId") or ""),
+        "error": str(entry.get("lastError") or ""),
+    }
+
+
+def _last_json_object(text: str) -> dict | None:
+    """Decode the last JSON object in ``text``; log noise may precede it."""
+    if not text:
+        return None
+    try:
+        value = json.loads(text)
+        if isinstance(value, dict):
+            return value
+    except ValueError:
+        pass
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            value = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def _channel_detail(info: dict) -> str:
+    """One-line summary the settings page shows under the channel card."""
+    if not info.get("plugin"):
+        return "网关中未找到微信渠道，请先注册插件。"
+    if not info.get("configured"):
+        return "插件已安装，尚未完成扫码绑定。"
+    account = info.get("account") or ""
+    state = "运行中" if info.get("running") else f"已绑定，但监控未运行（{info.get('lifecycle') or 'stopped'}）"
+    return f"{state}，账号 {account}。" if account else state
 
 
 def _stream_process(

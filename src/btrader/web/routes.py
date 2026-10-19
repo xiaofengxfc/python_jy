@@ -89,6 +89,7 @@ class NotifyTestPayload(BaseModel):
     message: str = ""
     channel: str = ""
     target: str = ""
+    account: str = ""
     command: str = ""
 
 
@@ -535,6 +536,7 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
             notifier.settings,
             channel=(payload.channel or "").strip() or notifier.settings.channel,
             target=(payload.target or "").strip() or notifier.settings.target,
+            account=(payload.account or "").strip() or notifier.settings.account,
             command=(payload.command or "").strip() or notifier.settings.command,
         )
         scratch = WeChatNotifier(
@@ -620,7 +622,7 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @router.post("/api/install/openclaw/login")
-    def channel_login() -> dict[str, Any]:
+    def channel_login(force: bool = False) -> dict[str, Any]:
         """Start the QR login and return the link the code encodes.
 
         The page renders that link as an image. The wizard's own terminal art
@@ -628,7 +630,11 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
         glyphs), which is why scanning it failed.
         """
         try:
-            return get_state().ctx.installer.start_login()
+            # ``force`` is the panel's "重新生成": the code on screen is spent
+            # or was rejected, so a fresh wizard has to replace it. Without the
+            # flag a second click reuses the live code, which is what keeps two
+            # wizards from invalidating each other.
+            return get_state().ctx.installer.start_login(force=force)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

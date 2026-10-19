@@ -174,6 +174,8 @@ export interface NotifySettings {
   channel: string;
   /** WeChat conversation the gateway should deliver to. */
   target: string;
+  /** Account id; empty means the gateway's default (single-account setups). */
+  account: string;
   /** OpenClaw executable; empty means "openclaw" from PATH. */
   command: string;
   on_fill: boolean;
@@ -259,6 +261,22 @@ export interface GatewayStatus {
   started_at: number;
 }
 
+/** One WeChat account bound to the gateway. */
+export interface WeChatAccount {
+  account: string;
+  /** The WeChat id that scanned the QR; also a valid push target. */
+  user: string;
+  base_url: string;
+}
+
+/** A recipient id an outbound message can be addressed to. */
+export interface WeChatTarget {
+  target: string;
+  account: string;
+  /** peer: has messaged the bot; account: the scanner's own id. */
+  source: string;
+}
+
 /** What the gateway says about the WeChat channel itself. */
 export interface ChannelStatus {
   channel: string;
@@ -268,9 +286,19 @@ export interface ChannelStatus {
   plugin: boolean;
   /** An account is linked, i.e. the QR scan has been done. */
   configured: boolean;
+  /** The channel's monitor is live in the gateway. */
+  running: boolean;
+  /** The plugin is enabled. */
+  enabled: boolean;
+  /** Gateway-reported lifecycle, e.g. "starting" or "running". */
+  lifecycle: string;
+  /** Account id currently bound (matches `--account`). */
+  account: string;
+  accounts: WeChatAccount[];
+  targets: WeChatTarget[];
   /** missing | installed | ready | unknown */
   state: string;
-  /** Raw `channels list --all` excerpt, for the "what went wrong" case. */
+  /** One-line summary for the card, or the raw CLI excerpt as a fallback. */
   detail: string;
   gateway?: GatewayStatus;
 }
@@ -283,6 +311,8 @@ export interface LoginStatus {
   url: string;
   /** A code is available to display right now. */
   has_qr: boolean;
+  /** Bumped whenever the wizard prints a refreshed code. */
+  revision: number;
   error: string;
   command: string[];
   started_at: number;
