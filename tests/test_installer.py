@@ -340,3 +340,94 @@ def test_register_channel_fails_when_the_gateway_still_cannot_see_it(
     assert status["state"] == "failed"
     # It retried once with an explicit version before giving up.
     assert any("plugins" in run and "update" in run for run in runs[1:])
+
+# --------------------------------------------------------------- QR login
+def _wait_login(installer: OpenClawInstaller, limit: float = 5.0) -> dict:
+    """Poll ``login_status()`` until the pending code is no longer waiting."""
+    deadline = time.time() + limit
+    while time.time() < deadline:
+        status = installer.login_status()
+        if status["state"] not in ("starting", "waiting"):
+            return status
+        time.sleep(0.01)
+    raise AssertionError(f"扫码会话没有在 {limit:g} 秒内结束：{installer.login_status()}")
+
+
+def test_login_status_is_idle_before_anything_starts() -> None:
+    status = OpenClawInstaller().login_status()
+    assert status["state"] == "idle"
+    assert status["has_qr"] is False
+
+
+def test_login_lifts_the_link_out_of_the_terminal_art(fake_env, monkeypatch) -> None:
+    """The page renders this link as an image; the art itself does not scan.
+
+    Verified against the real CLI: the printed fallback link and the QR payload
+    are byte-identical, so the link is the correct thing to draw.
+    """
+    fake_env["which"]["openclaw"] = "/usr/local/bin/openclaw"
+    url = "https://liteapp.weixin.qq.com/q/7GiQu1?qrcode=deadbeef&bot_type=3"
+    monkeypatch.setattr(
+        "btrader.installer.subprocess.Popen",
+        lambda *a, **k: FakeProcess(
+            ["正在启动...", "█ ▄▄▄▄▄ █", "若二维码未能显示，可访问以下链接：", url, "正在等待操作..."],
+            code=0,
+        ),
+    )
+    installer = OpenClawInstaller()
+    installer.start_login()
+    status = _wait_login(installer)
+    assert url in installer.login_status()["lines"]
+    # A clean exit means WeChat confirmed the scan; the code is no longer shown.
+    assert status["state"] == "done"
+    assert status["url"] == ""
+
+
+def test_a_pending_login_is_reused_not_restarted(fake_env, monkeypatch) -> None:
+    """A second click must not invalidate the code the user is looking at."""
+    fake_env["which"]["openclaw"] = "/usr/local/bin/openclaw"
+    spawned = []
+
+    class BlockingProcess(FakeProcess):
+        def __init__(self) -> None:
+            super().__init__(["正在等待操作..."])
+            self.stdout = io.StringIO("")
+
+    def popen(*args, **kwargs):
+        spawned.append(args)
+        return BlockingProcess()
+
+    monkeypatch.setattr("btrader.installer.subprocess.Popen", popen)
+    installer = OpenClawInstaller()
+    first = installer.start_login()
+    second = installer.start_login()
+    assert len(spawned) == 1, "重复点击不应创建第二个扫码会话"
+    assert first["state"] == second["state"] == "waiting"
+
+
+def test_qr_svg_is_refused_until_a_link_exists() -> None:
+    with pytest.raises(ValueError, match="二维码尚未生成"):
+        OpenClawInstaller().login_qr_svg()
+
+
+def test_qr_svg_encodes_the_captured_link(fake_env, monkeypatch) -> None:
+    fake_env["which"]["openclaw"] = "/usr/local/bin/openclaw"
+    url = "https://liteapp.weixin.qq.com/q/7GiQu1?qrcode=cafebabe&bot_type=3"
+
+    class BlockingProcess(FakeProcess):
+        def __init__(self) -> None:
+            super().__init__([url])
+            self.stdout = io.StringIO("")
+
+    monkeypatch.setattr(
+        "btrader.installer.subprocess.Popen", lambda *a, **k: BlockingProcess()
+    )
+    installer = OpenClawInstaller()
+    installer.start_login()
+    # The reader thread fills the link in; the image can only be built after.
+    deadline = time.time() + 5
+    while time.time() < deadline and not installer.login_status()["has_qr"]:
+        time.sleep(0.01)
+    svg = installer.login_qr_svg().decode("utf-8")
+    assert svg.lstrip().startswith("<?xml")
+    assert "<svg" in svg

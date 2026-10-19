@@ -16,8 +16,10 @@ follow from it:
 
 from __future__ import annotations
 
+import io
 import logging
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -42,6 +44,14 @@ NPM_REGISTRIES = ("https://registry.npmjs.org", "https://registry.npmmirror.com"
 
 INSTALL_TIMEOUT = 900.0
 LOG_LINES = 400
+# A login QR is short-lived: WeChat invalidates it after a couple of minutes.
+# The child is stopped at this point instead of waiting forever on a dead code.
+LOGIN_TIMEOUT = 240.0
+# The CLI prints the very string its QR encodes as a fallback link, so the app
+# can lift it out and draw a real QR instead of relying on terminal art.
+# Verified by decoding the printed half-block QR: the payload and this link are
+# byte-identical.
+_LOGIN_URL_RE = re.compile(r"https://[^\s<>\"]+")
 
 
 @dataclass(frozen=True)
@@ -67,6 +77,25 @@ class _Run:
     cancel: threading.Event = field(default_factory=threading.Event)
 
 
+@dataclass
+class _Login:
+    """One ``channels login`` attempt and the QR link it printed.
+
+    ``url`` is what the page turns into an image. It is read from the child's
+    output rather than from the terminal art, because the art only scans when
+    the font renders half-blocks square — which is exactly what failed before.
+    """
+
+    command: list[str] = field(default_factory=list)
+    started_at: float = field(default_factory=time.time)
+    state: str = "starting"  # starting | waiting | done | failed | canceled | expired
+    url: str = ""
+    error: str = ""
+    lines: deque[str] = field(default_factory=lambda: deque(maxlen=LOG_LINES))
+    process: subprocess.Popen | None = None
+    cancel: threading.Event = field(default_factory=threading.Event)
+
+
 class OpenClawInstaller:
     """Runs ``npm install -g`` for OpenClaw in a background thread.
 
@@ -81,6 +110,9 @@ class OpenClawInstaller:
         self._run: _Run | None = None
         self._thread: threading.Thread | None = None
         self._process: subprocess.Popen | None = None
+        # The in-page QR flow. Separate from _run because installing software
+        # and linking an account are independent operations.
+        self._login: _Login | None = None
 
     # ------------------------------------------------------------------ public
     def status(self) -> dict:
@@ -161,22 +193,92 @@ class OpenClawInstaller:
         return self.status()
 
     def login_plan(self) -> list[str]:
-        """The argv a terminal needs to run so the user can scan a QR code.
-
-        Login is an interactive wizard: it asks whether to download the plugin
-        and then waits for a QR scan. That cannot be driven from a log stream,
-        so the page opens a real terminal instead of pretending to automate it.
-        """
+        """The argv that runs the login wizard and prints a QR code."""
         exe = _openclaw_executable()
         if not exe:
             raise ValueError("未找到 openclaw，请先完成自动安装与插件注册。")
         return [exe, "channels", "login", "--channel", WECHAT_CHANNEL]
 
+    def start_login(self) -> dict:
+        """Run ``channels login`` and capture the link its QR encodes.
+
+        The wizard draws the code with half-block characters, which only scan
+        when the terminal font renders those blocks square. ``cmd.exe`` uses a
+        raster font, so the code came out distorted and unscannable. The same
+        link is printed underneath as a fallback, so the page renders that as a
+        real image instead of asking the user to squint at a terminal.
+        """
+        args = self.login_plan()
+        with self._lock:
+            current = self._login
+            if current is not None and current.state in ("starting", "waiting"):
+                # Reuse the pending code: a second login would invalidate the
+                # one the user is already looking at.
+                return self._login_payload(current)
+            login = _Login(command=args)
+            self._login = login
+        threading.Thread(
+            target=self._work_login, args=(login,), name="openclaw-login", daemon=True
+        ).start()
+        return self.login_status()
+
+    def login_status(self) -> dict:
+        with self._lock:
+            login = self._login
+            if login is None:
+                return {
+                    "state": "idle",
+                    "url": "",
+                    "has_qr": False,
+                    "error": "",
+                    "command": [],
+                    "started_at": 0.0,
+                    "lines": [],
+                }
+            return self._login_payload(login)
+
+    def login_qr_svg(self) -> bytes:
+        """The captured login link rendered as an SVG QR code.
+
+        SVG rather than PNG on purpose: ``qrcode`` writes it without Pillow, so
+        the app does not grow a binary image dependency just for this.
+        """
+        with self._lock:
+            login = self._login
+            url = login.url if login is not None else ""
+        if not url:
+            raise ValueError("二维码尚未生成，请先点击“扫码授权”。")
+        import qrcode
+        import qrcode.image.svg
+
+        code = qrcode.QRCode(
+            border=2,
+            box_size=10,
+            error_correction=qrcode.constants.ERROR_CORRECT_M,
+        )
+        code.add_data(url)
+        code.make(fit=True)
+        image = code.make_image(image_factory=qrcode.image.svg.SvgPathImage)
+        buffer = io.BytesIO()
+        image.save(buffer)
+        return buffer.getvalue()
+
+    def cancel_login(self) -> dict:
+        """Stop a pending QR before it expires on its own."""
+        with self._lock:
+            login = self._login
+            process = login.process if login is not None else None
+        if login is None or login.state not in ("starting", "waiting"):
+            return self.login_status()
+        login.cancel.set()
+        _terminate(process)
+        return self.login_status()
+
     def open_login_terminal(self) -> dict:
         """Spawn a visible terminal running the login wizard.
 
-        Returned, not automated: the scan happens between the user and WeChat,
-        and a process we cannot see would just hang. Failure to open a window is
+        Kept as a fallback for a machine where the in-page flow cannot be used
+        (e.g. the CLI prints no fallback link). Failure to open a window is
         reported with the command so it can be pasted into a shell by hand.
         """
         args = self.login_plan()
@@ -362,6 +464,101 @@ class OpenClawInstaller:
             return
         with self._lock:
             run.lines.append(text)
+
+    @staticmethod
+    def _login_payload(login: _Login) -> dict:
+        return {
+            "state": login.state,
+            "url": login.url,
+            "has_qr": bool(login.url),
+            "error": login.error,
+            "command": list(login.command),
+            "started_at": login.started_at,
+            # Tail only: enough to explain a failure, small enough to poll.
+            "lines": list(login.lines)[-12:],
+        }
+
+    def _work_login(self, login: _Login) -> None:
+        """Run the wizard, keep its output, and stop when the code is spent."""
+        kwargs: dict = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "stdin": subprocess.DEVNULL,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "shell": False,
+            "bufsize": 1,
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = getattr(
+                subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200
+            )
+        else:
+            kwargs["start_new_session"] = True
+        try:
+            process = subprocess.Popen(_wrap_launcher(login.command), **kwargs)
+        except Exception as exc:
+            with self._lock:
+                login.state = "failed"
+                login.error = f"无法启动 openclaw：{exc}"
+            log.warning("启动微信扫码登录失败", exc_info=True)
+            return
+        with self._lock:
+            login.process = process
+            login.state = "waiting"
+        deadline = time.time() + LOGIN_TIMEOUT
+        try:
+            assert process.stdout is not None
+            for line in process.stdout:
+                if login.cancel.is_set() or time.time() > deadline:
+                    break
+                text = (line or "").rstrip()
+                if not text:
+                    continue
+                match = _LOGIN_URL_RE.search(text)
+                with self._lock:
+                    login.lines.append(text)
+                    if match and not login.url:
+                        login.url = match.group(0)
+                        log.info("已获取微信扫码链接（二维码已在页面渲染）")
+            if login.cancel.is_set():
+                _terminate(process)
+                process.wait(timeout=5)
+                with self._lock:
+                    login.state = "canceled"
+                    login.url = ""
+                    login.error = "扫码授权已取消。"
+                return
+            if time.time() > deadline:
+                _terminate(process)
+                process.wait(timeout=5)
+                with self._lock:
+                    login.state = "expired"
+                    login.url = ""
+                    login.error = "二维码已过期，请重新生成。"
+                return
+            code = process.wait(timeout=30)
+            if code != 0:
+                tail = "\n".join(list(login.lines)[-3:])
+                with self._lock:
+                    login.state = "failed"
+                    login.url = ""
+                    login.error = f"openclaw 返回退出码 {code}" + (f"：{tail}" if tail else "。")
+                return
+            with self._lock:
+                login.state = "done"
+                login.url = ""
+                login.error = ""
+            log.info("微信扫码授权完成")
+        except Exception as exc:  # pragma: no cover - defensive
+            with self._lock:
+                login.state = "failed"
+                login.error = f"扫码登录出错：{exc}"
+            log.warning("微信扫码登录失败", exc_info=True)
+        finally:
+            with self._lock:
+                login.process = None
 
     def _work_channel(self, run: _Run) -> None:
         """Register the channel, retrying with an explicit version on a pin.

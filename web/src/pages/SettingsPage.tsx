@@ -6,6 +6,7 @@ import type {
   ChannelStatus,
   CredentialItem,
   InstallStatus,
+  LoginStatus,
   NotifyStatus,
   RiskState,
 } from "../types";
@@ -67,6 +68,9 @@ export default function SettingsPage({ settings, onSaved }: Props) {
   const [channel, setChannel] = useState<ChannelStatus | null>(null);
   const [channelBusy, setChannelBusy] = useState(false);
   const [channelNote, setChannelNote] = useState("");
+  const [login, setLogin] = useState<LoginStatus | null>(null);
+  // Bumped on every new code so the <img> reloads instead of showing the old SVG.
+  const [qrNonce, setQrNonce] = useState(0);
 
   const loadChannel = useCallback(async () => {
     try {
@@ -106,11 +110,49 @@ export default function SettingsPage({ settings, onSaved }: Props) {
     setChannelBusy(true);
     setChannelNote("");
     try {
-      const result = await api<{ command: string[] }>("/api/install/openclaw/login", {
+      const result = await api<LoginStatus>("/api/install/openclaw/login", {
         method: "POST",
       });
+      setLogin(result);
+      setQrNonce((n) => n + 1);
+    } catch (error) {
+      setChannelNote(error instanceof Error ? error.message : String(error));
+    } finally {
+      setChannelBusy(false);
+    }
+  };
+
+  const refreshLogin = async () => {
+    try {
+      setLogin(await api<LoginStatus>("/api/install/openclaw/login"));
+    } catch {
+      /* the poll is best effort; the panel keeps the last known state */
+    }
+  };
+
+  const cancelLogin = async () => {
+    setChannelBusy(true);
+    try {
+      setLogin(
+        await api<LoginStatus>("/api/install/openclaw/login/cancel", { method: "POST" }),
+      );
+    } catch (error) {
+      setChannelNote(error instanceof Error ? error.message : String(error));
+    } finally {
+      setChannelBusy(false);
+    }
+  };
+
+  const openLoginTerminal = async () => {
+    setChannelBusy(true);
+    setChannelNote("");
+    try {
+      const result = await api<{ command: string[] }>(
+        "/api/install/openclaw/terminal",
+        { method: "POST" },
+      );
       setChannelNote(
-        "已打开终端窗口，请在窗口里扫码完成授权；完成后回到本页点“刷新状态”。" +
+        "已打开终端窗口，二维码在窗口里；完成后回到本页点“刷新状态”。" +
           `若没有弹出窗口，请手动执行：${result.command.join(" ")}`,
       );
     } catch (error) {
@@ -119,6 +161,22 @@ export default function SettingsPage({ settings, onSaved }: Props) {
       setChannelBusy(false);
     }
   };
+
+  // Poll while a code is pending: it becomes "done" the moment WeChat reports
+  // the scan, and the page must swap the QR for a success message on its own.
+  useEffect(() => {
+    const state = login?.state;
+    if (state !== "starting" && state !== "waiting") return;
+    const timer = window.setInterval(() => {
+      void refreshLogin();
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [login?.state]);
+
+  // A finished scan changes the channel state, so the panel must re-read it.
+  useEffect(() => {
+    if (login?.state === "done") void loadChannel();
+  }, [login?.state, loadChannel]);
 
   const startGateway = async () => {
     setChannelBusy(true);
@@ -970,10 +1028,81 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                   >
                     扫码授权
                   </button>
+                  <button
+                    type="button"
+                    className="btn-sm"
+                    disabled={channelBusy || channel?.plugin === false}
+                    onClick={() => void openLoginTerminal()}
+                  >
+                    在终端中打开
+                  </button>
                   <span className="faint" style={{ fontSize: 11 }}>
-                    扫码会打开一个终端窗口，二维码在窗口里。
+                    二维码直接显示在本页，用手机微信扫描即可。
                   </span>
                 </div>
+                {/* The CLI draws its code with half-block characters, which only
+                    scan when the terminal font renders them square. cmd.exe uses
+                    a raster font, so the code came out distorted; the link it
+                    prints is what this panel turns into a real image. */}
+                {login && login.state !== "idle" && (
+                  <div className="install-head" style={{ alignItems: "flex-start" }}>
+                    <div>
+                      {login.has_qr && (login.state === "waiting" || login.state === "starting") ? (
+                        <>
+                          <img
+                            src={`/api/install/openclaw/login/qr.svg?n=${qrNonce}`}
+                            alt="微信扫码登录二维码"
+                            width={220}
+                            height={220}
+                            style={{ background: "#fff", borderRadius: 8, padding: 8 }}
+                          />
+                          <div className="faint" style={{ fontSize: 11, marginTop: 6 }}>
+                            打开微信「扫一扫」，扫描上方二维码完成绑定。
+                          </div>
+                          <div className="install-head" style={{ marginTop: 6 }}>
+                            <button
+                              type="button"
+                              className="btn-sm"
+                              disabled={channelBusy}
+                              onClick={() => void openLogin()}
+                            >
+                              刷新二维码
+                            </button>
+                            <button
+                              type="button"
+                              className="btn-sm"
+                              disabled={channelBusy}
+                              onClick={() => void cancelLogin()}
+                            >
+                              取消
+                            </button>
+                          </div>
+                          {login.url && (
+                            <div className="faint" style={{ fontSize: 11, marginTop: 6 }}>
+                              手机无法扫码时，可在微信中打开：
+                              <a href={login.url} target="_blank" rel="noreferrer">
+                                授权链接
+                              </a>
+                            </div>
+                          )}
+                        </>
+                      ) : login.state === "done" ? (
+                        <div className="verdict ok">扫码授权完成，微信通道已绑定。</div>
+                      ) : login.state === "expired" ? (
+                        <div className="verdict bad">
+                          二维码已过期。请点“扫码授权”重新生成。
+                        </div>
+                      ) : login.state === "canceled" ? (
+                        <div className="hint">已取消本次扫码授权。</div>
+                      ) : (
+                        <div className="verdict bad">{login.error || "扫码登录失败。"}</div>
+                      )}
+                      {login.state === "failed" && login.lines.length > 0 && (
+                        <pre className="install-cmd">{login.lines.join("\n")}</pre>
+                      )}
+                    </div>
+                  </div>
+                )}
                 {channelNote && <div className="hint">{channelNote}</div>}
                 {/* The gateway is its own process: a channel can be perfectly
                     configured and still deliver nothing while it is down. */}

@@ -275,6 +275,21 @@ export interface ChannelStatus {
   gateway?: GatewayStatus;
 }
 
+/** The link the WeChat login QR encodes, as printed by the CLI. */
+export interface LoginStatus {
+  /** idle | starting | waiting | done | failed | canceled | expired */
+  state: string;
+  /** The encoded link. Rendered as an image; also offered as a fallback. */
+  url: string;
+  /** A code is available to display right now. */
+  has_qr: boolean;
+  error: string;
+  command: string[];
+  started_at: number;
+  /** Tail of the CLI's output, for the failure case. */
+  lines: string[];
+}
+
 export interface CredentialItem {
   market: string;
   label: string;

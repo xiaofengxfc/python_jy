@@ -18,7 +18,7 @@ from dataclasses import asdict, replace
 from datetime import datetime
 from typing import Any, Callable
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel, Field
 
 from ..backtest import BacktestConfig, grid_search, run_backtest
@@ -621,10 +621,47 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
 
     @router.post("/api/install/openclaw/login")
     def channel_login() -> dict[str, Any]:
-        """Open a terminal for the interactive WeChat QR scan.
+        """Start the QR login and return the link the code encodes.
 
-        The login wizard asks questions and draws a QR code, so it cannot be
-        driven from a log stream; the returned command is what the window runs.
+        The page renders that link as an image. The wizard's own terminal art
+        is unreadable in a default ``cmd.exe`` window (raster font, half-block
+        glyphs), which is why scanning it failed.
+        """
+        try:
+            return get_state().ctx.installer.start_login()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.get("/api/install/openclaw/login")
+    def channel_login_status() -> dict[str, Any]:
+        """Whether a code is pending, already scanned, or spent."""
+        return get_state().ctx.installer.login_status()
+
+    @router.get("/api/install/openclaw/login/qr.svg")
+    def channel_login_qr() -> Response:
+        """The pending login link as a scannable QR image."""
+        try:
+            svg = get_state().ctx.installer.login_qr_svg()
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return Response(
+            content=svg,
+            media_type="image/svg+xml",
+            # A code is single-use: never let a browser replay a stale one.
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @router.post("/api/install/openclaw/login/cancel")
+    def channel_login_cancel() -> dict[str, Any]:
+        """Discard the pending code before it expires on its own."""
+        return get_state().ctx.installer.cancel_login()
+
+    @router.post("/api/install/openclaw/terminal")
+    def channel_login_terminal() -> dict[str, Any]:
+        """Fallback: open the wizard in a real terminal.
+
+        Only useful when the CLI prints no fallback link; the page keeps it as
+        a secondary action rather than the primary path.
         """
         try:
             return get_state().ctx.installer.open_login_terminal()
