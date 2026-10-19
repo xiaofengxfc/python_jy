@@ -213,7 +213,7 @@ class WeChatNotifier:
             if not job.text:
                 continue
             try:
-                if not str(self.settings.target or "").strip():
+                if not normalize_target(self.settings.target):
                     # Enqueued while a target was set, target cleared before we
                     # got here. Retrying would only repeat the same refusal.
                     continue
@@ -261,6 +261,7 @@ class WeChatNotifier:
                 "或在设置中填写可执行文件的完整路径。"
             )
         channel = (self.settings.channel or DEFAULT_CHANNEL).strip() or DEFAULT_CHANNEL
+        target = normalize_target(self.settings.target)
         if not target:
             raise NotifyError("尚未填写微信接收目标，无法发送。")
         account = str(self.settings.account or "").strip()

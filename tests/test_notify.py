@@ -97,11 +97,87 @@ def test_send_now_builds_the_openclaw_message_command(captured) -> None:
     assert captured["kwargs"]["shell"] is False
 
 
-def test_windows_cmd_shim_is_launched_through_comspec(monkeypatch) -> None:
+def test_account_is_only_passed_when_set(captured) -> None:
+    """One bound account needs no ``--account``; two do, or the plugin refuses."""
+    notifier = WeChatNotifier(
+        NotifySettings(enabled=True, target="wxid-123", command="openclaw")
+    )
+    notifier._resolve_command = lambda: "openclaw"  # type: ignore[method-assign]
+    notifier.send_now("hello")
+    assert "--account" not in captured["args"]
+
+    notifier.settings.account = "abc-im-bot"
+    notifier.send_now("hello")
+    assert captured["args"][captured["args"].index("--account") + 1] == "abc-im-bot"
+
+
+def test_target_warning_names_the_expected_suffix() -> None:
+    from btrader.notify import normalize_target, target_warning
+
+    assert target_warning("") == ""
+    warning = target_warning("wxid-123")
+    assert "@im.wechat" in warning
+    assert target_warning("wxid-123@im.wechat") == ""
+    # A pasted ``weixin:`` prefix is stripped rather than sent as part of the id.
+    assert normalize_target("weixin: wxid-9 ") == "wxid-9"
+
+
+
+def test_windows_cmd_shim_falls_back_to_comspec(monkeypatch) -> None:
+    """An unreadable shim still has to reach ``cmd``, but safely.
+
+    The fallback quotes every argument and flattens newlines, because ``cmd``
+    would otherwise end the command at the first line break.
+    """
     monkeypatch.setattr("btrader.notify.os.name", "nt")
     monkeypatch.setenv("COMSPEC", r"C:\Windows\System32\cmd.exe")
-    argv = WeChatNotifier._wrap_launcher([r"C:\npm\openclaw.cmd", "message"])
-    assert argv[:3] == [r"C:\Windows\System32\cmd.exe", "/c", r"C:\npm\openclaw.cmd"]
+    argv = WeChatNotifier._wrap_launcher([r"C:\npm\openclaw.cmd", "message", "a\nb"])
+    assert argv[:5] == [
+        r"C:\Windows\System32\cmd.exe",
+        "/d",
+        "/s",
+        "/c",
+        argv[4],
+    ]
+    # One command string, every element quoted, and no raw newline left in it.
+    assert '"C:\\npm\\openclaw.cmd"' in argv[4]
+    assert '"a b"' in argv[4]
+    assert "\n" not in argv[4]
+
+
+def test_windows_shim_runs_the_node_entry_without_a_shell(monkeypatch, tmp_path) -> None:
+    """The npm shim is parsed so ``node`` runs the script directly.
+
+    Going through ``cmd.exe`` truncated multi-line notifications at the first
+    newline (and let ``&`` start a second command), which is exactly what every
+    formatted message contains. Running the embedded script keeps the text byte
+    for byte.
+    """
+    monkeypatch.setattr("btrader.notify.os.name", "nt")
+    script = tmp_path / "node_modules" / "openclaw" / "openclaw.mjs"
+    script.parent.mkdir(parents=True)
+    script.write_text("", encoding="utf-8")
+    shim = tmp_path / "openclaw.cmd"
+    shim.write_text(
+        "@ECHO off\r\n"
+        'IF EXIST "%dp0%\\node.exe" (\r\n'
+        '  SET "_prog=%dp0%\\node.exe"\r\n'
+        ") ELSE (\r\n"
+        '  SET "_prog=node"\r\n'
+        ")\r\n"
+        'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  '
+        '"%dp0%\\node_modules\\openclaw\\openclaw.mjs" %*\r\n',
+        encoding="utf-8",
+    )
+    node = tmp_path / "node.exe"
+    node.write_text("", encoding="utf-8")
+    message = "【纸面成交】BTC/USDT\n买入 0.5 @ 82,000.0000\nA&B 100% | x>y"
+    argv = WeChatNotifier._wrap_launcher([str(shim), "message", "send", "--message", message])
+    assert argv[0] == str(node)
+    assert argv[1] == str(script)
+    # The text survives intact: no shell to split on newlines or operators.
+    assert argv[-1] == message
+
 
 
 def test_plain_executable_is_not_wrapped(monkeypatch) -> None:
