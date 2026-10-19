@@ -220,6 +220,30 @@ export interface NotifyStatus {
   pending: number;
 }
 
+/** State of the "install OpenClaw" helper. */
+export interface InstallStatus {
+  /** The `openclaw` CLI is on PATH. */
+  available: boolean;
+  /** `node --version` output, empty when Node.js is missing. */
+  node: string;
+  node_path: string;
+  npm: string;
+  npm_path: string;
+  /** A usable npm was found, so an install can be started. */
+  ready: boolean;
+  /** Why it cannot start (missing Node.js, bad path), Chinese, may be empty. */
+  reason: string;
+  registries: string[];
+  running: boolean;
+  /** idle | running | done | failed | canceled */
+  state: string;
+  command: string[];
+  started_at: number;
+  finished_at: number;
+  error: string;
+  log: string[];
+}
+
 export interface CredentialItem {
   market: string;
   label: string;

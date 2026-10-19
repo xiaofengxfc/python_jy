@@ -27,6 +27,7 @@ from ..core.credentials import Credentials
 from ..core.types import TIMEFRAME_SECONDS, MarketType, Network, RunMode
 from ..engine.auto import AutoTrader, AutoTraderConfig
 from ..exchange.rest import BinanceREST
+from ..installer import InstallOptions
 from ..notify import WeChatNotifier
 from .. import paths
 
@@ -89,6 +90,20 @@ class NotifyTestPayload(BaseModel):
     channel: str = ""
     target: str = ""
     command: str = ""
+
+
+class InstallPayload(BaseModel):
+    """Options for installing OpenClaw from the settings page.
+
+    ``with_wechat`` is the only switch with a real consequence, and it is on by
+    default: a gateway without the plugin cannot deliver the messages this
+    feature exists for.
+    """
+
+    with_wechat: bool = True
+    registry: str = ""
+    node_path: str = ""
+    npm_path: str = ""
 
 
 class CredentialsPayload(BaseModel):
@@ -333,6 +348,20 @@ def _serialize_result(result, params: dict[str, Any], limit_points: int = 1200) 
     }
 
 
+def _install_options(payload: InstallPayload) -> InstallOptions:
+    """Translate the request body into installer options.
+
+    Kept apart from the routes so the mapping (and its empty-string handling) is
+    testable without an HTTP client.
+    """
+    return InstallOptions(
+        with_wechat=bool(payload.with_wechat),
+        registry=(payload.registry or "").strip(),
+        node_path=(payload.node_path or "").strip(),
+        npm_path=(payload.npm_path or "").strip(),
+    )
+
+
 def build_router(get_state: Callable[[], Any]) -> APIRouter:
     router = APIRouter()
     auto = AutoController()
@@ -520,6 +549,48 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
         notifier.last_error_at = 0.0
         notifier.last_success_at = scratch.last_success_at
         return result
+
+    # ------------------------------------------------------ openclaw install
+    @router.get("/api/install/openclaw")
+    def install_status() -> dict[str, Any]:
+        """Node/npm availability plus the state and log of the last install.
+
+        The page polls this while a run is in flight; the log tail is part of
+        the same payload so a slow npm cannot show up as a frozen button with no
+        explanation.
+        """
+        return get_state().ctx.installer.status()
+
+    @router.post("/api/install/openclaw/plan")
+    def install_plan(payload: InstallPayload) -> dict[str, Any]:
+        """Preview the exact command, so nothing runs unseen."""
+        ctx = get_state().ctx
+        options = _install_options(payload)
+        try:
+            argv = ctx.installer.plan(options)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"command": argv, "options": asdict(options)}
+
+    @router.post("/api/install/openclaw")
+    def install_start(payload: InstallPayload) -> dict[str, Any]:
+        """Start ``npm install --global ...`` in the background.
+
+        Installing software is the one action on this page that changes the
+        machine, so it is a deliberate, separate call — never a side effect of
+        saving settings or of a status poll.
+        """
+        ctx = get_state().ctx
+        options = _install_options(payload)
+        try:
+            return ctx.installer.start(options)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @router.post("/api/install/openclaw/cancel")
+    def install_cancel() -> dict[str, Any]:
+        """Stop the running install and the npm tree it spawned."""
+        return get_state().ctx.installer.cancel()
 
 
     # ------------------------------------------------------------------ news

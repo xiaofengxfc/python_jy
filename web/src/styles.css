@@ -1512,6 +1512,37 @@ input[type="range"].input:focus {
   flex: 1 1 0;
 }
 
+/* ------------------------------------------------- openclaw install panel */
+.install-box {
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.install-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.install-cmd {
+  margin: 0;
+  padding: 8px 10px;
+  max-height: 180px;
+  overflow: auto;
+  border-radius: var(--radius-sm);
+  background: var(--bg-hover);
+  color: var(--text-2);
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
 .ticket-note {
   padding: 0 13px 12px;
   color: var(--text-3);

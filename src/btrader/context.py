@@ -14,6 +14,7 @@ from .engine.risk import RiskManager
 from .engine.trading import TradingService
 from .exchange.klines import KlineStore
 from .exchange.rest import BinanceREST
+from .installer import OpenClawInstaller
 from .news import NewsService
 from .notify import WeChatNotifier
 from .strategy.registry import StrategyRegistry
@@ -59,6 +60,9 @@ class AppContext:
             self.settings, self.rest, self.risk, self.paper, self.db,
             notifier=self.notifier,
         )
+        # Installs the CLI the notifier shells out to. Separate object because
+        # it owns a process, not a message queue.
+        self.installer = OpenClawInstaller()
         # Keyless feed: announcements plus two RSS outlets, no token to manage.
         self.news = NewsService()
 
@@ -171,6 +175,10 @@ class AppContext:
         self.notifier.settings = self.settings.notify
 
     def shutdown(self) -> None:
+        try:
+            self.installer.shutdown()
+        except Exception:  # pragma: no cover - best effort on exit
+            log.debug("停止安装进程失败", exc_info=True)
         try:
             self.notifier.stop()
         except Exception:  # pragma: no cover - best effort on exit

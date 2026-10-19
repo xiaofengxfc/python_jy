@@ -1,7 +1,13 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api";
 import { TIMEFRAMES } from "../format";
-import type { AppSettings, CredentialItem, NotifyStatus, RiskState } from "../types";
+import type {
+  AppSettings,
+  CredentialItem,
+  InstallStatus,
+  NotifyStatus,
+  RiskState,
+} from "../types";
 
 interface Props {
   settings: AppSettings | null;
@@ -49,6 +55,85 @@ export default function SettingsPage({ settings, onSaved }: Props) {
   const [riskBusy, setRiskBusy] = useState(false);
   const [notifyStatus, setNotifyStatus] = useState<NotifyStatus | null>(null);
   const [notifyBusy, setNotifyBusy] = useState(false);
+  const [install, setInstall] = useState<InstallStatus | null>(null);
+  const [installBusy, setInstallBusy] = useState(false);
+  const [installError, setInstallError] = useState("");
+  const [installOpen, setInstallOpen] = useState(false);
+  const [installWithWechat, setInstallWithWechat] = useState(true);
+  const [installRegistry, setInstallRegistry] = useState("");
+  const [installNpmPath, setInstallNpmPath] = useState("");
+  const [installPlan, setInstallPlan] = useState<string[]>([]);
+
+  const loadInstall = useCallback(async () => {
+    try {
+      const next = await api<InstallStatus>("/api/install/openclaw");
+      setInstall(next);
+      // Poll faster while npm is running: the log is the only feedback the
+      // user gets, and a 10 s gap looks like a hang.
+      return next;
+    } catch {
+      return null;
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadInstall();
+  }, [loadInstall]);
+
+  useEffect(() => {
+    if (!install?.running) return;
+    const timer = window.setInterval(() => void loadInstall(), 2000);
+    return () => window.clearInterval(timer);
+  }, [install?.running, loadInstall]);
+
+  const previewInstall = async () => {
+    setInstallError("");
+    try {
+      const result = await api<{ command: string[] }>("/api/install/openclaw/plan", {
+        method: "POST",
+        body: JSON.stringify({
+          with_wechat: installWithWechat,
+          registry: installRegistry,
+          npm_path: installNpmPath,
+        }),
+      });
+      setInstallPlan(result.command);
+      setInstallOpen(true);
+    } catch (error) {
+      setInstallPlan([]);
+      setInstallOpen(true);
+      setInstallError(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const startInstall = async () => {
+    setInstallBusy(true);
+    setInstallError("");
+    try {
+      const next = await api<InstallStatus>("/api/install/openclaw", {
+        method: "POST",
+        body: JSON.stringify({
+          with_wechat: installWithWechat,
+          registry: installRegistry,
+          npm_path: installNpmPath,
+        }),
+      });
+      setInstall(next);
+    } catch (error) {
+      setInstallError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setInstallBusy(false);
+    }
+  };
+
+  const cancelInstall = async () => {
+    setInstallError("");
+    try {
+      setInstall(await api<InstallStatus>("/api/install/openclaw/cancel", { method: "POST" }));
+    } catch (error) {
+      setInstallError(error instanceof Error ? error.message : String(error));
+    }
+  };
 
   const loadNotify = useCallback(async () => {
     try {
@@ -620,9 +705,147 @@ export default function SettingsPage({ settings, onSaved }: Props) {
               </div>
               {notifyStatus && !notifyStatus.available && (
                 <div className="verdict bad">
-                  未找到 OpenClaw：请先安装微信 ClawBot，或在上方填写 openclaw 的完整路径。
+                  未找到 OpenClaw：可点下方的“自动安装 OpenClaw”，或在上方填写 openclaw 的完整路径。
                 </div>
               )}
+              <div className="install-box">
+                <div className="install-head">
+                  <span className="card-title" style={{ fontSize: 12 }}>
+                    OpenClaw 环境
+                  </span>
+                  <span className="faint" style={{ fontSize: 11 }}>
+                    {install
+                      ? install.node
+                        ? `Node ${install.node}${install.npm ? ` · npm ${install.npm}` : ""}`
+                        : "未检测到 Node.js"
+                      : "检测中…"}
+                  </span>
+                  <span className="spacer" />
+                  {install?.running ? (
+                    <button type="button" className="btn-sm" onClick={() => void cancelInstall()}>
+                      取消安装
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      className="btn-sm"
+                      disabled={installBusy}
+                      onClick={() => void previewInstall()}
+                    >
+                      自动安装 OpenClaw
+                    </button>
+                  )}
+                </div>
+                {installError && <div className="verdict bad">{installError}</div>}
+                {installOpen && (
+                  <>
+                    <label className="check">
+                      <input
+                        type="checkbox"
+                        checked={installWithWechat}
+                        disabled={install?.running}
+                        onChange={(event) => {
+                          setInstallWithWechat(event.target.checked);
+                          setInstallPlan([]);
+                        }}
+                      />
+                      同时安装微信 ClawBot 插件（缺少它无法推送到微信）
+                    </label>
+                    <div className="form-grid">
+                      <div className="field">
+                        <label className="field-label" htmlFor="install-registry">
+                          <span>npm 镜像源</span>
+                          <em>装不下来时换一个</em>
+                        </label>
+                        <select
+                          id="install-registry"
+                          className="select"
+                          value={installRegistry}
+                          disabled={install?.running}
+                          onChange={(event) => {
+                            setInstallRegistry(event.target.value);
+                            setInstallPlan([]);
+                          }}
+                        >
+                          <option value="">官方源 registry.npmjs.org</option>
+                          {(install?.registries ?? [])
+                            .filter((item) => item !== "https://registry.npmjs.org")
+                            .map((item) => (
+                              <option key={item} value={item}>
+                                国内镜像 {item.replace("https://", "")}
+                              </option>
+                            ))}
+                        </select>
+                      </div>
+                      <div className="field">
+                        <label className="field-label" htmlFor="install-npm">
+                          <span>npm 路径</span>
+                          <em>可留空，默认从 PATH 查找</em>
+                        </label>
+                        <input
+                          id="install-npm"
+                          value={installNpmPath}
+                          disabled={install?.running}
+                          onChange={(event) => {
+                            setInstallNpmPath(event.target.value);
+                            setInstallPlan([]);
+                          }}
+                          placeholder={install?.npm_path || "npm"}
+                        />
+                      </div>
+                    </div>
+                    {install && !install.ready && (
+                      <div className="verdict bad">{install.reason}</div>
+                    )}
+                    {installPlan.length > 0 && (
+                      <pre className="install-cmd">{installPlan.join(" ")}</pre>
+                    )}
+                    {!install?.running && (
+                      <div className="install-head">
+                        <button
+                          type="button"
+                          className="btn-sm primary"
+                          disabled={installBusy || install?.ready === false}
+                          onClick={() => void startInstall()}
+                        >
+                          {installBusy ? "启动中…" : "开始安装"}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-sm"
+                          onClick={() => {
+                            setInstallOpen(false);
+                            setInstallPlan([]);
+                            setInstallError("");
+                          }}
+                        >
+                          收起
+                        </button>
+                        <span className="faint" style={{ fontSize: 11 }}>
+                          安装会执行 npm 全局安装，可能需要几分钟。
+                        </span>
+                      </div>
+                    )}
+                  </>
+                )}
+                {install && install.state !== "idle" && (
+                  <>
+                    <div className="hint">
+                      {install.state === "running"
+                        ? "正在安装…"
+                        : install.state === "done"
+                          ? "安装完成：openclaw 已可用。"
+                          : install.state === "canceled"
+                            ? "安装已取消。"
+                            : "安装失败。"}
+                      {install.error && install.state !== "done" ? ` ${install.error}` : ""}
+                    </div>
+                    {install.log.length > 0 && (
+                      <pre className="install-cmd">{install.log.join("\n")}</pre>
+                    )}
+                  </>
+                )}
+              </div>
               {notifyStatus?.last_error && (
                 <div className="verdict bad">
                   {notifyStatus.last_error}
