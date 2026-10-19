@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -39,7 +40,18 @@ log = logging.getLogger(__name__)
 DEFAULT_CHANNEL = "openclaw-weixin"
 DEFAULT_COMMAND = "openclaw"
 # Chat text is cheap for us and a wall of it is unreadable on a lock screen.
+# The WeChat plugin chunks outbound text at 4000 characters, so staying well
+# below that keeps every message in a single bubble.
 MAX_MESSAGE_CHARS = 2000
+# The plugin resolves the recipient against its per-account context-token store,
+# which is keyed by the raw Weixin user id. Those ids always end with this
+# suffix, so a truncated paste (a bare wxid) silently sends without a context
+# token — worth naming in the settings page instead of only in the gateway log.
+WECHAT_ID_SUFFIX = "@im.wechat"
+# npm's Windows shim embeds the real script path in a quoted string, e.g.
+# ``"%dp0%\node_modules\openclaw\openclaw.mjs" %*``. Lifting that out lets the
+# notifier call node directly instead of handing the text to cmd.exe.
+_SHIM_SCRIPT_RE = re.compile(r'"([^"]+\.(?:js|mjs|cjs))"', re.IGNORECASE)
 
 
 class NotifyError(RuntimeError):
@@ -57,6 +69,11 @@ class NotifySettings:
     enabled: bool = False
     channel: str = DEFAULT_CHANNEL
     target: str = ""
+    # Multiple WeChat accounts can be bound to one gateway. Empty means "the
+    # default account", which is what a single-account setup should leave alone;
+    # with two bound accounts the plugin cannot guess and the send fails, so the
+    # page offers this field instead of forcing a CLI flag by hand.
+    account: str = ""
     command: str = DEFAULT_COMMAND
     # Events are opt-in individually so an active strategy cannot spam the phone.
     on_fill: bool = True
@@ -150,8 +167,12 @@ class WeChatNotifier:
             "enabled": self.settings.enabled,
             "channel": self.settings.channel,
             "target": self.settings.target,
+            "account": self.settings.account,
             "command": self.settings.command,
             "available": bool(self._resolve_command()),
+            # Surface a target the plugin cannot match before the user saves it;
+            # an empty string means "no complaint".
+            "target_warning": target_warning(self.settings.target) if self.settings.enabled else "",
             "last_error": self.last_error,
             "last_error_at": self.last_error_at,
             "last_success_at": self.last_success_at,
@@ -240,9 +261,9 @@ class WeChatNotifier:
                 "或在设置中填写可执行文件的完整路径。"
             )
         channel = (self.settings.channel or DEFAULT_CHANNEL).strip() or DEFAULT_CHANNEL
-        target = str(self.settings.target or "").strip()
         if not target:
             raise NotifyError("尚未填写微信接收目标，无法发送。")
+        account = str(self.settings.account or "").strip()
         args = [
             command,
             "message",
@@ -255,6 +276,11 @@ class WeChatNotifier:
             text,
             "--json",
         ]
+        if account:
+            # Only when the user named one: an explicit ``--account`` selects that
+            # account, while omitting it lets the plugin pick its default (and
+            # disambiguate by context token when several are bound).
+            args.extend(["--account", account])
         try:
             completed = subprocess.run(
                 self._wrap_launcher(args),
@@ -298,18 +324,31 @@ class WeChatNotifier:
 
     @staticmethod
     def _wrap_launcher(args: list[str]) -> list[str]:
-        """Make a Windows ``.cmd``/``.bat`` shim executable by CreateProcess.
+        """Make a Windows ``.cmd``/``.bat`` shim executable without a shell.
 
-        npm installs the CLI as ``openclaw.cmd``; Windows cannot exec that
-        directly with ``shell=False``. Routing through ``cmd.exe /c`` keeps the
-        argument list intact (``list2cmdline`` quotes it) instead of handing a
-        single command string to a shell.
+        npm installs the CLI as ``openclaw.cmd``, and Windows cannot exec that
+        directly with ``shell=False``. The obvious workaround — ``cmd.exe /c`` —
+        is wrong for this payload: ``cmd`` treats a newline as a command
+        separator and ``&``, ``|``, ``>``, ``<``, ``^`` as operators, so a
+        multi-line notification arrived truncated at the first line and a
+        message containing ``&`` could run part of itself as a command.
+
+        The shim is a tiny batch file whose real work is one quoted script path,
+        so that path is lifted out and run through ``node`` directly. Only when
+        the shim cannot be read does this fall back to ``cmd.exe``, with the
+        text flattened onto one line so the argument at least survives intact.
         """
         first = args[0] if args else ""
         if os.name != "nt" or not first.lower().endswith((".cmd", ".bat")):
             return args
+        direct = _node_entry_argv(first, args[1:])
+        if direct:
+            return direct
         comspec = os.environ.get("COMSPEC") or "cmd.exe"
-        return [comspec, "/c", *args]
+        # ``/d`` skips AutoRun scripts and ``/s`` keeps the quoting we build here
+        # instead of letting cmd re-parse it.
+        command_line = " ".join(_quote_for_cmd(arg) for arg in args)
+        return [comspec, "/d", "/s", "/c", command_line]
 
     # --------------------------------------------------------------- formatting
     @staticmethod
@@ -364,10 +403,81 @@ class WeChatNotifier:
 
 def _prepare(text: str) -> str:
     """Trim and clamp a message. Returns ``""`` for anything not worth sending."""
-    cleaned = (text or "").strip()
+    # A NUL byte cannot cross CreateProcess at all; dropping it is better than
+    # failing the whole send on a stray control character.
+    cleaned = (text or "").replace("\x00", "").strip()
     if len(cleaned) > MAX_MESSAGE_CHARS:
         cleaned = cleaned[: MAX_MESSAGE_CHARS - 1] + "…"
     return cleaned
+
+
+def normalize_target(raw: str) -> str:
+    """Trim a recipient id, tolerating a pasted chat label around it."""
+    text = str(raw or "").strip().strip("\"'").strip()
+    if text.lower().startswith("weixin:"):
+        text = text.split(":", 1)[1].strip()
+    return text
+
+
+def target_warning(target: str) -> str:
+    """Explain a target the plugin cannot match to a conversation token.
+
+    The channel resolves the recipient against its own context-token store,
+    keyed by the raw Weixin id (``<wxid>@im.wechat``). A bare wxid still sends,
+    but without the token the plugin warns and the reply can land in the wrong
+    conversation, so the settings page says so before the user saves it.
+    """
+    text = normalize_target(target)
+    if not text:
+        return ""
+    if not text.lower().endswith(WECHAT_ID_SUFFIX):
+        return (
+            f"接收目标通常以 {WECHAT_ID_SUFFIX} 结尾：先给 ClawBot 发一条消息，"
+            "再从网关日志里复制完整的用户 ID。"
+        )
+    return ""
+
+
+def _node_entry_argv(shim: str, args: list[str]) -> list[str] | None:
+    """Return ``[node, script, *args]`` for an npm shim, or ``None``.
+
+    Works from the shim's own text rather than from a guessed package layout, so
+    it keeps working when npm changes its global prefix or the package is
+    installed under a scope. ``%dp0%`` is the shim's directory.
+    """
+    try:
+        with open(shim, "r", encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+    except OSError:
+        return None
+    script = ""
+    for match in _SHIM_SCRIPT_RE.finditer(text):
+        script = match.group(1)
+    if not script:
+        return None
+    folder = os.path.dirname(os.path.abspath(shim))
+    script = re.sub(r"%dp0%", lambda _m: folder, script, flags=re.IGNORECASE)
+    script = re.sub(r"%~dp0", lambda _m: folder + os.sep, script, flags=re.IGNORECASE)
+    if not os.path.isabs(script):
+        script = os.path.join(folder, script)
+    if not os.path.isfile(script):
+        return None
+    # npm ships a private node.exe beside the shim when it manages the runtime;
+    # otherwise the PATH lookup that found the shim will find node too.
+    local_node = os.path.join(folder, "node.exe")
+    node = local_node if os.path.isfile(local_node) else (shutil.which("node") or "node")
+    return [node, script, *args]
+
+
+def _quote_for_cmd(arg: str) -> str:
+    """Quote one argv element for the ``cmd.exe`` fallback path.
+
+    Newlines are flattened because ``cmd`` would otherwise end the command
+    there, which is exactly the truncation this fallback exists to survive.
+    """
+    clean = str(arg).replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    return '"' + clean.replace('"', '""') + '"'
+
 
 
 def _parse_json(stdout: str) -> dict | None:
