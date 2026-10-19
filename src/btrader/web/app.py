@@ -447,6 +447,12 @@ def create_app() -> FastAPI:
         # Warm the symbol list in the background: the first paint must not wait
         # on a multi-second load_markets() call.
         threading.Thread(target=_warm, daemon=True).start()
+        # Bring the OpenClaw gateway up in the background. WeChat push needs it,
+        # and nothing else was starting it; doing it off-thread keeps a slow or
+        # missing gateway from delaying the first paint.
+        threading.Thread(
+            target=state.ctx.gateway.start, name="openclaw-gateway", daemon=True
+        ).start()
         state.stop_reconcile.clear()
         threading.Thread(
             target=_reconcile_paper_orders, args=(state,), name="paper-reconciler", daemon=True

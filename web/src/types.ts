@@ -244,6 +244,21 @@ export interface InstallStatus {
   log: string[];
 }
 
+/** Whether the local gateway process is up; WeChat push needs it. */
+export interface GatewayStatus {
+  /** idle | starting | running | failed | external */
+  state: string;
+  /** The port actually accepts connections right now. */
+  reachable: boolean;
+  /** We started this process, so we will stop it on exit. */
+  managed: boolean;
+  host: string;
+  port: number;
+  command: string[];
+  error: string;
+  started_at: number;
+}
+
 /** What the gateway says about the WeChat channel itself. */
 export interface ChannelStatus {
   channel: string;
@@ -257,6 +272,7 @@ export interface ChannelStatus {
   state: string;
   /** Raw `channels list --all` excerpt, for the "what went wrong" case. */
   detail: string;
+  gateway?: GatewayStatus;
 }
 
 export interface CredentialItem {

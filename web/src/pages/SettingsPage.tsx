@@ -120,6 +120,23 @@ export default function SettingsPage({ settings, onSaved }: Props) {
     }
   };
 
+  const startGateway = async () => {
+    setChannelBusy(true);
+    setChannelNote("");
+    try {
+      const result = await api<{ state: string; error: string }>(
+        "/api/install/openclaw/gateway",
+        { method: "POST" },
+      );
+      setChannelNote(result.error || "网关已启动。");
+      await loadChannel();
+    } catch (error) {
+      setChannelNote(error instanceof Error ? error.message : String(error));
+    } finally {
+      setChannelBusy(false);
+    }
+  };
+
   const loadInstall = useCallback(async () => {
     try {
       const next = await api<InstallStatus>("/api/install/openclaw");
@@ -958,6 +975,35 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                   </span>
                 </div>
                 {channelNote && <div className="hint">{channelNote}</div>}
+                {/* The gateway is its own process: a channel can be perfectly
+                    configured and still deliver nothing while it is down. */}
+                <div className="install-head" style={{ marginTop: 8 }}>
+                  <span className="faint" style={{ fontSize: 11 }}>
+                    {!channel?.gateway
+                      ? "网关状态检测中…"
+                      : channel.gateway.reachable
+                        ? `网关运行中（${channel.gateway.host}:${channel.gateway.port}${
+                            channel.gateway.managed ? "，随本程序启动" : "，由外部启动"
+                          }）`
+                        : channel.gateway.state === "starting"
+                          ? "网关正在启动…"
+                          : "网关未运行，推送会失败"}
+                  </span>
+                  <span className="spacer" />
+                  {channel?.gateway && !channel.gateway.reachable && (
+                    <button
+                      type="button"
+                      className="btn-sm"
+                      disabled={channelBusy}
+                      onClick={() => void startGateway()}
+                    >
+                      启动网关
+                    </button>
+                  )}
+                </div>
+                {channel?.gateway?.error && (
+                  <div className="verdict bad">{channel.gateway.error}</div>
+                )}
               </div>
               {notifyStatus?.last_error && (
                 <div className="verdict bad">

@@ -14,6 +14,7 @@ from .engine.risk import RiskManager
 from .engine.trading import TradingService
 from .exchange.klines import KlineStore
 from .exchange.rest import BinanceREST
+from .gateway import GatewaySupervisor
 from .installer import OpenClawInstaller
 from .news import NewsService
 from .notify import WeChatNotifier
@@ -63,6 +64,9 @@ class AppContext:
         # Installs the CLI the notifier shells out to. Separate object because
         # it owns a process, not a message queue.
         self.installer = OpenClawInstaller()
+        # Starts the gateway the notifier talks to. WeChat push fails without it,
+        # and nothing else here was starting it.
+        self.gateway = GatewaySupervisor()
         # Keyless feed: announcements plus two RSS outlets, no token to manage.
         self.news = NewsService()
 
@@ -179,6 +183,11 @@ class AppContext:
             self.installer.shutdown()
         except Exception:  # pragma: no cover - best effort on exit
             log.debug("停止安装进程失败", exc_info=True)
+        try:
+            # Only stops a gateway we started; an external one keeps running.
+            self.gateway.stop()
+        except Exception:  # pragma: no cover - best effort on exit
+            log.debug("停止 OpenClaw 网关失败", exc_info=True)
         try:
             self.notifier.stop()
         except Exception:  # pragma: no cover - best effort on exit

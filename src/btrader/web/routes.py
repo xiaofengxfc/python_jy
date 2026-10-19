@@ -597,9 +597,19 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
         """Whether the gateway knows the WeChat channel and has an account.
 
         Read from the gateway rather than inferred from files on disk, because a
-        plugin can be installed and still be disabled or unconfigured.
+        plugin can be installed and still be disabled or unconfigured. The
+        gateway's own process state rides along: a channel is useless when the
+        gateway is down, and the page has to say which of the two is wrong.
         """
-        return get_state().ctx.installer.channel_status()
+        ctx = get_state().ctx
+        status = ctx.installer.channel_status()
+        status["gateway"] = ctx.gateway.status()
+        return status
+
+    @router.post("/api/install/openclaw/gateway")
+    def gateway_start() -> dict[str, Any]:
+        """Start the local gateway without restarting the app."""
+        return get_state().ctx.gateway.start()
 
     @router.post("/api/install/openclaw/channel")
     def channel_register() -> dict[str, Any]:
