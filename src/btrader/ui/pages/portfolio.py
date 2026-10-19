@@ -8,6 +8,7 @@ from PySide6.QtCore import QTimer, Signal
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -16,8 +17,8 @@ from PySide6.QtWidgets import (
 from ...context import AppContext
 from ...core.types import MarketType
 from ...exchange.symbols import format_amount
-from ..theme import DOWN, UP
-from ..widgets.common import Card, MetricCard, money_text, pnl_color
+from .. import theme
+from ..widgets.common import Card, MetricCard, PageHeader, money_text, pnl_color
 from ..widgets.tables import DataTable
 from ..workers import TaskRunner
 
@@ -41,25 +42,21 @@ class PortfolioPage(QWidget):
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(12, 12, 12, 12)
-        root.setSpacing(10)
+        root.setContentsMargins(*theme.PAGE_MARGIN)
+        root.setSpacing(theme.PAGE_GAP)
 
-        header = QHBoxLayout()
-        title = QLabel("资产与持仓")
-        title.setObjectName("Title")
-        header.addWidget(title)
+        header = PageHeader("资产与持仓", "账户余额、合约持仓与纸面账户表现")
         self.mode_label = QLabel("")
-        self.mode_label.setObjectName("Muted")
-        header.addWidget(self.mode_label)
-        header.addStretch(1)
+        self.mode_label.setObjectName("Subtitle")
+        header.actions.addWidget(self.mode_label)
         self.refresh_btn = QPushButton("刷新")
         self.refresh_btn.setObjectName("Flat")
         self.refresh_btn.clicked.connect(self.refresh)
-        header.addWidget(self.refresh_btn)
-        root.addLayout(header)
+        header.add_action(self.refresh_btn)
+        root.addWidget(header)
 
         cards = QHBoxLayout()
-        cards.setSpacing(10)
+        cards.setSpacing(theme.PAGE_GAP)
         self.equity_card = MetricCard("总权益 (USDT)")
         self.available_card = MetricCard("可用余额")
         self.pnl_card = MetricCard("未实现盈亏")
@@ -68,35 +65,62 @@ class PortfolioPage(QWidget):
             cards.addWidget(card)
         root.addLayout(cards)
 
-        self.paper_card = Card()
+        # Left: how the account is allocated. Right: what it holds.
+        tables = QHBoxLayout()
+        tables.setSpacing(theme.PAGE_GAP)
+
+        left_column = QVBoxLayout()
+        left_column.setSpacing(theme.PAGE_GAP)
+
+        balances_card = Card(padding=14)
+        balances_head = QHBoxLayout()
+        balances_title = QLabel("账户余额")
+        balances_title.setObjectName("Title")
+        balances_head.addWidget(balances_title)
+        balances_head.addStretch(1)
+        self.balances_count = QLabel("")
+        self.balances_count.setObjectName("Subtitle")
+        balances_head.addWidget(self.balances_count)
+        balances_card.body().addLayout(balances_head)
+        self.balances_table = DataTable(["币种", "可用", "冻结", "合计"])
+        self.balances_table.setMinimumHeight(180)
+        balances_card.body().addWidget(self.balances_table, 1)
+        left_column.addWidget(balances_card, 3)
+
+        paper_card = Card(padding=14)
         paper_title = QLabel("纸面账户")
         paper_title.setObjectName("Title")
-        self.paper_card.body().addWidget(paper_title)
+        paper_card.body().addWidget(paper_title)
         self.paper_summary = QLabel("--")
+        self.paper_summary.setObjectName("Subtitle")
         self.paper_summary.setWordWrap(True)
-        self.paper_card.body().addWidget(self.paper_summary)
+        paper_card.body().addWidget(self.paper_summary)
+        paper_card.body().addStretch(1)
         reset_btn = QPushButton("重置纸面账户")
-        reset_btn.setObjectName("Flat")
-        reset_btn.setFixedWidth(140)
+        reset_btn.setObjectName("Danger")
         reset_btn.clicked.connect(self._reset_paper)
-        self.paper_card.body().addWidget(reset_btn)
-        root.addWidget(self.paper_card)
+        paper_card.body().addWidget(reset_btn)
+        left_column.addWidget(paper_card, 2)
+        tables.addLayout(left_column, 2)
 
+        positions_card = Card(padding=14)
+        positions_head = QHBoxLayout()
         positions_title = QLabel("持仓")
         positions_title.setObjectName("Title")
-        root.addWidget(positions_title)
+        positions_head.addWidget(positions_title)
+        positions_head.addStretch(1)
+        self.positions_count = QLabel("")
+        self.positions_count.setObjectName("Subtitle")
+        positions_head.addWidget(self.positions_count)
+        positions_card.body().addLayout(positions_head)
         self.positions_table = DataTable(
             ["交易对", "方向", "数量", "开仓价", "标记价", "未实现盈亏", "杠杆", "强平价"]
         )
-        self.positions_table.setMinimumHeight(180)
-        root.addWidget(self.positions_table, 1)
+        self.positions_table.setMinimumHeight(240)
+        positions_card.body().addWidget(self.positions_table, 1)
+        tables.addWidget(positions_card, 3)
 
-        balances_title = QLabel("账户余额")
-        balances_title.setObjectName("Title")
-        root.addWidget(balances_title)
-        self.balances_table = DataTable(["币种", "可用", "冻结", "合计"])
-        self.balances_table.setMinimumHeight(150)
-        root.addWidget(self.balances_table, 1)
+        root.addLayout(tables, 1)
 
     # ------------------------------------------------------------------ data
     def refresh(self) -> None:
@@ -218,7 +242,8 @@ class PortfolioPage(QWidget):
                     f"{float(position.get('leverage') or 1):g}x",
                     f"{float(position.get('liquidationPrice') or 0):,.4f}",
                 ],
-                colors=[None, UP if side == "多" else DOWN, None, None, None, pnl_color(pnl), None, None],
+                colors=[None, theme.current().up if side == "多" else theme.current().down,
+                        None, None, None, pnl_color(pnl), None, None],
             )
             row += 1
 
@@ -240,6 +265,7 @@ class PortfolioPage(QWidget):
             self.available_card.set_value(money_text(free))
         self.pnl_card.set_value(f"{unrealized:+,.2f}", pnl_color(unrealized))
         self.realized_card.set_value("--")
+        self.positions_count.setText(f"{row} 个持仓" if row else "无持仓")
 
         self.balances_table.setRowCount(0)
         totals = balance.get("total") or {}
@@ -249,6 +275,7 @@ class PortfolioPage(QWidget):
             ((asset, float(value or 0)) for asset, value in totals.items() if value),
             key=lambda item: -item[1],
         )
+        self.balances_count.setText(f"{len(rows)} 个币种" if rows else "无余额")
         for row, (asset, value) in enumerate(rows):
             self.balances_table.set_row(
                 row,

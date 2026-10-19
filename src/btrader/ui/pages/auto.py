@@ -11,7 +11,6 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QMessageBox,
@@ -25,8 +24,8 @@ from PySide6.QtWidgets import (
 from ...context import AppContext
 from ...core.types import TIMEFRAMES, MarketType, RunMode
 from ...engine.auto import AutoTrader, AutoTraderConfig
-from ..theme import DOWN, TEXT_DIM, UP
-from ..widgets.common import Card, mono_font
+from .. import theme
+from ..widgets.common import Card, PageHeader, mono_font
 from ..widgets.tables import DataTable
 
 log = logging.getLogger(__name__)
@@ -44,45 +43,88 @@ class AutoPage(QWidget):
 
     # -------------------------------------------------------------------- ui
     def _build_ui(self) -> None:
-        root = QHBoxLayout(self)
-        root.setContentsMargins(12, 12, 12, 12)
-        root.setSpacing(10)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(*theme.PAGE_MARGIN)
+        outer.setSpacing(theme.PAGE_GAP)
+        outer.addWidget(PageHeader("自动交易", "策略信号自动执行，所有订单都会经过风控检查"))
+
+        # The run state spans the page: it is the first thing to check.
+        outer.addWidget(self._build_state_card())
+
+        root = QHBoxLayout()
+        root.setSpacing(theme.PAGE_GAP)
 
         side = QVBoxLayout()
-        side.setSpacing(10)
+        side.setSpacing(theme.PAGE_GAP)
         side.addWidget(self._build_config_group())
         side.addWidget(self._build_control_group())
         side.addStretch(1)
-        root.addLayout(side)
+        side_holder = QWidget()
+        side_holder.setLayout(side)
+        side_holder.setFixedWidth(340)
+        root.addWidget(side_holder)
 
         right = QVBoxLayout()
-        right.setSpacing(10)
-        self.state_card = Card()
-        self.state_label = QLabel("未运行")
-        self.state_label.setObjectName("Title")
-        self.signal_label = QLabel("目标仓位：--")
-        self.signal_label.setObjectName("Muted")
-        self.state_card.body().addWidget(self.state_label)
-        self.state_card.body().addWidget(self.signal_label)
-        right.addWidget(self.state_card)
+        right.setSpacing(theme.PAGE_GAP)
 
+        log_card = Card(padding=14)
         log_title = QLabel("运行日志")
         log_title.setObjectName("Title")
-        right.addWidget(log_title)
+        log_card.body().addWidget(log_title)
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
-        self.log_view.setFont(mono_font(10))
+        self.log_view.setFont(mono_font(11))
         self.log_view.setMaximumBlockCount(2000)
-        right.addWidget(self.log_view, 1)
+        self.log_view.setFrameShape(QPlainTextEdit.Shape.NoFrame)
+        log_card.body().addWidget(self.log_view, 1)
+        right.addWidget(log_card, 1)
 
+        orders_card = Card(padding=14)
+        orders_title = QLabel("本次运行委托")
+        orders_title.setObjectName("Title")
+        orders_card.body().addWidget(orders_title)
         self.orders_table = DataTable(["时间", "交易对", "方向", "数量", "价格", "模式"])
-        self.orders_table.setMaximumHeight(160)
-        right.addWidget(self.orders_table)
+        self.orders_table.setMaximumHeight(190)
+        orders_card.body().addWidget(self.orders_table)
+        right.addWidget(orders_card)
         root.addLayout(right, 1)
+        outer.addLayout(root, 1)
+
+    def _build_state_card(self) -> QWidget:
+        card = Card(padding=14)
+        layout = QHBoxLayout()
+        layout.setSpacing(28)
+
+        state_col = QVBoxLayout()
+        state_col.setSpacing(3)
+        caption = QLabel("运行状态")
+        caption.setObjectName("Eyebrow")
+        self.state_label = QLabel("未运行")
+        self.state_label.setObjectName("Title")
+        state_col.addWidget(caption)
+        state_col.addWidget(self.state_label)
+        layout.addLayout(state_col)
+
+        signal_col = QVBoxLayout()
+        signal_col.setSpacing(3)
+        signal_caption = QLabel("最新信号")
+        signal_caption.setObjectName("Eyebrow")
+        self.signal_label = QLabel("目标仓位：--")
+        self.signal_label.setObjectName("Subtitle")
+        signal_col.addWidget(signal_caption)
+        signal_col.addWidget(self.signal_label)
+        layout.addLayout(signal_col, 1)
+
+        card.body().addLayout(layout)
+        return card
 
     def _build_config_group(self) -> QWidget:
-        group = QGroupBox("自动交易配置")
-        layout = QFormLayout(group)
+        card = Card(padding=14)
+        title = QLabel("自动交易配置")
+        title.setObjectName("Title")
+        card.body().addWidget(title)
+        layout = QFormLayout()
+        layout.setVerticalSpacing(8)
 
         self.market_combo = QComboBox()
         for market in MarketType:
@@ -134,14 +176,19 @@ class AutoPage(QWidget):
         self.poll_spin.setValue(15)
         self.poll_spin.setSuffix(" 秒")
         layout.addRow("轮询间隔", self.poll_spin)
-        return group
+        card.body().addLayout(layout)
+        return card
 
     def _build_control_group(self) -> QWidget:
-        group = QGroupBox("控制")
-        layout = QVBoxLayout(group)
+        card = Card(padding=14)
+        title = QLabel("控制")
+        title.setObjectName("Title")
+        card.body().addWidget(title)
+        layout = QVBoxLayout()
+        layout.setSpacing(8)
         self.start_btn = QPushButton("启动自动交易")
         self.start_btn.setObjectName("Primary")
-        self.start_btn.setMinimumHeight(36)
+        self.start_btn.setMinimumHeight(38)
         self.start_btn.clicked.connect(self._start)
         layout.addWidget(self.start_btn)
 
@@ -161,10 +208,11 @@ class AutoPage(QWidget):
             "说明：自动交易只在新 K 线收盘后计算信号；所有订单都会经过风控检查。"
             "实盘首次使用请先用纸面模式验证。"
         )
-        note.setObjectName("Muted")
+        note.setObjectName("Subtitle")
         note.setWordWrap(True)
         layout.addWidget(note)
-        return group
+        card.body().addLayout(layout)
+        return card
 
     # ------------------------------------------------------------- strategies
     def _on_market_changed(self) -> None:
@@ -282,16 +330,20 @@ class AutoPage(QWidget):
         self._append(level, message)
 
     def _append(self, level: str, message: str) -> None:
-        color = {"ERROR": DOWN, "WARN": "#f0b90b", "TRADE": UP}.get(level, TEXT_DIM)
+        palette = theme.current()
+        color = {"ERROR": palette.down, "WARN": palette.accent, "TRADE": palette.up}.get(
+            level, palette.text_dim
+        )
         stamp = datetime.now().strftime("%H:%M:%S")
         self.log_view.appendHtml(
-            f'<span style="color:{TEXT_DIM}">{stamp}</span> '
+            f'<span style="color:{palette.text_dim}">{stamp}</span> '
             f'<span style="color:{color}">[{level}]</span> {message}'
         )
 
     def _on_signal(self, target: float, reason: str) -> None:
+        palette = theme.current()
         text = {1.0: "做多", -1.0: "做空", 0.0: "空仓"}.get(target, f"{target:+.2f}")
-        color = UP if target > 0 else DOWN if target < 0 else TEXT_DIM
+        color = palette.up if target > 0 else palette.down if target < 0 else palette.text_dim
         self.signal_label.setText(f"目标仓位：{text}　（{reason}）")
         self.signal_label.setStyleSheet(f"color: {color};")
         self._append("SIGNAL", f"信号变化 → {text}（{reason}）")
@@ -301,8 +353,11 @@ class AutoPage(QWidget):
             QApplication.beep()
 
     def _on_state(self, running: bool) -> None:
+        palette = theme.current()
         self.state_label.setText("运行中" if running else "已停止")
-        self.state_label.setStyleSheet(f"color: {UP if running else TEXT_DIM};")
+        self.state_label.setStyleSheet(
+            f"color: {palette.up if running else palette.text_dim};"
+        )
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
         if self._trader:

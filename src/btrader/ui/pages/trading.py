@@ -5,20 +5,18 @@ from __future__ import annotations
 import logging
 
 import pandas as pd
-from PySide6.QtCore import Qt, QTimer, Signal
+import qtawesome as qta
+from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
     QFrame,
-    QGridLayout,
     QHBoxLayout,
     QLabel,
     QMessageBox,
     QPushButton,
-    QScrollArea,
-    QSizePolicy,
     QSplitter,
     QTabWidget,
     QVBoxLayout,
@@ -31,14 +29,71 @@ from ...core.types import TIMEFRAMES, MarketType, OrderSide, OrderType, RunMode
 from ...engine.trading import OrderRejected, OrderRequest
 from ...exchange.rest import ExchangeError
 from ...exchange.symbols import format_amount, ticker_from_ccxt
-from ..theme import DOWN, TEXT_DIM, UP
+from .. import theme
 from ..widgets.chart import CandleChart
-from ..widgets.common import Card, mono_font, pnl_color
+from ..widgets.common import Card, PageHeader, divider
 from ..widgets.orderbook import OrderBookWidget
 from ..widgets.tables import DataTable
 from ..workers import TaskRunner
 
 log = logging.getLogger(__name__)
+
+
+class OrderDrawer(QFrame):
+    """Bottom dock for open orders / history / fills.
+
+    Collapsed it is a single bar; clicking the bar slides the tab widget in
+    and out, so the chart keeps the vertical space by default.
+    """
+
+    HEADER_H = 34
+    EXPANDED_H = 236
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("Drawer")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 6, 10, 8)
+        layout.setSpacing(6)
+
+        self.header = QPushButton()
+        self.header.setObjectName("DrawerHeader")
+        self.header.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.header.setFixedHeight(self.HEADER_H - 12)
+        self.header.setToolTip("展开或收起委托面板")
+        self.header.clicked.connect(self.toggle)
+        layout.addWidget(self.header)
+
+        self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
+        self.tabs.currentChanged.connect(lambda _i: self.sync_header())
+        layout.addWidget(self.tabs, 1)
+
+        self._expanded = False
+        self.set_expanded(False)
+        theme.bus().changed.connect(lambda _p: self.sync_header())
+
+    def toggle(self) -> None:
+        self.set_expanded(not self._expanded)
+
+    def set_expanded(self, expanded: bool) -> None:
+        self._expanded = expanded
+        self.tabs.setVisible(expanded)
+        self.setFixedHeight(self.EXPANDED_H if expanded else self.HEADER_H + 14)
+        self.sync_header()
+
+    def sync_header(self) -> None:
+        palette = theme.current()
+        index = max(0, self.tabs.currentIndex())
+        label = self.tabs.tabText(index) if self.tabs.count() else "委托"
+        self.header.setText(f"  {label}")
+        self.header.setIcon(
+            qta.icon(
+                "fa6s.chevron-up" if self._expanded else "fa6s.chevron-down",
+                color=palette.text_dim,
+            )
+        )
+        self.header.setIconSize(QSize(11, 11))
 
 
 class TradingPage(QWidget):
@@ -71,81 +126,111 @@ class TradingPage(QWidget):
     # --------------------------------------------------------------- building
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(8, 8, 8, 8)
-        root.setSpacing(8)
+        root.setContentsMargins(*theme.PAGE_MARGIN)
+        root.setSpacing(theme.PAGE_GAP)
+        root.addWidget(PageHeader("交易", "行情、订单簿与手动下单"))
         root.addWidget(self._build_symbol_bar())
+
+        # The drawer exists before it is placed: its collapsed bar sits under
+        # the chart and owns the order tabs.
+        self._build_bottom_tabs()
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(theme.PAGE_GAP)
 
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(6)
+        left_layout.setSpacing(theme.PAGE_GAP)
+
+        # The chart owns all remaining height; orders live in the drawer bar.
+        chart_card = Card(padding=10)
         self.chart = CandleChart()
-        left_layout.addWidget(self.chart, 1)
-        left_layout.addWidget(self._build_bottom_tabs())
+        chart_card.body().addWidget(self.chart, 1)
+        left_layout.addWidget(chart_card, 1)
+        left_layout.addWidget(self.drawer)
         splitter.addWidget(left)
 
         right = QWidget()
-        right.setMinimumWidth(300)
-        right.setMaximumWidth(420)
+        right.setMinimumWidth(320)
+        right.setMaximumWidth(360)
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(8)
-        right_layout.addWidget(self._build_book_card(), 3)
-        right_layout.addWidget(self._build_order_ticket(), 4)
-        right_layout.addStretch(1)
+        right_layout.setSpacing(theme.PAGE_GAP)
+        right_layout.addWidget(self._build_book_card(), 2)
+        right_layout.addWidget(self._build_order_ticket(), 3)
         splitter.addWidget(right)
-        splitter.setStretchFactor(0, 4)
-        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 0)
+        splitter.setSizes([1040, 330])
         root.addWidget(splitter, 1)
 
+    def _stat(self, layout: QHBoxLayout, caption: str) -> QLabel:
+        column = QVBoxLayout()
+        column.setSpacing(1)
+        label = QLabel(caption)
+        label.setObjectName("Eyebrow")
+        value = QLabel("--")
+        value.setStyleSheet("font-size: 13px; font-weight: 600;")
+        column.addWidget(label)
+        column.addWidget(value)
+        layout.addLayout(column)
+        return value
+
     def _build_symbol_bar(self) -> QWidget:
-        bar = QFrame()
-        bar.setObjectName("Panel")
-        layout = QHBoxLayout(bar)
-        layout.setContentsMargins(12, 8, 12, 8)
-        layout.setSpacing(10)
+        card = Card(padding=14)
+        layout = QHBoxLayout()
+        layout.setSpacing(16)
 
         self.market_combo = QComboBox()
         for market in MarketType:
             self.market_combo.addItem(market.label, market.value)
-        self.market_combo.setFixedWidth(120)
+        self.market_combo.setFixedWidth(116)
         self.market_combo.currentIndexChanged.connect(self._on_market_changed)
         layout.addWidget(self.market_combo)
 
         self.symbol_combo = QComboBox()
         self.symbol_combo.setEditable(True)
-        self.symbol_combo.setMinimumWidth(200)
+        self.symbol_combo.setMinimumWidth(180)
         self.symbol_combo.setEditText(self.ctx.settings.last_symbol)
         self.symbol_combo.lineEdit().returnPressed.connect(self._on_symbol_changed)
         self.symbol_combo.activated.connect(lambda _: self._on_symbol_changed())
         layout.addWidget(self.symbol_combo)
 
+        separator = divider(horizontal=False)
+        separator.setFixedHeight(38)
+        layout.addWidget(separator)
+
+        price_column = QVBoxLayout()
+        price_column.setSpacing(0)
+        price_row = QHBoxLayout()
+        price_row.setSpacing(10)
         self.price_label = QLabel("--")
         self.price_label.setObjectName("SymbolPrice")
-        layout.addWidget(self.price_label)
-
+        price_row.addWidget(self.price_label)
         self.change_label = QLabel("")
-        layout.addWidget(self.change_label)
+        price_row.addWidget(self.change_label)
+        price_row.addStretch(1)
+        price_column.addLayout(price_row)
+        self.symbol_caption = QLabel("")
+        self.symbol_caption.setObjectName("Subtitle")
+        price_column.addWidget(self.symbol_caption)
+        layout.addLayout(price_column)
 
         layout.addStretch(1)
 
-        self.high_label = QLabel("")
-        self.high_label.setObjectName("Muted")
-        self.low_label = QLabel("")
-        self.low_label.setObjectName("Muted")
-        self.volume_label = QLabel("")
-        self.volume_label.setObjectName("Muted")
-        layout.addWidget(self.high_label)
-        layout.addWidget(self.low_label)
-        layout.addWidget(self.volume_label)
+        stats = QHBoxLayout()
+        stats.setSpacing(22)
+        self.high_label = self._stat(stats, "24H 最高")
+        self.low_label = self._stat(stats, "24H 最低")
+        self.volume_label = self._stat(stats, "24H 成交额")
+        layout.addLayout(stats)
 
         self.timeframe_combo = QComboBox()
         self.timeframe_combo.addItems(TIMEFRAMES)
         self.timeframe_combo.setCurrentText(self.ctx.settings.timeframe)
-        self.timeframe_combo.setFixedWidth(80)
+        self.timeframe_combo.setFixedWidth(82)
         self.timeframe_combo.currentTextChanged.connect(self._on_timeframe_changed)
         layout.addWidget(self.timeframe_combo)
 
@@ -153,17 +238,18 @@ class TradingPage(QWidget):
         self.refresh_btn.setObjectName("Flat")
         self.refresh_btn.clicked.connect(lambda: self._load_klines(reset_zoom=True))
         layout.addWidget(self.refresh_btn)
-        return bar
+        card.body().addLayout(layout)
+        return card
 
     def _build_book_card(self) -> QWidget:
-        card = Card()
+        card = Card(padding=14)
         header = QHBoxLayout()
         title = QLabel("订单簿")
         title.setObjectName("Title")
         header.addWidget(title)
         header.addStretch(1)
         self.book_spread = QLabel("")
-        self.book_spread.setObjectName("Muted")
+        self.book_spread.setObjectName("Subtitle")
         header.addWidget(self.book_spread)
         card.body().addLayout(header)
         self.book = OrderBookWidget()
@@ -171,24 +257,27 @@ class TradingPage(QWidget):
         return card
 
     def _build_order_ticket(self) -> QWidget:
-        card = Card()
+        card = Card(padding=14)
+        header = QHBoxLayout()
         title = QLabel("手动下单")
         title.setObjectName("Title")
-        card.body().addWidget(title)
+        header.addWidget(title)
+        header.addStretch(1)
 
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("纸面交易", RunMode.PAPER.value)
         self.mode_combo.addItem("实盘", RunMode.LIVE.value)
         if self.ctx.network.value == "testnet":
             self.mode_combo.addItem("测试网实盘", RunMode.LIVE.value)
-        mode_row = QHBoxLayout()
-        mode_row.addWidget(QLabel("模式"))
-        mode_row.addWidget(self.mode_combo, 1)
-        card.body().addLayout(mode_row)
+        self.mode_combo.setFixedWidth(120)
+        header.addWidget(self.mode_combo)
+        card.body().addLayout(header)
+        card.body().addWidget(divider())
 
         form = QFormLayout()
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        form.setSpacing(6)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignVCenter)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(8)
 
         self.side_combo = QComboBox()
         self.side_combo.addItem("买入 / 做多", OrderSide.BUY.value)
@@ -232,33 +321,33 @@ class TradingPage(QWidget):
         self.reduce_check = QCheckBox("只减仓")
         self.reduce_check.setEnabled(False)
         form.addRow("", self.reduce_check)
-
         card.body().addLayout(form)
 
         self.estimate_label = QLabel("预计金额：--")
-        self.estimate_label.setObjectName("Muted")
+        self.estimate_label.setObjectName("Subtitle")
         card.body().addWidget(self.estimate_label)
 
         self.unit_hint = QLabel("")
-        self.unit_hint.setObjectName("Muted")
+        self.unit_hint.setObjectName("Subtitle")
         self.unit_hint.setWordWrap(True)
         card.body().addWidget(self.unit_hint)
 
         buttons = QHBoxLayout()
+        buttons.setSpacing(10)
         self.buy_btn = QPushButton("买入 / 做多")
         self.buy_btn.setObjectName("Buy")
-        self.buy_btn.setMinimumHeight(36)
+        self.buy_btn.setMinimumHeight(38)
         self.buy_btn.clicked.connect(lambda: self._submit_order(OrderSide.BUY.value))
         self.sell_btn = QPushButton("卖出 / 做空")
         self.sell_btn.setObjectName("Sell")
-        self.sell_btn.setMinimumHeight(36)
+        self.sell_btn.setMinimumHeight(38)
         self.sell_btn.clicked.connect(lambda: self._submit_order(OrderSide.SELL.value))
         buttons.addWidget(self.buy_btn)
         buttons.addWidget(self.sell_btn)
         card.body().addLayout(buttons)
 
         self.mode_hint = QLabel("")
-        self.mode_hint.setObjectName("Muted")
+        self.mode_hint.setObjectName("Subtitle")
         self.mode_hint.setWordWrap(True)
         card.body().addWidget(self.mode_hint)
 
@@ -271,7 +360,8 @@ class TradingPage(QWidget):
         return card
 
     def _build_bottom_tabs(self) -> QWidget:
-        self.bottom_tabs = QTabWidget()
+        self.drawer = OrderDrawer()
+        self.bottom_tabs = self.drawer.tabs
 
         open_page = QWidget()
         open_layout = QVBoxLayout(open_page)
@@ -300,9 +390,8 @@ class TradingPage(QWidget):
         self.trades_table = DataTable(["时间", "交易对", "方向", "价格", "数量", "手续费"])
         self.bottom_tabs.addTab(self.orders_table, "历史委托")
         self.bottom_tabs.addTab(self.trades_table, "成交记录")
-        self.bottom_tabs.setFixedHeight(200)
         self._open_orders: list[dict] = []
-        return self.bottom_tabs
+        return self.drawer
 
     # ------------------------------------------------------------- data loads
     def _bootstrap(self) -> None:
@@ -405,11 +494,12 @@ class TradingPage(QWidget):
         self._fill_paper_limits(symbol, ticker.last)
         self.price_label.setText(f"{ticker.last:,.4f}")
         self.change_label.setText(f"{ticker.change_pct:+.2f}%")
-        color = UP if ticker.change_pct >= 0 else DOWN
+        color = theme.current().up if ticker.change_pct >= 0 else theme.current().down
         self.change_label.setStyleSheet(f"color: {color}; font-weight: 600;")
-        self.high_label.setText(f"24h 高 {ticker.high:,.4f}")
-        self.low_label.setText(f"24h 低 {ticker.low:,.4f}")
-        self.volume_label.setText(f"24h 额 {ticker.quote_volume:,.0f}")
+        self.high_label.setText(f"{ticker.high:,.4f}")
+        self.low_label.setText(f"{ticker.low:,.4f}")
+        self.volume_label.setText(f"{ticker.quote_volume:,.0f}")
+        self.symbol_caption.setText(f"{symbol} · 最新价")
         if self.type_combo.currentData() == OrderType.MARKET.value:
             self.price_spin.blockSignals(True)
             self.price_spin.setValue(ticker.last)
@@ -523,10 +613,10 @@ class TradingPage(QWidget):
         mode = self.mode_combo.currentData()
         if mode == RunMode.LIVE.value:
             self.mode_hint.setText("⚠ 实盘模式将使用真实资金下单，请确认风控设置。")
-            self.mode_hint.setStyleSheet("color: #f0b90b;")
+            self.mode_hint.setStyleSheet(f"color: {theme.current().accent};")
         else:
             self.mode_hint.setText("纸面交易使用模拟资金，行情为真实行情。")
-            self.mode_hint.setStyleSheet(f"color: {TEXT_DIM};")
+            self.mode_hint.setStyleSheet(f"color: {theme.current().text_dim};")
 
     def _set_futures_controls(self) -> None:
         futures = self._market().is_futures
@@ -702,6 +792,7 @@ class TradingPage(QWidget):
         index = self.bottom_tabs.indexOf(self._open_orders_page)
         if index >= 0:
             self.bottom_tabs.setTabText(index, f"当前委托 ({len(self._open_orders)})")
+        self.drawer.sync_header()
 
     def _cancel_selected_order(self) -> None:
         row = self.open_orders_table.currentRow()

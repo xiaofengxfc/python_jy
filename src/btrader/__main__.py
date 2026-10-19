@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont, QIcon, QPixmap, QPainter, QColor
+from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication
 
 from . import APP_NAME, __version__
@@ -61,10 +61,10 @@ def main() -> None:
     app.setApplicationVersion(__version__)
     app.setOrganizationName(APP_NAME)
     app.setWindowIcon(_make_icon())
-    app.setFont(QFont("Microsoft YaHei UI", 9))
 
     from .ui.theme import apply_theme
 
+    # `apply_theme` registers the bundled Inter faces and sets the app font.
     apply_theme(app)
 
     from .context import AppContext

@@ -10,7 +10,7 @@ import pyqtgraph as pg
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtWidgets import QVBoxLayout, QWidget
 
-from ..theme import BG, BG_ALT, BORDER, DOWN, GRID, TEXT, TEXT_DIM, UP
+from .. import theme
 
 
 class DateAxis(pg.AxisItem):
@@ -46,8 +46,6 @@ class CandleChart(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        pg.setConfigOptions(antialias=False, background=BG, foreground=TEXT_DIM)
-
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -63,8 +61,8 @@ class CandleChart(QWidget):
         self.price_plot.setXLink(self.volume_plot)
         self.price_plot.showAxis("bottom", False)
 
-        self.price_plot.addLegend(offset=(-10, 8), labelTextColor=TEXT_DIM)
-        self.price_plot.getPlotItem().legend.setBrush(pg.mkBrush(20, 24, 32, 200))
+        self.price_plot.addLegend(offset=(-10, 8))
+        self._legend = self.price_plot.getPlotItem().legend
 
         self._df = pd.DataFrame()
         self._candles: pg.GraphicsObject | None = None
@@ -75,16 +73,51 @@ class CandleChart(QWidget):
         self._last_price_line: pg.InfiniteLine | None = None
         self._label_text = ""
 
+        self._sync_theme()
+        theme.bus().changed.connect(self._on_theme_changed)
+
+    # ----------------------------------------------------------------- theme
+    def _on_theme_changed(self, *_args) -> None:
+        self._sync_theme()
+        if not self._df.empty:
+            self._redraw()
+
+    def _sync_theme(self) -> None:
+        palette = theme.current()
+        for widget in (self.price_plot, self.volume_plot):
+            widget.setBackground(palette.bg_card)
+            item = widget.getPlotItem()
+            for axis in ("left", "right", "top", "bottom"):
+                ax = item.getAxis(axis)
+                ax.setPen(pg.mkPen(palette.border))
+                ax.setTextPen(pg.mkPen(palette.text_dim))
+        if self._legend is not None:
+            self._legend.setBrush(pg.mkBrush(palette.bg_card))
+            self._legend.setPen(pg.mkPen(palette.border))
+            self._legend.setLabelTextColor(palette.text_dim)
+        if self._last_price_line is not None:
+            self._last_price_line.setPen(
+                pg.mkPen(palette.accent, width=1, style=Qt.PenStyle.DashLine)
+            )
+
+    def _redraw(self) -> None:
+        """Rebuild cached graphics after a theme change."""
+        df = self._df
+        if df.empty:
+            return
+        overlays = {}
+        for curve in self._overlays:
+            if curve.name is not None:
+                overlays[curve.name] = curve.getData()[1]
+        self.set_data(df, reset_zoom=False)
+        if overlays:
+            self.set_overlays({name: pd.Series(values) for name, values in overlays.items()})
+
     def _setup_plot(self, widget: pg.PlotWidget) -> None:
-        widget.setBackground(BG)
-        widget.showGrid(x=True, y=True, alpha=0.18)
+        widget.showGrid(x=True, y=True, alpha=0.10)
         item = widget.getPlotItem()
         item.setMenuEnabled(False)
         item.hideButtons()
-        for axis in ("left", "right", "top", "bottom"):
-            ax = item.getAxis(axis)
-            ax.setPen(pg.mkPen(BORDER))
-            ax.setTextPen(pg.mkPen(TEXT_DIM))
         item.getAxis("right").setStyle(showValues=False)
         widget.setMouseEnabled(x=True, y=False)
 
@@ -121,9 +154,10 @@ class CandleChart(QWidget):
         self._volume_items.clear()
         if self._df.empty:
             return
+        palette = theme.current()
         volume = self._df["volume"].to_numpy(dtype=float)
-        colors = np.where(closes >= opens, UP, DOWN)
-        brushes = [pg.mkBrush(c + "88") for c in colors]
+        colors = np.where(closes >= opens, palette.up, palette.down)
+        brushes = [pg.mkBrush(c + "66") for c in colors]
         bars = pg.BarGraphItem(x=x, height=volume, width=0.7, brushes=brushes, pen=None)
         self.volume_plot.addItem(bars)
         self._volume_items.append(bars)
@@ -146,17 +180,25 @@ class CandleChart(QWidget):
         self._overlays.clear()
         if not series or self._df.empty:
             return
-        colors = ["#4f9dff", "#ffb84d", "#b388ff", "#5ad1c7", "#ff8a80"]
+        palette = theme.current()
+        colors = [
+            palette.accent,
+            "#f59e0b",
+            "#a78bfa",
+            "#2dd4bf",
+            "#fb7185",
+        ]
         for i, (name, values) in enumerate(series.items()):
             y = np.asarray(values, dtype=float)
             if len(y) != len(self._df):
                 continue
-            pen = pg.mkPen(colors[i % len(colors)], width=1.3)
+            pen = pg.mkPen(colors[i % len(colors)], width=1.4)
             curve = pg.PlotDataItem(np.arange(len(y)), y, pen=pen, name=name)
             self.price_plot.addItem(curve)
             self._overlays.append(curve)
 
     def set_price_line(self, price: float) -> None:
+        palette = theme.current()
         if price <= 0:
             if self._last_price_line is not None:
                 self.price_plot.removeItem(self._last_price_line)
@@ -167,9 +209,13 @@ class CandleChart(QWidget):
                 pos=price,
                 angle=0,
                 movable=False,
-                pen=pg.mkPen("#f0b90b", width=1, style=Qt.PenStyle.DashLine),
+                pen=pg.mkPen(palette.accent, width=1, style=Qt.PenStyle.DashLine),
                 label=f"{price:,.4f}",
-                labelOpts={"position": 0.98, "color": "#f0b90b", "fill": (30, 34, 44, 220)},
+                labelOpts={
+                    "position": 0.98,
+                    "color": palette.accent,
+                    "fill": (palette.bg_card),
+                },
             )
             self.price_plot.addItem(self._last_price_line)
         else:
@@ -182,6 +228,7 @@ class CandleChart(QWidget):
         self._markers = {"entry": [], "exit": []}
         if trades is None or trades.empty or self._df.empty:
             return
+        palette = theme.current()
         ts_to_index = {int(t): i for i, t in enumerate(self._df["timestamp"])}
         for _, row in trades.iterrows():
             entry_idx = ts_to_index.get(int(row["entry_time"]))
@@ -191,7 +238,8 @@ class CandleChart(QWidget):
                 symbol = "t1" if is_long else "t"
                 marker = pg.ScatterPlotItem(
                     [entry_idx], [row["entry_price"]], symbol=symbol, size=11,
-                    brush=pg.mkBrush(UP if is_long else DOWN), pen=pg.mkPen("#0f1115"),
+                    brush=pg.mkBrush(palette.up if is_long else palette.down),
+                    pen=pg.mkPen(palette.bg_card),
                 )
                 self.price_plot.addItem(marker)
                 self._markers["entry"].append(marker)
@@ -200,8 +248,8 @@ class CandleChart(QWidget):
                 pnl = float(row["pnl"])
                 marker = pg.ScatterPlotItem(
                     [exit_idx], [row["exit_price"]], symbol=symbol, size=11,
-                    brush=pg.mkBrush("#26a69a" if pnl > 0 else "#ef5350"),
-                    pen=pg.mkPen("#0f1115"),
+                    brush=pg.mkBrush(palette.up if pnl > 0 else palette.down),
+                    pen=pg.mkPen(palette.bg_card),
                 )
                 self.price_plot.addItem(marker)
                 self._markers["exit"].append(marker)
@@ -255,13 +303,14 @@ class CandlestickItem(pg.GraphicsObject):
     def generatePicture(self) -> None:
         from PySide6.QtGui import QPainter, QPicture
 
+        palette = theme.current()
         picture = QPicture()
         painter = QPainter(picture)
         width = 0.34
-        up_pen = pg.mkPen(UP, width=1)
-        down_pen = pg.mkPen(DOWN, width=1)
-        up_brush = pg.mkBrush(UP)
-        down_brush = pg.mkBrush(DOWN)
+        up_pen = pg.mkPen(palette.up, width=1)
+        down_pen = pg.mkPen(palette.down, width=1)
+        up_brush = pg.mkBrush(palette.up)
+        down_brush = pg.mkBrush(palette.down)
         for i in range(len(self.x)):
             o, h, l, c = self.open[i], self.high[i], self.low[i], self.close[i]
             rising = c >= o

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 import pandas as pd
 from PySide6.QtCore import QDateTime, Qt, QThread, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -17,7 +18,6 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFormLayout,
     QGridLayout,
-    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -40,9 +40,9 @@ from ...context import AppContext
 from ...core.types import TIMEFRAMES, MarketType
 from ...exchange.klines import KlineStore
 from ...strategy.base import ParamSpec
-from ..theme import DOWN, TEXT_DIM, UP
+from .. import theme
 from ..widgets.chart import CandleChart
-from ..widgets.common import Card, MetricCard, money_text, percent_text, pnl_color
+from ..widgets.common import Card, MetricCard, PageHeader, money_text, percent_text, pnl_color
 from ..widgets.tables import DataTable
 from ..workers import TaskRunner
 
@@ -136,18 +136,22 @@ class BacktestPage(QWidget):
 
     # ------------------------------------------------------------------- ui
     def _build_ui(self) -> None:
-        root = QHBoxLayout(self)
-        root.setContentsMargins(12, 12, 12, 12)
-        root.setSpacing(10)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(*theme.PAGE_MARGIN)
+        outer.setSpacing(theme.PAGE_GAP)
+        outer.addWidget(PageHeader("策略回测", "历史数据驱动的策略验证与参数优化"))
+
+        root = QHBoxLayout()
+        root.setSpacing(theme.PAGE_GAP)
 
         config_panel = QScrollArea()
         config_panel.setWidgetResizable(True)
-        config_panel.setFixedWidth(330)
+        config_panel.setFixedWidth(340)
         config_panel.setFrameShape(QScrollArea.Shape.NoFrame)
         holder = QWidget()
         side = QVBoxLayout(holder)
-        side.setContentsMargins(0, 0, 6, 0)
-        side.setSpacing(10)
+        side.setContentsMargins(0, 0, 8, 0)
+        side.setSpacing(theme.PAGE_GAP)
 
         side.addWidget(self._build_data_group())
         side.addWidget(self._build_strategy_group())
@@ -160,10 +164,10 @@ class BacktestPage(QWidget):
         right = QWidget()
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(8)
+        right_layout.setSpacing(theme.PAGE_GAP)
 
         metrics = QGridLayout()
-        metrics.setSpacing(8)
+        metrics.setSpacing(theme.PAGE_GAP)
         self.m_return = MetricCard("总收益率")
         self.m_annual = MetricCard("年化收益")
         self.m_dd = MetricCard("最大回撤")
@@ -176,6 +180,7 @@ class BacktestPage(QWidget):
             metrics.addWidget(card, i // 3, i % 3)
         right_layout.addLayout(metrics)
 
+        results_card = Card(padding=12)
         self.tabs = QTabWidget()
         self.chart = CandleChart()
         self.chart_tab = QWidget()
@@ -193,12 +198,16 @@ class BacktestPage(QWidget):
         self.tabs.addTab(self.trades_table, "交易明细")
         self.tabs.addTab(self.equity_table, "权益曲线")
         self.tabs.addTab(self.optimize_panel, "参数优化")
-        right_layout.addWidget(self.tabs, 1)
+        results_card.body().addWidget(self.tabs, 1)
+        right_layout.addWidget(results_card, 1)
         root.addWidget(right, 1)
+        outer.addLayout(root, 1)
 
     def _build_data_group(self) -> QWidget:
-        group = QGroupBox("数据")
-        form = QFormLayout(group)
+        card = Card(padding=14)
+        card.body().addWidget(self._section("数据"))
+        form = QFormLayout()
+        form.setVerticalSpacing(8)
 
         self.market_combo = QComboBox()
         for market in MarketType:
@@ -227,33 +236,52 @@ class BacktestPage(QWidget):
         form.addRow(self.load_btn)
 
         self.data_label = QLabel("尚未加载数据")
-        self.data_label.setObjectName("Muted")
+        self.data_label.setObjectName("Subtitle")
         self.data_label.setWordWrap(True)
         form.addRow(self.data_label)
-        return group
+        card.body().addLayout(form)
+        return card
+
+    def _section(self, title: str, subtitle: str = "") -> QWidget:
+        """Card header: title plus an optional one-line hint."""
+        holder = QWidget()
+        layout = QVBoxLayout(holder)
+        layout.setContentsMargins(0, 0, 0, 4)
+        layout.setSpacing(2)
+        label = QLabel(title)
+        label.setObjectName("Title")
+        layout.addWidget(label)
+        if subtitle:
+            hint = QLabel(subtitle)
+            hint.setObjectName("Subtitle")
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
+        return holder
 
     def _build_strategy_group(self) -> QWidget:
-        group = QGroupBox("策略与参数")
-        layout = QVBoxLayout(group)
+        card = Card(padding=14)
+        card.body().addWidget(self._section("策略与参数"))
         self.strategy_combo = QComboBox()
         self.strategy_combo.currentIndexChanged.connect(self._on_strategy_changed)
-        layout.addWidget(self.strategy_combo)
+        card.body().addWidget(self.strategy_combo)
 
         self.strategy_desc = QLabel("")
-        self.strategy_desc.setObjectName("Muted")
+        self.strategy_desc.setObjectName("Subtitle")
         self.strategy_desc.setWordWrap(True)
-        layout.addWidget(self.strategy_desc)
+        card.body().addWidget(self.strategy_desc)
 
         self.params_form_host = QWidget()
         self.params_form = QFormLayout(self.params_form_host)
         self.params_form.setContentsMargins(0, 4, 0, 0)
-        self.params_form.setSpacing(6)
-        layout.addWidget(self.params_form_host)
-        return group
+        self.params_form.setSpacing(8)
+        card.body().addWidget(self.params_form_host)
+        return card
 
     def _build_cost_group(self) -> QWidget:
-        group = QGroupBox("资金与成本")
-        form = QFormLayout(group)
+        card = Card(padding=14)
+        card.body().addWidget(self._section("资金与成本"))
+        form = QFormLayout()
+        form.setVerticalSpacing(8)
 
         self.capital_spin = QDoubleSpinBox()
         self.capital_spin.setRange(100, 1e9)
@@ -306,14 +334,17 @@ class BacktestPage(QWidget):
         self.tp_spin.setValue(0)
         self.tp_spin.setSuffix(" %")
         form.addRow("止盈", self.tp_spin)
-        return group
+        card.body().addLayout(form)
+        return card
 
     def _build_action_group(self) -> QWidget:
-        group = QGroupBox("运行")
-        layout = QVBoxLayout(group)
+        card = Card(padding=14)
+        card.body().addWidget(self._section("运行"))
+        layout = QVBoxLayout()
+        layout.setSpacing(8)
         self.run_btn = QPushButton("开始回测")
         self.run_btn.setObjectName("Primary")
-        self.run_btn.setMinimumHeight(34)
+        self.run_btn.setMinimumHeight(38)
         self.run_btn.clicked.connect(self._run)
         layout.addWidget(self.run_btn)
 
@@ -322,10 +353,12 @@ class BacktestPage(QWidget):
         layout.addWidget(self.progress)
 
         self.promote_btn = QPushButton("用此参数开始纸面交易")
+        self.promote_btn.setObjectName("Flat")
         self.promote_btn.setEnabled(False)
         self.promote_btn.clicked.connect(self._promote)
         layout.addWidget(self.promote_btn)
-        return group
+        card.body().addLayout(layout)
+        return card
 
     def _build_optimize_panel(self) -> QWidget:
         panel = QWidget()
@@ -335,7 +368,7 @@ class BacktestPage(QWidget):
         hint = QLabel(
             "为每个参数填写候选值（逗号分隔），例如 5,10,20。组合数过多时会很慢。"
         )
-        hint.setObjectName("Muted")
+        hint.setObjectName("Subtitle")
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
@@ -556,7 +589,10 @@ class BacktestPage(QWidget):
         metrics = result.metrics
         self.m_return.set_value(percent_text(metrics["total_return"]), pnl_color(metrics["total_return"]))
         self.m_annual.set_value(percent_text(metrics["annual_return"]), pnl_color(metrics["annual_return"]))
-        self.m_dd.set_value(percent_text(metrics["max_drawdown"]), DOWN if metrics["max_drawdown"] < 0 else None)
+        self.m_dd.set_value(
+            percent_text(metrics["max_drawdown"]),
+            theme.current().down if metrics["max_drawdown"] < 0 else None,
+        )
         self.m_sharpe.set_value(f"{metrics['sharpe']:.2f}")
         self.m_trades.set_value(f"{int(metrics['trades'])}")
         self.m_win.set_value(percent_text(metrics["win_rate"], 1))
@@ -624,7 +660,8 @@ class BacktestPage(QWidget):
                     str(int(row["bars"])),
                     reasons.get(row["exit_reason"], row["exit_reason"]),
                 ],
-                colors=[None, UP if row["side"] == "long" else DOWN, None, None, None, None, None,
+                colors=[None, theme.current().up if row["side"] == "long" else theme.current().down,
+                        None, None, None, None, None,
                         pnl_color(row["pnl"]), pnl_color(row["pnl"]), None, None],
             )
 
@@ -643,7 +680,8 @@ class BacktestPage(QWidget):
                     percent_text(record["drawdown"]),
                     percent_text(record["position"], 1),
                 ],
-                colors=[None, None, DOWN if record["drawdown"] < -0.001 else None, None],
+                colors=[None, None,
+                        theme.current().down if record["drawdown"] < -0.001 else None, None],
             )
             row += 1
 
@@ -706,7 +744,7 @@ class BacktestPage(QWidget):
                 item = QTableWidgetItem(text)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 if name == "m_sharpe":
-                    item.setForeground(Qt.GlobalColor.white)
+                    item.setForeground(QColor(theme.current().accent))
                 self.opt_table.setItem(row, col, item)
         self.status.emit(f"参数优化完成：{len(frame)} 组结果")
 

@@ -1,9 +1,9 @@
-"""Binance-style order book ladder with depth bars."""
+"""Order book ladder with depth bars."""
 
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHeaderView,
@@ -14,15 +14,14 @@ from PySide6.QtWidgets import (
 
 from ...core.models import OrderBook
 from ...exchange.symbols import format_amount
-from ..theme import BG, DOWN, TEXT, TEXT_DIM, UP
+from .. import theme
 
 
 class _DepthItem(QTableWidgetItem):
-    def __init__(self, text: str, ratio: float, color: str, side: str) -> None:
+    def __init__(self, text: str, ratio: float, color: str) -> None:
         super().__init__(text)
         self._ratio = max(0.0, min(1.0, ratio))
         self._color = QColor(color)
-        self._side = side
         self.setTextAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
@@ -30,10 +29,13 @@ class _DepthItem(QTableWidgetItem):
     def set_ratio(self, ratio: float) -> None:
         self._ratio = max(0.0, min(1.0, ratio))
 
+    def set_bar_color(self, color: str) -> None:
+        self._color = QColor(color)
+
     def paint(self, painter, option, widget=None):  # noqa: D401 - Qt override
         if self._ratio > 0:
             fill = QColor(self._color)
-            fill.setAlpha(38)
+            fill.setAlpha(30)
             painter.fillRect(
                 option.rect.x(),
                 option.rect.y(),
@@ -45,6 +47,8 @@ class _DepthItem(QTableWidgetItem):
 
 
 class OrderBookWidget(QWidget):
+    """Asks on top (red), bids below (green), with cumulative depth bars."""
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         from PySide6.QtWidgets import QVBoxLayout
@@ -56,21 +60,42 @@ class OrderBookWidget(QWidget):
         self.table.setHorizontalHeaderLabels(["价格", "数量", "累计"])
         self.table.verticalHeader().setVisible(False)
         self.table.setShowGrid(False)
+        self.table.setFrameShape(QTableWidget.Shape.NoFrame)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        header.setFixedHeight(26)
-        self.table.verticalHeader().setDefaultSectionSize(19)
+        header.setFixedHeight(30)
+        header.setDefaultAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.table.verticalHeader().setDefaultSectionSize(22)
         layout.addWidget(self.table)
-        self._levels = 15
+        self._levels = 12
         self._last_price = 0.0
+        theme.bus().changed.connect(self._repaint)
+
+    def _repaint(self, *_args) -> None:
+        palette = theme.current()
+        for row in range(self.table.rowCount()):
+            for col in range(3):
+                item = self.table.item(row, col)
+                if item is None:
+                    continue
+                if col == 0:
+                    item.setForeground(QColor(palette.down if row < self._levels else palette.up))
+                else:
+                    item.setForeground(QColor(palette.text))
+                if isinstance(item, _DepthItem):
+                    item.set_bar_color(palette.down if row < self._levels else palette.up)
+        self.table.viewport().update()
 
     def set_levels(self, levels: int) -> None:
         self._levels = max(5, levels)
 
     def update_book(self, book: OrderBook) -> None:
+        palette = theme.current()
         asks = list(reversed(book.asks[: self._levels]))
         bids = book.bids[: self._levels]
         rows = len(asks) + len(bids)
@@ -85,14 +110,13 @@ class OrderBookWidget(QWidget):
 
         for row, (price, amount) in enumerate(asks):
             ask_cum += amount
-            self._set_row(row, price, amount, ask_cum, ask_max, UP, DOWN, is_ask=True)
-            continue
+            self._set_row(row, price, amount, ask_cum, ask_max, palette.down)
         offset = len(asks)
         for row, (price, amount) in enumerate(bids):
             bid_cum += amount
-            self._set_row(offset + row, price, amount, bid_cum, bid_max, DOWN, UP, is_ask=False)
+            self._set_row(offset + row, price, amount, bid_cum, bid_max, palette.up)
 
-        self.table.setMinimumHeight(rows * 19 + 26)
+        self.table.setMinimumHeight(rows * 22 + 30)
 
     def _build_rows(self) -> None:
         for row in range(self.table.rowCount()):
@@ -110,22 +134,21 @@ class OrderBookWidget(QWidget):
         amount: float,
         cumulative: float,
         max_amount: float,
-        price_color: str,
-        bar_color: str,
-        is_ask: bool,
+        color: str,
     ) -> None:
+        palette = theme.current()
         ratio = cumulative / max_amount if max_amount else 0.0
         values = (f"{price:,.4f}", format_amount(amount), format_amount(cumulative))
         for col, text in enumerate(values):
             current = self.table.item(row, col)
-            if current is None:
-                current = _DepthItem(text, ratio, bar_color, "ask" if is_ask else "bid")
+            if current is None or not isinstance(current, _DepthItem):
+                current = _DepthItem(text, ratio, color)
                 self.table.setItem(row, col, current)
             else:
                 current.setText(text)
-                if isinstance(current, _DepthItem):
-                    current.set_ratio(ratio)
-            current.setForeground(QColor(price_color if col == 0 else TEXT))
+                current.set_ratio(ratio)
+                current.set_bar_color(color)
+            current.setForeground(QColor(color if col == 0 else palette.text))
 
     def clear(self) -> None:
         self.table.setRowCount(0)

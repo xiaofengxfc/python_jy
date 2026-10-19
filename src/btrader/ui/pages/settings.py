@@ -7,20 +7,22 @@ import os
 import subprocess
 import sys
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QScrollArea,
     QSpinBox,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -28,17 +30,26 @@ from PySide6.QtWidgets import (
 from ... import paths
 from ...context import AppContext
 from ...core.types import MarketType, Network
-from ..theme import TEXT_DIM
-from ..widgets.common import mono_font
+from .. import theme
+from ..widgets.common import Card, PageHeader, mono_font
 from ..widgets.tables import DataTable
 from ..workers import TaskRunner
 
 log = logging.getLogger(__name__)
 
 
+def _section_item(title: str, hint: str) -> QListWidgetItem:
+    """One settings section entry: a name with a one-line description."""
+    item = QListWidgetItem(f"{title}\n{hint}")
+    item.setSizeHint(QSize(0, 52))
+    item.setToolTip(hint)
+    return item
+
+
 class SettingsPage(QWidget):
     status = Signal(str)
     network_changed = Signal()
+    theme_changed = Signal(str)
 
     def __init__(self, ctx: AppContext, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -49,33 +60,74 @@ class SettingsPage(QWidget):
 
     def _build_ui(self) -> None:
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setContentsMargins(*theme.PAGE_MARGIN)
+        outer.setSpacing(theme.PAGE_GAP)
+
+        header = PageHeader("设置", "API 凭据、交易环境、风控限制与策略插件")
+        outer.addWidget(header)
+
+        root = QHBoxLayout()
+        root.setSpacing(theme.PAGE_GAP)
+
+        self.section_list = QListWidget()
+        self.section_list.setObjectName("SettingsNav")
+        self.section_list.setFixedWidth(188)
+        self.section_list.setFrameShape(QListWidget.Shape.NoFrame)
+        self.section_list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.section_list.setSpacing(2)
+        root.addWidget(self.section_list)
+
+        self.section_stack = QStackedWidget()
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         holder = QWidget()
-        root = QVBoxLayout(holder)
-        root.setContentsMargins(0, 0, 8, 0)
-        root.setSpacing(12)
-        root.addWidget(self._build_api_group())
-        root.addWidget(self._build_network_group())
-        root.addWidget(self._build_risk_group())
-        root.addWidget(self._build_strategy_group())
-        root.addWidget(self._build_paths_group())
-        root.addStretch(1)
+        root_layout = QVBoxLayout(holder)
+        root_layout.setContentsMargins(0, 0, 10, 0)
+        root_layout.setSpacing(theme.PAGE_GAP)
+
+        groups = [
+            ("API 凭据", "密钥、权限与连通性", self._build_api_group()),
+            ("交易环境", "主网/测试网与默认市场", self._build_network_group()),
+            ("风控限制", "下单金额、持仓与熔断阈值", self._build_risk_group()),
+            ("外观", "深色 / 浅色主题", self._build_appearance_group()),
+            ("策略插件", "本地策略加载目录", self._build_strategy_group()),
+            ("数据目录", "配置、缓存与日志位置", self._build_paths_group()),
+        ]
+        for title, hint, widget in groups:
+            self.section_list.addItem(_section_item(title, hint))
+            self.section_stack.addWidget(widget)
+
+        root_layout.addWidget(self.section_stack)
+        root_layout.addStretch(1)
         scroll.setWidget(holder)
-        outer.addWidget(scroll)
+        root.addWidget(scroll, 1)
+        outer.addLayout(root, 1)
+
+        self.section_list.currentRowChanged.connect(self.section_stack.setCurrentIndex)
+        self.section_list.setCurrentRow(0)
+
+    def _group_card(self, title: str, hint: str = "") -> tuple[Card, QVBoxLayout]:
+        """A settings section: raised card with a title and optional hint."""
+        card = Card(padding=16)
+        heading = QLabel(title)
+        heading.setObjectName("Title")
+        card.body().addWidget(heading)
+        if hint:
+            note = QLabel(hint)
+            note.setObjectName("Subtitle")
+            note.setWordWrap(True)
+            card.body().addWidget(note)
+        return card, card.body()
 
     def _build_api_group(self) -> QWidget:
-        group = QGroupBox("币安 API 凭据")
-        layout = QVBoxLayout(group)
-        hint = QLabel(
+        card, layout = self._group_card(
+            "币安 API 凭据",
             "API Key 与 Secret 通过系统密钥环（Windows 凭据管理器）保存，不会写入配置文件。"
-            "建议只授予「读取 + 现货/合约交易」权限，切勿开启提现权限，并绑定 IP 白名单。"
+            "建议只授予「读取 + 现货/合约交易」权限，切勿开启提现权限，并绑定 IP 白名单。",
         )
-        hint.setObjectName("Muted")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
 
         form = QFormLayout()
         self.status_label = QLabel("未知")
@@ -126,11 +178,22 @@ class SettingsPage(QWidget):
         self.api_result = QLabel("")
         self.api_result.setWordWrap(True)
         layout.addWidget(self.api_result)
-        return group
+        return card
+
+    def _build_appearance_group(self) -> QWidget:
+        card, layout = self._group_card("外观", "切换即时生效，设置会保存在本机。")
+        form = QFormLayout()
+        self.theme_combo = QComboBox()
+        for label, value in (("深色", "dark"), ("浅色", "light"), ("跟随系统", "system")):
+            self.theme_combo.addItem(label, value)
+        self.theme_combo.currentIndexChanged.connect(self._on_theme_changed)
+        form.addRow("主题", self.theme_combo)
+        layout.addLayout(form)
+        return card
 
     def _build_network_group(self) -> QWidget:
-        group = QGroupBox("网络与市场")
-        form = QFormLayout(group)
+        card, layout = self._group_card("网络与市场")
+        form = QFormLayout()
         self.network_combo = QComboBox()
         for network in Network:
             self.network_combo.addItem(network.label, network.value)
@@ -146,12 +209,13 @@ class SettingsPage(QWidget):
         self.sound_check = QCheckBox("信号提醒音")
         self.sound_check.toggled.connect(self._save_notifications)
         form.addRow("", self.sound_check)
-        return group
+        layout.addLayout(form)
+        return card
 
     def _build_risk_group(self) -> QWidget:
-        group = QGroupBox("风控限制（0 表示不限制）")
-        layout = QVBoxLayout(group)
+        card, layout = self._group_card("风控限制", "0 表示不限制。所有实盘订单在提交前都会先经过这些检查。")
         form = QFormLayout()
+        form.setVerticalSpacing(8)
         risk = self.ctx.settings.risk
 
         self.max_order_spin = QDoubleSpinBox()
@@ -212,22 +276,18 @@ class SettingsPage(QWidget):
         save_btn.clicked.connect(self._save_risk)
         row.addWidget(save_btn)
         self.risk_state = QLabel("")
-        self.risk_state.setObjectName("Muted")
+        self.risk_state.setObjectName("Subtitle")
         row.addWidget(self.risk_state)
         row.addStretch(1)
         layout.addLayout(row)
-        return group
+        return card
 
     def _build_strategy_group(self) -> QWidget:
-        group = QGroupBox("策略插件")
-        layout = QVBoxLayout(group)
-        hint = QLabel(
+        card, layout = self._group_card(
+            "策略插件",
             "把自己的策略 .py 文件放入下面的目录，重启应用后即可在回测/自动交易中选择。"
-            "策略需继承 btrader.strategy.base.Strategy 并实现 generate()。"
+            "策略需继承 btrader.strategy.base.Strategy 并实现 generate()。",
         )
-        hint.setObjectName("Muted")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
 
         row = QHBoxLayout()
         self.strategy_path = QLabel(str(paths.user_strategies_dir()))
@@ -248,11 +308,10 @@ class SettingsPage(QWidget):
         self.strategy_table.setMinimumHeight(140)
         layout.addWidget(self.strategy_table)
         self._fill_strategy_table()
-        return group
+        return card
 
     def _build_paths_group(self) -> QWidget:
-        group = QGroupBox("数据目录")
-        layout = QVBoxLayout(group)
+        card, layout = self._group_card("数据目录", "配置文件、行情缓存与日志的存放位置。")
         for label, path in [
             ("配置", paths.data_dir()),
             ("缓存", paths.cache_dir()),
@@ -272,28 +331,38 @@ class SettingsPage(QWidget):
         open_btn.setFixedWidth(130)
         open_btn.clicked.connect(lambda: self._open_path(paths.data_dir()))
         layout.addWidget(open_btn)
-        return group
+        return card
 
     # ---------------------------------------------------------------- loading
     def _load_values(self) -> None:
         s = self.ctx.settings
         self.network_combo.blockSignals(True)
         self.market_combo.blockSignals(True)
+        self.theme_combo.blockSignals(True)
         self.network_combo.setCurrentIndex(self.network_combo.findData(s.network))
         self.market_combo.setCurrentIndex(self.market_combo.findData(s.market_type))
+        self.theme_combo.setCurrentIndex(self.theme_combo.findData(getattr(s, "theme", "dark")))
         self.network_combo.blockSignals(False)
         self.market_combo.blockSignals(False)
+        self.theme_combo.blockSignals(False)
         self.sound_check.setChecked(s.notification_sound)
         self._update_credential_status()
+
+    def _on_theme_changed(self) -> None:
+        value = self.theme_combo.currentData()
+        self.ctx.settings.theme = value
+        self.ctx.save_settings()
+        self.theme_changed.emit(value)
+        self.status.emit(f"主题已切换：{self.theme_combo.currentText()}")
 
     def _update_credential_status(self) -> None:
         creds = self.ctx.credentials.load(self.ctx.network, self.ctx.market_type)
         if creds.is_set:
             self.status_label.setText(f"已配置（{creds.masked_key}）· {self.ctx.network.label}")
-            self.status_label.setStyleSheet("color: #26a69a;")
+            self.status_label.setStyleSheet(f"color: {theme.current().up};")
         else:
             self.status_label.setText("未配置")
-            self.status_label.setStyleSheet(f"color: {TEXT_DIM};")
+            self.status_label.setStyleSheet(f"color: {theme.current().text_dim};")
 
     def _fill_strategy_table(self) -> None:
         metas = self.ctx.strategies.meta_list()
@@ -338,11 +407,11 @@ class SettingsPage(QWidget):
                 f"连接成功，账户资产 {len(funded)} 项；USDT 余额 "
                 f"{float(assets.get('USDT') or 0):,.2f}"
             )
-            self.api_result.setStyleSheet("color: #26a69a;")
+            self.api_result.setStyleSheet(f"color: {theme.current().up};")
 
         def failed(message: str) -> None:
             self.api_result.setText(f"连接失败：{message}")
-            self.api_result.setStyleSheet("color: #ef5350;")
+            self.api_result.setStyleSheet(f"color: {theme.current().down};")
 
         self.runner.run(check, done, failed)
 

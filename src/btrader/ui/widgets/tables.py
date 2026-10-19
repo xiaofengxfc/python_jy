@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
 )
 
-from ..theme import TEXT, TEXT_DIM
+from .. import theme
 
 
 class DataTable(QTableWidget):
@@ -23,14 +23,18 @@ class DataTable(QTableWidget):
         self.setHorizontalHeaderLabels(headers)
         self.verticalHeader().setVisible(False)
         self.setShowGrid(False)
-        self.setAlternatingRowColors(True)
+        self.setAlternatingRowColors(False)
         self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.verticalHeader().setDefaultSectionSize(24)
+        self.setFrameShape(QTableWidget.Shape.NoFrame)
+        self.verticalHeader().setDefaultSectionSize(30)
         header = self.horizontalHeader()
         header.setHighlightSections(False)
         header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        header.setDefaultAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
 
     def set_stretch_column(self, index: int) -> None:
         header = self.horizontalHeader()
@@ -47,7 +51,7 @@ class DataTable(QTableWidget):
                 self.setItem(row, col, item)
             item.setText(text)
             color = colors[col] if colors and col < len(colors) else None
-            item.setForeground(QColor(color or TEXT))
+            item.setForeground(QColor(color or theme.current().text))
 
     def load_dataframe(
         self,
@@ -72,7 +76,7 @@ class DataTable(QTableWidget):
                     )
                     self.setItem(row, col, item)
                 item.setText(text)
-                item.setForeground(QColor(TEXT))
+                item.setForeground(QColor(theme.current().text))
 
     def clear_rows(self) -> None:
         self.setRowCount(0)

@@ -26,6 +26,11 @@ datas += collect_data_files("ccxt")
 # The window icon is loaded at runtime from the bundle, not just embedded in
 # the executable's resource section.
 datas += [(str(ROOT / "packaging" / "bitrader.ico"), "packaging")]
+# Bundled UI font (Inter) so every machine renders the interface identically.
+datas += [
+    (str(path), "btrader/assets/fonts")
+    for path in (ROOT / "src" / "btrader" / "assets" / "fonts").glob("*.ttf")
+]
 
 a = Analysis(
     # `run.py` is the entry point: it adds src/ to sys.path and imports the

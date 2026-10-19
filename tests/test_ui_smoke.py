@@ -55,11 +55,17 @@ def test_chart_accepts_data(app):
     assert chart.frame.empty
 
 
-def test_theme_stylesheet_contains_tokens(app):
+def test_theme_supports_dark_and_light(app):
     from btrader.ui import theme
 
-    assert theme.ACCENT in theme.STYLESHEET
-    assert "#f0b90b" in theme.STYLESHEET
+    dark = theme.apply_theme(app, "dark")
+    assert dark.is_dark
+    assert theme.DARK.accent in app.styleSheet()
+    light = theme.apply_theme(app, "light")
+    assert not light.is_dark
+    assert theme.LIGHT.accent in app.styleSheet()
+    assert "#f0b90b" not in app.styleSheet()  # old Binance yellow is gone
+    theme.apply_theme(app, "dark")  # leave the shared app on the default
 
 
 def test_paper_limit_order_fills_when_price_crosses(app, ctx):
