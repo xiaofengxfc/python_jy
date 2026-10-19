@@ -5,7 +5,14 @@ import { foldTick } from "../liveCandle";
 import { useMarketStream } from "../hooks/useMarketStream";
 import type { Account, Candle, Health, SymbolInfo } from "../types";
 import BottomTabs from "../components/BottomTabs";
-import Chart, { type Indicator } from "../components/Chart";
+import Chart, {
+  INDICATOR_SPECS,
+  clampParam,
+  defaultParams,
+  type Indicator,
+  type IndicatorConfig,
+  type IndicatorParams,
+} from "../components/Chart";
 import OrderBook from "../components/OrderBook";
 import OrderTicket from "../components/OrderTicket";
 import SymbolPicker from "../components/SymbolPicker";
@@ -19,12 +26,73 @@ interface Props {
 
 const FEE_RATE = 0.0004;
 
-const INDICATORS: [Indicator, string][] = [
-  ["none", "无"],
-  ["boll", "BOLL"],
-  ["macd", "MACD"],
-  ["rsi", "RSI"],
+const INDICATORS: { group: string; items: [Indicator, string][] }[] = [
+  {
+    group: "主图",
+    items: [
+      ["ma", "MA"],
+      ["ema", "EMA"],
+      ["boll", "BOLL"],
+    ],
+  },
+  {
+    group: "副图",
+    items: [
+      ["macd", "MACD"],
+      ["rsi", "RSI"],
+      ["kdj", "KDJ"],
+      ["wr", "WR"],
+      ["cci", "CCI"],
+      ["obv", "OBV"],
+      ["atr", "ATR"],
+      ["dmi", "DMI"],
+    ],
+  },
 ];
+
+/** Which indicators are switched on lives in the browser: it is a view
+ * preference, not account state, and it must survive a reload without asking
+ * the backend. */
+const INDICATOR_STORAGE_KEY = "btrader.indicators.v1";
+
+/** Clamp a stored parameter set into the spec, filling missing keys from the
+ * defaults. A config written by an older build must not break the chart. */
+function normaliseParams(name: Indicator, raw: unknown): IndicatorParams {
+  const base = defaultParams(name);
+  if (!raw || typeof raw !== "object") return base;
+  const values = raw as Record<string, unknown>;
+  INDICATOR_SPECS[name].params.forEach((param) => {
+    const stored = values[param.key];
+    if (typeof stored !== "number" || !Number.isFinite(stored)) return;
+    base[param.key] = Math.min(param.max, Math.max(param.min, stored));
+  });
+  return base;
+}
+
+function loadIndicators(): IndicatorConfig[] {
+  try {
+    const raw = localStorage.getItem(INDICATOR_STORAGE_KEY);
+    if (raw == null) return [{ name: "ma", params: defaultParams("ma") }];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    const seen = new Set<Indicator>();
+    const out: IndicatorConfig[] = [];
+    parsed.forEach((item) => {
+      const name = (item as { name?: unknown } | null)?.name;
+      if (typeof name !== "string" || !(name in INDICATOR_SPECS)) return;
+      const indicator = name as Indicator;
+      if (seen.has(indicator)) return;
+      seen.add(indicator);
+      out.push({
+        name: indicator,
+        params: normaliseParams(indicator, (item as { params?: unknown }).params),
+      });
+    });
+    return out;
+  } catch {
+    return [{ name: "ma", params: defaultParams("ma") }];
+  }
+}
 
 export default function TradingPage({
   health,
@@ -36,7 +104,12 @@ export default function TradingPage({
   const [symbol, setSymbol] = useState("");
   const [symbols, setSymbols] = useState<SymbolInfo[]>([]);
   const [timeframe, setTimeframe] = useState("15m");
-  const [indicator, setIndicator] = useState<Indicator>("none");
+  /** Every indicator switched on, with its parameters. Several may be stacked
+   * at once; MA is the default because trend context is what most traders look
+   * at first. Loaded from localStorage so a reload keeps the setup. */
+  const [indicators, setIndicators] = useState<IndicatorConfig[]>(loadIndicators);
+  /** Indicator whose parameter editor is open, if any. */
+  const [editing, setEditing] = useState<Indicator | null>(null);
   const [candles, setCandles] = useState<Candle[]>([]);
   /** Timeframe the series in `candles` was loaded for. While a switch is in
    * flight the old series is still on screen; folding it with the new bar
@@ -63,6 +136,16 @@ export default function TradingPage({
     { value: "usdm" as const, label: MARKET_LABELS.usdm },
     { value: "coinm" as const, label: MARKET_LABELS.coinm },
   ];
+
+  // Keep the indicator setup in the browser so a reload restores it. Writing
+  // on every change is cheap here: a handful of numbers in one key.
+  useEffect(() => {
+    try {
+      localStorage.setItem(INDICATOR_STORAGE_KEY, JSON.stringify(indicators));
+    } catch {
+      // A full or disabled storage must not break trading.
+    }
+  }, [indicators]);
 
   /* ---------------------------------------------------------- symbols */
   useEffect(() => {
@@ -443,22 +526,112 @@ export default function TradingPage({
                 ))}
               </div>
               <span className="spacer" />
+            </div>
+            <div className="card-head indicator-bar">
               <span className="faint" style={{ fontSize: 11 }}>
                 指标
               </span>
-              <div className="segmented">
-                {INDICATORS.map(([value, label]) => (
-                  <button
-                    key={value}
-                    type="button"
-                    aria-pressed={indicator === value}
-                    onClick={() => setIndicator(value)}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
+              {INDICATORS.map(({ group, items }) => (
+                <div className="segmented" key={group} title={group}>
+                  {items.map(([value, label]) => {
+                    const on = indicators.some((item) => item.name === value);
+                    return (
+                      <button
+                        key={value}
+                        type="button"
+                        aria-pressed={on}
+                        onClick={() =>
+                          setIndicators((current) =>
+                            current.some((item) => item.name === value)
+                              ? current.filter((item) => item.name !== value)
+                              : [...current, { name: value, params: defaultParams(value) }],
+                          )
+                        }
+                        onDoubleClick={() => {
+                          // Double-click opens the parameters of an active
+                          // indicator without adding a separate gear button
+                          // for every one of the eleven types.
+                          if (on) setEditing(value);
+                        }}
+                        title={on ? `${label} 参数（双击编辑）` : `添加 ${label}`}
+                      >
+                        {label}
+                      </button>
+                    );
+                  })}
+                </div>
+              ))}
+              {indicators.length > 0 && (
+                <button
+                  type="button"
+                  className="link-btn"
+                  onClick={() => {
+                    setIndicators([]);
+                    setEditing(null);
+                  }}
+                >
+                  清空
+                </button>
+              )}
             </div>
+            {editing && indicators.some((item) => item.name === editing) && (
+              <div className="card-head indicator-params">
+                <span className="faint" style={{ fontSize: 11 }}>
+                  {INDICATOR_SPECS[editing].label} 参数
+                </span>
+                {INDICATOR_SPECS[editing].params.map((param) => {
+                  const current =
+                    indicators.find((item) => item.name === editing)?.params[param.key] ??
+                    param.value;
+                  return (
+                    <label key={param.key} className="indicator-param">
+                      <span>{param.label}</span>
+                      <input
+                        type="number"
+                        min={param.min}
+                        max={param.max}
+                        step={param.step}
+                        value={current}
+                        onChange={(event) => {
+                          const next = Number(event.target.value);
+                          if (!Number.isFinite(next)) return;
+                          setIndicators((items) =>
+                            items.map((item) =>
+                              item.name === editing
+                                ? {
+                                    ...item,
+                                    params: {
+                                      ...item.params,
+                                      [param.key]: clampParam(editing, param.key, next),
+                                    },
+                                  }
+                                : item,
+                            ),
+                          );
+                        }}
+                      />
+                    </label>
+                  );
+                })}
+                <span className="spacer" />
+                <button
+                  type="button"
+                  className="link-btn"
+                  onClick={() =>
+                    setIndicators((items) =>
+                      items.map((item) =>
+                        item.name === editing ? { ...item, params: defaultParams(editing) } : item,
+                      ),
+                    )
+                  }
+                >
+                  恢复默认
+                </button>
+                <button type="button" className="link-btn" onClick={() => setEditing(null)}>
+                  收起
+                </button>
+              </div>
+            )}
             <Chart
               candles={candles}
               seriesKey={`${market}:${symbol}`}
@@ -467,7 +640,7 @@ export default function TradingPage({
               lastPrice={lastPrice}
               loading={chartLoading}
               error={chartError}
-              indicator={indicator}
+              indicators={indicators}
               onLoadOlder={() => void loadOlder()}
               olderLoading={olderLoading}
             />

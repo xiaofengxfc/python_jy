@@ -538,6 +538,49 @@ p {
   border-bottom: 1px solid var(--border);
 }
 
+/* The indicator row wraps on narrow windows; it owns its height instead of
+   forcing the timeframe row to scroll sideways. */
+.card-head.indicator-bar {
+  height: auto;
+  min-height: 36px;
+  flex-wrap: wrap;
+  padding-top: 4px;
+  padding-bottom: 4px;
+  row-gap: 4px;
+}
+
+/* Parameter editor for the selected indicator. Sits under the indicator row
+   and only appears while one is being edited. */
+.card-head.indicator-params {
+  height: auto;
+  min-height: 34px;
+  flex-wrap: wrap;
+  padding-top: 4px;
+  padding-bottom: 4px;
+  row-gap: 4px;
+  background: var(--bg-hover, #f7f7f7);
+}
+
+.indicator-param {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-2, #5b5b5b);
+}
+
+.indicator-param input {
+  width: 58px;
+  height: 24px;
+  padding: 0 6px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+}
+
 .card-title {
   font-size: 12px;
   font-weight: 600;
@@ -901,6 +944,28 @@ input[type="range"].input:focus {
   /* The trading screen has no title bar, so it needs its own breathing room
      at the top to line up with the other pages. */
   margin-top: 12px;
+}
+
+/* A fixed 312px order rail leaves the chart ~110px wide on small windows,
+   which reads as a broken chart. Stack the rail under the chart instead and
+   give the candles the full width. */
+@media (max-width: 900px) {
+  .trading {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .trading-main > .card:nth-child(2) {
+    min-height: 320px;
+  }
+
+  .trading-rail {
+    overflow: visible;
+  }
+
+  .trading-rail > .card:first-child {
+    flex: 0 0 auto;
+    max-height: 360px;
+  }
 }
 
 .trading-main,
