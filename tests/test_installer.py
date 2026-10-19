@@ -414,20 +414,49 @@ def test_qr_svg_encodes_the_captured_link(fake_env, monkeypatch) -> None:
     fake_env["which"]["openclaw"] = "/usr/local/bin/openclaw"
     url = "https://liteapp.weixin.qq.com/q/7GiQu1?qrcode=cafebabe&bot_type=3"
 
+    class HangingStream:
+        """Yields the printed link, then keeps the pipe open like the wizard.
+
+        A real ``channels login`` stays alive while it waits for the scan; a
+        stream that closes immediately makes the worker report "done" and clear
+        the link, which is not the state the page renders the code in.
+        """
+
+        def __init__(self, lines: list[str]) -> None:
+            self._lines = lines
+            self._closed = threading.Event()
+
+        def __iter__(self):
+            for line in self._lines:
+                yield line + "\n"
+            self._closed.wait(30)
+
+        def close(self) -> None:
+            self._closed.set()
+
     class BlockingProcess(FakeProcess):
         def __init__(self) -> None:
-            super().__init__([url])
-            self.stdout = io.StringIO("")
+            super().__init__([])
+            self.stdout = HangingStream([url])
+
+        def wait(self, timeout=None) -> int:
+            self.stdout.close()
+            return 0
+
+        def poll(self):
+            return None
 
     monkeypatch.setattr(
         "btrader.installer.subprocess.Popen", lambda *a, **k: BlockingProcess()
     )
     installer = OpenClawInstaller()
-    installer.start_login()
+    login = installer.start_login()
+    assert login["state"] == "waiting"
     # The reader thread fills the link in; the image can only be built after.
     deadline = time.time() + 5
     while time.time() < deadline and not installer.login_status()["has_qr"]:
         time.sleep(0.01)
+    assert installer.login_status()["url"] == url
     svg = installer.login_qr_svg().decode("utf-8")
     assert svg.lstrip().startswith("<?xml")
     assert "<svg" in svg

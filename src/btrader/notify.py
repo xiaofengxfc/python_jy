@@ -135,7 +135,8 @@ class WeChatNotifier:
         except queue.Full:
             # Dropping the newest is honest: the channel is wedged, and blocking
             # the caller (a fill handler) to wait for it would be worse.
-            self.dropped += 1
+            with self._lock:
+                self.dropped += 1
             log.warning("微信通知队列已满，丢弃一条消息")
             return False
         return True
@@ -154,7 +155,7 @@ class WeChatNotifier:
         text = _prepare(text)
         if not text:
             raise NotifyError("消息内容为空")
-        if not str(self.settings.target or "").strip():
+        if not normalize_target(self.settings.target):
             raise NotifyError("尚未填写微信接收目标，无法发送。")
         try:
             return self._run(text)
@@ -363,12 +364,12 @@ class WeChatNotifier:
         realized: float | None = None,
         market: str = "",
     ) -> str:
-        action = "买入" if side == "buy" else "卖出"
+        action = _action_label(side)
         where = "实盘" if mode == "live" else "纸面"
         venue = {"spot": "现货", "usdm": "U 本位", "coinm": "币本位"}.get(market, market)
         lines = [
             f"【{where}成交】{symbol}",
-            f"{action} {amount:.8g} @ {price:,.4f}",
+            f"{action} {_format_amount(amount)} @ {_format_price(price)}",
         ]
         if venue:
             lines.append(f"市场：{venue}")
@@ -384,7 +385,7 @@ class WeChatNotifier:
         where = "实盘" if mode == "live" else "纸面"
         return (
             f"【{where}{label}触发】{symbol}\n"
-            f"平仓 {amount:.8g} @ {price:,.4f}"
+            f"平仓 {_format_amount(amount)} @ {_format_price(price)}"
         )
 
     @staticmethod
@@ -400,6 +401,61 @@ class WeChatNotifier:
     def format_warning(*, title: str, detail: str = "") -> str:
         text = f"【风险提示】{title}"
         return f"{text}\n{detail}" if detail else text
+
+
+def _action_label(side: str) -> str:
+    """Name the trade direction without inventing one.
+
+    The old code said "卖出" for anything that was not exactly ``"buy"``, so a
+    missing or unexpected side produced a confidently wrong message. An unknown
+    side now says so, which is honest and still readable on a lock screen.
+    """
+    key = str(side or "").strip().lower()
+    if key in ("buy", "long"):
+        return "买入"
+    if key in ("sell", "short"):
+        return "卖出"
+    return "成交"
+
+
+def _format_price(value: float) -> str:
+    """Render a price with enough precision to be meaningful.
+
+    A fixed four decimals is wrong for both ends of the market: a 82,000 USDT
+    price gained two noise digits, and a 0.00001234 alt price was printed as
+    ``0.0000`` — a fill message that told the user nothing. Decimals therefore
+    scale with magnitude, and thousands separators are kept.
+    """
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    magnitude = abs(price)
+    if magnitude >= 1000:
+        decimals = 2
+    elif magnitude >= 100:
+        decimals = 3
+    elif magnitude >= 1:
+        decimals = 4
+    elif magnitude >= 0.01:
+        decimals = 5
+    else:
+        decimals = 8
+    return f"{price:,.{decimals}f}"
+
+
+def _format_amount(value: float) -> str:
+    """Render a base-asset quantity without scientific notation.
+
+    ``"{:.8g}"`` turned a dust-sized exit into ``1e-07``; a chat message should
+    show the number the exchange does.
+    """
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    text = f"{amount:.8f}".rstrip("0").rstrip(".")
+    return text or "0"
 
 
 def _prepare(text: str) -> str:

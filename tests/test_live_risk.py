@@ -191,7 +191,7 @@ def test_slices_of_one_order_produce_a_single_message(tmp_path):
     text, kind = notifier.sent[0]
     assert kind == "fill"
     # merged size, share-weighted price: (0.4*110 + 0.6*120) / 1.0
-    assert "平仓" not in text and "卖出 1 @ 116.0000" in text
+    assert "平仓" not in text and "卖出 1 @ 116.000" in text
     db.close()
 
 

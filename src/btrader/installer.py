@@ -216,6 +216,11 @@ class OpenClawInstaller:
                 # one the user is already looking at.
                 return self._login_payload(current)
             login = _Login(command=args)
+            # Mark the session pending *before* the thread starts. The worker
+            # used to set this, so two clicks in the same tick both saw
+            # "starting", both spawned a wizard, and the second QR invalidated
+            # the one the user was already scanning.
+            login.state = "waiting"
             self._login = login
         threading.Thread(
             target=self._work_login, args=(login,), name="openclaw-login", daemon=True

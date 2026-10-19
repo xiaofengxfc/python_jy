@@ -264,6 +264,41 @@ def test_protection_format_labels_stop_loss() -> None:
     assert "实盘止损触发" in text and "ETH/USDT" in text
 
 
+def test_small_price_is_not_rounded_away() -> None:
+    """A 0.00001234 price used to print as 0.0000 — a useless fill message."""
+    text = WeChatNotifier.format_fill(
+        symbol="SHIB/USDT", side="buy", amount=1_000_000, price=0.00001234, mode="paper"
+    )
+    assert "0.00001234" in text
+    assert "0.0000 " not in text
+
+
+def test_large_price_keeps_cents_without_noise() -> None:
+    text = WeChatNotifier.format_fill(
+        symbol="BTC/USDT", side="buy", amount=0.5, price=82000.0, mode="paper"
+    )
+    assert "82,000.00" in text
+    assert "82,000.0000" not in text
+
+
+def test_dust_amount_does_not_use_scientific_notation() -> None:
+    text = WeChatNotifier.format_protection(
+        symbol="BTC/USDT", kind="take_profit", price=90000.0, amount=1e-7, mode="paper"
+    )
+    assert "0.0000001" in text
+    assert "e-07" not in text.lower()
+
+
+def test_unknown_side_does_not_claim_a_direction() -> None:
+    """Reporting "卖出" for a blank side is worse than saying nothing."""
+    text = WeChatNotifier.format_fill(
+        symbol="BTC/USDT", side="", amount=0.1, price=82000.0, mode="paper"
+    )
+    assert "卖出" not in text
+    assert "成交" in text
+
+
+
 class JsonCompleted:
     def __init__(self, stdout: str, returncode: int = 0, stderr: str = "") -> None:
         self.returncode = returncode
