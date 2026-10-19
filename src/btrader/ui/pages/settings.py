@@ -111,7 +111,7 @@ class SettingsPage(QWidget):
 
     def _group_card(self, title: str, hint: str = "") -> tuple[Card, QVBoxLayout]:
         """A settings section: raised card with a title and optional hint."""
-        card = Card(padding=16)
+        card = Card()
         heading = QLabel(title)
         heading.setObjectName("Title")
         card.body().addWidget(heading)

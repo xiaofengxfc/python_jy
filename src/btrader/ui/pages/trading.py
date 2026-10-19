@@ -10,8 +10,8 @@ from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QButtonGroup,
     QDoubleSpinBox,
-    QFormLayout,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -108,6 +108,9 @@ class TradingPage(QWidget):
         self._spec = None  # ContractSpec for the selected symbol
         self._df = pd.DataFrame()
         self._loading = False
+        self._live_available: float | None = None
+        self._balance_pending = False
+        self._pending_percent: int | None = None
 
         self._build_ui()
 
@@ -145,7 +148,7 @@ class TradingPage(QWidget):
         left_layout.setSpacing(theme.PAGE_GAP)
 
         # The chart owns all remaining height; orders live in the drawer bar.
-        chart_card = Card(padding=10)
+        chart_card = Card(padding=8)
         self.chart = CandleChart()
         chart_card.body().addWidget(self.chart, 1)
         left_layout.addWidget(chart_card, 1)
@@ -179,7 +182,7 @@ class TradingPage(QWidget):
         return value
 
     def _build_symbol_bar(self) -> QWidget:
-        card = Card(padding=14)
+        card = Card()
         layout = QHBoxLayout()
         layout.setSpacing(16)
 
@@ -199,13 +202,13 @@ class TradingPage(QWidget):
         layout.addWidget(self.symbol_combo)
 
         separator = divider(horizontal=False)
-        separator.setFixedHeight(38)
+        separator.setFixedHeight(theme.CONTROL_HEIGHT)
         layout.addWidget(separator)
 
         price_column = QVBoxLayout()
         price_column.setSpacing(0)
         price_row = QHBoxLayout()
-        price_row.setSpacing(10)
+        price_row.setSpacing(theme.CONTROL_GAP)
         self.price_label = QLabel("--")
         self.price_label.setObjectName("SymbolPrice")
         price_row.addWidget(self.price_label)
@@ -242,7 +245,7 @@ class TradingPage(QWidget):
         return card
 
     def _build_book_card(self) -> QWidget:
-        card = Card(padding=14)
+        card = Card()
         header = QHBoxLayout()
         title = QLabel("订单簿")
         title.setObjectName("Title")
@@ -256,73 +259,121 @@ class TradingPage(QWidget):
         card.body().addWidget(self.book, 1)
         return card
 
+    def _field_row(self, caption: str, widget: QWidget, extra: QWidget | None = None) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setSpacing(theme.CONTROL_GAP)
+        label = QLabel(caption)
+        label.setObjectName("FieldLabel")
+        label.setFixedWidth(36)
+        row.addWidget(label)
+        row.addWidget(widget, 1)
+        if extra is not None:
+            row.addWidget(extra)
+        return row
+
+    def _segment_row(self, options: list[tuple[str, str]], on_click) -> QHBoxLayout:
+        """A two-state segmented control. Options are (label, value)."""
+        row = QHBoxLayout()
+        row.setSpacing(0)
+        self.type_group = QButtonGroup(self)
+        self.type_group.setExclusive(True)
+        for index, (label, value) in enumerate(options):
+            button = QPushButton(label)
+            button.setObjectName("SegmentLeft" if index == 0 else "SegmentRight")
+            button.setCheckable(True)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setProperty("segmentValue", value)
+            self.type_group.addButton(button, index)
+            row.addWidget(button)
+        self.type_group.button(0).setChecked(True)
+        self.type_group.idClicked.connect(lambda _index: on_click())
+        return row
+
+    def _size_toggle(self) -> QWidget:
+        holder = QWidget()
+        row = QHBoxLayout(holder)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(0)
+        self.size_group = QButtonGroup(self)
+        self.size_group.setExclusive(True)
+        for index, (label, value) in enumerate((("金额", "quote"), ("数量", "amount"))):
+            button = QPushButton(label)
+            button.setObjectName("MiniSegmentLeft" if index == 0 else "MiniSegmentRight")
+            button.setCheckable(True)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setProperty("segmentValue", value)
+            self.size_group.addButton(button, index)
+            row.addWidget(button)
+        self.size_group.button(0).setChecked(True)
+        self.size_group.idClicked.connect(lambda _index: self._on_size_mode_changed())
+        return holder
+
+    def _order_type(self) -> str:
+        button = self.type_group.checkedButton()
+        return button.property("segmentValue") if button else OrderType.MARKET.value
+
+    def _size_mode_value(self) -> str:
+        button = self.size_group.checkedButton()
+        return button.property("segmentValue") if button else "quote"
+
     def _build_order_ticket(self) -> QWidget:
-        card = Card(padding=14)
+        card = Card()
+
         header = QHBoxLayout()
         title = QLabel("手动下单")
         title.setObjectName("Title")
         header.addWidget(title)
         header.addStretch(1)
-
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("纸面交易", RunMode.PAPER.value)
         self.mode_combo.addItem("实盘", RunMode.LIVE.value)
         if self.ctx.network.value == "testnet":
             self.mode_combo.addItem("测试网实盘", RunMode.LIVE.value)
         self.mode_combo.setFixedWidth(120)
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         header.addWidget(self.mode_combo)
         card.body().addLayout(header)
         card.body().addWidget(divider())
 
-        form = QFormLayout()
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignVCenter)
-        form.setHorizontalSpacing(12)
-        form.setVerticalSpacing(8)
+        # Step 1 — order type.
+        card.body().addLayout(
+            self._segment_row(
+                [("市价", OrderType.MARKET.value), ("限价", OrderType.LIMIT.value)],
+                self._on_order_type_changed,
+            )
+        )
 
-        self.side_combo = QComboBox()
-        self.side_combo.addItem("买入 / 做多", OrderSide.BUY.value)
-        self.side_combo.addItem("卖出 / 做空", OrderSide.SELL.value)
-        form.addRow("方向", self.side_combo)
-
-        self.type_combo = QComboBox()
-        self.type_combo.addItem("市价", OrderType.MARKET.value)
-        self.type_combo.addItem("限价", OrderType.LIMIT.value)
-        self.type_combo.currentIndexChanged.connect(self._on_order_type_changed)
-        form.addRow("类型", self.type_combo)
-
+        # Step 2 — price, then size with its unit toggle beside the field.
         self.price_spin = QDoubleSpinBox()
         self.price_spin.setDecimals(6)
         self.price_spin.setRange(0, 1e12)
         self.price_spin.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
         self.price_spin.setEnabled(False)
-        form.addRow("价格", self.price_spin)
-
-        self.size_mode = QComboBox()
-        self.size_mode.addItem("按金额 (USDT)", "quote")
-        self.size_mode.addItem("按数量", "amount")
-        self.size_mode.currentIndexChanged.connect(self._on_size_mode_changed)
-        form.addRow("下单方式", self.size_mode)
+        self.price_spin.setAlignment(Qt.AlignmentFlag.AlignRight)
+        card.body().addLayout(self._field_row("价格", self.price_spin))
 
         self.amount_spin = QDoubleSpinBox()
         self.amount_spin.setDecimals(6)
         self.amount_spin.setRange(0, 1e12)
         self.amount_spin.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
+        self.amount_spin.setAlignment(Qt.AlignmentFlag.AlignRight)
         self.amount_spin.setValue(self.ctx.settings.default_order_quote)
-        form.addRow("数量", self.amount_spin)
+        card.body().addLayout(self._field_row("数量", self.amount_spin, self._size_toggle()))
 
-        self.leverage_spin = QDoubleSpinBox()
-        self.leverage_spin.setDecimals(0)
-        self.leverage_spin.setRange(1, 125)
-        self.leverage_spin.setValue(1)
-        self.leverage_spin.setEnabled(False)
-        self.leverage_spin.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
-        form.addRow("杠杆", self.leverage_spin)
+        # Step 3 — quick sizing by share of available balance.
+        self.percent_row = QHBoxLayout()
+        self.percent_row.setSpacing(6)
+        self.percent_buttons: list[QPushButton] = []
+        for percent in (25, 50, 75, 100):
+            button = QPushButton(f"{percent}%")
+            button.setObjectName("Percent")
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.clicked.connect(lambda _checked=False, value=percent: self._apply_percent(value))
+            self.percent_row.addWidget(button)
+            self.percent_buttons.append(button)
+        card.body().addLayout(self.percent_row)
 
-        self.reduce_check = QCheckBox("只减仓")
-        self.reduce_check.setEnabled(False)
-        form.addRow("", self.reduce_check)
-        card.body().addLayout(form)
-
+        # Step 4 — read-back before committing.
         self.estimate_label = QLabel("预计金额：--")
         self.estimate_label.setObjectName("Subtitle")
         card.body().addWidget(self.estimate_label)
@@ -332,15 +383,32 @@ class TradingPage(QWidget):
         self.unit_hint.setWordWrap(True)
         card.body().addWidget(self.unit_hint)
 
+        self.leverage_spin = QDoubleSpinBox()
+        self.leverage_spin.setDecimals(0)
+        self.leverage_spin.setRange(1, 125)
+        self.leverage_spin.setValue(1)
+        self.leverage_spin.setEnabled(False)
+        self.leverage_spin.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
+        leverage_row = QHBoxLayout()
+        leverage_row.setSpacing(theme.CONTROL_GAP)
+        leverage_row.addLayout(self._field_row("杠杆", self.leverage_spin), 1)
+        self.reduce_check = QCheckBox("只减仓")
+        self.reduce_check.setEnabled(False)
+        leverage_row.addWidget(self.reduce_check)
+        card.body().addLayout(leverage_row)
+
+        card.body().addWidget(divider())
+
+        # Step 5 — the side is the last decision.
         buttons = QHBoxLayout()
-        buttons.setSpacing(10)
+        buttons.setSpacing(theme.CONTROL_GAP)
         self.buy_btn = QPushButton("买入 / 做多")
         self.buy_btn.setObjectName("Buy")
-        self.buy_btn.setMinimumHeight(38)
+        self.buy_btn.setMinimumHeight(theme.CONTROL_HEIGHT + 4)
         self.buy_btn.clicked.connect(lambda: self._submit_order(OrderSide.BUY.value))
         self.sell_btn = QPushButton("卖出 / 做空")
         self.sell_btn.setObjectName("Sell")
-        self.sell_btn.setMinimumHeight(38)
+        self.sell_btn.setMinimumHeight(theme.CONTROL_HEIGHT + 4)
         self.sell_btn.clicked.connect(lambda: self._submit_order(OrderSide.SELL.value))
         buttons.addWidget(self.buy_btn)
         buttons.addWidget(self.sell_btn)
@@ -353,9 +421,7 @@ class TradingPage(QWidget):
 
         self.price_spin.valueChanged.connect(self._update_estimate)
         self.amount_spin.valueChanged.connect(self._update_estimate)
-        self.size_mode.currentIndexChanged.connect(self._update_estimate)
         self.leverage_spin.valueChanged.connect(self._update_estimate)
-        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         self._on_mode_changed()
         return card
 
@@ -500,7 +566,7 @@ class TradingPage(QWidget):
         self.low_label.setText(f"{ticker.low:,.4f}")
         self.volume_label.setText(f"{ticker.quote_volume:,.0f}")
         self.symbol_caption.setText(f"{symbol} · 最新价")
-        if self.type_combo.currentData() == OrderType.MARKET.value:
+        if self._order_type() == OrderType.MARKET.value:
             self.price_spin.blockSignals(True)
             self.price_spin.setValue(ticker.last)
             self.price_spin.blockSignals(False)
@@ -597,19 +663,84 @@ class TradingPage(QWidget):
             self._load_klines(reset_zoom=True)
 
     def _on_order_type_changed(self) -> None:
-        is_limit = self.type_combo.currentData() == OrderType.LIMIT.value
+        is_limit = self._order_type() == OrderType.LIMIT.value
         self.price_spin.setEnabled(is_limit)
         if is_limit and self._ticker:
             self.price_spin.setValue(self._ticker.last)
 
     def _on_size_mode_changed(self) -> None:
-        if self.size_mode.currentData() == "amount":
+        if self._size_mode_value() == "amount":
+            self.amount_spin.setDecimals(6)
             self.amount_spin.setValue(0.001)
         else:
+            self.amount_spin.setDecimals(2)
             self.amount_spin.setValue(self.ctx.settings.default_order_quote)
         self._update_estimate()
 
+    def _effective_price(self) -> float:
+        """Limit price when set, otherwise the last traded price."""
+        price = self.price_spin.value()
+        if price <= 0 and self._ticker:
+            price = self._ticker.last
+        return price
+
+    def _available_quote(self) -> float | None:
+        """Quote balance backing the percentage shortcuts, None if unknown."""
+        if RunMode(self.mode_combo.currentData()) is RunMode.PAPER:
+            return max(0.0, self.ctx.paper.account.cash)
+        return self._live_available
+
+    def _request_balance(self) -> None:
+        """Fetch the live quote balance once, then replay a pending shortcut."""
+        if self._balance_pending:
+            return
+        market = self._market()
+        rest = self.ctx.rest_for(market)
+        if not rest.has_credentials:
+            self._pending_percent = None
+            self.unit_hint.setText("未配置 API 凭据，无法读取实盘可用余额。")
+            return
+        self._balance_pending = True
+        self.status.emit("正在读取可用余额…")
+
+        def fetch():
+            return rest.fetch_balance(market)
+
+        def done(balance: dict) -> None:
+            self._balance_pending = False
+            free = balance.get("free") or {}
+            self._live_available = float(free.get("USDT") or 0.0)
+            pending, self._pending_percent = self._pending_percent, None
+            if pending:
+                self._apply_percent(pending)
+
+        def failed(message: str) -> None:
+            self._balance_pending = False
+            self._pending_percent = None
+            self._show_error(message)
+
+        self.runner.run(fetch, done, failed)
+
+    def _apply_percent(self, percent: int) -> None:
+        """Fill the size field with a share of the available balance."""
+        available = self._available_quote()
+        if available is None:
+            self._pending_percent = percent
+            self._request_balance()
+            return
+        quote = available * percent / 100.0
+        if self._size_mode_value() == "quote":
+            self.amount_spin.setValue(round(quote, 2))
+            return
+        price = self._effective_price()
+        if price <= 0:
+            self._show_error("尚未获取到有效价格。")
+            return
+        self.amount_spin.setValue(round(quote / price, 6))
+
     def _on_mode_changed(self) -> None:
+        if hasattr(self, "_live_available"):
+            self._live_available = None
         mode = self.mode_combo.currentData()
         if mode == RunMode.LIVE.value:
             self.mode_hint.setText("⚠ 实盘模式将使用真实资金下单，请确认风控设置。")
@@ -624,10 +755,8 @@ class TradingPage(QWidget):
         self.reduce_check.setEnabled(futures)
 
     def _update_estimate(self) -> None:
-        price = self.price_spin.value()
-        if price <= 0 and self._ticker:
-            price = self._ticker.last
-        if self.size_mode.currentData() == "quote":
+        price = self._effective_price()
+        if self._size_mode_value() == "quote":
             quote = self.amount_spin.value()
             amount = quote / price if price > 0 else 0.0
         else:
@@ -650,14 +779,12 @@ class TradingPage(QWidget):
         symbol = self.current_symbol()
         market = self._market()
         mode = RunMode(self.mode_combo.currentData())
-        price = self.price_spin.value()
-        if price <= 0 and self._ticker:
-            price = self._ticker.last
+        price = self._effective_price()
         if price <= 0:
             self._show_error("尚未获取到有效价格。")
             return
 
-        if self.size_mode.currentData() == "quote":
+        if self._size_mode_value() == "quote":
             quote = self.amount_spin.value()
             if quote <= 0:
                 self._show_error("请输入下单金额。")
@@ -687,7 +814,7 @@ class TradingPage(QWidget):
                     return
 
         market_type = market
-        order_type = self.type_combo.currentData()
+        order_type = self._order_type()
         leverage = self.leverage_spin.value() if market.is_futures else 1.0
         reduce_only = self.reduce_check.isChecked() and market.is_futures
 

@@ -180,7 +180,7 @@ class BacktestPage(QWidget):
             metrics.addWidget(card, i // 3, i % 3)
         right_layout.addLayout(metrics)
 
-        results_card = Card(padding=12)
+        results_card = Card()
         self.tabs = QTabWidget()
         self.chart = CandleChart()
         self.chart_tab = QWidget()
@@ -204,7 +204,7 @@ class BacktestPage(QWidget):
         outer.addLayout(root, 1)
 
     def _build_data_group(self) -> QWidget:
-        card = Card(padding=14)
+        card = Card()
         card.body().addWidget(self._section("数据"))
         form = QFormLayout()
         form.setVerticalSpacing(8)
@@ -259,7 +259,7 @@ class BacktestPage(QWidget):
         return holder
 
     def _build_strategy_group(self) -> QWidget:
-        card = Card(padding=14)
+        card = Card()
         card.body().addWidget(self._section("策略与参数"))
         self.strategy_combo = QComboBox()
         self.strategy_combo.currentIndexChanged.connect(self._on_strategy_changed)
@@ -278,7 +278,7 @@ class BacktestPage(QWidget):
         return card
 
     def _build_cost_group(self) -> QWidget:
-        card = Card(padding=14)
+        card = Card()
         card.body().addWidget(self._section("资金与成本"))
         form = QFormLayout()
         form.setVerticalSpacing(8)
@@ -338,13 +338,13 @@ class BacktestPage(QWidget):
         return card
 
     def _build_action_group(self) -> QWidget:
-        card = Card(padding=14)
+        card = Card()
         card.body().addWidget(self._section("运行"))
         layout = QVBoxLayout()
         layout.setSpacing(8)
         self.run_btn = QPushButton("开始回测")
         self.run_btn.setObjectName("Primary")
-        self.run_btn.setMinimumHeight(38)
+        self.run_btn.setMinimumHeight(theme.CONTROL_HEIGHT + 4)
         self.run_btn.clicked.connect(self._run)
         layout.addWidget(self.run_btn)
 

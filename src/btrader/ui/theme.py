@@ -43,12 +43,14 @@ FONT_FALLBACK = '"Microsoft YaHei UI", "Segoe UI", sans-serif'
 FONT_STACK = f'"{FONT_FAMILY}", {FONT_FALLBACK}'
 
 # --------------------------------------------------------------- layout scale
-# Medium density: 13px base text, 10px card radius, 14px gutters.
+# Clean density: 13px base text, 8px card radius, 16px gutters.
 BASE_FONT_PX = 13
-CARD_RADIUS = 10
-CONTROL_RADIUS = 8
-PAGE_MARGIN = (24, 20, 24, 18)
-PAGE_GAP = 14
+CARD_RADIUS = 8
+CONTROL_RADIUS = 6
+CONTROL_HEIGHT = 36
+CONTROL_GAP = 10
+PAGE_MARGIN = (24, 20, 24, 20)
+PAGE_GAP = 16
 CARD_PADDING = 16
 
 
@@ -102,41 +104,41 @@ def mono_font(size: int = BASE_FONT_PX, bold: bool = False) -> QFont:
 DARK = Palette(
     name="dark",
     is_dark=True,
-    bg="#0b0d13",
-    bg_alt="#11141c",
-    bg_card="#171b25",
-    bg_hover="#1e2431",
-    border="#242a37",
-    text="#e8ebf2",
-    text_dim="#8b93a7",
-    accent="#6d7cff",
-    accent_hover="#8b97ff",
-    accent_text="#ffffff",
-    up="#22c55e",
-    down="#ef4444",
-    grid="#1c222d",
-    sidebar="#0e1118",
-    shadow_alpha=110,
+    bg="#0e0f11",
+    bg_alt="#121316",
+    bg_card="#16181b",
+    bg_hover="#1e2024",
+    border="#282b30",
+    text="#e8e9eb",
+    text_dim="#8b9096",
+    accent="#9fb0c9",
+    accent_hover="#b6c4d8",
+    accent_text="#14161a",
+    up="#2eb86a",
+    down="#e05b5b",
+    grid="#1c1f23",
+    sidebar="#121316",
+    shadow_alpha=0,
 )
 
 LIGHT = Palette(
     name="light",
     is_dark=False,
-    bg="#f4f5f8",
+    bg="#ffffff",
     bg_alt="#ffffff",
     bg_card="#ffffff",
-    bg_hover="#eef0f5",
-    border="#e2e5ec",
-    text="#1a1d26",
-    text_dim="#6b7280",
-    accent="#4f46e5",
-    accent_hover="#4338ca",
+    bg_hover="#f2f3f5",
+    border="#e4e6e9",
+    text="#16181d",
+    text_dim="#71767d",
+    accent="#3f4a5c",
+    accent_hover="#333c4a",
     accent_text="#ffffff",
-    up="#16a34a",
-    down="#dc2626",
-    grid="#e8ebf1",
+    up="#1a9c5b",
+    down="#d94848",
+    grid="#eef0f2",
     sidebar="#ffffff",
-    shadow_alpha=26,
+    shadow_alpha=0,
 )
 
 PALETTES = {"dark": DARK, "light": LIGHT}
@@ -209,12 +211,17 @@ def stylesheet(p: Palette) -> str:
     sell_soft = _rgba(p.down, 0.16)
     return f"""
 QWidget {{
-    background-color: {p.bg};
     color: {p.text};
     font-family: {FONT_STACK};
     font-size: {BASE_FONT_PX}px;
 }}
+/* Only the window paints the page colour. Every other container stays
+   transparent, otherwise nested widgets stack their own fill on top of the
+   card behind them and the layout reads as stacked colour blocks. */
 QMainWindow, QDialog {{ background-color: {p.bg}; }}
+QScrollArea, QScrollArea > QWidget > QWidget {{ background: transparent; }}
+QStackedWidget {{ background: transparent; }}
+QAbstractScrollArea {{ background: transparent; }}
 
 /* ---------------------------------------------------------- surfaces */
 QFrame#Sidebar {{ background: {p.sidebar}; border-right: 1px solid {p.border}; }}
@@ -239,7 +246,6 @@ QFrame#Card {{
     border: 1px solid {p.border};
     border-radius: {CARD_RADIUS}px;
 }}
-QFrame#Card:hover {{ border-color: {p.border}; }}
 QFrame#Divider {{ background: {p.border}; border: none; }}
 QFrame#Drawer {{
     background: {p.bg_card};
@@ -289,6 +295,7 @@ QLabel#Eyebrow {{
     color: {p.text_dim}; font-size: 11px; font-weight: 600;
     letter-spacing: 0.6px;
 }}
+QLabel#FieldLabel {{ color: {p.text_dim}; font-size: 12px; font-weight: 500; }}
 
 /* ---------------------------------------------------------- sidebar nav */
 QPushButton#NavItem {{
@@ -335,8 +342,9 @@ QPushButton#CloseButton:hover {{ background: #e5484d; color: #ffffff; }}
 QPushButton {{
     background: {p.bg_hover};
     border: 1px solid transparent;
-    border-radius: 8px;
-    padding: 7px 14px;
+    border-radius: {CONTROL_RADIUS}px;
+    padding: 0 14px;
+    min-height: {CONTROL_HEIGHT - 2}px;
     color: {p.text};
     font-size: 13px;
 }}
@@ -344,13 +352,11 @@ QPushButton:hover {{ background: {p.border}; }}
 QPushButton:pressed {{ background: {p.bg_hover}; }}
 QPushButton:disabled {{ color: {p.text_dim}; background: {p.bg_alt}; }}
 QPushButton#Buy {{
-    background: {p.up}; border-color: transparent; color: #ffffff;
-    font-weight: 650; padding: 9px 14px;
+    background: {p.up}; border-color: transparent; color: #ffffff; font-weight: 600;
 }}
 QPushButton#Buy:hover {{ background: {p.up}; border-color: {p.up}; }}
 QPushButton#Sell {{
-    background: {p.down}; border-color: transparent; color: #ffffff;
-    font-weight: 650; padding: 9px 14px;
+    background: {p.down}; border-color: transparent; color: #ffffff; font-weight: 600;
 }}
 QPushButton#Sell:hover {{ background: {p.down}; border-color: {p.down}; }}
 QPushButton#BuySubtle {{
@@ -372,22 +378,94 @@ QPushButton#Flat {{
 }}
 QPushButton#Flat:hover {{ background: {p.bg_hover}; border-color: {p.border}; }}
 QPushButton#Ghost {{
-    background: transparent; border: none; color: {p.text_dim}; padding: 6px 10px;
+    background: transparent; border: none; color: {p.text_dim}; padding: 0 10px;
 }}
 QPushButton#Ghost:hover {{ background: {p.bg_hover}; color: {p.text}; }}
+
+/* ---------------------------------------------------- segmented controls */
+QPushButton#SegmentLeft, QPushButton#SegmentRight {{
+    background: transparent;
+    border: 1px solid {p.border};
+    color: {p.text_dim};
+    padding: 0 12px;
+    min-height: {CONTROL_HEIGHT - 2}px;
+    font-size: 13px;
+}}
+QPushButton#SegmentLeft {{
+    border-top-left-radius: {CONTROL_RADIUS}px;
+    border-bottom-left-radius: {CONTROL_RADIUS}px;
+    border-right: none;
+}}
+QPushButton#SegmentRight {{
+    border-top-right-radius: {CONTROL_RADIUS}px;
+    border-bottom-right-radius: {CONTROL_RADIUS}px;
+}}
+QPushButton#SegmentLeft:hover, QPushButton#SegmentRight:hover {{
+    background: {p.bg_hover};
+    color: {p.text};
+}}
+QPushButton#SegmentLeft:checked, QPushButton#SegmentRight:checked {{
+    background: {p.accent};
+    border-color: {p.accent};
+    color: {p.accent_text};
+    font-weight: 600;
+}}
+QPushButton#MiniSegmentLeft, QPushButton#MiniSegmentRight {{
+    background: transparent;
+    border: 1px solid {p.border};
+    color: {p.text_dim};
+    padding: 0 9px;
+    min-height: {CONTROL_HEIGHT - 4}px;
+    font-size: 12px;
+    max-width: 44px;
+}}
+QPushButton#MiniSegmentLeft {{
+    border-top-left-radius: {CONTROL_RADIUS}px;
+    border-bottom-left-radius: {CONTROL_RADIUS}px;
+    border-right: none;
+}}
+QPushButton#MiniSegmentRight {{
+    border-top-right-radius: {CONTROL_RADIUS}px;
+    border-bottom-right-radius: {CONTROL_RADIUS}px;
+}}
+QPushButton#MiniSegmentLeft:hover, QPushButton#MiniSegmentRight:hover {{
+    background: {p.bg_hover};
+    color: {p.text};
+}}
+QPushButton#MiniSegmentLeft:checked, QPushButton#MiniSegmentRight:checked {{
+    background: {p.accent};
+    border-color: {p.accent};
+    color: {p.accent_text};
+}}
+QPushButton#Percent {{
+    background: transparent;
+    border: 1px solid {p.border};
+    border-radius: {CONTROL_RADIUS}px;
+    color: {p.text_dim};
+    padding: 0;
+    min-height: {CONTROL_HEIGHT - 10}px;
+    font-size: 12px;
+}}
+QPushButton#Percent:hover {{
+    background: {p.bg_hover};
+    border-color: {p.text_dim};
+    color: {p.text};
+}}
 
 /* ---------------------------------------------------------- inputs */
 QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QDateTimeEdit,
 QPlainTextEdit, QTextEdit {{
     background: {p.bg_alt};
     border: 1px solid {p.border};
-    border-radius: 8px;
-    padding: 6px 10px;
+    border-radius: {CONTROL_RADIUS}px;
+    padding: 0 10px;
+    min-height: {CONTROL_HEIGHT - 2}px;
+    max-height: {CONTROL_HEIGHT - 2}px;
     color: {p.text};
     selection-background-color: {p.accent};
     selection-color: {p.accent_text};
-    min-height: 20px;
 }}
+QPlainTextEdit, QTextEdit {{ padding: 8px 10px; min-height: 0; max-height: 16777215px; }}
 QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus,
 QDateTimeEdit:focus, QPlainTextEdit:focus, QTextEdit:focus {{
     border-color: {p.accent};
@@ -468,7 +546,7 @@ QSplitter::handle:vertical {{ height: 6px; }}
 
 QGroupBox {{
     border: 1px solid {p.border};
-    border-radius: 10px;
+    border-radius: {CARD_RADIUS}px;
     margin-top: 10px;
     padding-top: 10px;
     font-weight: 600;

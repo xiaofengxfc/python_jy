@@ -67,7 +67,7 @@ class AutoPage(QWidget):
         right = QVBoxLayout()
         right.setSpacing(theme.PAGE_GAP)
 
-        log_card = Card(padding=14)
+        log_card = Card()
         log_title = QLabel("运行日志")
         log_title.setObjectName("Title")
         log_card.body().addWidget(log_title)
@@ -79,7 +79,7 @@ class AutoPage(QWidget):
         log_card.body().addWidget(self.log_view, 1)
         right.addWidget(log_card, 1)
 
-        orders_card = Card(padding=14)
+        orders_card = Card()
         orders_title = QLabel("本次运行委托")
         orders_title.setObjectName("Title")
         orders_card.body().addWidget(orders_title)
@@ -91,7 +91,7 @@ class AutoPage(QWidget):
         outer.addLayout(root, 1)
 
     def _build_state_card(self) -> QWidget:
-        card = Card(padding=14)
+        card = Card()
         layout = QHBoxLayout()
         layout.setSpacing(28)
 
@@ -119,7 +119,7 @@ class AutoPage(QWidget):
         return card
 
     def _build_config_group(self) -> QWidget:
-        card = Card(padding=14)
+        card = Card()
         title = QLabel("自动交易配置")
         title.setObjectName("Title")
         card.body().addWidget(title)
@@ -180,7 +180,7 @@ class AutoPage(QWidget):
         return card
 
     def _build_control_group(self) -> QWidget:
-        card = Card(padding=14)
+        card = Card()
         title = QLabel("控制")
         title.setObjectName("Title")
         card.body().addWidget(title)
@@ -188,13 +188,13 @@ class AutoPage(QWidget):
         layout.setSpacing(8)
         self.start_btn = QPushButton("启动自动交易")
         self.start_btn.setObjectName("Primary")
-        self.start_btn.setMinimumHeight(38)
+        self.start_btn.setMinimumHeight(theme.CONTROL_HEIGHT + 4)
         self.start_btn.clicked.connect(self._start)
         layout.addWidget(self.start_btn)
 
         self.stop_btn = QPushButton("停止")
         self.stop_btn.setObjectName("Danger")
-        self.stop_btn.setMinimumHeight(32)
+        self.stop_btn.setMinimumHeight(theme.CONTROL_HEIGHT)
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self._stop)
         layout.addWidget(self.stop_btn)

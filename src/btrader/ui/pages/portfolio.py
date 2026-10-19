@@ -72,7 +72,7 @@ class PortfolioPage(QWidget):
         left_column = QVBoxLayout()
         left_column.setSpacing(theme.PAGE_GAP)
 
-        balances_card = Card(padding=14)
+        balances_card = Card()
         balances_head = QHBoxLayout()
         balances_title = QLabel("账户余额")
         balances_title.setObjectName("Title")
@@ -87,7 +87,7 @@ class PortfolioPage(QWidget):
         balances_card.body().addWidget(self.balances_table, 1)
         left_column.addWidget(balances_card, 3)
 
-        paper_card = Card(padding=14)
+        paper_card = Card()
         paper_title = QLabel("纸面账户")
         paper_title.setObjectName("Title")
         paper_card.body().addWidget(paper_title)
@@ -103,7 +103,7 @@ class PortfolioPage(QWidget):
         left_column.addWidget(paper_card, 2)
         tables.addLayout(left_column, 2)
 
-        positions_card = Card(padding=14)
+        positions_card = Card()
         positions_head = QHBoxLayout()
         positions_title = QLabel("持仓")
         positions_title.setObjectName("Title")
