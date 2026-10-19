@@ -37,7 +37,7 @@ echo Building installer...
 pushd packaging
 "%NSIS_DIR%\makensis.exe" installer.nsi || (popd & exit /b 1)
 popd
-echo Done: dist\biTrader-Setup-0.1.0.exe
+echo Done: dist\biTrader-Setup-*.exe
 
 :end
 endlocal

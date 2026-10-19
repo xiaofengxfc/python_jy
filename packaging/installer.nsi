@@ -11,7 +11,7 @@ SetCompressor /SOLID lzma
 
 !define APP_NAME "biTrader"
 !define APP_DISPLAY "biTrader · 币安交易工作台"
-!define APP_VERSION "0.1.0"
+!define APP_VERSION "0.2.0"
 !define APP_PUBLISHER "biTrader"
 !define APP_EXE "biTrader.exe"
 !define APP_DIR_NAME "biTrader"
