@@ -312,6 +312,42 @@ class OpenClawInstaller:
             raise ValueError(f"无法打开终端窗口（{exc}）。请手动执行：{' '.join(args)}") from exc
         return {"command": args, "channel": WECHAT_CHANNEL}
 
+    def logout(self, account: str = "") -> dict:
+        """Unbind a WeChat account and remove what it left on disk.
+
+        ``channels logout`` drops the gateway's session, but the plugin keeps
+        its own credential files, so the account reappears in the next status
+        read (and every push needs its ``--account``). Both halves are done
+        here: the CLI first, then the plugin's files, so the page's "解绑"
+        really means unbound. Without ``account`` the bound one is used; doing
+        nothing when nothing is bound is a no-op rather than an error.
+        """
+        exe = _openclaw_executable()
+        if not exe:
+            raise ValueError("未找到 openclaw，请先完成安装。")
+        bound = wechat_accounts()
+        chosen = account.strip() or (bound[0]["account"] if bound else "")
+        args = [exe, "channels", "logout", "--channel", WECHAT_CHANNEL]
+        if chosen:
+            args.extend(["--account", chosen])
+        code, output = _run_command(args)
+        removed = _forget_account(chosen) if chosen else []
+        # A CLI that refuses (older build, no such session) still leaves files
+        # behind; report the truth instead of claiming success.
+        ok = code == 0 or bool(removed and not wechat_accounts())
+        detail = output.strip()[-400:]
+        if not ok:
+            raise ValueError(
+                "解绑失败：" + (detail or f"openclaw 返回退出码 {code}")
+            )
+        return {
+            "ok": True,
+            "account": chosen,
+            "removed": removed,
+            "detail": detail,
+            "channel": WECHAT_CHANNEL,
+        }
+
     def channel_status(self) -> dict:
         """Whether the gateway knows the WeChat channel and has an account.
 
@@ -842,6 +878,63 @@ def wechat_targets() -> list[dict]:
             seen.add(user)
             targets.append({"target": user, "account": account_id, "source": "account"})
     return targets
+
+
+def _forget_account(account: str) -> list[str]:
+    """Delete one account's files and drop it from the plugin's index.
+
+    Returns the names removed, so the caller can report precisely what changed.
+    """
+    if not account:
+        return []
+    root = _state_dir() / "openclaw-weixin"
+    folder = root / "accounts"
+    removed: list[str] = []
+    for suffix in (".json", ".context-tokens.json", ".sync.json"):
+        path = folder / f"{account}{suffix}"
+        try:
+            if path.is_file():
+                path.unlink()
+                removed.append(path.name)
+        except OSError:
+            log.debug("无法删除 %s", path, exc_info=True)
+    index = root / "accounts.json"
+    try:
+        listed = json.loads(index.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        listed = None
+    if isinstance(listed, list):
+        kept = [item for item in listed if item != account]
+        try:
+            if kept:
+                index.write_text(
+                    json.dumps(kept, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+                )
+            else:
+                index.unlink()
+            removed.append(index.name)
+        except OSError:
+            log.debug("无法更新 %s", index, exc_info=True)
+    return removed
+
+
+def _run_command(args: list[str], timeout: float = 60.0) -> tuple[int, str]:
+    """Run a short command and return ``(exit_code, combined output)``."""
+    try:
+        completed = subprocess.run(
+            _wrap_launcher(args),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            shell=False,
+            stdin=subprocess.DEVNULL,
+        )
+    except Exception as exc:
+        log.debug("执行 %s 失败", args, exc_info=True)
+        return 1, str(exc)
+    return completed.returncode, (completed.stdout or "") + (completed.stderr or "")
 
 
 def _channels_status_json(exe: str, channel: str) -> dict | None:

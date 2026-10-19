@@ -13,6 +13,7 @@ are replaced.
 from __future__ import annotations
 
 import io
+import json
 import os
 import threading
 import time
@@ -27,6 +28,7 @@ from btrader.installer import (
     WECHAT_PACKAGE,
     InstallOptions,
     OpenClawInstaller,
+    wechat_accounts,
 )
 
 
@@ -476,3 +478,59 @@ def test_qr_svg_encodes_the_captured_link(fake_env, monkeypatch) -> None:
     svg = installer.login_qr_svg().decode("utf-8")
     assert svg.lstrip().startswith("<?xml")
     assert "<svg" in svg
+
+
+def _bind_account(tmp_path, account: str = "acc-1") -> None:
+    """Write the files a completed scan leaves behind, under a temp state dir."""
+    root = tmp_path / "openclaw-weixin"
+    (root / "accounts").mkdir(parents=True)
+    (root / "accounts.json").write_text(json.dumps([account]), encoding="utf-8")
+    (root / "accounts" / f"{account}.json").write_text(
+        json.dumps({"token": "t", "userId": "user-1@im.wechat"}), encoding="utf-8"
+    )
+    (root / "accounts" / f"{account}.context-tokens.json").write_text(
+        json.dumps({"peer-1@im.wechat": {"token": "c"}}), encoding="utf-8"
+    )
+    (root / "accounts" / f"{account}.sync.json").write_text("{}", encoding="utf-8")
+
+
+def test_logout_removes_the_account_and_its_files(tmp_path, monkeypatch) -> None:
+    """解绑 has to leave nothing behind.
+
+    ``channels logout`` only drops the gateway session; the plugin keeps its own
+    credential files, so the "deleted" account came straight back in the next
+    status read.
+    """
+    monkeypatch.setenv("OPENCLAW_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr("btrader.installer._openclaw_executable", lambda: "/usr/bin/openclaw")
+    seen: dict = {}
+
+    def fake_run(args, timeout=60.0):
+        seen["args"] = args
+        return 0, "logged out"
+
+    monkeypatch.setattr("btrader.installer._run_command", fake_run)
+    _bind_account(tmp_path)
+    installer = OpenClawInstaller()
+
+    result = installer.logout()
+
+    assert result["ok"] is True
+    assert result["account"] == "acc-1"
+    assert seen["args"][:4] == ["/usr/bin/openclaw", "channels", "logout", "--channel"]
+    assert "acc-1" in seen["args"]
+    assert not list((tmp_path / "openclaw-weixin" / "accounts").iterdir())
+    assert not (tmp_path / "openclaw-weixin" / "accounts.json").exists()
+    assert wechat_accounts() == []
+
+
+def test_logout_reports_a_refused_cli(tmp_path, monkeypatch) -> None:
+    """A CLI that refuses must not be reported as a successful unbind."""
+    monkeypatch.setenv("OPENCLAW_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr("btrader.installer._openclaw_executable", lambda: "/usr/bin/openclaw")
+    monkeypatch.setattr(
+        "btrader.installer._run_command", lambda args, timeout=60.0: (1, "not supported")
+    )
+    installer = OpenClawInstaller()
+    with pytest.raises(ValueError, match="解绑失败"):
+        installer.logout()

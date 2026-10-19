@@ -621,6 +621,77 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @router.post("/api/install/openclaw/logout")
+    def channel_logout(account: str = "") -> dict[str, Any]:
+        """Unbind a WeChat account and delete the credential files it left.
+
+        Without this the only way back to "未绑定" was editing the plugin's
+        state directory by hand: the page could bind but never release.
+
+        The notifier's own target is cleared with it — a stale recipient is
+        exactly what turns "已解绑" into a wall of failed sends.
+        """
+        ctx = get_state().ctx
+        try:
+            result = ctx.installer.logout(account)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        notify = ctx.settings.notify
+        if notify.target or notify.account or notify.enabled:
+            ctx.settings.notify = replace(notify, enabled=False, target="", account="")
+            ctx.save_settings()
+        result["settings"] = ctx.settings.to_dict()
+        return result
+
+    @router.post("/api/install/openclaw/bind")
+    def channel_bind(send_test: bool = True) -> dict[str, Any]:
+        """Finish a scan in one step: persist the recipient, enable, verify.
+
+        The scan only links the account in the gateway. The notifier carries its
+        own settings, so the flow used to end with a bound channel whose push
+        switch was still off and whose target was empty — "扫码成功了但收不到
+        通知". Everything the scan already knows is applied here instead of
+        asking the user to copy an id into another card and save.
+        """
+        ctx = get_state().ctx
+        status = ctx.installer.channel_status()
+        if not status.get("configured"):
+            raise HTTPException(status_code=400, detail="尚未完成扫码绑定，请先扫码。")
+        targets = status.get("targets") or []
+        if not targets:
+            raise HTTPException(status_code=400, detail="已绑定账号，但没有可用的接收目标。")
+        primary = targets[0]
+        settings = ctx.settings
+        settings.notify = replace(
+            settings.notify,
+            enabled=True,
+            target=primary["target"],
+            account=primary["account"],
+        )
+        # ``save_settings`` also rebinds the running notifier, so the change
+        # takes effect without a restart.
+        ctx.save_settings()
+
+        # A configured channel still delivers nothing while the gateway is down.
+        gateway = ctx.gateway.status()
+        if not gateway.get("reachable"):
+            gateway = ctx.gateway.start()
+        result: dict[str, Any] = {
+            "ok": True,
+            "target": primary["target"],
+            "account": primary["account"],
+            "gateway": gateway,
+            "test": None,
+            "settings": settings.to_dict(),
+        }
+        if send_test:
+            try:
+                ctx.notifier.send_now("biTrader：微信通知已绑定并开启。")
+                result["test"] = {"ok": True, "error": ""}
+            except Exception as exc:  # report, do not fail the binding
+                result["test"] = {"ok": False, "error": str(exc)}
+        return result
+
     @router.post("/api/install/openclaw/login")
     def channel_login(force: bool = False) -> dict[str, Any]:
         """Start the QR login and return the link the code encodes.
@@ -854,7 +925,11 @@ def _apply_notify(target: Any, values: dict[str, Any]) -> None:
             raise HTTPException(status_code=400, detail=f"通知字段 {key} 的值无效")
     if target.enabled and not str(target.target or "").strip():
         raise HTTPException(
-            status_code=400, detail="开启微信通知前，请先填写接收目标（会话 ID 或备注名）。"
+            status_code=400,
+            detail=(
+                "开启微信通知前，请先完成扫码绑定（会自动填入接收目标），"
+                "或手动填写接收目标。"
+            ),
         )
 
 

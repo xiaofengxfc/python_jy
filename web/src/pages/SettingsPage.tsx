@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api";
 import { TIMEFRAMES } from "../format";
 import type {
@@ -168,6 +168,61 @@ export default function SettingsPage({ settings, onSaved }: Props) {
     }
   };
 
+  // Finishing the scan is one step, not three. The server already knows the
+  // bound account's recipient id, so it persists it, turns the push switch on
+  // and proves the channel with a test message.
+  const completeBind = async () => {
+    setChannelBusy(true);
+    setChannelNote("");
+    try {
+      const result = await api<{
+        target: string;
+        account: string;
+        settings: AppSettings;
+        test: { ok: boolean; error: string } | null;
+      }>("/api/install/openclaw/bind", { method: "POST" });
+      onSaved(result.settings);
+      const test = result.test;
+      setChannelNote(
+        `已绑定 ${result.account || "当前账号"}，接收目标 ${result.target}，推送已开启。` +
+          (test
+            ? test.ok
+              ? "测试消息已发送，请查看微信。"
+              : `测试消息发送失败：${test.error}`
+            : ""),
+      );
+      await loadChannel();
+      await loadNotify();
+    } catch (error) {
+      setChannelNote(error instanceof Error ? error.message : String(error));
+    } finally {
+      setChannelBusy(false);
+    }
+  };
+
+  const logoutAccount = async () => {
+    // Destructive and irreversible without a fresh scan, so it asks first.
+    if (!window.confirm("解绑当前微信账号？解绑后需要重新扫码才能接收通知。")) return;
+    setChannelBusy(true);
+    setChannelNote("");
+    try {
+      const result = await api<{ account: string; removed: string[] }>(
+        "/api/install/openclaw/logout",
+        { method: "POST" },
+      );
+      setChannelNote(
+        `已解绑 ${result.account || "当前账号"}` +
+          `（清理 ${result.removed.length} 个文件）。需要时重新扫码即可。`,
+      );
+      setLogin(null);
+      await loadChannel();
+    } catch (error) {
+      setChannelNote(error instanceof Error ? error.message : String(error));
+    } finally {
+      setChannelBusy(false);
+    }
+  };
+
   const openLoginTerminal = async () => {
     setChannelBusy(true);
     setChannelNote("");
@@ -202,6 +257,18 @@ export default function SettingsPage({ settings, onSaved }: Props) {
   useEffect(() => {
     if (login?.state === "done") void loadChannel();
   }, [login?.state, loadChannel]);
+
+  // ...and it must also finish the job by itself: persist the recipient, turn
+  // the push switch on and prove delivery. Running it once per scan is what
+  // keeps a finished binding from turning into a "still nothing arrives" loop.
+  const bindKey = useRef("");
+  useEffect(() => {
+    if (login?.state !== "done" || !channel?.configured) return;
+    const key = `${channel.account}|${login.started_at}`;
+    if (bindKey.current === key) return;
+    bindKey.current = key;
+    void completeBind();
+  }, [login?.state, login?.started_at, channel?.account, channel?.configured]);
 
   const startGateway = async () => {
     setChannelBusy(true);
@@ -849,6 +916,14 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                   >
                     填入已绑定账号
                   </button>
+                  <button
+                    type="button"
+                    className="btn-sm"
+                    disabled={channelBusy}
+                    onClick={() => void logoutAccount()}
+                  >
+                    解绑账号
+                  </button>
                 </div>
               )}
               {notifyStatus?.target_warning && (
@@ -1077,6 +1152,26 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                             : "状态未知"}
                   </span>
                   <span className="spacer" />
+                  {channel?.configured && (
+                    <>
+                      <button
+                        type="button"
+                        className="btn-sm"
+                        disabled={channelBusy}
+                        onClick={() => void completeBind()}
+                      >
+                        完成绑定并开启通知
+                      </button>
+                      <button
+                        type="button"
+                        className="btn-sm"
+                        disabled={channelBusy}
+                        onClick={() => void logoutAccount()}
+                      >
+                        解绑账号
+                      </button>
+                    </>
+                  )}
                   <button
                     type="button"
                     className="btn-sm"
