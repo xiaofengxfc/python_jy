@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api";
 import { TIMEFRAMES } from "../format";
-import type { AppSettings, CredentialItem, RiskState } from "../types";
+import type { AppSettings, CredentialItem, NotifyStatus, RiskState } from "../types";
 
 interface Props {
   settings: AppSettings | null;
@@ -47,6 +47,42 @@ export default function SettingsPage({ settings, onSaved }: Props) {
   const [credBusy, setCredBusy] = useState<string>("");
   const [risk, setRisk] = useState<RiskState | null>(null);
   const [riskBusy, setRiskBusy] = useState(false);
+  const [notifyStatus, setNotifyStatus] = useState<NotifyStatus | null>(null);
+  const [notifyBusy, setNotifyBusy] = useState(false);
+
+  const loadNotify = useCallback(async () => {
+    try {
+      setNotifyStatus(await api<NotifyStatus>("/api/notify"));
+    } catch {
+      // Reachability is informational; a failure must not block the form.
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadNotify();
+    const timer = window.setInterval(() => void loadNotify(), 10000);
+    return () => window.clearInterval(timer);
+  }, [loadNotify]);
+
+  const patchNotify = (values: Partial<AppSettings["notify"]>) => {
+    setDraft((current) =>
+      current ? { ...current, notify: { ...current.notify, ...values } } : current,
+    );
+  };
+
+  const testNotify = async () => {
+    setNotifyBusy(true);
+    setFlash(null);
+    try {
+      await api("/api/notify/test", { method: "POST", body: JSON.stringify({ message: "" }) });
+      setFlash({ tone: "ok", text: "测试消息已发送，请查看微信。" });
+      await loadNotify();
+    } catch (error) {
+      setFlash({ tone: "err", text: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setNotifyBusy(false);
+    }
+  };
 
   const loadRisk = useCallback(async () => {
     try {
@@ -123,6 +159,7 @@ export default function SettingsPage({ settings, onSaved }: Props) {
           theme: draft.theme,
           notification_sound: draft.notification_sound,
           risk: draft.risk,
+          notify: draft.notify,
         }),
       });
       onSaved(result.settings);
@@ -465,6 +502,109 @@ export default function SettingsPage({ settings, onSaved }: Props) {
               </label>
               <div className="hint">
                 提示只在应用内弹出，不会触发系统通知。主题切换在保存后立即生效。
+              </div>
+            </div>
+          </div>
+
+          <div className="card">
+            <div className="card-head">
+              <span className="card-title">微信通知（ClawBot）</span>
+              <span className="spacer" />
+              <span className="faint" style={{ fontSize: 11 }}>
+                {notifyStatus
+                  ? notifyStatus.available
+                    ? "OpenClaw 已找到"
+                    : "未找到 OpenClaw"
+                  : "检测中…"}
+              </span>
+              <button
+                type="button"
+                className="btn-sm"
+                disabled={notifyBusy}
+                onClick={() => void testNotify()}
+              >
+                {notifyBusy ? "发送中…" : "发送测试"}
+              </button>
+            </div>
+            <div className="card-body stack">
+              <label className="check">
+                <input
+                  type="checkbox"
+                  checked={draft.notify.enabled}
+                  onChange={(event) => patchNotify({ enabled: event.target.checked })}
+                />
+                启用微信推送
+              </label>
+              <div className="form-grid">
+                <div className="field">
+                  <label className="field-label" htmlFor="notify-target">
+                    <span>接收目标</span>
+                    <em>会话 ID</em>
+                  </label>
+                  <input
+                    id="notify-target"
+                    value={draft.notify.target}
+                    onChange={(event) => patchNotify({ target: event.target.value })}
+                    placeholder="先给 ClawBot 发一条消息，再填写它返回的会话 ID"
+                  />
+                </div>
+                <div className="field">
+                  <label className="field-label" htmlFor="notify-command">
+                    <span>OpenClaw 路径</span>
+                    <em>可留空</em>
+                  </label>
+                  <input
+                    id="notify-command"
+                    value={draft.notify.command}
+                    onChange={(event) => patchNotify({ command: event.target.value })}
+                    placeholder="openclaw"
+                  />
+                </div>
+              </div>
+              <div className="form-grid">
+                <label className="check">
+                  <input
+                    type="checkbox"
+                    checked={draft.notify.on_fill}
+                    onChange={(event) => patchNotify({ on_fill: event.target.checked })}
+                  />
+                  成交回报
+                </label>
+                <label className="check">
+                  <input
+                    type="checkbox"
+                    checked={draft.notify.on_protection}
+                    onChange={(event) => patchNotify({ on_protection: event.target.checked })}
+                  />
+                  止损 / 止盈触发
+                </label>
+                <label className="check">
+                  <input
+                    type="checkbox"
+                    checked={draft.notify.on_risk_halt}
+                    onChange={(event) => patchNotify({ on_risk_halt: event.target.checked })}
+                  />
+                  风控熔断
+                </label>
+                <label className="check">
+                  <input
+                    type="checkbox"
+                    checked={draft.notify.on_live_warning}
+                    onChange={(event) => patchNotify({ on_live_warning: event.target.checked })}
+                  />
+                  实盘保护单告警
+                </label>
+              </div>
+              {notifyStatus && !notifyStatus.available && (
+                <div className="verdict bad">
+                  未找到 OpenClaw：请先安装微信 ClawBot，或在上方填写 openclaw 的完整路径。
+                </div>
+              )}
+              {notifyStatus?.last_error && (
+                <div className="verdict bad">{notifyStatus.last_error}</div>
+              )}
+              <div className="hint">
+                推送经由本机 OpenClaw 网关转给微信。改动需要先保存设置；“发送测试”使用的是已保存的配置。
               </div>
             </div>
           </div>

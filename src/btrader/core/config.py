@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import paths
+from ..notify import NotifySettings
 from .types import MarketType, Network
 
 log = logging.getLogger(__name__)
@@ -44,6 +45,8 @@ class AppSettings:
     risk: RiskSettings = field(default_factory=RiskSettings)
     notification_sound: bool = True
     theme: str = "light"
+    # WeChat push via the local OpenClaw gateway (see ``btrader.notify``).
+    notify: NotifySettings = field(default_factory=NotifySettings)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -66,10 +69,17 @@ class ConfigStore:
             return AppSettings()
 
         risk_raw = raw.pop("risk", {}) or {}
+        notify_raw = raw.pop("notify", {}) or {}
         known = {f for f in AppSettings.__dataclass_fields__}
         settings = AppSettings(**{k: v for k, v in raw.items() if k in known})
         risk_known = {f for f in RiskSettings.__dataclass_fields__}
         settings.risk = RiskSettings(**{k: v for k, v in risk_raw.items() if k in risk_known})
+        # Nested dataclasses must be rebuilt from their dicts; leaving a plain
+        # dict here would break every ``settings.notify.<field>`` read.
+        notify_known = {f for f in NotifySettings.__dataclass_fields__}
+        settings.notify = NotifySettings(
+            **{k: v for k, v in notify_raw.items() if k in notify_known}
+        )
         return settings
 
     def save(self) -> None:

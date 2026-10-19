@@ -16,6 +16,7 @@ from ..core.storage import Database
 from ..core.types import MarketType, Network, OrderSide, OrderType, RunMode
 from ..exchange.rest import BinanceREST, ExchangeError
 from ..exchange.symbols import format_amount
+from ..notify import WeChatNotifier
 from .paper import PaperBroker
 from .risk import RiskDecision, RiskManager
 
@@ -93,12 +94,18 @@ class TradingService:
         risk: RiskManager,
         paper: PaperBroker,
         db: Database,
+        notifier: "WeChatNotifier | None" = None,
     ) -> None:
         self.settings = settings
         self.rest = rest
         self.risk = risk
         self.paper = paper
         self.db = db
+        # Optional: pushes fills, protective exits and breaker trips to WeChat.
+        # Always best-effort, never on the order path's critical section.
+        self.notifier = notifier
+        # Last breaker reason already pushed to WeChat (dedupe across exits).
+        self._halt_announced = ""
         self.network = Network(settings.network)
         # Leverage already pushed to the venue, keyed by (market, symbol).
         # Setting it on every order would burn a signed request each time.
@@ -333,6 +340,7 @@ class TradingService:
             # reconciler. Recording it here is what lets the daily-loss and
             # consecutive-loss breakers see exits at all.
             self._record_fill(order)
+            self.notify_fill(order, mode=req.mode, market=req.market_type.value)
             self.db.save_order("paper", req.market_type.value, order, req.mode.value)
             self.save_paper_state()
             log.info(
@@ -386,6 +394,15 @@ class TradingService:
         warnings: list[str] = []
         if not req.reduce_only:
             protection, warnings = self._arm_live_protection(req, order, exchange_amount)
+            if warnings:
+                self._notify(
+                    WeChatNotifier.format_warning(
+                        title=f"{req.symbol} 保护单未完全挂上",
+                        detail="\n".join(warnings[:5]),
+                    ),
+                    kind="warning",
+                )
+        self.notify_fill(order, mode=req.mode, market=req.market_type.value)
         log.info(
             "实盘下单 %s %s %s %s @ %s -> %s",
             req.symbol, req.side, format_amount(base_qty), req.order_type, price,
@@ -522,6 +539,71 @@ class TradingService:
             realized,
         )
 
+    # ------------------------------------------------------------ notifications
+    def _notify(self, text: str, *, kind: str) -> None:
+        """Hand a message to the WeChat notifier. Never raises.
+
+        Notifications are additive: a missing OpenClaw install, a logged-out
+        plugin or a full queue must not turn a filled order into an error.
+        """
+        notifier = self.notifier
+        if notifier is None:
+            return
+        try:
+            notifier.notify(text, kind=kind)
+        except Exception:  # pragma: no cover - notification is best effort
+            log.debug("微信通知入队失败", exc_info=True)
+
+    def notify_fill(self, order: dict, *, mode: RunMode, market: str = "") -> None:
+        """Push one executed order. Used by the paper and live paths alike."""
+        if not order:
+            return
+        status = str(order.get("status") or "").lower()
+        if status not in ("closed", "partially_filled"):
+            return
+        try:
+            amount = float(order.get("filled") or order.get("amount") or 0.0)
+            price = float(order.get("average") or order.get("price") or 0.0)
+        except (TypeError, ValueError):
+            return
+        if amount <= 0 or price <= 0:
+            return
+        realized = order.get("realized")
+        text = WeChatNotifier.format_fill(
+            symbol=str(order.get("symbol") or ""),
+            side=str(order.get("side") or ""),
+            amount=amount,
+            price=price,
+            mode=mode.value,
+            realized=float(realized) if realized is not None else None,
+            market=market or str(order.get("market") or ""),
+        )
+        self._notify(text, kind="fill")
+
+    def notify_risk_halt(self) -> None:
+        """Push a breaker trip, if one is active and has not been announced yet.
+
+        ``notify_risk_halt`` is called after every recorded exit; re-sending the
+        same reason on each one would turn a breaker into a phone spammer. The
+        last announced reason is remembered, and cleared once the breaker is.
+        """
+        notifier = self.notifier
+        if notifier is None or not notifier.settings.enabled:
+            return
+        state = self.risk.state
+        reason = state.halted_reason or ""
+        if not reason:
+            self._halt_announced = ""
+            return
+        if reason == self._halt_announced:
+            return
+        self._halt_announced = reason
+        self._notify(
+            WeChatNotifier.format_halt(reason=reason, day_pnl=state.day_pnl),
+            kind="risk",
+        )
+
+
     # -------------------------------------------------------- live accounting
     def _live_ledger(self) -> dict:
         data = self.db.get_json(LIVE_LEDGER_KEY)
@@ -596,6 +678,18 @@ class TradingService:
                             symbol,
                             trade.get("side"),
                             result["realized"],
+                        )
+                        self._notify(
+                            WeChatNotifier.format_fill(
+                                symbol=symbol,
+                                side=str(trade.get("side") or ""),
+                                amount=float(result.get("closedQty") or 0.0),
+                                price=float(result.get("price") or trade.get("price") or 0.0),
+                                mode=RunMode.LIVE.value,
+                                realized=float(result["realized"]),
+                                market=market.value,
+                            ),
+                            kind="fill",
                         )
                     try:
                         self.db.save_trade(self._account_id(), trade, RunMode.LIVE.value)
@@ -712,6 +806,7 @@ class TradingService:
         filled = self.paper.mark(symbol, price)
         for order in filled:
             self._record_fill(order)
+            self.notify_fill(order, mode=RunMode.PAPER, market=order.get("market") or "spot")
             try:
                 self.db.save_order(
                     "paper", order.get("market") or "spot", order, RunMode.PAPER.value
@@ -720,6 +815,7 @@ class TradingService:
                 log.warning("纸面成交写库失败", exc_info=True)
         if filled:
             self.save_paper_state()
+            self.notify_risk_halt()
         return filled
 
     def check_protections(self, symbol: str, price: float) -> list[dict]:
@@ -727,6 +823,7 @@ class TradingService:
         orders = self.paper.check_protections(symbol, price)
         for order in orders:
             self._record_fill(order)
+            self._notify_protection(order)
             try:
                 self.db.save_order(
                     "paper", order.get("market") or "spot", order, RunMode.PAPER.value
@@ -735,7 +832,36 @@ class TradingService:
                 log.warning("保护单写库失败", exc_info=True)
         if orders:
             self.save_paper_state()
+            self.notify_risk_halt()
         return orders
+
+    def _notify_protection(self, order: dict) -> None:
+        """Push a stop-loss / take-profit exit.
+
+        These are the messages worth waking up for, so they get their own
+        wording instead of blending into the ordinary fill stream.
+        """
+        kind = str(order.get("protection") or "")
+        if kind not in ("stop_loss", "take_profit"):
+            self.notify_fill(order, mode=RunMode.PAPER, market=order.get("market") or "")
+            return
+        try:
+            amount = float(order.get("filled") or order.get("amount") or 0.0)
+            price = float(order.get("average") or order.get("triggerPrice") or 0.0)
+        except (TypeError, ValueError):
+            return
+        if amount <= 0 or price <= 0:
+            return
+        self._notify(
+            WeChatNotifier.format_protection(
+                symbol=str(order.get("symbol") or ""),
+                kind=kind,
+                price=price,
+                amount=amount,
+                mode=RunMode.PAPER.value,
+            ),
+            kind="protection",
+        )
 
     # --------------------------------------------------------------- hierarchy
     def _ensure_leverage(

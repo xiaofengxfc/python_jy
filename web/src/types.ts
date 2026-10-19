@@ -168,6 +168,20 @@ export interface Portfolio {
   equity_history: { t: number; equity: number }[];
 }
 
+export interface NotifySettings {
+  enabled: boolean;
+  /** OpenClaw channel id for the WeChat plugin. */
+  channel: string;
+  /** WeChat conversation the gateway should deliver to. */
+  target: string;
+  /** OpenClaw executable; empty means "openclaw" from PATH. */
+  command: string;
+  on_fill: boolean;
+  on_protection: boolean;
+  on_risk_halt: boolean;
+  on_live_warning: boolean;
+}
+
 export interface AppSettings {
   network: string;
   market_type: string;
@@ -188,6 +202,20 @@ export interface AppSettings {
   };
   notification_sound: boolean;
   theme: string;
+  notify: NotifySettings;
+}
+
+/** Reachability of the local OpenClaw gateway, as reported by the backend. */
+export interface NotifyStatus {
+  enabled: boolean;
+  channel: string;
+  target: string;
+  command: string;
+  available: boolean;
+  last_error: string;
+  last_success_at: number;
+  dropped: number;
+  pending: number;
 }
 
 export interface CredentialItem {

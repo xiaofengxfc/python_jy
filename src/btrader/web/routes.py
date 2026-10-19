@@ -74,6 +74,13 @@ class SettingsPayload(BaseModel):
     theme: str | None = None
     notification_sound: bool | None = None
     risk: dict[str, Any] | None = None
+    notify: dict[str, Any] | None = None
+
+
+class NotifyTestPayload(BaseModel):
+    """One-off message body for the settings page's “测试” button."""
+
+    message: str = ""
 
 
 class CredentialsPayload(BaseModel):
@@ -429,6 +436,8 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
             settings.notification_sound = payload.notification_sound
         if payload.risk is not None:
             _apply_risk(settings.risk, payload.risk)
+        if payload.notify is not None:
+            _apply_notify(settings.notify, payload.notify)
 
         ctx.save_settings()
         return {"ok": True, "settings": settings.to_dict()}
@@ -457,6 +466,32 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
         log.warning("风控熔断已手动解除，日内基准重置")
         return risk.snapshot()
 
+    # ------------------------------------------------------- wechat notify
+    @router.get("/api/notify")
+    def notify_status() -> dict[str, Any]:
+        """Whether the OpenClaw CLI can be found, plus the last outcome.
+
+        The settings page shows this instead of claiming success: a missing CLI
+        or an empty target is the ordinary failure, and the user needs the real
+        reason to fix it.
+        """
+        return get_state().ctx.notifier.status()
+
+    class NotifyTestPayload(BaseModel):
+        message: str = ""
+
+    @router.post("/api/notify/test")
+    def notify_test(payload: NotifyTestPayload) -> dict[str, Any]:
+        """Send one message synchronously so the user sees the real error."""
+        ctx = get_state().ctx
+        text = payload.message.strip() or "biTrader 微信通知测试：如果你收到这条消息，说明推送已打通。"
+        try:
+            result = ctx.notifier.send_now(text)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return result
+
+
     # ------------------------------------------------------------------ news
     @router.get("/api/news")
     def news(symbol: str = "", limit: int = 20) -> dict[str, Any]:
@@ -468,7 +503,8 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
         ctx = get_state().ctx
         return ctx.news.snapshot(symbol, limit=limit)
 
-    # ---------------------------------------------------------- credentials    @router.get("/api/credentials")
+    # ---------------------------------------------------------- credentials
+    @router.get("/api/credentials")
     def credentials() -> dict[str, Any]:
         ctx = get_state().ctx
         network = _network(None) or ctx.network
@@ -615,6 +651,28 @@ def _apply_risk(risk: RiskSettings, values: dict[str, Any]) -> None:
             setattr(risk, key, bool(value) if isinstance(current, bool) else type(current)(value))
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail=f"风控字段 {key} 的值无效")
+
+
+def _apply_notify(target: Any, values: dict[str, Any]) -> None:
+    """Same contract as :func:`_apply_risk`, for the WeChat push settings.
+
+    ``enabled`` without a target would queue messages that can never be
+    delivered, so that combination is rejected up front instead of failing
+    silently on the first fill.
+    """
+    for key, value in values.items():
+        if not hasattr(target, key):
+            log.debug("忽略未知通知字段: %s", key)
+            continue
+        current = getattr(target, key)
+        try:
+            setattr(target, key, bool(value) if isinstance(current, bool) else type(current)(value))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"通知字段 {key} 的值无效")
+    if target.enabled and not str(target.target or "").strip():
+        raise HTTPException(
+            status_code=400, detail="开启微信通知前，请先填写接收目标（会话 ID 或备注名）。"
+        )
 
 
 def _validate_backtest(state, payload: BacktestPayload):

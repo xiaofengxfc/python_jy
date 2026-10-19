@@ -15,6 +15,7 @@ from .engine.trading import TradingService
 from .exchange.klines import KlineStore
 from .exchange.rest import BinanceREST
 from .news import NewsService
+from .notify import WeChatNotifier
 from .strategy.registry import StrategyRegistry
 
 log = logging.getLogger(__name__)
@@ -48,7 +49,13 @@ class AppContext:
         except Exception:  # pragma: no cover - a corrupt row must not block startup
             log.warning("恢复纸面账户失败，使用初始资金", exc_info=True)
         self.risk = RiskManager(self.settings.risk, self.db)
-        self.trading = TradingService(self.settings, self.rest, self.risk, self.paper, self.db)
+        # Outbound WeChat push. Constructed even when disabled so the settings
+        # page can report whether the OpenClaw CLI is actually reachable.
+        self.notifier = WeChatNotifier(self.settings.notify)
+        self.trading = TradingService(
+            self.settings, self.rest, self.risk, self.paper, self.db,
+            notifier=self.notifier,
+        )
         # Keyless feed: announcements plus two RSS outlets, no token to manage.
         self.news = NewsService()
 
@@ -135,8 +142,15 @@ class AppContext:
 
     def save_settings(self) -> None:
         self.config.save()
+        # The notifier reads this same object, so an enable/target change takes
+        # effect on the next message without rebuilding anything.
+        self.notifier.settings = self.settings.notify
 
     def shutdown(self) -> None:
+        try:
+            self.notifier.stop()
+        except Exception:  # pragma: no cover - best effort on exit
+            log.debug("停止微信通知线程失败", exc_info=True)
         try:
             self.db.close()
         except Exception:  # pragma: no cover - best effort on exit
