@@ -57,6 +57,18 @@ const ICONS: Record<PageKey, ReactNode> = {
       strokeLinecap="round"
     />
   ),
+  lab: (
+    <>
+      <path
+        d="M6 2.5h4M6.5 2.5v3.1L3.9 11.1a1.4 1.4 0 0 0 1.2 2.2h5.8a1.4 1.4 0 0 0 1.2-2.2L9.5 5.6V2.5"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path d="M5.1 9.5h5.8" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+    </>
+  ),
   settings: (
     <>
       <circle cx="8" cy="8" r="2.2" stroke="currentColor" strokeWidth="1.4" />
@@ -74,6 +86,7 @@ const LABELS: [PageKey, string][] = [
   ["trading", "交易"],
   ["portfolio", "资产"],
   ["backtest", "回测"],
+  ["lab", "实验室"],
   ["settings", "设置"],
 ];
 

@@ -7,9 +7,10 @@ import TradingPage from "./pages/TradingPage";
 import PortfolioPage from "./pages/PortfolioPage";
 import SettingsPage from "./pages/SettingsPage";
 import BacktestPage from "./pages/BacktestPage";
+import StrategyLabPage from "./pages/StrategyLabPage";
 import type { AppSettings, Health } from "./types";
 
-export type PageKey = "trading" | "portfolio" | "auto" | "backtest" | "settings";
+export type PageKey = "trading" | "portfolio" | "auto" | "backtest" | "lab" | "settings";
 
 export default function App() {
   const [page, setPage] = useState<PageKey>("trading");
@@ -90,6 +91,7 @@ export default function App() {
         )}
         {page === "portfolio" && <PortfolioPage onEquity={handleAccountChange} />}
         {page === "backtest" && <BacktestPage />}
+        {page === "lab" && <StrategyLabPage />}
         {page === "settings" && (
           <SettingsPage settings={settings} onSaved={setSettings} />
         )}

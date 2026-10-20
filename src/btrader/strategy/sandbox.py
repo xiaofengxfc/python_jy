@@ -20,7 +20,15 @@ BANNED_MODULES = {
 }
 ALLOWED_MODULES = {
     "math", "statistics", "numpy", "pandas", "typing", "dataclasses",
+    # `from __future__ import annotations` is a compile-time flag, not a runtime
+    # module, and models add it to every file. Rejecting it made the reviewer
+    # fight the linter instead of reading the strategy.
+    "__future__",
     "btrader.strategy.base",
+    # Read-only indicator helpers: a candidate may use them once a human copies
+    # it into the real strategy package, which is where the import resolves.
+    "btrader.core.indicators",
+    "btrader.core",
 }
 BANNED_NAMES = {
     "eval", "exec", "compile", "open", "input", "breakpoint", "globals", "locals",
@@ -96,6 +104,16 @@ def check_code(code: str) -> CheckReport:
             module = node.module or ""
             imports.append(module)
             root = _root_module(module)
+            # A relative import inside a candidate only matters once a human
+            # copies the file into a package; it cannot reach the network or
+            # the filesystem, so it is not treated as an escape hatch. Banned
+            # module names are still rejected.
+            if node.level:
+                if module in BANNED_MODULES or root in BANNED_MODULES:
+                    issues.append(
+                        CheckIssue("banned_import", f"禁止从 {module} 导入", node.lineno)
+                    )
+                continue
             if module in BANNED_MODULES or root in BANNED_MODULES:
                 issues.append(
                     CheckIssue("banned_import", f"禁止从 {module} 导入", node.lineno)

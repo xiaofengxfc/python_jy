@@ -371,6 +371,7 @@ class LLMService:
         system: str = "",
         cache_key: str = "",
         kind: str = "",
+        max_tokens: int | None = None,
     ) -> dict[str, Any]:
         """One completion. Never raises; failures come back as ``ok=False``.
 
@@ -418,7 +419,9 @@ class LLMService:
             return result
 
         try:
-            text, tokens = self._request(spec, settings, key, system, prompt)
+            text, tokens = self._request(
+                spec, settings, key, system, prompt, max_tokens=max_tokens
+            )
         except AIError as exc:
             result["error"] = str(exc)
             result["elapsed"] = round(time.time() - started, 3)
@@ -475,14 +478,17 @@ class LLMService:
         key: str,
         system: str,
         prompt: str,
+        *,
+        max_tokens: int | None = None,
     ) -> tuple[str, int]:
         style = spec["style"]
         base = settings.base_url.rstrip("/")
+        output_limit = int(max_tokens or settings.max_tokens)
         if style == "anthropic":
             url = f"{base}/v1/messages"
             payload = {
                 "model": settings.model,
-                "max_tokens": int(settings.max_tokens),
+                "max_tokens": output_limit,
                 "temperature": float(settings.temperature),
                 "messages": [{"role": "user", "content": prompt}],
             }
@@ -504,7 +510,7 @@ class LLMService:
                 "stream": False,
                 "options": {
                     "temperature": float(settings.temperature),
-                    "num_predict": int(settings.max_tokens),
+                    "num_predict": output_limit,
                 },
             }
             headers = {"content-type": "application/json"}
@@ -517,7 +523,7 @@ class LLMService:
                 "model": settings.model,
                 "messages": messages,
                 "temperature": float(settings.temperature),
-                "max_tokens": int(settings.max_tokens),
+                "max_tokens": output_limit,
                 "stream": False,
             }
             headers = {

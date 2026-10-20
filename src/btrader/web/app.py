@@ -31,6 +31,7 @@ from ..exchange.symbols import format_amount, load_symbols
 from ..exchange import mirror
 from ..logging_setup import error_buffer
 from .routes import build_router
+from .routes_lab import build_lab_router
 from .stream import StreamHub
 
 log = logging.getLogger(__name__)
@@ -519,6 +520,8 @@ def create_app() -> FastAPI:
 
     app = FastAPI(title="biTrader Web", lifespan=lifespan)
     app.include_router(build_router(get_state))
+    # Phase 4-B: candidate review + multi-round parameter reflection.
+    app.include_router(build_lab_router(get_state))
 
     if STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

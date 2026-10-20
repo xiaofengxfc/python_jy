@@ -102,6 +102,7 @@ class CandidateStore:
             note=note,
         )
         code_path = self._path(candidate_id, ".py")
+        candidate.__dict__["_dir"] = str(self.directory)
         tmp = code_path.with_suffix(".py.tmp")
         tmp.write_text(code, encoding="utf-8")
         tmp.replace(code_path)
