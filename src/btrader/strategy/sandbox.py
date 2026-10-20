@@ -63,6 +63,17 @@ def _root_module(name: str) -> str:
     return name.split(".", 1)[0]
 
 
+def _safe_getattr(node: ast.Call) -> bool:
+    """A literal, non-dunder attribute name is the only allowed getattr form."""
+    if len(node.args) < 2 or node.keywords:
+        return False
+    name = node.args[1]
+    if not isinstance(name, ast.Constant) or not isinstance(name.value, str):
+        return False
+    attr = name.value
+    return not (attr.startswith("__") and attr.endswith("__"))
+
+
 def check_code(code: str) -> CheckReport:
     """Static checks for a candidate strategy module."""
     issues: list[CheckIssue] = []
@@ -123,7 +134,12 @@ def check_code(code: str) -> CheckReport:
                     CheckIssue("unknown_import", f"未在白名单中的模块 {module}", node.lineno)
                 )
         elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-            if node.func.id in BANNED_NAMES:
+            if node.func.id == "getattr" and _safe_getattr(node):
+                # `getattr(params, "period", 20)` is ordinary strategy code.
+                # The dangerous form is a computed or dunder name, which can
+                # reach attributes the dunder check above was written to stop.
+                pass
+            elif node.func.id in BANNED_NAMES:
                 issues.append(
                     CheckIssue("banned_call", f"禁止调用 {node.func.id}()", node.lineno)
                 )

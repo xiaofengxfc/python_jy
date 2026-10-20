@@ -118,6 +118,28 @@ def test_relative_import_of_banned_module_is_still_rejected():
     assert not check_code("from ..os import getcwd\n" + SAFE_CODE).ok
 
 
+def test_literal_getattr_is_allowed_but_computed_and_dunder_are_not():
+    """Models wrap optional params in getattr; only the literal form is safe."""
+    literal = SAFE_CODE.replace(
+        'ma = df["close"].rolling(params["period"]).mean()',
+        'period = getattr(params, "period", 20)\n'
+        '        ma = df["close"].rolling(period).mean()',
+    )
+    assert check_code(literal).ok
+
+    computed = SAFE_CODE.replace(
+        'ma = df["close"].rolling(params["period"]).mean()',
+        "ma = df[\"close\"].rolling(getattr(params, key)).mean()",
+    )
+    assert not check_code(computed).ok
+
+    dunder = SAFE_CODE.replace(
+        'ma = df["close"].rolling(params["period"]).mean()',
+        'ma = df["close"].rolling(getattr(params, "__class__")).mean()',
+    )
+    assert not check_code(dunder).ok
+
+
 # --------------------------------------------------------------- candidates
 def test_candidate_create_and_review(tmp_path: Path):
     store = CandidateStore(tmp_path)
