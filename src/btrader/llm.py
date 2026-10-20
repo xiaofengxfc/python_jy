@@ -77,6 +77,14 @@ PROVIDERS: dict[str, dict[str, Any]] = {
 
 DEFAULT_PROVIDER = "deepseek"
 
+# Some OpenAI-compatible relays sit behind a Cloudflare-style WAF that rejects
+# urllib's default ``Python-urllib/3.x`` User-Agent with a bare HTTP 403 whose
+# body reads "error code: 1010". The request never reaches the model, so the
+# key looks unauthorised for no reason. An explicit honest UA — the same one
+# ``news.py`` sends — is all those endpoints need to accept the call.
+USER_AGENT = "biTrader/0.5 (+desktop)"
+ACCEPT = "application/json"
+
 # A briefing per closed candle is the intended frequency; more than a few
 # hundred calls a day means a loop is misconfigured and is about to cost money.
 DEFAULT_DAILY_LIMIT = 300
@@ -517,6 +525,13 @@ class LLMService:
                 "authorization": f"Bearer {key}",
             }
 
+        # Every provider gets these two: a bare urllib client is rejected by
+        # some relays' WAF before the request ever reaches the model (a 403
+        # whose body says "error code: 1010"), which the user would otherwise
+        # read as "this key may not access that model".
+        headers.setdefault("user-agent", USER_AGENT)
+        headers.setdefault("accept", ACCEPT)
+
         body = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:
@@ -545,17 +560,34 @@ class LLMService:
         return text, tokens
 
 
+# A 403 from the edge is not a 403 from the model: a WAF in front of an
+# OpenAI-compatible relay rejects clients by signature with a bare
+# "error code: 1010" page, and blaming the key sends the user to the wrong fix.
+_WAF_MARKERS = ("cloudflare", "error code: 1010", "error code: 1015", "error code: 1020")
+
+
+def _looks_like_waf_block(detail: str) -> bool:
+    lowered = (detail or "").lower()
+    return any(marker in lowered for marker in _WAF_MARKERS)
+
+
 def _http_error_text(code: int, detail: str, provider: str) -> str:
     """Turn the usual HTTP codes into something the user can act on."""
-    hint = {
-        401: "API Key 无效或已过期。",
-        402: "账户余额不足。",
-        403: "这个 Key 没有访问该模型的权限。",
-        404: "模型名或接口地址不对。",
-        429: "触发频率限制，稍后再试。",
-    }.get(code)
-    if code >= 500:
-        hint = "模型服务端错误，稍后重试。"
+    if code == 403 and _looks_like_waf_block(detail):
+        hint = (
+            "请求被服务商前面的防火墙拦截了（Cloudflare 1010），"
+            "不是 Key 或模型权限问题；检查网络/代理，或联系服务商放行客户端。"
+        )
+    else:
+        hint = {
+            401: "API Key 无效或已过期。",
+            402: "账户余额不足。",
+            403: "这个 Key 没有访问该模型的权限。",
+            404: "模型名或接口地址不对。",
+            429: "触发频率限制，稍后再试。",
+        }.get(code)
+        if code >= 500:
+            hint = "模型服务端错误，稍后重试。"
     message = hint or f"HTTP {code}。"
     if detail:
         message += f" {detail}"

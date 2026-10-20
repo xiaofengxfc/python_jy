@@ -12,7 +12,10 @@ bug would be silent and expensive:
 
 from __future__ import annotations
 
+import io
 import json
+import urllib.error
+import urllib.request
 
 import pandas as pd
 import pytest
@@ -601,3 +604,227 @@ def test_market_frame_reports_both_failures(monkeypatch) -> None:
     # why the primary was unavailable.
     assert "币安不可达" in str(caught.value.detail)
     assert "备用源" in str(caught.value.detail)
+
+
+# --------------------------------------------------------- transport (the wire)
+#
+# A relay in front of an OpenAI-compatible endpoint rejected urllib's default
+# ``Python-urllib/3.x`` User-Agent with HTTP 403 and a body reading
+# "error code: 1010" — before the request ever reached the model. The old code
+# mapped that to "这个 Key 没有访问该模型的权限。", which sent the user to the
+# wrong fix. These tests pin the wire format (a real client name, JSON headers,
+# the documented URLs and payloads) and the two 403 stories apart, so the bug
+# cannot come back silently and the message cannot regress into blame.
+
+_COMPLETIONS = {
+    "openai": {
+        "choices": [{"message": {"content": "好的"}}],
+        "usage": {"total_tokens": 12},
+    },
+    "anthropic": {
+        "content": [{"type": "text", "text": "好的"}],
+        "usage": {"input_tokens": 10, "output_tokens": 2},
+    },
+    "ollama": {
+        "message": {"content": "好的"},
+        "prompt_eval_count": 10,
+        "eval_count": 2,
+    },
+}
+
+
+class FakeResponse:
+    """Minimal ``urlopen`` result: a context manager whose ``read`` is all we use."""
+
+    def __init__(self, payload: dict) -> None:
+        self._body = json.dumps(payload).encode("utf-8")
+
+    def __enter__(self) -> "FakeResponse":
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        return False
+
+    def read(self) -> bytes:
+        return self._body
+
+
+def _header(request, name: str) -> str:
+    """Case-insensitive lookup: ``urllib`` stores ``User-agent``, not ``User-Agent``."""
+    for key, value in request.headers.items():
+        if key.lower() == name.lower():
+            return value
+    return ""
+
+
+def _service(tmp_path, monkeypatch, provider: str) -> LLMService:
+    """An enabled service whose key, cache and audit trail are all throwaway."""
+    monkeypatch.setenv("BITRADER_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(llm, "load_key", lambda: "sk-test")
+    llm.reset_cache()
+    return LLMService(AISettings(enabled=True, provider=provider))
+
+
+def _capture_request(monkeypatch, payload: dict) -> list:
+    """Replace ``urlopen`` with a recorder; returns the captured Requests."""
+    seen: list[urllib.request.Request] = []
+
+    def fake_urlopen(request, timeout=None):
+        seen.append(request)
+        return FakeResponse(payload)
+
+    monkeypatch.setattr(llm.urllib.request, "urlopen", fake_urlopen)
+    return seen
+
+
+def test_openai_request_has_the_documented_url_headers_and_payload(
+    tmp_path, monkeypatch
+) -> None:
+    service = _service(tmp_path, monkeypatch, "openai")
+    seen = _capture_request(monkeypatch, _COMPLETIONS["openai"])
+
+    result = service.ask("问题", system="你是分析师")
+
+    assert result["ok"] is True
+    assert result["text"] == "好的"
+    assert result["tokens"] == 12
+    request = seen[0]
+    assert request.full_url == "https://api.openai.com/v1/chat/completions"
+    assert request.get_method() == "POST"
+    # The whole point of the regression: a client name, not urllib's default.
+    assert _header(request, "User-Agent") == llm.USER_AGENT
+    assert _header(request, "Accept") == "application/json"
+    assert _header(request, "Content-Type") == "application/json"
+    assert _header(request, "Authorization") == "Bearer sk-test"
+    payload = json.loads(request.data.decode("utf-8"))
+    assert payload["model"] == "gpt-4o-mini"
+    assert payload["stream"] is False
+    assert payload["temperature"] == pytest.approx(0.2)
+    assert payload["max_tokens"] == 1200
+    assert payload["messages"][0] == {"role": "system", "content": "你是分析师"}
+    assert payload["messages"][-1] == {"role": "user", "content": "问题"}
+
+
+def test_anthropic_request_uses_its_own_headers_and_a_system_field(
+    tmp_path, monkeypatch
+) -> None:
+    service = _service(tmp_path, monkeypatch, "anthropic")
+    seen = _capture_request(monkeypatch, _COMPLETIONS["anthropic"])
+
+    result = service.ask("问题", system="你是分析师")
+
+    assert result["ok"] is True
+    assert result["text"] == "好的"
+    assert result["tokens"] == 12
+    request = seen[0]
+    assert request.full_url == "https://api.anthropic.com/v1/messages"
+    assert _header(request, "x-api-key") == "sk-test"
+    assert _header(request, "anthropic-version") == "2023-06-01"
+    assert _header(request, "User-Agent") == llm.USER_AGENT
+    assert _header(request, "Accept") == "application/json"
+    assert "authorization" not in {key.lower() for key in request.headers}
+    payload = json.loads(request.data.decode("utf-8"))
+    # Anthropic takes the system prompt as a top-level field, not a message.
+    assert payload["system"] == "你是分析师"
+    assert payload["messages"] == [{"role": "user", "content": "问题"}]
+    assert payload["max_tokens"] == 1200
+
+
+def test_ollama_request_is_local_and_sends_no_credentials(tmp_path, monkeypatch) -> None:
+    service = _service(tmp_path, monkeypatch, "ollama")
+    seen = _capture_request(monkeypatch, _COMPLETIONS["ollama"])
+
+    result = service.ask("问题", system="你是分析师")
+
+    assert result["ok"] is True
+    assert result["text"] == "好的"
+    request = seen[0]
+    assert request.full_url == "http://127.0.0.1:11434/api/chat"
+    assert _header(request, "User-Agent") == llm.USER_AGENT
+    assert _header(request, "Accept") == "application/json"
+    lowered = {key.lower() for key in request.headers}
+    # A local model needs no key, and none may be leaked to it.
+    assert "authorization" not in lowered
+    assert "x-api-key" not in lowered
+    payload = json.loads(request.data.decode("utf-8"))
+    assert payload["stream"] is False
+    assert payload["options"]["temperature"] == pytest.approx(0.2)
+    assert payload["options"]["num_predict"] == 1200
+    assert payload["messages"][0] == {"role": "system", "content": "你是分析师"}
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic", "ollama"])
+def test_no_style_ever_sends_the_urllib_default_user_agent(
+    tmp_path, monkeypatch, provider
+) -> None:
+    """The exact string Cloudflare-style relays reject with "error code: 1010"."""
+    service = _service(tmp_path, monkeypatch, provider)
+    seen = _capture_request(monkeypatch, _COMPLETIONS[provider])
+
+    assert service.ask("问题")["ok"] is True
+    user_agent = _header(seen[0], "User-Agent")
+    assert user_agent == llm.USER_AGENT
+    assert user_agent
+    assert "python-urllib" not in user_agent.lower()
+
+
+def test_a_waf_403_is_not_reported_as_a_key_permission_problem() -> None:
+    text = llm._http_error_text(403, "error code: 1010", "openai")
+    assert "防火墙" in text
+    assert "Cloudflare" in text
+    assert "1010" in text
+    # Blaming the key is exactly the misleading message this test exists for.
+    assert "没有访问该模型" not in text
+
+
+def test_a_model_permission_403_keeps_the_permission_wording() -> None:
+    text = llm._http_error_text(403, '{"error":{"message":"model not allowed"}}', "openai")
+    assert "没有访问该模型" in text
+    # A real permission error must not be excused as a firewall block.
+    assert "防火墙" not in text
+
+
+def test_ask_turns_a_waf_403_into_ok_false_with_the_detail(tmp_path, monkeypatch) -> None:
+    service = _service(tmp_path, monkeypatch, "openai")
+
+    def fake_urlopen(request, timeout=None):
+        raise urllib.error.HTTPError(
+            request.full_url,
+            403,
+            "Forbidden",
+            {},
+            io.BytesIO(b"error code: 1010"),
+        )
+
+    monkeypatch.setattr(llm.urllib.request, "urlopen", fake_urlopen)
+    result = service.ask("问题")
+
+    assert result["ok"] is False
+    assert result["text"] == ""
+    assert "防火墙" in result["error"]
+    assert "error code: 1010" in result["error"]
+    assert "没有访问该模型" not in result["error"]
+    # A rejected request is not a billable call, and it must be audited.
+    assert llm.cache().calls_today() == 0
+    tail = llm.audit_tail(5)
+    assert tail and tail[0]["ok"] is False
+
+
+def test_ask_keeps_the_permission_wording_for_a_json_403(tmp_path, monkeypatch) -> None:
+    service = _service(tmp_path, monkeypatch, "openai")
+
+    def fake_urlopen(request, timeout=None):
+        raise urllib.error.HTTPError(
+            request.full_url,
+            403,
+            "Forbidden",
+            {},
+            io.BytesIO(b'{"error":{"message":"model not allowed"}}'),
+        )
+
+    monkeypatch.setattr(llm.urllib.request, "urlopen", fake_urlopen)
+    result = service.ask("问题")
+
+    assert result["ok"] is False
+    assert "没有访问该模型" in result["error"]
+    assert "防火墙" not in result["error"]
