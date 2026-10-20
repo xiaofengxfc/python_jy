@@ -6,7 +6,6 @@ import LogPanel from "./components/LogPanel";
 import TradingPage from "./pages/TradingPage";
 import PortfolioPage from "./pages/PortfolioPage";
 import SettingsPage from "./pages/SettingsPage";
-import AutoPage from "./pages/AutoPage";
 import BacktestPage from "./pages/BacktestPage";
 import type { AppSettings, Health } from "./types";
 
@@ -90,7 +89,6 @@ export default function App() {
           />
         )}
         {page === "portfolio" && <PortfolioPage onEquity={handleAccountChange} />}
-        {page === "auto" && <AutoPage />}
         {page === "backtest" && <BacktestPage />}
         {page === "settings" && (
           <SettingsPage settings={settings} onSaved={setSettings} />

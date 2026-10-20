@@ -9,7 +9,21 @@ const MODES: [string, string][] = [
   ["live", "实盘"],
 ];
 
-export default function AutoPage() {
+interface Props {
+  /** Rendered inside the trading page: no page head, and the market / symbol /
+   * timeframe follow the chart above instead of being chosen twice. */
+  embedded?: boolean;
+  market?: string;
+  symbol?: string;
+  timeframe?: string;
+}
+
+export default function AutoPage({
+  embedded = false,
+  market: sharedMarket,
+  symbol: sharedSymbol,
+  timeframe: sharedTimeframe,
+}: Props = {}) {
   const [strategies, setStrategies] = useState<Strategy[]>([]);
   const [symbols, setSymbols] = useState<SymbolInfo[]>([]);
   const [status, setStatus] = useState<AutoStatus | null>(null);
@@ -84,6 +98,23 @@ export default function AutoPage() {
 
   const running = status?.running ?? false;
 
+  // Embedded in the trading page: the pair and timeframe are the ones already
+  // on the chart, so an auto run can never quietly trade a different symbol
+  // than the one the user is looking at. Changes while running are ignored
+  // (the backend owns the running config).
+  useEffect(() => {
+    if (!embedded || running || !sharedMarket) return;
+    setMarket(sharedMarket);
+  }, [embedded, running, sharedMarket]);
+  useEffect(() => {
+    if (!embedded || running || !sharedSymbol) return;
+    setSymbol(sharedSymbol);
+  }, [embedded, running, sharedSymbol]);
+  useEffect(() => {
+    if (!embedded || running || !sharedTimeframe) return;
+    setTimeframe(sharedTimeframe);
+  }, [embedded, running, sharedTimeframe]);
+
   const start = async () => {
     setBusy(true);
     setError("");
@@ -136,33 +167,61 @@ export default function AutoPage() {
 
   return (
     <>
-      <div className="page-head">
-        <h1 className="page-title">自动交易</h1>
-        <span className={`live-badge ${running ? "" : "idle"}`}>
-          <span className={`dot ${running ? "live" : ""}`} />
-          {running ? "运行中" : "未运行"}
-        </span>
-        <span className="spacer" />
-        {running ? (
-          <button type="button" className="btn-sm" disabled={busy} onClick={stop}>
-            {busy ? "处理中…" : "停止"}
-          </button>
-        ) : (
-          <button
-            type="button"
-            className="btn-sm primary"
-            disabled={busy || !strategyKey}
-            onClick={start}
-          >
-            {busy ? "启动中…" : "启动"}
-          </button>
-        )}
-      </div>
+      {embedded ? (
+        <div className="card-head auto-head">
+          <span className="card-title">自动交易</span>
+          <span className={`live-badge ${running ? "" : "idle"}`}>
+            <span className={`dot ${running ? "live" : ""}`} />
+            {running ? "运行中" : "未运行"}
+          </span>
+          <span className="faint" style={{ fontSize: 11 }}>
+            跟随图表：{market} · {symbol || "—"} · {timeframe}
+          </span>
+          <span className="spacer" />
+          {running ? (
+            <button type="button" className="btn-sm" disabled={busy} onClick={stop}>
+              {busy ? "处理中…" : "停止"}
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="btn-sm primary"
+              disabled={busy || !strategyKey}
+              onClick={start}
+            >
+              {busy ? "启动中…" : "启动"}
+            </button>
+          )}
+        </div>
+      ) : (
+        <div className="page-head">
+          <h1 className="page-title">自动交易</h1>
+          <span className={`live-badge ${running ? "" : "idle"}`}>
+            <span className={`dot ${running ? "live" : ""}`} />
+            {running ? "运行中" : "未运行"}
+          </span>
+          <span className="spacer" />
+          {running ? (
+            <button type="button" className="btn-sm" disabled={busy} onClick={stop}>
+              {busy ? "处理中…" : "停止"}
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="btn-sm primary"
+              disabled={busy || !strategyKey}
+              onClick={start}
+            >
+              {busy ? "启动中…" : "启动"}
+            </button>
+          )}
+        </div>
+      )}
 
       {error && <div className="banner error">{error}</div>}
       {notice && <div className="banner">{notice}</div>}
 
-      <div className="stack">
+      <div className={embedded ? "auto-section" : "stack"}>
         <div className="stack">
           <div className="card">
             <div className="card-head">
@@ -170,58 +229,62 @@ export default function AutoPage() {
             </div>
             <div className="card-body stack">
               <div className="form-grid">
-                <div className="field">
-                  <label className="field-label" htmlFor="auto-market">
-                    <span>市场</span>
-                  </label>
-                  <select
-                    id="auto-market"
-                    className="select"
-                    value={market}
-                    disabled={running}
-                    onChange={(event) => setMarket(event.target.value)}
-                  >
-                    <option value="spot">现货</option>
-                    <option value="usdm">U 本位合约</option>
-                    <option value="coinm">币本位合约</option>
-                  </select>
-                </div>
-                <div className="field">
-                  <label className="field-label" htmlFor="auto-symbol">
-                    <span>交易对</span>
-                  </label>
-                  <select
-                    id="auto-symbol"
-                    className="select"
-                    value={symbol}
-                    disabled={running}
-                    onChange={(event) => setSymbol(event.target.value)}
-                  >
-                    {symbols.map((item) => (
-                      <option key={item.symbol} value={item.symbol}>
-                        {item.display}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div className="field">
-                  <label className="field-label" htmlFor="auto-timeframe">
-                    <span>K 线周期</span>
-                  </label>
-                  <select
-                    id="auto-timeframe"
-                    className="select"
-                    value={timeframe}
-                    disabled={running}
-                    onChange={(event) => setTimeframe(event.target.value)}
-                  >
-                    {TIMEFRAMES.map(([value, label]) => (
-                      <option key={value} value={value}>
-                        {label}
-                      </option>
-                    ))}
-                  </select>
-                </div>
+                {!embedded && (
+                  <>
+                    <div className="field">
+                      <label className="field-label" htmlFor="auto-market">
+                        <span>市场</span>
+                      </label>
+                      <select
+                        id="auto-market"
+                        className="select"
+                        value={market}
+                        disabled={running}
+                        onChange={(event) => setMarket(event.target.value)}
+                      >
+                        <option value="spot">现货</option>
+                        <option value="usdm">U 本位合约</option>
+                        <option value="coinm">币本位合约</option>
+                      </select>
+                    </div>
+                    <div className="field">
+                      <label className="field-label" htmlFor="auto-symbol">
+                        <span>交易对</span>
+                      </label>
+                      <select
+                        id="auto-symbol"
+                        className="select"
+                        value={symbol}
+                        disabled={running}
+                        onChange={(event) => setSymbol(event.target.value)}
+                      >
+                        {symbols.map((item) => (
+                          <option key={item.symbol} value={item.symbol}>
+                            {item.display}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="field">
+                      <label className="field-label" htmlFor="auto-timeframe">
+                        <span>K 线周期</span>
+                      </label>
+                      <select
+                        id="auto-timeframe"
+                        className="select"
+                        value={timeframe}
+                        disabled={running}
+                        onChange={(event) => setTimeframe(event.target.value)}
+                      >
+                        {TIMEFRAMES.map(([value, label]) => (
+                          <option key={value} value={value}>
+                            {label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </>
+                )}
                 <div className="field">
                   <label className="field-label" htmlFor="auto-mode">
                     <span>运行模式</span>

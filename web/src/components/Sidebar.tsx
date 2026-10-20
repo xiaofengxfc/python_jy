@@ -73,7 +73,6 @@ const ICONS: Record<PageKey, ReactNode> = {
 const LABELS: [PageKey, string][] = [
   ["trading", "交易"],
   ["portfolio", "资产"],
-  ["auto", "自动交易"],
   ["backtest", "回测"],
   ["settings", "设置"],
 ];

@@ -6,6 +6,7 @@ import { useMarketStream } from "../hooks/useMarketStream";
 import type { Account, AILevel, Candle, Health, SymbolInfo } from "../types";
 import AIPanel from "../components/AIPanel";
 import BottomTabs from "../components/BottomTabs";
+import AutoPage from "./AutoPage";
 import Chart, {
   INDICATOR_SPECS,
   clampParam,
@@ -14,6 +15,10 @@ import Chart, {
   type IndicatorConfig,
   type IndicatorParams,
 } from "../components/Chart";
+import DrawingToolbar from "../components/DrawingToolbar";
+import FloatingWindow from "../components/FloatingWindow";
+import type { Drawing, DrawingTool } from "../components/drawings";
+import { levelsToDrawings, loadDrawings, saveDrawings } from "../components/drawingsStore";
 import OrderBook from "../components/OrderBook";
 import OrderTicket from "../components/OrderTicket";
 import SymbolPicker from "../components/SymbolPicker";
@@ -132,19 +137,30 @@ export default function TradingPage({
   /** Price levels the AI named for the pair on screen, and whether the chart
    * should draw them. Hiding rather than clearing keeps a second click cheap:
    * the analysis is already paid for. */
-  const [aiLevels, setAiLevels] = useState<AILevel[]>([]);
   const [aiLevelsOn, setAiLevelsOn] = useState(true);
+  /** Lines the trader drew by hand plus AI levels converted to editable lines. */
+  const [drawings, setDrawings] = useState<Drawing[]>([]);
+  const [drawingTool, setDrawingTool] = useState<DrawingTool>("select");
+  const [selectedDrawing, setSelectedDrawing] = useState<string | null>(null);
+  const [drawingsVisible, setDrawingsVisible] = useState(true);
+  /** The AI window floats over the chart; open on first visit so the analysis
+   * is visible instead of clipped in the rail. */
+  const [aiWindowOpen, setAiWindowOpen] = useState(true);
 
   const { ticker, book, connected, tradeVolume, tradeWhen, tradePrice, tradeSeq } =
     useMarketStream(market, symbol);
   const requestId = useRef(0);
 
   /** The AI panel hands its levels up here; the chart reads them from state, so
-   * a redraw (zoom, resize, live tick) never needs to re-ask the model. */
+   * a redraw (zoom, resize, live tick) never needs to re-ask the model. Levels
+   * arrive as editable drawings so the trader can move a support line the model
+   * placed too optimistically instead of retyping it. */
   const applyAiLevels = useCallback((levels: AILevel[], owner: string) => {
-    // An empty owner means "clear": the panel does that when the pair changes.
-    setAiLevels(owner ? levels : []);
-    if (owner) setAiLevelsOn(true);
+    setAiLevelsOn(true);
+    setDrawings((current) => {
+      const manual = current.filter((item) => item.source !== "ai");
+      return owner ? [...manual, ...levelsToDrawings(levels)] : manual;
+    });
   }, []);
 
   const marketItems = health?.markets ?? [
@@ -162,6 +178,30 @@ export default function TradingPage({
       // A full or disabled storage must not break trading.
     }
   }, [indicators]);
+
+  /* -------------------------------------------------------- drawings */
+  // One key per market+symbol+timeframe: a support drawn on BTC 15m is not a
+  // level on ETH 1h. The skip flag avoids writing the previous pair's lines
+  // into the new pair's key before the load effect has run.
+  const skipDrawingSave = useRef(true);
+  useEffect(() => {
+    skipDrawingSave.current = true;
+    if (!symbol) {
+      setDrawings([]);
+      setSelectedDrawing(null);
+      return;
+    }
+    setDrawings(loadDrawings(market, symbol, timeframe));
+    setSelectedDrawing(null);
+  }, [market, symbol, timeframe]);
+  useEffect(() => {
+    if (!symbol) return;
+    if (skipDrawingSave.current) {
+      skipDrawingSave.current = false;
+      return;
+    }
+    saveDrawings(market, symbol, timeframe, drawings);
+  }, [drawings, market, symbol, timeframe]);
 
   /* ---------------------------------------------------------- symbols */
   useEffect(() => {
@@ -546,7 +586,32 @@ export default function TradingPage({
                 ))}
               </div>
               <span className="spacer" />
+              <button
+                type="button"
+                className="link-btn"
+                onClick={() => setAiWindowOpen(true)}
+                title="打开 AI 分析窗口（可拖动、可缩放）"
+              >
+                AI 分析
+              </button>
             </div>
+            <DrawingToolbar
+              tool={drawingTool}
+              onChange={setDrawingTool}
+              selected={drawings.find((item) => item.id === selectedDrawing) ?? null}
+              count={drawings.length}
+              onDelete={() => {
+                if (!selectedDrawing) return;
+                setDrawings((current) => current.filter((item) => item.id !== selectedDrawing));
+                setSelectedDrawing(null);
+              }}
+              onClear={() => {
+                setDrawings([]);
+                setSelectedDrawing(null);
+              }}
+              visible={drawingsVisible}
+              onToggleVisible={() => setDrawingsVisible((value) => !value)}
+            />
             <div className="card-head indicator-bar">
               <span className="faint" style={{ fontSize: 11 }}>
                 指标
@@ -669,7 +734,13 @@ export default function TradingPage({
               indicators={indicators}
               onLoadOlder={() => void loadOlder()}
               olderLoading={olderLoading}
-              aiLevels={aiLevelsOn ? aiLevels : []}
+              drawings={drawingsVisible ? drawings : []}
+              onDrawingsChange={setDrawings}
+              drawingTool={drawingTool}
+              selectedId={selectedDrawing}
+              onSelect={setSelectedDrawing}
+              onToolDone={() => setDrawingTool("select")}
+              drawingsVisible={drawingsVisible}
             />
           </div>
 
@@ -687,15 +758,6 @@ export default function TradingPage({
         </div>
 
         <div className="trading-rail">
-          <AIPanel
-            market={market}
-            symbol={symbol}
-            timeframe={timeframe}
-            onLevels={applyAiLevels}
-            showLevels={aiLevelsOn}
-            onShowLevels={setAiLevelsOn}
-          />
-
           <div className="card">
             <div className="card-head">
               <span className="card-title">盘口</span>
@@ -731,6 +793,38 @@ export default function TradingPage({
           />
         </div>
       </div>
+
+      {/* The old standalone "自动交易" page is merged here: same pair, same
+          timeframe, right under the chart it trades. */}
+      <AutoPage embedded market={market} symbol={symbol} timeframe={timeframe} />
+
+      {/* The AI panel used to be the first card of the right rail, where a long
+          answer was clipped to two lines and could not be read at all. It is a
+          floating window now: draggable, resizable, collapsible, and open by
+          default so the analysis is visible without hunting for it. */}
+      <FloatingWindow
+        title={`AI 分析 · ${symbol || "—"}`}
+        open={aiWindowOpen}
+        onClose={() => setAiWindowOpen(false)}
+        storageKey="btrader.ai.window.v1"
+        defaultRect={{ x: 980, y: 96, w: 600, h: 560 }}
+        minWidth={360}
+        minHeight={280}
+        footer={
+          <span className="faint" style={{ fontSize: 11 }}>
+            拖动标题栏移动，右下角缩放；价位会以可编辑画线出现在图上
+          </span>
+        }
+      >
+        <AIPanel
+          market={market}
+          symbol={symbol}
+          timeframe={timeframe}
+          onLevels={applyAiLevels}
+          showLevels={aiLevelsOn}
+          onShowLevels={setAiLevelsOn}
+        />
+      </FloatingWindow>
     </>
   );
 }

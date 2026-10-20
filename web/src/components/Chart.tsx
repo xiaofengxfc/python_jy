@@ -3,6 +3,9 @@ import type { PointerEvent as ReactPointerEvent } from "react";
 import type { AILevel, Candle } from "../types";
 import { fmtPrice, shortTime } from "../format";
 import { cssVar, useThemeRevision } from "../hooks/useThemeRevision";
+import type { Drawing, DrawingPoint, DrawingTool } from "./drawings";
+import { drawingLabel, lineColor } from "./drawings";
+import { newDrawingId } from "./drawingsStore";
 
 /** Levels the AI named, drawn as labelled horizontal lines over the candles.
  * They are validated against the traded range on the backend, so anything that
@@ -166,8 +169,23 @@ interface Props {
   onLoadOlder?: () => void;
   /** A history request is in flight; shown as a hint and used to rate-limit. */
   olderLoading?: boolean;
-  /** Support/resistance/stop lines the AI proposed for this symbol. */
+  /** Support/resistance/stop lines the AI proposed for this symbol. Kept for
+   * backwards compatibility; the trading page now feeds those same levels in
+   * through ``drawings`` so they can be edited like any manual line. */
   aiLevels?: AILevel[];
+  /** The trader's drawings plus AI levels converted to editable lines. */
+  drawings?: Drawing[];
+  /** Replaces the whole list; the parent owns persistence, so every drag goes
+   * through this callback instead of mutating local state. */
+  onDrawingsChange?: (next: Drawing[]) => void;
+  /** Active tool. ``select`` is pointer/pan mode. */
+  drawingTool?: DrawingTool;
+  selectedId?: string | null;
+  onSelect?: (id: string | null) => void;
+  /** Called once a line has been placed, so the parent can drop back to select. */
+  onToolDone?: () => void;
+  /** Without this, drawings are hidden but never deleted (e.g. AI lines). */
+  drawingsVisible?: boolean;
 }
 
 /** Colours are read from the active theme's tokens at paint time, so switching
@@ -236,6 +254,65 @@ const MIN_WHEEL_STEPS = 0.5;
  * gets its axis narrowed. */
 const SPIKE_RATIO = 4;
 
+/** Geometry of the price panel, captured by ``draw()`` so pointer maths uses
+ * the exact numbers the candles were painted with (and never its own copy). */
+interface ChartGeometry {
+  left: number;
+  right: number;
+  top: number;
+  priceH: number;
+  min: number;
+  max: number;
+  step: number;
+  plotX: number;
+  /** Index of the first candle in the slice and how many are drawn. */
+  start: number;
+  barCount: number;
+}
+
+/** Index of the candle whose open time is closest to ``t``. Binary search:
+ * drawings can be hours or weeks away from the visible window. */
+function indexOfTime(candles: Candle[], t: number): number {
+  if (!candles.length) return 0;
+  let low = 0;
+  let high = candles.length - 1;
+  while (low < high) {
+    const mid = (low + high) >> 1;
+    if (candles[mid]!.t < t) low = mid + 1;
+    else high = mid;
+  }
+  if (low > 0 && Math.abs(candles[low - 1]!.t - t) <= Math.abs(candles[low]!.t - t)) {
+    return low - 1;
+  }
+  return low;
+}
+
+/** Candle open time ``delta`` bars away from ``t``, clamped to the series. A
+ * trend line dragged sideways keeps its shape instead of drifting in price. */
+function shiftTime(candles: Candle[], t: number, delta: number): number {
+  if (!candles.length) return t;
+  const index = indexOfTime(candles, t) + delta;
+  const clamped = Math.min(candles.length - 1, Math.max(0, index));
+  return candles[clamped]!.t;
+}
+
+/** Shortest distance from a point to a line segment, in pixels. */
+function distanceToSegment(
+  x: number,
+  y: number,
+  ax: number,
+  ay: number,
+  bx: number,
+  by: number,
+): number {
+  const dx = bx - ax;
+  const dy = by - ay;
+  const lengthSq = dx * dx + dy * dy;
+  if (lengthSq === 0) return Math.hypot(x - ax, y - ay);
+  const t = Math.min(1, Math.max(0, ((x - ax) * dx + (y - ay) * dy) / lengthSq));
+  return Math.hypot(x - (ax + t * dx), y - (ay + t * dy));
+}
+
 export default function Chart({
   candles,
   seriesKey,
@@ -248,6 +325,13 @@ export default function Chart({
   onLoadOlder,
   olderLoading = false,
   aiLevels = [],
+  drawings = [],
+  onDrawingsChange,
+  drawingTool = "select",
+  selectedId = null,
+  onSelect,
+  onToolDone,
+  drawingsVisible = true,
 }: Props) {
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -261,6 +345,24 @@ export default function Chart({
   const [zoomBars, setZoomBars] = useState<number | null>(null);
   const [hover, setHover] = useState<{ x: number; y: number } | null>(null);
   const drag = useRef<{ x: number; start: number } | null>(null);
+  /** Geometry of the last paint; pointer maths must match what was drawn. */
+  const geomRef = useRef<ChartGeometry | null>(null);
+  /** The rubber-band line while a trend line is being dragged out. */
+  const [preview, setPreview] = useState<{ a: DrawingPoint; b: DrawingPoint } | null>(null);
+  const trendDraft = useRef<{ a: DrawingPoint } | null>(null);
+  const lineDrag = useRef<
+    | { mode: "move-hline"; id: string; startY: number; startPrice: number }
+    | {
+        mode: "move-trend";
+        id: string;
+        startX: number;
+        startY: number;
+        a: DrawingPoint;
+        b: DrawingPoint;
+      }
+    | { mode: "move-endpoint"; id: string; which: "a" | "b" }
+    | null
+  >(null);
   // The oldest bar and series seen so far, used to tell a prepended history
   // block apart from a new bar at the tail. Keyed on the *loaded data*, not on
   // the requested timeframe: during a switch the old candles are still on
@@ -330,7 +432,7 @@ export default function Chart({
       // Keep the zoom-out limit in step with the panel width.
       const measured = Math.floor(wrap.getBoundingClientRect().width);
       setPlotWidth((current) => (current === measured ? current : measured));
-      draw(
+      geomRef.current = draw(
         canvas,
         wrap,
         candles,
@@ -342,6 +444,10 @@ export default function Chart({
         indicators,
         colors(),
         aiLevels,
+        drawings,
+        selectedId,
+        preview,
+        drawingsVisible,
       );
     };
     paint();
@@ -358,18 +464,243 @@ export default function Chart({
     hover,
     indicators,
     aiLevels,
+    drawings,
+    selectedId,
+    preview,
+    drawingsVisible,
     themeRevision,
   ]);
 
+  /** Canvas-local pointer position (draw() measures from the canvas box). */
+  const localPoint = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+  };
+
+  /** Keep receiving moves after the pointer leaves the canvas. Synthetic
+   * pointers (automation, some touch emulation) have no capture target, so a
+   * failed capture must not abort the drag. */
+  const capture = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // Nothing to capture; the drag still works while the pointer stays put.
+    }
+  };
+
+  /** Screen y → price, null outside the price panel. */
+  const priceAt = (geom: ChartGeometry, y: number): number | null => {
+    const ratio = (y - geom.top) / geom.priceH;
+    if (!Number.isFinite(ratio) || ratio < 0 || ratio > 1) return null;
+    return geom.max - ratio * (geom.max - geom.min);
+  };
+
+  /** Screen x → nearest visible candle open time, null when there is no data. */
+  const barAt = (geom: ChartGeometry, x: number): number | null => {
+    const raw = Math.round((x - geom.plotX) / Math.max(0.0001, geom.step) - 0.5);
+    const local = Math.min(geom.barCount - 1, Math.max(0, raw));
+    return candles[geom.start + local]?.t ?? null;
+  };
+
+  const yOfPrice = (geom: ChartGeometry, price: number): number =>
+    geom.top + geom.priceH * (1 - (price - geom.min) / (geom.max - geom.min || 1));
+
+  const xOfTime = (geom: ChartGeometry, t: number): number =>
+    geom.plotX + (indexOfTime(candles, t) - geom.start + 0.5) * geom.step;
+
+  /** Topmost drawing within the grab tolerance of a canvas point. */
+  const hitTest = (x: number, y: number): Drawing | null => {
+    const geom = geomRef.current;
+    if (!geom) return null;
+    for (let index = drawings.length - 1; index >= 0; index -= 1) {
+      const item = drawings[index]!;
+      if (item.kind === "hline") {
+        const lineY = yOfPrice(geom, item.price);
+        if (
+          lineY >= geom.top - 6 &&
+          lineY <= geom.top + geom.priceH + 6 &&
+          Math.abs(y - lineY) <= 6
+        ) {
+          return item;
+        }
+        continue;
+      }
+      const ax = xOfTime(geom, item.a.t);
+      const ay = yOfPrice(geom, item.a.price);
+      const bx = xOfTime(geom, item.b.t);
+      const by = yOfPrice(geom, item.b.price);
+      if (Math.hypot(x - ax, y - ay) <= 9 || Math.hypot(x - bx, y - by) <= 9) return item;
+      if (distanceToSegment(x, y, ax, ay, bx, by) <= 6) return item;
+    }
+    return null;
+  };
+
   const onPointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     if (event.button !== 0) return;
+    const geom = geomRef.current;
+    if (!geom) return;
+    const { x, y } = localPoint(event);
+
+    if (drawingTool === "hline") {
+      const price = priceAt(geom, y);
+      if (price == null || !onDrawingsChange) return;
+      const item: Drawing = {
+        id: newDrawingId("hline"),
+        kind: "hline",
+        price,
+        source: "manual",
+      };
+      onDrawingsChange([...drawings, item]);
+      onSelect?.(item.id);
+      onToolDone?.();
+      return;
+    }
+
+    if (drawingTool === "trend") {
+      const t = barAt(geom, x);
+      const price = priceAt(geom, y);
+      if (t == null || price == null) return;
+      trendDraft.current = { a: { t, price } };
+      setPreview({ a: { t, price }, b: { t, price } });
+      capture(event);
+      return;
+    }
+
+    // Select mode: editing an existing line must win over panning the chart.
+    if (selectedId && onDrawingsChange) {
+      const selected = drawings.find((item) => item.id === selectedId);
+      if (selected?.kind === "hline" && Math.abs(y - yOfPrice(geom, selected.price)) <= 6) {
+        lineDrag.current = {
+          mode: "move-hline",
+          id: selected.id,
+          startY: y,
+          startPrice: selected.price,
+        };
+        capture(event);
+        return;
+      }
+      if (selected?.kind === "trend") {
+        const ax = xOfTime(geom, selected.a.t);
+        const ay = yOfPrice(geom, selected.a.price);
+        const bx = xOfTime(geom, selected.b.t);
+        const by = yOfPrice(geom, selected.b.price);
+        const nearA = Math.hypot(x - ax, y - ay);
+        const nearB = Math.hypot(x - bx, y - by);
+        if (Math.min(nearA, nearB) <= 9) {
+          lineDrag.current = {
+            mode: "move-endpoint",
+            id: selected.id,
+            which: nearA <= nearB ? "a" : "b",
+          };
+          capture(event);
+          return;
+        }
+        if (distanceToSegment(x, y, ax, ay, bx, by) <= 6) {
+          lineDrag.current = {
+            mode: "move-trend",
+            id: selected.id,
+            startX: x,
+            startY: y,
+            a: { ...selected.a },
+            b: { ...selected.b },
+          };
+          capture(event);
+          return;
+        }
+      }
+    }
+
+    const hit = hitTest(x, y);
+    if (hit && onDrawingsChange) {
+      onSelect?.(hit.id);
+      if (hit.kind === "hline") {
+        lineDrag.current = {
+          mode: "move-hline",
+          id: hit.id,
+          startY: y,
+          startPrice: hit.price,
+        };
+      } else {
+        lineDrag.current = {
+          mode: "move-trend",
+          id: hit.id,
+          startX: x,
+          startY: y,
+          a: { ...hit.a },
+          b: { ...hit.b },
+        };
+      }
+      capture(event);
+      return;
+    }
+
+    onSelect?.(null);
     drag.current = { x: event.clientX, start: offset };
-    event.currentTarget.setPointerCapture(event.pointerId);
+    capture(event);
   };
 
   const onPointerMove = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     const rect = event.currentTarget.getBoundingClientRect();
-    setHover({ x: event.clientX - rect.left, y: event.clientY - rect.top });
+    const x = event.clientX - rect.left;
+    const y = event.clientY - rect.top;
+    setHover({ x, y });
+    const geom = geomRef.current;
+    if (!geom) return;
+
+    if (trendDraft.current) {
+      const t = barAt(geom, x);
+      const price = priceAt(geom, y);
+      if (t != null && price != null) {
+        setPreview({ a: trendDraft.current.a, b: { t, price } });
+      }
+      return;
+    }
+
+    const state = lineDrag.current;
+    if (state && onDrawingsChange) {
+      const pricePerPixel = (geom.max - geom.min) / Math.max(1, geom.priceH);
+      if (state.mode === "move-hline") {
+        const price = state.startPrice + (state.startY - y) * pricePerPixel;
+        onDrawingsChange(
+          drawings.map((item) =>
+            item.id === state.id && item.kind === "hline" ? { ...item, price } : item,
+          ),
+        );
+      } else if (state.mode === "move-trend") {
+        const deltaBars = Math.round((x - state.startX) / Math.max(0.0001, geom.step));
+        const deltaPrice = (state.startY - y) * pricePerPixel;
+        onDrawingsChange(
+          drawings.map((item) => {
+            if (item.id !== state.id || item.kind !== "trend") return item;
+            return {
+              ...item,
+              a: {
+                t: shiftTime(candles, state.a.t, deltaBars),
+                price: state.a.price + deltaPrice,
+              },
+              b: {
+                t: shiftTime(candles, state.b.t, deltaBars),
+                price: state.b.price + deltaPrice,
+              },
+            };
+          }),
+        );
+      } else {
+        const t = barAt(geom, x);
+        const price = priceAt(geom, y);
+        if (t != null && price != null) {
+          onDrawingsChange(
+            drawings.map((item) =>
+              item.id === state.id && item.kind === "trend"
+                ? { ...item, [state.which]: { t, price } }
+                : item,
+            ),
+          );
+        }
+      }
+      return;
+    }
+
     if (!drag.current) return;
     // Match the plot width used by draw(): 8px left pad + 62px price axis.
     // Use the bars actually on screen, not the zoom intent: when the series is
@@ -391,9 +722,67 @@ export default function Chart({
   };
 
   const endDrag = (event: ReactPointerEvent<HTMLCanvasElement>) => {
-    if (drag.current) event.currentTarget.releasePointerCapture(event.pointerId);
+    if (trendDraft.current) {
+      const geom = geomRef.current;
+      const rect = event.currentTarget.getBoundingClientRect();
+      const x = event.clientX - rect.left;
+      const y = event.clientY - rect.top;
+      const start = trendDraft.current.a;
+      trendDraft.current = null;
+      setPreview(null);
+      if (geom && onDrawingsChange) {
+        const t = barAt(geom, x);
+        const price = priceAt(geom, y);
+        const moved = Math.hypot(xOfTime(geom, start.t) - x, yOfPrice(geom, start.price) - y);
+        if (t != null && price != null && moved >= 8) {
+          const item: Drawing = {
+            id: newDrawingId("trend"),
+            kind: "trend",
+            a: start,
+            b: { t, price },
+            source: "manual",
+          };
+          onDrawingsChange([...drawings, item]);
+          onSelect?.(item.id);
+          onToolDone?.();
+        }
+      }
+    }
+    lineDrag.current = null;
+    if (drag.current || event.currentTarget.hasPointerCapture(event.pointerId)) {
+      try {
+        event.currentTarget.releasePointerCapture(event.pointerId);
+      } catch {
+        // Pointer capture can already be gone after a cancel; nothing to do.
+      }
+    }
     drag.current = null;
   };
+
+  // Delete removes the selected line; Escape abandons a half-drawn trend line
+  // and the selection. Ignored while an input has focus so typing a price is
+  // never mistaken for a chart shortcut.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const tag = target?.tagName?.toLowerCase() ?? "";
+      if (tag === "input" || tag === "textarea" || tag === "select" || target?.isContentEditable) {
+        return;
+      }
+      if ((event.key === "Delete" || event.key === "Backspace") && selectedId) {
+        event.preventDefault();
+        onDrawingsChange?.(drawings.filter((item) => item.id !== selectedId));
+        onSelect?.(null);
+      } else if (event.key === "Escape") {
+        trendDraft.current = null;
+        setPreview(null);
+        lineDrag.current = null;
+        onSelect?.(null);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [drawings, selectedId, onDrawingsChange, onSelect]);
 
   /** Wheel zooms around the pointer. Registered natively below so the page
    * behind the chart does not scroll at the same time (React's onWheel is a
@@ -480,6 +869,11 @@ export default function Chart({
         onPointerLeave={() => {
           setHover(null);
           drag.current = null;
+          lineDrag.current = null;
+          if (trendDraft.current) {
+            trendDraft.current = null;
+            setPreview(null);
+          }
         }}
       />
       {!empty && (
@@ -554,7 +948,11 @@ function draw(
   indicators: IndicatorConfig[],
   COLORS: ReturnType<typeof colors>,
   aiLevels: AILevel[] = [],
-) {
+  drawings: Drawing[] = [],
+  selectedId: string | null = null,
+  preview: { a: DrawingPoint; b: DrawingPoint } | null = null,
+  drawingsVisible = true,
+): ChartGeometry | null {
   const rect = wrap.getBoundingClientRect();
   // Never inflate the canvas past its container: a hard 240px floor made the
   // canvas wider than the chart panel on narrow windows, so it overflowed and
@@ -570,10 +968,10 @@ function draw(
   canvas.style.height = `${height}px`;
 
   const ctx = canvas.getContext("2d");
-  if (!ctx) return;
+  if (!ctx) return null;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, width, height);
-  if (!candles.length) return;
+  if (!candles.length) return null;
 
   const visible = Math.min(candles.length, Math.max(MIN_ZOOM_BARS, visibleBars));
   const end = Math.max(visible, candles.length - offset);
@@ -688,6 +1086,22 @@ function draw(
   const bodyLeft = (center: number) =>
     dense ? Math.round(center) - Math.floor(bodyW / 2) : center - bodyW / 2;
 
+  // Everything pointer maths needs, captured from this exact paint. Drawings
+  // and pan/drag hit-testing read it instead of recomputing the scale, so a
+  // line can never be drawn on one price and grabbed on another.
+  const geometry: ChartGeometry = {
+    left,
+    right,
+    top: padding.top,
+    priceH,
+    min,
+    max,
+    step,
+    plotX,
+    start,
+    barCount: slice.length,
+  };
+
   ctx.font = "10px Inter, sans-serif";
   ctx.textBaseline = "middle";
   ctx.textAlign = "left";
@@ -770,6 +1184,15 @@ function draw(
     bottom: padding.top + priceH,
     colors: COLORS,
   });
+
+  // The trader's own lines (and the AI levels once converted) go above the
+  // built-in indicators: they are annotations, not data.
+  if (drawingsVisible && drawings.length) {
+    drawDrawings(ctx, drawings, candles, geometry, COLORS, selectedId);
+  }
+  if (drawingsVisible && preview) {
+    drawTrendPreview(ctx, preview, candles, geometry, COLORS);
+  }
 
   const reference = referencePrice;
   const refY = yOf(reference);
@@ -856,6 +1279,8 @@ function draw(
     ctx.textAlign = "center";
     ctx.fillText(timeText, snapX, height - 10);
   }
+
+  return geometry;
 }
 
 function bands(values: number[], period: number, mult = 2) {
@@ -936,6 +1361,142 @@ function drawAILevels(
   ctx.textAlign = "center";
 }
 
+/** Draw one drawing: a horizontal level or a two-point trend line.
+ *
+ * Everything is clipped to the price panel. A support drawn for a price that is
+ * currently off-screen simply disappears — clamping it to the border would
+ * advertise a level at the wrong price. */
+function drawDrawings(
+  ctx: CanvasRenderingContext2D,
+  drawings: Drawing[],
+  candles: Candle[],
+  geom: ChartGeometry,
+  COLORS: ReturnType<typeof colors>,
+  selectedId: string | null,
+) {
+  const yOf = (price: number) =>
+    geom.top + geom.priceH * (1 - (price - geom.min) / (geom.max - geom.min || 1));
+  const xOf = (t: number) =>
+    geom.plotX + (indexOfTime(candles, t) - geom.start + 0.5) * geom.step;
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(geom.left, geom.top, geom.right - geom.left, geom.priceH);
+  ctx.clip();
+  ctx.font = "10px Inter, sans-serif";
+  ctx.textBaseline = "middle";
+  ctx.lineJoin = "round";
+  // Two levels a few points apart would print their price chips on top of each
+  // other; the line still shows, only the label is skipped.
+  const chipRows: number[] = [];
+
+  for (const item of drawings) {
+    const selected = item.id === selectedId;
+    const colour = lineColor(item);
+    ctx.strokeStyle = colour;
+    ctx.lineWidth = selected ? 2.2 : 1.4;
+
+    if (item.kind === "hline") {
+      const y = yOf(item.price);
+      if (y < geom.top - 2 || y > geom.top + geom.priceH + 2) continue;
+      ctx.setLineDash([7, 4]);
+      ctx.beginPath();
+      ctx.moveTo(geom.left, y);
+      ctx.lineTo(geom.right, y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      const text = drawingLabel(item)
+        ? `${drawingLabel(item)} ${fmtPrice(item.price)}`
+        : fmtPrice(item.price);
+      const chipW = Math.min(ctx.measureText(text).width + 8, geom.right - geom.left - 4);
+      const crowded = chipRows.some((used) => Math.abs(used - y) < 13);
+      if (!crowded) {
+        chipRows.push(y);
+        ctx.fillStyle = colour;
+        ctx.globalAlpha = 0.92;
+        ctx.fillRect(geom.left + 2, y - 8, chipW, 14);
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = COLORS.tagText;
+        ctx.textAlign = "left";
+        ctx.fillText(text, geom.left + 6, y + 2);
+      }
+      if (selected) {
+        ctx.fillStyle = COLORS.tagText;
+        ctx.beginPath();
+        ctx.arc(geom.right - 5, y, 4.5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = colour;
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+      continue;
+    }
+
+    const ax = xOf(item.a.t);
+    const ay = yOf(item.a.price);
+    const bx = xOf(item.b.t);
+    const by = yOf(item.b.price);
+    ctx.setLineDash([]);
+    ctx.beginPath();
+    ctx.moveTo(ax, ay);
+    ctx.lineTo(bx, by);
+    ctx.stroke();
+
+    const label = drawingLabel(item);
+    if (label) {
+      ctx.fillStyle = colour;
+      ctx.textAlign = "left";
+      ctx.fillText(label, Math.min(ax, bx) + 6, Math.min(ay, by) - 9);
+    }
+
+    if (selected) {
+      ctx.fillStyle = COLORS.tagText;
+      for (const [hx, hy] of [
+        [ax, ay],
+        [bx, by],
+      ] as const) {
+        ctx.beginPath();
+        ctx.arc(hx, hy, 4.5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = colour;
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+    }
+  }
+
+  ctx.restore();
+  ctx.setLineDash([]);
+  ctx.textAlign = "center";
+}
+
+/** The rubber-band line while a trend is being drawn: dashed, no handles. */
+function drawTrendPreview(
+  ctx: CanvasRenderingContext2D,
+  preview: { a: DrawingPoint; b: DrawingPoint },
+  candles: Candle[],
+  geom: ChartGeometry,
+  COLORS: ReturnType<typeof colors>,
+) {
+  const yOf = (price: number) =>
+    geom.top + geom.priceH * (1 - (price - geom.min) / (geom.max - geom.min || 1));
+  const xOf = (t: number) =>
+    geom.plotX + (indexOfTime(candles, t) - geom.start + 0.5) * geom.step;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(geom.left, geom.top, geom.right - geom.left, geom.priceH);
+  ctx.clip();
+  ctx.strokeStyle = COLORS.crosshair;
+  ctx.lineWidth = 1.2;
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath();
+  ctx.moveTo(xOf(preview.a.t), yOf(preview.a.price));
+  ctx.lineTo(xOf(preview.b.t), yOf(preview.b.price));
+  ctx.stroke();
+  ctx.restore();
+  ctx.setLineDash([]);
+}
 
 function drawLine(
   ctx: CanvasRenderingContext2D,
