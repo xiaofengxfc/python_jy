@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import { api, query } from "../api";
 import { TIMEFRAMES, fmt } from "../format";
 import type { Strategy, SymbolInfo } from "../types";
@@ -125,7 +126,7 @@ function paramsText(params: Record<string, unknown> | undefined): string {
 }
 
 /** One candidate row. Clicking it loads the source below. */
-function statusChip(candidate: Candidate): React.ReactNode {
+function statusChip(candidate: Candidate): ReactNode {
   const [label, kind] = CANDIDATE_STATE[candidate.status ?? ""] ?? [candidate.status ?? "未知", ""];
   return <span className={`lab-chip ${kind}`}>{label}</span>;
 }
@@ -488,7 +489,7 @@ export default function StrategyLabPage() {
               <div className="card-head">
                 <span className="card-title">代码预览</span>
                 <span className="spacer" />
-                {selected?.status === "pending" && (
+                {selected && (
                   <>
                     <input
                       className="input input-xs lab-note"
@@ -496,10 +497,25 @@ export default function StrategyLabPage() {
                       value={reviewNote}
                       onChange={(event) => setReviewNote(event.target.value)}
                     />
-                    <button type="button" className="btn-sm primary" onClick={() => void review(true)}>
+                    <button
+                      type="button"
+                      className="btn-sm primary"
+                      disabled={!selected.checks?.ok || selected.status === "approved"}
+                      title={
+                        selected.checks?.ok
+                          ? "批准该候选（不会自动注册为可交易策略）"
+                          : "静态检查未通过，不能批准"
+                      }
+                      onClick={() => void review(true)}
+                    >
                       批准
                     </button>
-                    <button type="button" className="btn-sm" onClick={() => void review(false)}>
+                    <button
+                      type="button"
+                      className="btn-sm"
+                      disabled={selected.status === "rejected"}
+                      onClick={() => void review(false)}
+                    >
                       拒绝
                     </button>
                   </>

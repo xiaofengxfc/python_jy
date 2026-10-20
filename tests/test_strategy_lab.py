@@ -100,6 +100,24 @@ def test_oversized_code_is_rejected():
     assert not check_code("x = 1\n" * 20_000).ok
 
 
+def test_future_and_internal_imports_are_allowed():
+    """Models prepend `from __future__` and reuse btrader indicators; neither
+    reaches the network, and rejecting them made every candidate fail."""
+    code = SAFE_CODE.replace(
+        "from btrader.strategy.base import Strategy, IntParam",
+        "from __future__ import annotations\n\n"
+        "import pandas as pd\n\n"
+        "from btrader.core import indicators as ta\n"
+        "from btrader.strategy.base import Strategy, IntParam",
+    )
+    report = check_code(code)
+    assert report.ok, report.issues
+
+
+def test_relative_import_of_banned_module_is_still_rejected():
+    assert not check_code("from ..os import getcwd\n" + SAFE_CODE).ok
+
+
 # --------------------------------------------------------------- candidates
 def test_candidate_create_and_review(tmp_path: Path):
     store = CandidateStore(tmp_path)

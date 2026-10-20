@@ -489,7 +489,7 @@ def test_cache_returns_the_same_answer_without_a_second_call(tmp_path, monkeypat
     service = LLMService(AISettings(enabled=True, cache_seconds=600))
     calls: list[str] = []
 
-    def fake_request(spec, settings, key, system, prompt):
+    def fake_request(spec, settings, key, system, prompt, **kwargs):
         calls.append(prompt)
         return "答案", 7
 
@@ -517,7 +517,7 @@ def test_audit_tail_records_every_call(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(llm, "load_key", lambda: "sk-test")
     llm.reset_cache()
     service = LLMService(AISettings(enabled=True))
-    monkeypatch.setattr(service, "_request", lambda *args: ("好的", 5))
+    monkeypatch.setattr(service, "_request", lambda *args, **kwargs: ("好的", 5))
     service.ask("问题", kind="test")
     tail = llm.audit_tail(10)
     assert len(tail) == 1
@@ -703,6 +703,23 @@ def test_openai_request_has_the_documented_url_headers_and_payload(
     assert payload["max_tokens"] == 1200
     assert payload["messages"][0] == {"role": "system", "content": "你是分析师"}
     assert payload["messages"][-1] == {"role": "user", "content": "问题"}
+
+
+def test_ask_can_override_output_tokens_per_call(tmp_path, monkeypatch) -> None:
+    """Strategy-lab code generation needs more than the global 1200 tokens.
+
+    The override must reach the wire payload for every provider style; silently
+    ignoring it truncates the JSON mid-string and the candidate is rejected for
+    reasons the user cannot see.
+    """
+    service = _service(tmp_path, monkeypatch, "openai")
+    seen = _capture_request(monkeypatch, _COMPLETIONS["openai"])
+
+    result = service.ask("写一个策略", max_tokens=2400)
+
+    assert result["ok"] is True
+    payload = json.loads(seen[0].data.decode("utf-8"))
+    assert payload["max_tokens"] == 2400
 
 
 def test_anthropic_request_uses_its_own_headers_and_a_system_field(
