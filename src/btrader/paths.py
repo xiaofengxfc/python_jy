@@ -60,5 +60,12 @@ def user_strategies_dir() -> Path:
     return path
 
 
+def strategy_candidates_dir() -> Path:
+    """AI 生成的候选策略目录；永远不参与 registry 的 import。"""
+    path = user_strategies_dir() / "candidates"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def project_root() -> Path:
     return Path(__file__).resolve().parents[2]
