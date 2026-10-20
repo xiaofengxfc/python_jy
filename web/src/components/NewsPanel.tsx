@@ -56,6 +56,11 @@ export default function NewsPanel({ symbol }: Props) {
   return (
     <div className="news-wrap">
       {feed?.error && <div className="banner error">{feed.error}</div>}
+      {feed?.fallback && (
+        <div className="banner warn">
+          {symbol} 暂无相关新闻，以下为市场要闻
+        </div>
+      )}
       {feed && feed.items.length > 0 ? (
         <ul className="news-list">
           {feed.items.map((item) => (
@@ -77,7 +82,7 @@ export default function NewsPanel({ symbol }: Props) {
         </div>
       )}
       <div className="news-foot faint">
-        来源 {feed?.source || "币安公告 · CoinTelegraph · Decrypt"} · 每 2 分钟刷新
+        按 {symbol} 筛选 · 来源 {feed?.source || "币安公告 · CoinTelegraph · Decrypt"} · 每 2 分钟刷新
         {feed?.cached ? " · 当前为缓存结果" : ""}
       </div>
     </div>

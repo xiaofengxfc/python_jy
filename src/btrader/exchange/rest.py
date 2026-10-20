@@ -57,10 +57,14 @@ class BinanceREST:
         credentials: Credentials | None = None,
         *,
         market_data: bool = False,
+        proxy: str = "",
     ) -> None:
         self.network = network
         self.credentials = credentials or Credentials()
         self.market_data = market_data
+        # Optional HTTP(S) proxy for networks where Binance is blocked or its
+        # DNS is poisoned (fapi/dapi resolve to unrelated hosts there).
+        self.proxy = (proxy or "").strip()
         self._clients: dict[MarketType, ccxt.Exchange] = {}
         self._specs: dict[tuple[MarketType, str], ContractSpec] = {}
         self._lock = threading.RLock()
@@ -79,6 +83,10 @@ class BinanceREST:
                 "options": {"defaultType": "swap" if market.is_futures else "spot"},
             }
             client = klass(params)
+            if self.proxy:
+                # ccxt's sync clients use requests, which reads this attribute.
+                # Applied before the first request so no traffic leaks direct.
+                client.proxies = {"http": self.proxy, "https": self.proxy}
             if self.network is Network.TESTNET:
                 # ccxt exposes sandbox mode per exchange.
                 if getattr(client, "has", {}).get("sandbox", True):

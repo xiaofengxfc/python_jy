@@ -899,6 +899,14 @@ input[type="range"].input:focus {
   color: var(--down);
 }
 
+/* Degraded-but-working notices: a fallback data source, a retried channel.
+   Amber, so it reads as "check this" rather than "something broke". */
+.banner.warn {
+  border-color: color-mix(in srgb, var(--warn, #b8860b) 40%, var(--border));
+  background: color-mix(in srgb, var(--warn, #b8860b) 10%, var(--bg-subtle));
+  color: color-mix(in srgb, var(--warn, #b8860b) 80%, var(--text-1));
+}
+
 .progress {
   height: 3px;
   border-radius: 999px;

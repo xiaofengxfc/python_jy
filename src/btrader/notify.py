@@ -618,6 +618,17 @@ def _explain_failure(detail: str, code: int) -> str:
     difference between a dead end and "重新扫码".
     """
     text = (detail or "").strip()
+    # The WeChat side rejects a send when the bot's session for that chat is
+    # gone — the plugin keeps a contextToken per conversation, and restarting
+    # the gateway makes the old one unusable. The CLI still reports it as a
+    # murky "prepare failed", so name the fix here.
+    lowered = text.lower()
+    if "prepare failed" in lowered or "ret=-2" in lowered:
+        return (
+            "微信侧拒绝发送（prepare failed）：ClawBot 的会话凭据已失效，"
+            "通常发生在网关重启之后。请在手机上给 ClawBot 发任意一条消息，"
+            "再重试即可恢复；状态页的 has_context 会从 false 变回 true。"
+        )
     generic = not text or "CLI command failed" in text
     if generic:
         try:

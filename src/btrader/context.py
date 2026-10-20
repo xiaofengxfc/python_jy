@@ -38,11 +38,13 @@ class AppContext:
         self.credentials = CredentialStore()
         self.creds: Credentials = self.credentials.load(self.network, self.market_type)
 
-        self.rest = BinanceREST(self.network, self.creds)
+        self.rest = BinanceREST(self.network, self.creds, proxy=self.settings.proxy)
         # Charting reads Binance's read-only public feed so candles look like
         # the real market even while orders go to the test network. Credentials
         # are deliberately withheld: a charting client can never sign anything.
-        self.market_rest = BinanceREST(self.network, Credentials(), market_data=True)
+        self.market_rest = BinanceREST(
+            self.network, Credentials(), market_data=True, proxy=self.settings.proxy
+        )
         self.paper = PaperBroker(starting_balance=10_000.0)
         # Resume the simulated account instead of handing out a fresh 10,000
         # every launch: cash, positions, resting orders and SL/TP guards.
@@ -87,7 +89,9 @@ class AppContext:
             creds = self.creds if market == self.market_type else self.credentials.load(
                 self.network, market
             )
-            self._market_rest[market] = BinanceREST(self.network, creds)
+            self._market_rest[market] = BinanceREST(
+                self.network, creds, proxy=self.settings.proxy
+            )
         return self._market_rest[market]
 
     def market_rest_for(self, market: MarketType) -> BinanceREST:
@@ -101,7 +105,10 @@ class AppContext:
         if market not in self._data_rest:
             base = self._market_rest.get(market) or self.rest_for(market)
             self._data_rest[market] = BinanceREST(
-                base.network, Credentials(), market_data=True
+                base.network,
+                Credentials(),
+                market_data=True,
+                proxy=self.settings.proxy,
             )
         return self._data_rest[market]
 
@@ -154,6 +161,23 @@ class AppContext:
     def save_settings(self) -> None:
         self.config.save()
         self._attach_settings()
+
+    def apply_proxy(self, proxy: str) -> None:
+        """Switch the outbound proxy and drop every cached exchange client.
+
+        ccxt reads ``proxies`` once per client, so a changed proxy only takes
+        effect after the clients are rebuilt; the caches hold the old ones.
+        """
+        cleaned = (proxy or "").strip()
+        if cleaned == self.settings.proxy:
+            return
+        self.settings.proxy = cleaned
+        self.rest.proxy = cleaned
+        self.rest.reset()
+        self._market_rest = {self.market_type: self.rest}
+        self.market_rest.proxy = cleaned
+        self.market_rest.reset()
+        self._data_rest = {self.market_type: self.market_rest}
 
     def reload_settings(self) -> None:
         """Re-read the config file into the live settings object.

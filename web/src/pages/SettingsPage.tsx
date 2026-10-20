@@ -467,13 +467,17 @@ export default function SettingsPage({ settings, onSaved }: Props) {
 
   const loadCredentials = useCallback(async () => {
     try {
-      const data = await api<{ items: CredentialItem[] }>("/api/credentials");
+      // Always name the network: the tab the user is looking at decides which
+      // keys are shown, and 主网 must never display 测试网 的 key.
+      const data = await api<{ network: string; items: CredentialItem[] }>(
+        `/api/credentials?network=${encodeURIComponent(network)}`,
+      );
       setCredentials(data.items);
       setCredentialsError("");
     } catch (error) {
       setCredentialsError(error instanceof Error ? error.message : String(error));
     }
-  }, []);
+  }, [network]);
 
   useEffect(() => {
     void loadCredentials();
@@ -503,6 +507,7 @@ export default function SettingsPage({ settings, onSaved }: Props) {
           timeframe: draft.timeframe,
           default_order_quote: draft.default_order_quote,
           kline_limit: draft.kline_limit,
+          proxy: draft.proxy,
           theme: draft.theme,
           notification_sound: draft.notification_sound,
           risk: draft.risk,
@@ -812,6 +817,24 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                     value={draft.kline_limit}
                     onChange={(event) => patch({ kline_limit: Number(event.target.value) })}
                   />
+                </div>
+              </div>
+              <div className="field">
+                <label className="field-label" htmlFor="set-proxy">
+                  <span>网络代理</span>
+                  <em>可选，例如 http://127.0.0.1:7890</em>
+                </label>
+                <input
+                  id="set-proxy"
+                  className="input"
+                  type="text"
+                  placeholder="留空表示直连"
+                  value={draft.proxy}
+                  onChange={(event) => patch({ proxy: event.target.value })}
+                />
+                <div className="faint" style={{ fontSize: 12 }}>
+                  币安合约域名（fapi.binance.com / dapi.binance.com）在部分网络被 DNS
+                  污染，填写代理后合约 K 线与下单才能直连币安；不填时代理不生效。
                 </div>
               </div>
             </div>

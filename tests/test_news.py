@@ -39,6 +39,15 @@ BINANCE_PAYLOAD = {
                 "articles": [
                     {"id": 2, "code": "bbb222", "title": "Binance Will Delist XYZ", "releaseDate": 1791000000000},
                     {"id": 3, "code": "", "title": "Broken row without a code"},
+                    # A pair-specific announcement, so the per-pair filter has
+                    # something matching to keep for BTC. Dated older than the
+                    # rows above so the ordering assertions stay meaningful.
+                    {
+                        "id": 4,
+                        "code": "ccc333",
+                        "title": "Binance Will Adjust BTC Perpetual Funding",
+                        "releaseDate": 1790000000000,
+                    },
                     "not-a-row",
                 ],
             },
@@ -74,7 +83,7 @@ RSS_TEXT = """<?xml version="1.0" encoding="utf-8"?>
 def test_binance_rows_are_normalised_and_labelled() -> None:
     items = parse_binance_announcements(BINANCE_PAYLOAD)
 
-    assert [item["id"] for item in items] == ["binance-1", "binance-2"]
+    assert [item["id"] for item in items] == ["binance-1", "binance-2", "binance-4"]
     first = items[0]
     assert first["source"] == "币安"
     assert first["kind"] == "上币公告"
@@ -129,8 +138,10 @@ def test_snapshot_merges_sources_and_filters_by_pair() -> None:
 
     assert len(calls) == 3  # announcements + two RSS feeds
     titles = [item["title"] for item in feed["items"]]
-    # Announcements are not pair filtered: they are what moves the venue.
-    assert "Binance Will List ABC" in titles
+    # Announcements are filtered by pair too: their catalog is global, so an
+    # unfiltered list showed other assets' listings while BTC was selected.
+    assert "Binance Will Adjust BTC Perpetual Funding" in titles
+    assert all("List ABC" not in title for title in titles)
     # RSS items are: only the BTC story mentions the base asset.
     assert "Bitcoin breaks 80k as BTC inflows surge" in titles
     assert all("Ethereum" not in title for title in titles)
@@ -172,7 +183,7 @@ def test_announcements_cannot_starve_the_market_sources() -> None:
                         {
                             "id": index,
                             "code": f"code{index}",
-                            "title": f"Announcement {index}",
+                            "title": f"Announcement {index} about BTC market making",
                             "releaseDate": 1791948608368 - index,
                         }
                         for index in range(50)

@@ -42,6 +42,9 @@ class AppSettings:
     timeframe: str = "15m"
     default_order_quote: float = 100.0
     kline_limit: int = 1000
+    # HTTP(S) proxy for exchange requests, e.g. "http://127.0.0.1:7890".
+    # Needed where Binance's domains are blocked or DNS-poisoned.
+    proxy: str = ""
     risk: RiskSettings = field(default_factory=RiskSettings)
     notification_sound: bool = True
     theme: str = "light"

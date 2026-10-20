@@ -115,6 +115,8 @@ export default function TradingPage({
    * flight the old series is still on screen; folding it with the new bar
    * duration would merge bars of different lengths into one. */
   const [candlesFor, setCandlesFor] = useState("");
+  /** Non-empty when the candles came from the fallback feed, not Binance. */
+  const [chartSource, setChartSource] = useState("");
   const [chartError, setChartError] = useState("");
   const [chartLoading, setChartLoading] = useState(true);
   const [symbolError, setSymbolError] = useState("");
@@ -185,12 +187,16 @@ export default function TradingPage({
     const id = ++requestId.current;
     setChartLoading(true);
     try {
-      const data = await api<{ candles: Candle[] }>(
+      const data = await api<{ candles: Candle[]; source?: string; degraded?: boolean }>(
         `/api/klines?${query({ market, symbol, timeframe, limit: 400 })}`,
       );
       if (id !== requestId.current) return;
       setCandles(data.candles ?? []);
       setCandlesFor(timeframe);
+      // Binance's futures domains are unreachable on some networks, in which
+      // case the server serves Gate.io perpetual candles. The chart must say so:
+      // these are not Binance's prices.
+      setChartSource(data.degraded ? data.source || "备用行情源" : "");
       setChartError("");
     } catch (error) {
       if (id !== requestId.current) return;
@@ -630,6 +636,12 @@ export default function TradingPage({
                 <button type="button" className="link-btn" onClick={() => setEditing(null)}>
                   收起
                 </button>
+              </div>
+            )}
+            {chartSource && (
+              <div className="banner warn" role="status">
+                行情来源：{chartSource}（币安合约接口在当前网络不可达，图表改用备用永续行情；
+                价格与币安存在价差，下单仍走币安）
               </div>
             )}
             <Chart

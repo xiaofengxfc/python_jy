@@ -87,6 +87,7 @@ class SettingsPayload(BaseModel):
     timeframe: str | None = None
     default_order_quote: float | None = Field(default=None, gt=0)
     kline_limit: int | None = Field(default=None, ge=100, le=1000)
+    proxy: str | None = None
     theme: str | None = None
     notification_sound: bool | None = None
     risk: dict[str, Any] | None = None
@@ -529,6 +530,10 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
             settings.default_order_quote = payload.default_order_quote
         if payload.kline_limit is not None:
             settings.kline_limit = payload.kline_limit
+        if payload.proxy is not None:
+            # Rebuilds the clients and drops their caches; ccxt reads
+            # ``proxies`` once, so an old client would keep going direct.
+            ctx.apply_proxy(payload.proxy)
         if payload.theme in ("light", "dark"):
             settings.theme = payload.theme
         if payload.notification_sound is not None:
@@ -867,22 +872,29 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
 
     # ---------------------------------------------------------- credentials
     @router.get("/api/credentials")
-    def credentials() -> dict[str, Any]:
+    def credentials(network: str | None = None) -> dict[str, Any]:
+        """Which keys are configured, for one network.
+
+        ``network`` must be honoured: the settings page has a 主网/测试网 switch,
+        and reading it from ``ctx.network`` instead made the 主网 tab show the
+        测试网 keys — the user then overwrote a real key believing they were
+        looking at a different slot.
+        """
         ctx = get_state().ctx
-        network = _network(None) or ctx.network
+        network_obj = _network(network) or ctx.network
         items = []
         for market in MarketType:
-            creds = ctx.credentials.load(network, market)
+            creds = ctx.credentials.load(network_obj, market)
             items.append(
                 {
                     "market": market.value,
                     "label": market.label,
                     "configured": creds.is_set,
                     "masked": creds.masked_key,
-                    "current": market is ctx.market_type and network is ctx.network,
+                    "current": market is ctx.market_type and network_obj is ctx.network,
                 }
             )
-        return {"network": network.value, "items": items}
+        return {"network": network_obj.value, "items": items}
 
     @router.post("/api/credentials")
     def save_credentials(payload: CredentialsPayload) -> dict[str, Any]:

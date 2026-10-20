@@ -195,6 +195,8 @@ export interface AppSettings {
   timeframe: string;
   default_order_quote: number;
   kline_limit: number;
+  /** HTTP(S) proxy for exchange calls; empty means direct. */
+  proxy: string;
   risk: {
     max_order_quote: number;
     max_order_pct: number;
@@ -362,6 +364,10 @@ export interface NewsFeed {
   cached: boolean;
   error: string;
   source: string;
+  /** Pair the feed was filtered for; guards against showing stale rows. */
+  symbol?: string;
+  /** True when the pair had no news and market-wide headlines stand in. */
+  fallback?: boolean;
 }
 
 /** Live breaker state. `halted` covers the kill switch and every cap, so the

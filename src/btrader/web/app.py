@@ -28,6 +28,7 @@ from ..context import AppContext
 from ..core.types import TIMEFRAME_SECONDS, MarketType, RunMode
 from ..engine.trading import OrderRejected, OrderRequest
 from ..exchange.symbols import format_amount, load_symbols
+from ..exchange import mirror
 from ..logging_setup import error_buffer
 from .routes import build_router
 from .stream import StreamHub
@@ -88,6 +89,54 @@ def _market(value: str) -> MarketType:
         return MarketType(value)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"未知市场：{value}") from exc
+
+
+def _mirror_candles(
+    market: MarketType,
+    symbol: str,
+    timeframe: str,
+    limit: int,
+    since: int | None,
+    primary: Exception,
+) -> list[list[float]] | None:
+    """备用合约行情（Gate 永续），取不到就返回 ``None``。
+
+    Only futures: spot already has a public Binance mirror, so a second source
+    there would add disagreement without adding reachability.
+    """
+    if not mirror.supports(market, timeframe):
+        return None
+    log.warning("币安行情不可用，改用备用源：%s", primary)
+    try:
+        rows = mirror.fetch_ohlcv(market, symbol, timeframe, since=since, limit=limit)
+    except Exception as exc:
+        log.warning("备用行情也不可用：%s", exc)
+        # Both failures are worth reporting: the first says why the primary is
+        # down, the second says the fallback could not rescue it either.
+        raise HTTPException(
+            status_code=503,
+            detail=_market_data_hint(market, f"{primary}；备用源：{exc}"),
+        ) from exc
+    if not rows:
+        return None
+    return rows
+
+
+def _market_data_hint(market: MarketType, detail: str) -> str:
+    """Name the usual cause of a contract-data failure instead of echoing ccxt."""
+    text = str(detail)
+    looks_like_network = any(
+        key in text.lower()
+        for key in ("timeout", "timed out", "connection", "network", "ssl", "proxy", "exchangeinfo")
+    )
+    if market.is_futures and looks_like_network:
+        return (
+            "无法连接币安合约行情接口（fapi.binance.com / dapi.binance.com），"
+            "常见原因是 DNS 污染或网络限制。可采取：1) 在设置里填写代理；"
+            "2) 合约图表会自动改用 Gate.io 永续行情（若其也失败则会显示这条错误）。"
+            f"原始错误：{text[:300]}"
+        )
+    return text
 
 
 # ---------------------------------------------------------------- serialising
@@ -517,22 +566,39 @@ def create_app() -> FastAPI:
         if timeframe not in TIMEFRAME_SECONDS:
             raise HTTPException(status_code=400, detail=f"不支持的周期：{timeframe}")
         limit = max(20, min(int(limit), 1000))
+        step = TIMEFRAME_SECONDS[timeframe] * 1000
+        since = max(0, int(before) - (limit + 1) * step) if before is not None else None
+        source = "Binance"
         try:
             with state.locks[mt]:
-                if before is not None:
-                    # Scrolling past the left edge asks for the window that
-                    # ends at the oldest candle the chart already holds. One
-                    # extra step covers the boundary bar itself.
-                    step = TIMEFRAME_SECONDS[timeframe] * 1000
-                    since = max(0, int(before) - (limit + 1) * step)
-                    frame = state.ctx.klines.fetch(
-                        mt, symbol, timeframe, limit=limit + 1, since=since
-                    )
-                    frame = frame[frame["timestamp"] < int(before)].tail(limit)
-                else:
-                    frame = state.ctx.klines.fetch(mt, symbol, timeframe, limit=limit)
+                frame = state.ctx.klines.fetch(
+                    mt, symbol, timeframe, limit=limit + 1 if before is not None else limit,
+                    since=since,
+                )
+            if before is not None:
+                # Scrolling past the left edge asks for the window that ends at
+                # the oldest candle the chart already holds. One extra step
+                # covers the boundary bar itself.
+                frame = frame[frame["timestamp"] < int(before)].tail(limit)
         except Exception as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
+            # 币安合约域名在部分网络会被 DNS 污染，界面就只剩「无法查看合约 K 线」。
+            # 现货有公共镜像，合约没有；此时用 Gate 永续兜底，并且把来源带回去，
+            # 让界面能标明「这不是币安的价格」。
+            rows = _mirror_candles(mt, symbol, timeframe, limit, since, exc)
+            if rows is None:
+                raise HTTPException(
+                    status_code=503, detail=_market_data_hint(mt, exc)
+                ) from exc
+            return {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "candles": [
+                    {"t": t, "o": o, "h": h, "l": l, "c": c, "v": v}
+                    for t, o, h, l, c, v in rows
+                ],
+                "source": mirror.source_label(),
+                "degraded": True,
+            }
         candles = [
             {
                 "t": int(row.timestamp),
@@ -544,7 +610,13 @@ def create_app() -> FastAPI:
             }
             for row in frame.itertuples(index=False)
         ]
-        return {"symbol": symbol, "timeframe": timeframe, "candles": candles}
+        return {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "candles": candles,
+            "source": source,
+            "degraded": False,
+        }
 
     @app.get("/api/ticker")
     def api_ticker(market: str = "spot", symbol: str = "BTC/USDT") -> dict[str, Any]:

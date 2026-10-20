@@ -171,6 +171,10 @@ def parse_rss(xml_text: str, *, source: str, limit: int = 20) -> list[dict[str, 
                 "url": link,
                 "source": source,
                 "kind": _clean(node.findtext("category") or "", 40),
+                # Kept for matching only: headlines name the asset, but the
+                # summary often carries the ticker the title spells out
+                # ("Bitcoin" in the title, "BTC" in the body).
+                "summary": _clean(node.findtext("description") or "", 600),
                 "published_at": _from_rfc822(node.findtext("pubDate") or ""),
             }
         )
@@ -209,16 +213,18 @@ def _http_get(url: str, timeout: float, *, as_text: bool = False) -> Any:
 
 
 def _mentions(item: dict[str, Any], base: str) -> bool:
-    """Loose pair match for the RSS feeds.
+    """Loose pair match.
 
     RSS has no reliable ticker field, so the base asset is looked for as a
     word, together with its full name (``BTC`` also matches ``Bitcoin``).
-    The announcements are already pair-specific and skip this filter.
+    Binance announcements go through the same filter: their catalogs are global
+    ("币安将上线 XXX"), so an unfiltered list showed ETH news while BTC was
+    selected.
     """
     if not base:
         return True
     terms = (base, *TICKER_ALIASES.get(base, ()))
-    haystack = f"{item.get('title', '')} {item.get('kind', '')}"
+    haystack = f"{item.get('title', '')} {item.get('kind', '')} {item.get('summary', '')}"
     return any(
         re.search(rf"\b{re.escape(term)}\b", haystack, re.IGNORECASE) for term in terms
     )
@@ -243,7 +249,9 @@ class NewsService:
         self._timeout = timeout
         self._fetch = fetcher
         self._lock = threading.Lock()
-        self._cache: dict[tuple[str, int], tuple[float, list[dict[str, Any]], str]] = {}
+        self._cache: dict[
+            tuple[str, int], tuple[float, list[dict[str, Any]], str, bool]
+        ] = {}
 
     @staticmethod
     def sources() -> list[str]:
@@ -254,26 +262,39 @@ class NewsService:
         base = symbol.split("/")[0].strip().upper()
         return [base] if base else []
 
-    def _binance(self, limit: int) -> tuple[list[dict[str, Any]], str]:
+    def _binance(
+        self, limit: int, base: str = ""
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+        """``(matching, everything, error)``.
+
+        Everything is returned too: when a pair has no news at all, the panel
+        shows the market-wide headlines instead of an empty box, and calls it
+        what it is.
+        """
         url = BINANCE_ANNOUNCEMENTS.format(size=max(limit, 20))
         try:
             payload = self._fetch(url, self._timeout)
         except NewsError as exc:
-            return [], f"币安公告：{exc}"
-        items = parse_binance_announcements(payload, limit=limit)
-        return items, ""
+            return [], [], f"币安公告：{exc}"
+        items = parse_binance_announcements(payload, limit=max(limit * 4, 20))
+        # The catalog is global, so the per-pair filter has to happen here;
+        # asking for more rows first keeps a narrow pair from going dry.
+        matched = [item for item in items if _mentions(item, base)]
+        return matched[:limit], items, ""
 
-    def _rss(self, source: str, url: str, base: str, limit: int) -> tuple[list[dict[str, Any]], str]:
+    def _rss(
+        self, source: str, url: str, base: str, limit: int
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
         try:
             text = self._fetch(url, self._timeout, as_text=True)
         except NewsError as exc:
-            return [], f"{source}：{exc}"
+            return [], [], f"{source}：{exc}"
         except TypeError:
             # Tests inject a plain ``fetcher(url, timeout)`` that returns a dict.
-            return [], f"{source}：新闻源返回了无法解析的内容"
-        items = parse_rss(text, source=source, limit=limit * 2)
+            return [], [], f"{source}：新闻源返回了无法解析的内容"
+        items = parse_rss(text, source=source, limit=max(limit * 4, 20))
         matched = [item for item in items if _mentions(item, base)]
-        return matched[:limit], ""
+        return matched[:limit], items, ""
 
     def snapshot(self, symbol: str = "", limit: int = 20) -> dict[str, Any]:
         limit = max(1, min(limit, 50))
@@ -289,9 +310,12 @@ class NewsService:
                     "cached": True,
                     "error": cached[2],
                     "source": " · ".join(self.sources()),
+                    "symbol": symbol,
+                    "fallback": cached[3],
                 }
 
         collected: list[dict[str, Any]] = []
+        unfiltered: list[dict[str, Any]] = []
         errors: list[str] = []
 
         # Announcements are always the newest rows, so without a quota they
@@ -301,14 +325,16 @@ class NewsService:
         binance_quota = max(3, limit * 2 // 5)
         rss_quota = max(2, limit // 5)
 
-        announcements, error = self._binance(binance_quota)
+        announcements, everything, error = self._binance(binance_quota, base)
         collected.extend(announcements)
+        unfiltered.extend(everything)
         if error:
             errors.append(error)
 
         for source, url in RSS_SOURCES:
-            items, error = self._rss(source, url, base, rss_quota)
+            items, everything, error = self._rss(source, url, base, rss_quota)
             collected.extend(items)
+            unfiltered.extend(everything)
             if error:
                 errors.append(error)
 
@@ -316,14 +342,25 @@ class NewsService:
         collected.sort(key=lambda row: row["published_at"], reverse=True)
         items = collected[:limit]
         message = "；".join(errors)
+        # A quiet pair must not look like a broken feed. Fall back to the
+        # market-wide headlines and label them, rather than showing nothing.
+        fallback = False
+        if base and not items and unfiltered:
+            unfiltered.sort(key=lambda row: row["published_at"], reverse=True)
+            items = unfiltered[:limit]
+            fallback = True
 
         with self._lock:
-            self._cache[key] = (now, items, message)
+            self._cache[key] = (now, items, message, fallback)
         return {
             "items": items,
             "cached": False,
             "error": message,
             "source": " · ".join(self.sources()),
+            # The panel labels the feed with the asset it was filtered for, so a
+            # stale render cannot pass for the newly selected pair.
+            "symbol": symbol,
+            "fallback": fallback,
         }
 
     def clear_cache(self) -> None:
