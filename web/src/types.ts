@@ -300,6 +300,11 @@ export interface ChannelStatus {
   account: string;
   accounts: WeChatAccount[];
   targets: WeChatTarget[];
+  /**
+   * A conversation exists (the user has messaged the bot), so a push can
+   * actually reach the phone. A bound account alone is not enough.
+   */
+  has_context: boolean;
   /** missing | installed | ready | unknown */
   state: string;
   /** One-line summary for the card, or the raw CLI excerpt as a fallback. */

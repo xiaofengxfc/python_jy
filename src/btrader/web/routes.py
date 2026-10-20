@@ -27,7 +27,7 @@ from ..core.credentials import Credentials
 from ..core.types import TIMEFRAME_SECONDS, MarketType, Network, RunMode
 from ..engine.auto import AutoTrader, AutoTraderConfig
 from ..exchange.rest import BinanceREST
-from ..installer import InstallOptions, restart_gateway_process
+from ..installer import InstallOptions, restart_gateway_process, wechat_has_context
 from ..notify import WeChatNotifier
 from .. import paths
 
@@ -550,6 +550,17 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
         notifier.last_error = ""
         notifier.last_error_at = 0.0
         notifier.last_success_at = scratch.last_success_at
+        # ``sent`` only means the channel accepted the message. WeChat lets a bot
+        # post solely inside a conversation the user opened, so without an inbound
+        # message the phone stays silent — say that instead of implying success.
+        if not wechat_has_context():
+            result = {
+                **result,
+                "warning": (
+                    "已提交给网关，但还没有会话上下文，手机可能收不到："
+                    "请先在手机微信里给 ClawBot 发一条任意消息，然后再点一次发送测试。"
+                ),
+            }
         return result
 
     # ------------------------------------------------------ openclaw install
@@ -711,9 +722,15 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
             "target": primary["target"],
             "account": primary["account"],
             "gateway": gateway,
+            "has_context": bool(status.get("has_context")),
             "test": None,
             "settings": settings.to_dict(),
         }
+        if not result["has_context"]:
+            result["warning"] = (
+                "绑定已生效，但还没有会话：请先在手机微信里给 ClawBot 发一条任意消息，"
+                "之后推送才能送达。"
+            )
         if send_test:
             try:
                 ctx.notifier.send_now("biTrader：微信通知已绑定并开启。")

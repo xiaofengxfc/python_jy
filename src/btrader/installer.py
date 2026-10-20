@@ -370,6 +370,9 @@ class OpenClawInstaller:
             "account": "",
             "accounts": [],
             "targets": [],
+            # A bound account alone cannot receive pushes: WeChat only allows a
+            # bot to reply inside a conversation the user opened first.
+            "has_context": False,
             "state": "unknown",
             "detail": "",
         }
@@ -386,6 +389,9 @@ class OpenClawInstaller:
             # guessing it by hand is what made "无法通知" so hard to clear.
             info["accounts"] = wechat_accounts()
             info["targets"] = wechat_targets()
+            info["has_context"] = any(
+                item.get("source") == "peer" for item in info["targets"]
+            )
             if info["configured"]:
                 info["state"] = "ready"
             elif info["plugin"]:
@@ -417,6 +423,7 @@ class OpenClawInstaller:
             info["detail"] = info["detail"] or "网关中未找到微信渠道"
         info["accounts"] = wechat_accounts()
         info["targets"] = wechat_targets()
+        info["has_context"] = any(item.get("source") == "peer" for item in info["targets"])
         return info
 
     def start(self, options: InstallOptions) -> dict:
@@ -951,6 +958,18 @@ def _run_command(args: list[str], timeout: float = 60.0) -> tuple[int, str]:
     return completed.returncode, (completed.stdout or "") + (completed.stderr or "")
 
 
+def wechat_has_context() -> bool:
+    """Whether any inbound message has established a reply context.
+
+    The WeChat bot API can only push into a conversation that already exists:
+    the plugin learns the peer's context token from the first message the user
+    sends *to* the bot. Until then ``message send`` still answers ``sent`` — the
+    message was handed to the channel — but nothing can reach the phone, which
+    is exactly the "发送成功但手机没收到" state.
+    """
+    return any(item.get("source") == "peer" for item in wechat_targets())
+
+
 def _channels_status_json(exe: str, channel: str) -> dict | None:
     """Live channel state from ``channels status --json``, or ``None``.
 
@@ -1030,7 +1049,11 @@ def _channel_detail(info: dict) -> str:
         return "插件已安装，尚未完成扫码绑定。"
     account = info.get("account") or ""
     state = "运行中" if info.get("running") else f"已绑定，但监控未运行（{info.get('lifecycle') or 'stopped'}）"
-    return f"{state}，账号 {account}。" if account else state
+    summary = f"{state}，账号 {account}。" if account else state
+    if not info.get("has_context"):
+        # Say the missing half out loud: "已绑定" is not "能收到".
+        summary += "还没有会话：请先在手机微信里给 ClawBot 发一条消息，之后推送才能送达。"
+    return summary
 
 
 def _stream_process(

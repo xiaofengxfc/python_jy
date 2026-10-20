@@ -404,16 +404,25 @@ export default function SettingsPage({ settings, onSaved }: Props) {
     try {
       // Send with the values currently in the form, not the saved ones: the
       // button's job is to verify a target or path before the user commits it.
-      await api("/api/notify/test", {
+      const result = await api<{ ok: boolean; warning?: string }>("/api/notify/test", {
         method: "POST",
         body: JSON.stringify({
           message: "",
           channel: draft.notify.channel,
           target: draft.notify.target,
+          account: draft.notify.account,
           command: draft.notify.command,
         }),
       });
-      setFlash({ tone: "ok", text: "测试消息已发送，请查看微信。" });
+      // ``ok`` only means the gateway accepted the message. WeChat delivers
+      // only into a conversation the user opened, so without a context token
+      // the honest answer is "已提交，但手机可能收不到" plus the one action
+      // that fixes it.
+      setFlash(
+        result.warning
+          ? { tone: "err", text: result.warning }
+          : { tone: "ok", text: "测试消息已发送，请查看微信。" },
+      );
       await loadNotify();
     } catch (error) {
       setFlash({ tone: "err", text: error instanceof Error ? error.message : String(error) });
@@ -1203,6 +1212,16 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                 {channel?.state === "missing" && channel.cli && (
                   <div className="verdict bad">
                     npm 装好了，但网关还不认识微信渠道。请先点“注册插件”。
+                  </div>
+                )}
+                {/* The last step is on the phone, and nothing else in the app can
+                    stand in for it: WeChat only allows a bot to reply inside a
+                    conversation the user opened first. */}
+                {channel?.configured && channel.has_context === false && (
+                  <div className="verdict bad">
+                    还差一步：请在手机微信里打开 ClawBot，随便发一条消息（例如 hi）。
+                    微信只允许机器人回复你已开启的会话，会话建立前推送不会送达。
+                    发完点“刷新状态”，这里会变成已就绪。
                   </div>
                 )}
                 <div className="install-head">
