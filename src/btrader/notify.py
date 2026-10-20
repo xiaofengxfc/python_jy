@@ -1,18 +1,22 @@
-"""Outbound WeChat notifications through a local OpenClaw gateway.
+"""Outbound 企业微信 notifications through a local OpenClaw gateway.
 
-The WeChat ClawBot plugin (``@tencent-weixin/openclaw-weixin-cli``) binds a
-personal WeChat account to an OpenClaw Gateway running on this machine. Once the
-plugin is installed and the account has been bound by scanning a QR code, the
-gateway exposes the bound conversation as a regular OpenClaw channel, so pushes
-go out through OpenClaw's own message CLI::
+The 企业微信 smart-bot plugin (``@wecom/wecom-openclaw-plugin``) keeps an
+outbound WebSocket (long connection) from the gateway on this machine to
+``wss://openws.work.weixin.qq.com``. Because the connection is outbound and
+authenticated with a Bot ID + Secret, there is no callback URL, no public IP and
+no QR code that can expire.
 
-    openclaw message send --channel <channel> --target <id> --message <text> --json
+Once the channel is configured, pushes go out through OpenClaw's own message
+CLI::
+
+    openclaw message send --channel wecom --target <userid> --message <text> --json
 
 That CLI is the stable, documented interface (``docs.openclaw.ai/cli/message``);
 there is no public per-message HTTP endpoint for a channel send, so this module
-shells out instead of inventing one. A missing CLI, a logged-out plugin or a
-gateway that is not running are normal, recoverable conditions: they are
-logged, surfaced to the settings page, and never allowed to interrupt trading.
+shells out instead of inventing one. A missing CLI, a plugin that was never
+registered, or a gateway that is not running are normal, recoverable conditions:
+they are logged, surfaced to the settings page, and never allowed to interrupt
+trading.
 
 Sends go through a bounded background queue. A hanging gateway must not stall an
 order submission or the paper reconciler, which run on critical paths.
@@ -41,17 +45,13 @@ log = logging.getLogger(__name__)
 # prefix, while older guides spell the channel after the npm package. The
 # settings page shows this value so a user whose gateway names it differently
 # can correct it instead of being told "send failed" with no context.
-DEFAULT_CHANNEL = "openclaw-weixin"
+# 企业微信智能机器人（长连接）的渠道名。由官方插件 `@wecom/wecom-openclaw-plugin`
+# 注册，连接方式为出站 WebSocket —— 不需要公网回调地址，也不会像个人微信 bot
+# 那样隔几小时就掉登录。
+DEFAULT_CHANNEL = "wecom"
 DEFAULT_COMMAND = "openclaw"
 # Chat text is cheap for us and a wall of it is unreadable on a lock screen.
-# The WeChat plugin chunks outbound text at 4000 characters, so staying well
-# below that keeps every message in a single bubble.
 MAX_MESSAGE_CHARS = 2000
-# The plugin resolves the recipient against its per-account context-token store,
-# which is keyed by the raw Weixin user id. Those ids always end with this
-# suffix, so a truncated paste (a bare wxid) silently sends without a context
-# token — worth naming in the settings page instead of only in the gateway log.
-WECHAT_ID_SUFFIX = "@im.wechat"
 # npm's Windows shim embeds the real script path in a quoted string, e.g.
 # ``"%dp0%\node_modules\openclaw\openclaw.mjs" %*``. Lifting that out lets the
 # notifier call node directly instead of handing the text to cmd.exe.
@@ -83,17 +83,15 @@ class NotifyError(RuntimeError):
 class NotifySettings:
     """Where and whether to push notifications.
 
-    ``target`` is the WeChat conversation OpenClaw should deliver to. Leaving it
-    empty makes the CLI refuse the send, which is reported rather than guessed.
+    ``target`` is the 企业微信 userid OpenClaw should deliver to. An empty value
+    makes the send refuse with an explanation instead of guessing a recipient.
     """
 
     enabled: bool = False
     channel: str = DEFAULT_CHANNEL
     target: str = ""
-    # Multiple WeChat accounts can be bound to one gateway. Empty means "the
-    # default account", which is what a single-account setup should leave alone;
-    # with two bound accounts the plugin cannot guess and the send fails, so the
-    # page offers this field instead of forcing a CLI flag by hand.
+    # The plugin's own account id inside the gateway. Empty means "the default
+    # account", which is what a single-bot setup should leave alone.
     account: str = ""
     command: str = DEFAULT_COMMAND
     # Events are opt-in individually so an active strategy cannot spam the phone.
@@ -150,9 +148,6 @@ class WeChatNotifier:
         # until which sends fail fast instead of waiting out the CLI.
         self._failures: int = 0
         self._open_until: float = 0.0
-        # Cached probe of the WeChat login (``session_state``).
-        self._session: dict = {"state": "unknown", "detail": "", "account": ""}
-        self._session_at: float = 0.0
 
     # ------------------------------------------------------------------- public
     def notify(self, text: str, *, kind: str = "") -> bool:
@@ -175,7 +170,7 @@ class WeChatNotifier:
             # the caller (a fill handler) to wait for it would be worse.
             with self._lock:
                 self.dropped += 1
-            log.warning("微信通知队列已满，丢弃一条消息")
+            log.warning("企业微信通知队列已满，丢弃一条消息")
             return False
         return True
 
@@ -195,10 +190,7 @@ class WeChatNotifier:
         if not text:
             raise NotifyError("消息内容为空")
         if not self._resolve_target()[0]:
-            raise NotifyError("尚未填写微信接收目标，无法发送。")
-        # An explicit test is the moment to re-ask WeChat: the user may have just
-        # scanned a new QR and the cached verdict would still say "expired".
-        self.session_state(refresh=True)
+            raise NotifyError("尚未填写企业微信接收人（userid），无法发送。")
         try:
             return self._run(text, respect_breaker=False)
         except NotifyError as exc:
@@ -226,30 +218,17 @@ class WeChatNotifier:
             # channel looks idle while messages are stacking up off-screen.
             "spooled": len(_spool_load()),
             "breaker_seconds": max(0, int(self._open_until - time.time())),
-            # WeChat's bot login expires on its own schedule and only a new QR
-            # scan renews it. Reporting it here is what lets the page say
-            # "重新扫码" instead of letting pushes fail silently.
-            "session": self.session_state(),
         }
 
     def session_state(self, *, refresh: bool = False) -> dict:
-        """Cached verdict on the WeChat login (probed at most once a minute)."""
-        now = time.time()
-        with self._lock:
-            if not refresh and self._session_at and now - self._session_at < 60.0:
-                return dict(self._session)
-        state = {"state": "unknown", "detail": "", "account": ""}
-        if self.settings.enabled and (self.settings.channel or "") == DEFAULT_CHANNEL:
-            try:
-                from .installer import wechat_session_state
+        """Kept for API compatibility: the 企业微信 bot has no expiring login.
 
-                state = wechat_session_state(self.settings.account)
-            except Exception as exc:  # pragma: no cover - best effort
-                state = {"state": "unknown", "detail": str(exc), "account": ""}
-        with self._lock:
-            self._session = state
-            self._session_at = now
-        return dict(state)
+        The personal-WeChat bot needed a QR scan every few hours; the 企业微信
+        intelligent bot authenticates once with Bot ID + Secret and holds an
+        outbound WebSocket, so there is nothing to re-scan. Returning a fixed
+        verdict keeps older callers (and saved JSON) working.
+        """
+        return {"state": "ok", "detail": "", "account": self.settings.account}
 
     def stop(self) -> None:
         self._stop.set()
@@ -295,12 +274,12 @@ class WeChatNotifier:
                 # Keep the message: the gateway being down is exactly when a
                 # 熔断 warning matters, and it is worth replaying later.
                 _spool_add(job.text)
-                log.warning("微信通知发送失败：%s", exc)
+                log.warning("企业微信通知发送失败：%s", exc)
             except Exception as exc:  # pragma: no cover - defensive
                 self._record_failure(f"发送异常：{exc}")
                 self._note_failure()
                 _spool_add(job.text)
-                log.warning("微信通知异常", exc_info=True)
+                log.warning("企业微信通知异常", exc_info=True)
             else:
                 # Proof the channel works again: drain what piled up meanwhile.
                 self._replay_spool()
@@ -323,7 +302,7 @@ class WeChatNotifier:
         if self._failures >= BREAKER_THRESHOLD:
             self._failures = 0
             self._open_until = time.time() + BREAKER_COOLDOWN
-            log.warning("微信通道连续失败，暂停发送 %g 秒", BREAKER_COOLDOWN)
+            log.warning("企业微信通道连续失败，暂停发送 %g 秒", BREAKER_COOLDOWN)
 
     def _preflight(self) -> None:
         """Fail in 0.4 s when nothing is listening on the gateway port.
@@ -383,22 +362,15 @@ class WeChatNotifier:
         return None
 
     def _resolve_target(self) -> tuple[str, str]:
-        """The recipient and account to send to.
+        """The recipient (WeCom userid) and account to send to.
 
-        An empty target falls back to the one bound WeChat account. The QR scan
-        writes the scanner's own WeChat id into the plugin's account file, and
-        that id is exactly what ``--target`` expects — requiring the user to
-        copy it out of a log is why "已经扫码登录但仍然发不出去" happened.
-        Ambiguous bindings (two accounts) still refuse, rather than guessing.
+        The aibot API addresses a conversation: for a single chat the chatid is
+        the member's userid. It only exists after that member has written to the
+        bot once, so an empty target is reported rather than guessed.
         """
-        target = normalize_target(self.settings.target)
-        account = str(self.settings.account or "").strip()
-        if target:
-            return target, account
-        bound = _bound_wechat_target()
-        if bound is None:
-            return "", account
-        return bound["target"], account or bound["account"]
+        return normalize_target(self.settings.target), str(
+            self.settings.account or ""
+        ).strip()
 
     def _run(
         self, text: str, *, from_queue: bool = False, respect_breaker: bool = True
@@ -414,14 +386,7 @@ class WeChatNotifier:
         channel = (self.settings.channel or DEFAULT_CHANNEL).strip() or DEFAULT_CHANNEL
         target, account = self._resolve_target()
         if not target:
-            raise NotifyError("尚未填写微信接收目标，无法发送。")
-        # A dead WeChat login cannot be revived by the CLI: skip the 30 s call and
-        # say what to do. The verdict is cached for a minute, so a fresh scan is
-        # picked up almost immediately.
-        if channel == DEFAULT_CHANNEL and self.session_state().get("state") == "expired":
-            raise NotifyError(
-                "微信登录已过期（session timeout），消息已暂存，重新扫码后会自动补发。"
-            )
+            raise NotifyError("尚未填写企业微信接收人（userid），无法发送。")
         self._preflight()
         args = [
             command,
@@ -471,7 +436,7 @@ class WeChatNotifier:
             reason = str(payload.get("error") or "OpenClaw 报告发送失败")
             raise NotifyError(reason[:500])
         if from_queue:
-            log.info("微信通知已发出（%s）", str(payload.get("messageId") or "") if payload else "")
+            log.info("企业微信通知已发出（%s）", str(payload.get("messageId") or "") if payload else "")
         self.last_error = ""
         self.last_error_at = 0.0
         self.last_success_at = time.time()
@@ -638,80 +603,42 @@ def _prepare(text: str) -> str:
 
 
 def normalize_target(raw: str) -> str:
-    """Trim a recipient id, tolerating a pasted chat label around it."""
+    """Trim a recipient id, tolerating a pasted label or channel prefix."""
     text = str(raw or "").strip().strip("\"'").strip()
-    if text.lower().startswith("weixin:"):
-        text = text.split(":", 1)[1].strip()
+    lowered = text.lower()
+    for prefix in ("wecom:", "qywx:", "wework:", "wechatwork:"):
+        if lowered.startswith(prefix):
+            text = text.split(":", 1)[1].strip()
+            break
     return text
 
 
 def _explain_failure(detail: str, code: int) -> str:
-    """Turn the CLI's generic failure into something actionable.
-
-    ``The CLI command failed. For help, run openclaw doctor`` is what the plugin
-    prints for every early failure — including "no account is bound", which is
-    by far the most common cause after an unbind. Saying so here is the
-    difference between a dead end and "重新扫码".
-    """
+    """Turn the CLI's generic failure into something actionable."""
     text = (detail or "").strip()
-    # The WeChat side rejects a send when the bot's session for that chat is
-    # gone — the plugin keeps a contextToken per conversation, and restarting
-    # the gateway makes the old one unusable. The CLI still reports it as a
-    # murky "prepare failed", so name the fix here.
     lowered = text.lower()
-    if "prepare failed" in lowered or "ret=-2" in lowered:
+    # WeCom's aibot API addresses conversations, not people: the chatid for a
+    # single chat is the member's userid, and it only exists after that member
+    # has written to the bot once. Naming the fix beats "invalid chatid".
+    if "93006" in lowered or "invalid chatid" in lowered:
         return (
-            "微信侧拒绝发送（prepare failed）：ClawBot 的会话凭据已失效，"
-            "通常发生在网关重启之后。请在手机上给 ClawBot 发任意一条消息，"
-            "再重试即可恢复；状态页的 has_context 会从 false 变回 true。"
+            "企业微信返回 93006（invalid chatid）：接收人 userid 不存在或还没和机器人说过话。"
+            "请先在企业微信里给这个机器人发一条消息，再把你的 userid 填进设置。"
         )
-    generic = not text or "CLI command failed" in text
-    if generic:
-        try:
-            from .installer import wechat_accounts
-
-            if not wechat_accounts():
-                return (
-                    "当前没有已绑定的微信账号（可能已解绑或尚未扫码）："
-                    "请到「设置 → 微信通道」重新扫码绑定后再发送。"
-                )
-        except Exception:  # pragma: no cover - best effort
-            pass
+    if "45009" in lowered or "api freq" in lowered:
+        return "企业微信接口触发频率限制（45009），消息已暂存，几分钟后会自动补发。"
     return text[:500] or f"OpenClaw 返回退出码 {code}"
 
 
-def _bound_wechat_target() -> dict | None:
-    """The single bound WeChat account's own recipient id, if unambiguous.
-
-    Imported lazily: the installer pulls in the whole gateway/CLI surface, and
-    the notifier is constructed during application start-up.
-    """
-    try:
-        from .installer import wechat_targets
-    except Exception:  # pragma: no cover - import cycle guard
-        return None
-    try:
-        targets = wechat_targets()
-    except Exception:  # pragma: no cover - best effort
-        return None
-    return targets[0] if len(targets) == 1 else None
-
-
 def target_warning(target: str) -> str:
-    """Explain a target the plugin cannot match to a conversation token.
-
-    The channel resolves the recipient against its own context-token store,
-    keyed by the raw Weixin id (``<wxid>@im.wechat``). A bare wxid still sends,
-    but without the token the plugin warns and the reply can land in the wrong
-    conversation, so the settings page says so before the user saves it.
-    """
+    """Warn about a target the WeCom bot cannot address yet."""
     text = normalize_target(target)
     if not text:
         return ""
-    if not text.lower().endswith(WECHAT_ID_SUFFIX):
+    if "@" in text or text.endswith(".wechat"):
         return (
-            f"接收目标通常以 {WECHAT_ID_SUFFIX} 结尾：先给 ClawBot 发一条消息，"
-            "再从网关日志里复制完整的用户 ID。"
+            "这看起来是个人微信的 ID。企业微信智能机器人要用成员 userid"
+            "（如 XiaoJiaJian），不是你微信的 wxid。"
         )
     return ""
 

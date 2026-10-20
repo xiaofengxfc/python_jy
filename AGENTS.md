@@ -64,10 +64,13 @@ Node 不在 PATH 时：`$env:Path = "D:\tool\node;" + $env:Path`。
 
 ## 5. 已验证的现实约束（别重新踩）
 
+- 推送通道是**企业微信智能机器人（API 模式 + 长连接）**：本机 OpenClaw 网关
+  主动连 `wss://openws.work.weixin.qq.com`，没有回调 URL、没有扫码、不会过期。
+  凭证在 `~/.openclaw/openclaw.json` 的 `channels.wecom.{botId,secret}`；
+  发送用 `--channel wecom --target <成员 userid>`。
 - 单次 `openclaw message send` 约 **30 秒**（Node 启动 + 网关往返）。
 - 网关冷启动要 **50 秒以上**，`START_TIMEOUT` 已调到 180 秒。
-- 微信 bot 只能在**已存在的会话**里推送：用户必须先在手机上给 ClawBot
-  发过消息（生成 contextToken），否则 CLI 仍返回 `sent` 但手机收不到。
-  页面用 `has_context` 标识这个状态。
-- 网关若由终端/登录向导启动（`state=external`），本程序只能通过
+- 企微机器人只能在**已存在的会话**里推送：目标成员必须先给机器人发过一条消息，
+  否则接口返回 `errcode 93006 invalid chatid`（目标写错也是这个码）。
+- 网关若由终端启动（`state=external`），本程序只能通过
   `openclaw gateway restart` 重启它。

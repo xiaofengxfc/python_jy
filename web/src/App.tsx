@@ -21,9 +21,6 @@ export default function App() {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [logOpen, setLogOpen] = useState(false);
   const [logErrors, setLogErrors] = useState(0);
-  /** WeChat login verdict; "expired" is worth interrupting the user for, since
-   * every push is silently dropped until they scan again. */
-  const [notifySession, setNotifySession] = useState<string>("");
 
   useEffect(() => {
     let cancelled = false;
@@ -60,31 +57,6 @@ export default function App() {
       .catch(() => undefined);
   }, []);
 
-  // WeChat's bot token expires on its own and then every push is dropped. Poll
-  // it slowly and put a banner up top, so the user finds out from the app
-  // rather than from a task notification that never arrived.
-  useEffect(() => {
-    let cancelled = false;
-    const check = async () => {
-      try {
-        const data = await api<{
-          enabled?: boolean;
-          session?: { state?: string; detail?: string };
-        }>("/api/notify");
-        if (cancelled) return;
-        setNotifySession(data.enabled === false ? "" : data.session?.state || "");
-      } catch {
-        if (!cancelled) setNotifySession("");
-      }
-    };
-    void check();
-    const timer = window.setInterval(check, 120_000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, []);
-
   const handleAccountChange = useCallback((value: number) => setEquity(value), []);
   const handleLogCounts = useCallback((errors: number) => setLogErrors(errors), []);
 
@@ -108,14 +80,6 @@ export default function App() {
 
       <main className="main">
         {healthError && page !== "trading" && <div className="banner error">{healthError}</div>}
-        {notifySession === "expired" && (
-          <div className="banner error">
-            微信登录已过期（session timeout），任务通知现在发不出去。
-            <button type="button" className="link-btn" onClick={() => setPage("settings")}>
-              去重新扫码
-            </button>
-          </div>
-        )}
 
         {page === "trading" && (
           <TradingPage

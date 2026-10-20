@@ -27,7 +27,7 @@ from ..core.credentials import Credentials
 from ..core.types import TIMEFRAME_SECONDS, MarketType, Network, RunMode
 from ..engine.auto import AutoTrader, AutoTraderConfig
 from ..exchange.rest import BinanceREST
-from ..installer import InstallOptions, restart_gateway_process, wechat_has_context
+from ..installer import InstallOptions, restart_gateway_process
 from ..notify import WeChatNotifier
 from .. import paths
 
@@ -596,7 +596,7 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
         ctx = get_state().ctx
         notifier = ctx.notifier
         text = payload.message.strip() or (
-            "biTrader 微信通知测试：如果你收到这条消息，说明推送已打通。"
+            "biTrader 企业微信通知测试：如果你收到这条消息，说明推送已打通。"
         )
         candidate = replace(
             notifier.settings,
@@ -616,17 +616,6 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
         notifier.last_error = ""
         notifier.last_error_at = 0.0
         notifier.last_success_at = scratch.last_success_at
-        # ``sent`` only means the channel accepted the message. WeChat lets a bot
-        # post solely inside a conversation the user opened, so without an inbound
-        # message the phone stays silent — say that instead of implying success.
-        if not wechat_has_context():
-            result = {
-                **result,
-                "warning": (
-                    "已提交给网关，但还没有会话上下文，手机可能收不到："
-                    "请先在手机微信里给 ClawBot 发一条任意消息，然后再点一次发送测试。"
-                ),
-            }
         return result
 
     # ------------------------------------------------------ openclaw install
@@ -673,17 +662,26 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
 
     @router.get("/api/install/openclaw/channel")
     def channel_status() -> dict[str, Any]:
-        """Whether the gateway knows the WeChat channel and has an account.
+        """Whether the gateway knows the 企业微信 channel and is connected.
 
         Read from the gateway rather than inferred from files on disk, because a
         plugin can be installed and still be disabled or unconfigured. The
-        gateway's own process state rides along: a channel is useless when the
-        gateway is down, and the page has to say which of the two is wrong.
+        gateway's own process state rides along: the long connection lives in
+        that process, so a channel is useless when the gateway is down and the
+        page has to say which of the two is wrong.
         """
         ctx = get_state().ctx
         status = ctx.installer.channel_status()
         status["gateway"] = ctx.gateway.status()
         return status
+
+    @router.post("/api/install/openclaw/channel")
+    def channel_register() -> dict[str, Any]:
+        """Register the 企业微信 plugin with the gateway, streamed to the log."""
+        try:
+            return get_state().ctx.installer.register_channel()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @router.post("/api/install/openclaw/gateway")
     def gateway_start() -> dict[str, Any]:
@@ -719,145 +717,6 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
                 "error": output.strip()[-300:] or f"openclaw 返回退出码 {code}",
             }
         return status
-
-    @router.post("/api/install/openclaw/channel")
-    def channel_register() -> dict[str, Any]:
-        """Register the WeChat plugin with the gateway, streamed to the log."""
-        try:
-            return get_state().ctx.installer.register_channel()
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    @router.post("/api/install/openclaw/logout")
-    def channel_logout(account: str = "") -> dict[str, Any]:
-        """Unbind a WeChat account and delete the credential files it left.
-
-        Without this the only way back to "未绑定" was editing the plugin's
-        state directory by hand: the page could bind but never release.
-
-        The notifier's own target is cleared with it — a stale recipient is
-        exactly what turns "已解绑" into a wall of failed sends.
-        """
-        ctx = get_state().ctx
-        try:
-            result = ctx.installer.logout(account)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        notify = ctx.settings.notify
-        if notify.target or notify.account or notify.enabled:
-            ctx.settings.notify = replace(notify, enabled=False, target="", account="")
-            ctx.save_settings()
-        result["settings"] = ctx.settings.to_dict()
-        return result
-
-    @router.post("/api/install/openclaw/bind")
-    def channel_bind(send_test: bool = True) -> dict[str, Any]:
-        """Finish a scan in one step: persist the recipient, enable, verify.
-
-        The scan only links the account in the gateway. The notifier carries its
-        own settings, so the flow used to end with a bound channel whose push
-        switch was still off and whose target was empty — "扫码成功了但收不到
-        通知". Everything the scan already knows is applied here instead of
-        asking the user to copy an id into another card and save.
-        """
-        ctx = get_state().ctx
-        status = ctx.installer.channel_status()
-        if not status.get("configured"):
-            raise HTTPException(status_code=400, detail="尚未完成扫码绑定，请先扫码。")
-        targets = status.get("targets") or []
-        if not targets:
-            raise HTTPException(status_code=400, detail="已绑定账号，但没有可用的接收目标。")
-        primary = targets[0]
-        settings = ctx.settings
-        settings.notify = replace(
-            settings.notify,
-            enabled=True,
-            target=primary["target"],
-            account=primary["account"],
-        )
-        # ``save_settings`` also rebinds the running notifier, so the change
-        # takes effect without a restart.
-        ctx.save_settings()
-
-        # A configured channel still delivers nothing while the gateway is down.
-        gateway = ctx.gateway.status()
-        if not gateway.get("reachable"):
-            gateway = ctx.gateway.start()
-        result: dict[str, Any] = {
-            "ok": True,
-            "target": primary["target"],
-            "account": primary["account"],
-            "gateway": gateway,
-            "has_context": bool(status.get("has_context")),
-            "test": None,
-            "settings": settings.to_dict(),
-        }
-        if not result["has_context"]:
-            result["warning"] = (
-                "绑定已生效，但还没有会话：请先在手机微信里给 ClawBot 发一条任意消息，"
-                "之后推送才能送达。"
-            )
-        if send_test:
-            try:
-                ctx.notifier.send_now("biTrader：微信通知已绑定并开启。")
-                result["test"] = {"ok": True, "error": ""}
-            except Exception as exc:  # report, do not fail the binding
-                result["test"] = {"ok": False, "error": str(exc)}
-        return result
-
-    @router.post("/api/install/openclaw/login")
-    def channel_login(force: bool = False) -> dict[str, Any]:
-        """Start the QR login and return the link the code encodes.
-
-        The page renders that link as an image. The wizard's own terminal art
-        is unreadable in a default ``cmd.exe`` window (raster font, half-block
-        glyphs), which is why scanning it failed.
-        """
-        try:
-            # ``force`` is the panel's "重新生成": the code on screen is spent
-            # or was rejected, so a fresh wizard has to replace it. Without the
-            # flag a second click reuses the live code, which is what keeps two
-            # wizards from invalidating each other.
-            return get_state().ctx.installer.start_login(force=force)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    @router.get("/api/install/openclaw/login")
-    def channel_login_status() -> dict[str, Any]:
-        """Whether a code is pending, already scanned, or spent."""
-        return get_state().ctx.installer.login_status()
-
-    @router.get("/api/install/openclaw/login/qr.svg")
-    def channel_login_qr() -> Response:
-        """The pending login link as a scannable QR image."""
-        try:
-            svg = get_state().ctx.installer.login_qr_svg()
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        return Response(
-            content=svg,
-            media_type="image/svg+xml",
-            # A code is single-use: never let a browser replay a stale one.
-            headers={"Cache-Control": "no-store"},
-        )
-
-    @router.post("/api/install/openclaw/login/cancel")
-    def channel_login_cancel() -> dict[str, Any]:
-        """Discard the pending code before it expires on its own."""
-        return get_state().ctx.installer.cancel_login()
-
-    @router.post("/api/install/openclaw/terminal")
-    def channel_login_terminal() -> dict[str, Any]:
-        """Fallback: open the wizard in a real terminal.
-
-        Only useful when the CLI prints no fallback link; the page keeps it as
-        a secondary action rather than the primary path.
-        """
-        try:
-            return get_state().ctx.installer.open_login_terminal()
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
 
     # ------------------------------------------------------------------ news
     @router.get("/api/news")

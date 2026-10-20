@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { api } from "../api";
 import { TIMEFRAMES } from "../format";
 import type {
@@ -6,7 +6,6 @@ import type {
   ChannelStatus,
   CredentialItem,
   InstallStatus,
-  LoginStatus,
   NotifyStatus,
   RiskState,
 } from "../types";
@@ -61,16 +60,12 @@ export default function SettingsPage({ settings, onSaved }: Props) {
   const [installBusy, setInstallBusy] = useState(false);
   const [installError, setInstallError] = useState("");
   const [installOpen, setInstallOpen] = useState(false);
-  const [installWithWechat, setInstallWithWechat] = useState(true);
   const [installRegistry, setInstallRegistry] = useState("");
   const [installNpmPath, setInstallNpmPath] = useState("");
   const [installPlan, setInstallPlan] = useState<string[]>([]);
   const [channel, setChannel] = useState<ChannelStatus | null>(null);
   const [channelBusy, setChannelBusy] = useState(false);
   const [channelNote, setChannelNote] = useState("");
-  const [login, setLogin] = useState<LoginStatus | null>(null);
-  // Bumped on every new code so the <img> reloads instead of showing the old SVG.
-  const [qrNonce, setQrNonce] = useState(0);
 
   const loadChannel = useCallback(async () => {
     try {
@@ -94,26 +89,6 @@ export default function SettingsPage({ settings, onSaved }: Props) {
     void loadChannel();
   }, [install?.state, install?.running, loadChannel]);
 
-  // A binding knows its own recipient id, so a fresh install never has to be
-  // told what to put in 接收目标 by hand. Fill it only while it is empty: an
-  // explicit value the user typed always wins.
-  useEffect(() => {
-    if (!channel || channel.targets.length !== 1) return;
-    const only = channel.targets[0];
-    if (!only) return;
-    setDraft((current) => {
-      if (!current || current.notify.target.trim()) return current;
-      return {
-        ...current,
-        notify: {
-          ...current.notify,
-          target: only.target,
-          account: current.notify.account || only.account,
-        },
-      };
-    });
-  }, [channel]);
-
   const registerChannel = async () => {
     setChannelBusy(true);
     setChannelNote("");
@@ -125,150 +100,6 @@ export default function SettingsPage({ settings, onSaved }: Props) {
       setChannelBusy(false);
     }
   };
-
-  const openLogin = async (force = false) => {
-    setChannelBusy(true);
-    setChannelNote("");
-    try {
-      // ``force`` cancels the pending wizard and prints a fresh code: the
-      // button exists for the "过期/扫不了" case, and reusing the old session
-      // would hand back the very code the user just rejected.
-      const result = await api<LoginStatus>(
-        `/api/install/openclaw/login${force ? "?force=true" : ""}`,
-        { method: "POST" },
-      );
-      setLogin(result);
-      setQrNonce((n) => n + 1);
-      if (force) setChannelNote("已重新生成二维码，请重新扫描。");
-    } catch (error) {
-      setChannelNote(error instanceof Error ? error.message : String(error));
-    } finally {
-      setChannelBusy(false);
-    }
-  };
-
-  const refreshLogin = async () => {
-    try {
-      setLogin(await api<LoginStatus>("/api/install/openclaw/login"));
-    } catch {
-      /* the poll is best effort; the panel keeps the last known state */
-    }
-  };
-
-  const cancelLogin = async () => {
-    setChannelBusy(true);
-    try {
-      setLogin(
-        await api<LoginStatus>("/api/install/openclaw/login/cancel", { method: "POST" }),
-      );
-    } catch (error) {
-      setChannelNote(error instanceof Error ? error.message : String(error));
-    } finally {
-      setChannelBusy(false);
-    }
-  };
-
-  // Finishing the scan is one step, not three. The server already knows the
-  // bound account's recipient id, so it persists it, turns the push switch on
-  // and proves the channel with a test message.
-  const completeBind = async () => {
-    setChannelBusy(true);
-    setChannelNote("");
-    try {
-      const result = await api<{
-        target: string;
-        account: string;
-        settings: AppSettings;
-        test: { ok: boolean; error: string } | null;
-      }>("/api/install/openclaw/bind", { method: "POST" });
-      onSaved(result.settings);
-      const test = result.test;
-      setChannelNote(
-        `已绑定 ${result.account || "当前账号"}，接收目标 ${result.target}，推送已开启。` +
-          (test
-            ? test.ok
-              ? "测试消息已发送，请查看微信。"
-              : `测试消息发送失败：${test.error}`
-            : ""),
-      );
-      await loadChannel();
-      await loadNotify();
-    } catch (error) {
-      setChannelNote(error instanceof Error ? error.message : String(error));
-    } finally {
-      setChannelBusy(false);
-    }
-  };
-
-  const logoutAccount = async () => {
-    // Destructive and irreversible without a fresh scan, so it asks first.
-    if (!window.confirm("解绑当前微信账号？解绑后需要重新扫码才能接收通知。")) return;
-    setChannelBusy(true);
-    setChannelNote("");
-    try {
-      const result = await api<{ account: string; removed: string[] }>(
-        "/api/install/openclaw/logout",
-        { method: "POST" },
-      );
-      setChannelNote(
-        `已解绑 ${result.account || "当前账号"}` +
-          `（清理 ${result.removed.length} 个文件）。需要时重新扫码即可。`,
-      );
-      setLogin(null);
-      await loadChannel();
-    } catch (error) {
-      setChannelNote(error instanceof Error ? error.message : String(error));
-    } finally {
-      setChannelBusy(false);
-    }
-  };
-
-  const openLoginTerminal = async () => {
-    setChannelBusy(true);
-    setChannelNote("");
-    try {
-      const result = await api<{ command: string[] }>(
-        "/api/install/openclaw/terminal",
-        { method: "POST" },
-      );
-      setChannelNote(
-        "已打开终端窗口，二维码在窗口里；完成后回到本页点“刷新状态”。" +
-          `若没有弹出窗口，请手动执行：${result.command.join(" ")}`,
-      );
-    } catch (error) {
-      setChannelNote(error instanceof Error ? error.message : String(error));
-    } finally {
-      setChannelBusy(false);
-    }
-  };
-
-  // Poll while a code is pending: it becomes "done" the moment WeChat reports
-  // the scan, and the page must swap the QR for a success message on its own.
-  useEffect(() => {
-    const state = login?.state;
-    if (state !== "starting" && state !== "waiting") return;
-    const timer = window.setInterval(() => {
-      void refreshLogin();
-    }, 2000);
-    return () => window.clearInterval(timer);
-  }, [login?.state]);
-
-  // A finished scan changes the channel state, so the panel must re-read it.
-  useEffect(() => {
-    if (login?.state === "done") void loadChannel();
-  }, [login?.state, loadChannel]);
-
-  // ...and it must also finish the job by itself: persist the recipient, turn
-  // the push switch on and prove delivery. Running it once per scan is what
-  // keeps a finished binding from turning into a "still nothing arrives" loop.
-  const bindKey = useRef("");
-  useEffect(() => {
-    if (login?.state !== "done" || !channel?.configured) return;
-    const key = `${channel.account}|${login.started_at}`;
-    if (bindKey.current === key) return;
-    bindKey.current = key;
-    void completeBind();
-  }, [login?.state, login?.started_at, channel?.account, channel?.configured]);
 
   const startGateway = async () => {
     setChannelBusy(true);
@@ -334,7 +165,6 @@ export default function SettingsPage({ settings, onSaved }: Props) {
       const result = await api<{ command: string[] }>("/api/install/openclaw/plan", {
         method: "POST",
         body: JSON.stringify({
-          with_wechat: installWithWechat,
           registry: installRegistry,
           npm_path: installNpmPath,
         }),
@@ -355,7 +185,6 @@ export default function SettingsPage({ settings, onSaved }: Props) {
       const next = await api<InstallStatus>("/api/install/openclaw", {
         method: "POST",
         body: JSON.stringify({
-          with_wechat: installWithWechat,
           registry: installRegistry,
           npm_path: installNpmPath,
         }),
@@ -421,7 +250,7 @@ export default function SettingsPage({ settings, onSaved }: Props) {
       setFlash(
         result.warning
           ? { tone: "err", text: result.warning }
-          : { tone: "ok", text: "测试消息已发送，请查看微信。" },
+          : { tone: "ok", text: "测试消息已发送，请查看企业微信。" },
       );
       await loadNotify();
     } catch (error) {
@@ -578,7 +407,6 @@ export default function SettingsPage({ settings, onSaved }: Props) {
 
   // The one bound recipient, if there is exactly one. Narrowed here because
   // the array index is optional and the card below reads it several times.
-  const boundTarget = channel?.targets.length === 1 ? channel?.targets[0] : undefined;
 
   return (
     <>
@@ -882,7 +710,7 @@ export default function SettingsPage({ settings, onSaved }: Props) {
 
           <div className="card">
             <div className="card-head">
-              <span className="card-title">微信通知（ClawBot）</span>
+              <span className="card-title">企业微信通知（智能机器人）</span>
               <span className="spacer" />
               <span className="faint" style={{ fontSize: 11 }}>
                 {notifyStatus
@@ -901,97 +729,49 @@ export default function SettingsPage({ settings, onSaved }: Props) {
               </button>
             </div>
             <div className="card-body stack">
-              {/* The bot login expires on WeChat's schedule; only a new scan
-                  renews it. Say so here, with the scan right next to it. */}
-              {notifyStatus?.session?.state === "expired" && (
-                <div className="banner error" role="alert">
-                  <span>{notifyStatus.session.detail || "微信登录已过期，需要重新扫码。"}</span>
-                  <span className="spacer" />
-                  <button
-                    type="button"
-                    className="btn-sm"
-                    onClick={() => void openLogin(true)}
-                  >
-                    重新扫码
-                  </button>
-                </div>
-              )}
               <label className="check">
                 <input
                   type="checkbox"
                   checked={draft.notify.enabled}
                   onChange={(event) => patchNotify({ enabled: event.target.checked })}
                 />
-                启用微信推送
+                启用企业微信推送
               </label>
               {/* A bound channel plus a closed master switch is the state that
                   looks like "已经登录但收不到通知"; say it instead of leaving
                   the user to discover a checkbox. */}
               {channel?.configured && !draft.notify.enabled && (
                 <div className="hint" style={{ color: "var(--warn, #b45309)" }}>
-                  微信通道已绑定，但推送总开关是关的：成交、风控通知都不会发出。
-                  勾选上面的“启用微信推送”并保存后生效。
+                  企业微信渠道已配置，但推送总开关是关的：成交、风控通知都不会发出。
+                  勾选上面的“启用企业微信推送”并保存后生效。
                 </div>
               )}
               <div className="form-grid">
                 <div className="field">
                   <label className="field-label" htmlFor="notify-target">
-                    <span>接收目标</span>
-                    <em>形如 xxx@im.wechat</em>
+                    <span>接收人 userid</span>
+                    <em>企业微信通讯录里的成员账号</em>
                   </label>
                   <input
                     id="notify-target"
                     value={draft.notify.target}
                     onChange={(event) => patchNotify({ target: event.target.value })}
-                    placeholder="先给 ClawBot 发一条消息，或点下方“填入已绑定账号”"
+                    placeholder="例：XiaoJiaJian（先给机器人发过消息的那个账号）"
                   />
                 </div>
                 <div className="field">
                   <label className="field-label" htmlFor="notify-channel">
                     <span>通道名</span>
-                    <em>默认 openclaw-weixin</em>
+                    <em>默认 wecom，一般不用改</em>
                   </label>
                   <input
                     id="notify-channel"
                     value={draft.notify.channel}
                     onChange={(event) => patchNotify({ channel: event.target.value })}
-                    placeholder="openclaw-weixin"
+                    placeholder="wecom"
                   />
                 </div>
               </div>
-              {/* The bound account already knows its own WeChat id, so the user
-                  should never have to copy it out of a log. One click fills it. */}
-              {boundTarget && (
-                <div className="install-head" style={{ marginTop: 2 }}>
-                  <span className="faint" style={{ fontSize: 11 }}>
-                    已绑定账号：{channel?.account || boundTarget.account}
-                    {boundTarget.target !== draft.notify.target &&
-                      `，可用接收目标 ${boundTarget.target}`}
-                  </span>
-                  <span className="spacer" />
-                  <button
-                    type="button"
-                    className="btn-sm"
-                    disabled={boundTarget.target === draft.notify.target}
-                    onClick={() =>
-                      patchNotify({
-                        target: boundTarget.target,
-                        account: boundTarget.account,
-                      })
-                    }
-                  >
-                    填入已绑定账号
-                  </button>
-                  <button
-                    type="button"
-                    className="btn-sm"
-                    disabled={channelBusy}
-                    onClick={() => void logoutAccount()}
-                  >
-                    解绑账号
-                  </button>
-                </div>
-              )}
               {notifyStatus?.target_warning && (
                 <div className="hint" style={{ color: "var(--warn, #b45309)" }}>
                   {notifyStatus.target_warning}
@@ -1000,13 +780,13 @@ export default function SettingsPage({ settings, onSaved }: Props) {
               <div className="field">
                 <label className="field-label" htmlFor="notify-account">
                   <span>账号</span>
-                  <em>绑定多个微信账号时填写，留空用默认</em>
+                  <em>插件内的账号标识，留空用 default</em>
                 </label>
                 <input
                   id="notify-account"
                   value={draft.notify.account}
                   onChange={(event) => patchNotify({ account: event.target.value })}
-                  placeholder="例：6b0e6d3bca3a-im-bot"
+                  placeholder="default"
                 />
               </div>
               <div className="field">
@@ -1107,18 +887,6 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                 {installError && <div className="verdict bad">{installError}</div>}
                 {installOpen && (
                   <>
-                    <label className="check">
-                      <input
-                        type="checkbox"
-                        checked={installWithWechat}
-                        disabled={install?.running}
-                        onChange={(event) => {
-                          setInstallWithWechat(event.target.checked);
-                          setInstallPlan([]);
-                        }}
-                      />
-                      同时安装微信 ClawBot 插件（缺少它无法推送到微信）
-                    </label>
                     <div className="form-grid">
                       <div className="field">
                         <label className="field-label" htmlFor="install-registry">
@@ -1213,20 +981,20 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                     )}
                   </>
                 )}
-                {/* Registration and login are separate from installing: npm only
-                    puts files on disk, the gateway keeps its own plugin ledger,
-                    and the scan happens between the user and WeChat. */}
+                {/* The plugin lives in the gateway's own ledger, not in npm's
+                    prefix: registering it is what makes ``message send`` know
+                    the channel. */}
                 <div className="install-head" style={{ marginTop: 10 }}>
                   <span className="card-title" style={{ fontSize: 12 }}>
-                    微信通道
+                    企业微信渠道
                   </span>
                   <span className="faint" style={{ fontSize: 11 }}>
                     {!channel
                       ? "检测中…"
                       : channel.state === "ready"
-                        ? "已绑定，可直接推送"
+                        ? "长连接已就绪，可直接推送"
                         : channel.state === "installed"
-                          ? "插件已注册，尚未扫码绑定"
+                          ? "插件已装，尚未填写 Bot ID / Secret"
                           : channel.state === "missing"
                             ? channel.cli
                               ? "插件未注册到网关"
@@ -1234,26 +1002,14 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                             : "状态未知"}
                   </span>
                   <span className="spacer" />
-                  {channel?.configured && (
-                    <>
-                      <button
-                        type="button"
-                        className="btn-sm"
-                        disabled={channelBusy}
-                        onClick={() => void completeBind()}
-                      >
-                        完成绑定并开启通知
-                      </button>
-                      <button
-                        type="button"
-                        className="btn-sm"
-                        disabled={channelBusy}
-                        onClick={() => void logoutAccount()}
-                      >
-                        解绑账号
-                      </button>
-                    </>
-                  )}
+                  <button
+                    type="button"
+                    className="btn-sm primary"
+                    disabled={channelBusy || install?.running || !install?.available}
+                    onClick={() => void registerChannel()}
+                  >
+                    注册企业微信插件
+                  </button>
                   <button
                     type="button"
                     className="btn-sm"
@@ -1265,118 +1021,19 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                 </div>
                 {channel?.state === "missing" && channel.cli && (
                   <div className="verdict bad">
-                    npm 装好了，但网关还不认识微信渠道。请先点“注册插件”。
+                    网关还不认识企业微信渠道。请先点“注册企业微信插件”。
                   </div>
                 )}
-                {/* The last step is on the phone, and nothing else in the app can
-                    stand in for it: WeChat only allows a bot to reply inside a
-                    conversation the user opened first. */}
-                {channel?.configured && channel.has_context === false && (
+                {channel?.state === "installed" && (
                   <div className="verdict bad">
-                    还差一步：请在手机微信里打开 ClawBot，随便发一条消息（例如 hi）。
-                    微信只允许机器人回复你已开启的会话，会话建立前推送不会送达。
-                    发完点“刷新状态”，这里会变成已就绪。
-                  </div>
-                )}
-                <div className="install-head">
-                  <button
-                    type="button"
-                    className="btn-sm"
-                    disabled={channelBusy || install?.running || !install?.available}
-                    onClick={() => void registerChannel()}
-                  >
-                    注册微信插件
-                  </button>
-                  <button
-                    type="button"
-                    className="btn-sm primary"
-                    disabled={channelBusy || channel?.plugin === false}
-                    onClick={() => void openLogin()}
-                  >
-                    扫码授权
-                  </button>
-                  <button
-                    type="button"
-                    className="btn-sm"
-                    disabled={channelBusy || channel?.plugin === false}
-                    onClick={() => void openLoginTerminal()}
-                  >
-                    在终端中打开
-                  </button>
-                  <span className="faint" style={{ fontSize: 11 }}>
-                    二维码直接显示在本页，用手机微信扫描即可。
-                  </span>
-                </div>
-                {/* The CLI draws its code with half-block characters, which only
-                    scan when the terminal font renders them square. cmd.exe uses
-                    a raster font, so the code came out distorted; the link it
-                    prints is what this panel turns into a real image. */}
-                {login && login.state !== "idle" && (
-                  <div className="install-head" style={{ alignItems: "flex-start" }}>
-                    <div>
-                      {login.has_qr && (login.state === "waiting" || login.state === "starting") ? (
-                        <>
-                          <img
-                            // Keyed on the server's revision: the wizard
-                            // refreshes an expiring code on its own, and the
-                            // page must show the new one instead of the dead
-                            // SVG the browser already cached.
-                            src={`/api/install/openclaw/login/qr.svg?n=${qrNonce}-${login.revision}`}
-                            alt="微信扫码登录二维码"
-                            width={220}
-                            height={220}
-                            style={{ background: "#fff", borderRadius: 8, padding: 8 }}
-                          />
-                          <div className="faint" style={{ fontSize: 11, marginTop: 6 }}>
-                            打开微信「扫一扫」，扫描上方二维码完成绑定。
-                          </div>
-                          <div className="install-head" style={{ marginTop: 6 }}>
-                            <button
-                              type="button"
-                              className="btn-sm"
-                              disabled={channelBusy}
-                              onClick={() => void openLogin(true)}
-                            >
-                              刷新二维码
-                            </button>
-                            <button
-                              type="button"
-                              className="btn-sm"
-                              disabled={channelBusy}
-                              onClick={() => void cancelLogin()}
-                            >
-                              取消
-                            </button>
-                          </div>
-                          {login.url && (
-                            <div className="faint" style={{ fontSize: 11, marginTop: 6 }}>
-                              手机无法扫码时，可在微信中打开：
-                              <a href={login.url} target="_blank" rel="noreferrer">
-                                授权链接
-                              </a>
-                            </div>
-                          )}
-                        </>
-                      ) : login.state === "done" ? (
-                        <div className="verdict ok">扫码授权完成，微信通道已绑定。</div>
-                      ) : login.state === "expired" ? (
-                        <div className="verdict bad">
-                          二维码已过期。请点“扫码授权”重新生成。
-                        </div>
-                      ) : login.state === "canceled" ? (
-                        <div className="hint">已取消本次扫码授权。</div>
-                      ) : (
-                        <div className="verdict bad">{login.error || "扫码登录失败。"}</div>
-                      )}
-                      {login.state === "failed" && login.lines.length > 0 && (
-                        <pre className="install-cmd">{login.lines.join("\n")}</pre>
-                      )}
-                    </div>
+                    插件已装，但还没有 Bot ID / Secret：在
+                    ~/.openclaw/openclaw.json 的 channels.wecom 里填上，再重启网关。
                   </div>
                 )}
                 {channelNote && <div className="hint">{channelNote}</div>}
-                {/* The gateway is its own process: a channel can be perfectly
-                    configured and still deliver nothing while it is down. */}
+                {/* The gateway is its own process: the long connection lives
+                    inside it, so a configured channel still delivers nothing
+                    while it is down. */}
                 <div className="install-head" style={{ marginTop: 8 }}>
                   <span className="faint" style={{ fontSize: 11 }}>
                     {!channel?.gateway
@@ -1445,8 +1102,9 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                 </div>
               )}
               <div className="hint">
-                推送经由本机 OpenClaw 网关转给微信。先在微信「设置 → 插件 → ClawBot」中完成扫码绑定，
-                再填入通道返回的会话 ID；“发送测试”使用的就是上面填写的内容，无需先保存。
+                推送经由本机 OpenClaw 网关的长连接直接送到企业微信智能机器人，没有二维码、
+                也不会过期；“接收人”填企业微信里的成员 userid，对方先给机器人发过消息，
+                推送才送得进去。“发送测试”用的就是上面填写的内容，无需先保存。
               </div>
             </div>
           </div>

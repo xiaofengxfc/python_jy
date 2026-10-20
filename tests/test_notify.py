@@ -40,12 +40,12 @@ def captured(monkeypatch) -> dict:
 
 
 def _notifier(**overrides) -> WeChatNotifier:
-    settings = NotifySettings(enabled=True, target="wxid-123", **overrides)
+    settings = NotifySettings(enabled=True, target="XiaoJiaJian", **overrides)
     return WeChatNotifier(settings, timeout=1.0)
 
 
 def test_disabled_notifier_queues_nothing() -> None:
-    notifier = WeChatNotifier(NotifySettings(enabled=False, target="wxid-123"))
+    notifier = WeChatNotifier(NotifySettings(enabled=False, target="XiaoJiaJian"))
     assert notifier.notify("hello") is False
     assert notifier.status()["pending"] == 0
 
@@ -57,33 +57,23 @@ def test_default_timeout_outlasts_a_real_send() -> None:
     reported a timeout while the message actually reached WeChat — which is
     exactly what "扫码登录成功但无法通知" looked like from the page.
     """
-    notifier = WeChatNotifier(NotifySettings(enabled=True, target="wxid-123"))
+    notifier = WeChatNotifier(NotifySettings(enabled=True, target="XiaoJiaJian"))
     assert notifier.timeout >= 60.0
 
 
-def test_empty_target_falls_back_to_the_bound_account(captured, monkeypatch) -> None:
-    """A completed scan already knows where to deliver, so nothing to type.
-
-    The plugin stores the scanning account's WeChat id; with exactly one bound
-    account that id is the recipient. Requiring the user to copy it by hand was
-    the reason notifications stayed silent right after a successful login.
-    """
-    monkeypatch.setattr(
-        "btrader.notify._bound_wechat_target",
-        lambda: {"target": "abc@im.wechat", "account": "acc-1", "source": "account"},
+def test_the_account_travels_with_the_target(captured) -> None:
+    """企业微信可能绑定多个机器人账号，账号随目标一起下发。"""
+    notifier = WeChatNotifier(
+        NotifySettings(enabled=True, target="XiaoJiaJian", account="default"), timeout=1.0
     )
-    notifier = WeChatNotifier(NotifySettings(enabled=True, target=""), timeout=1.0)
     notifier.send_now("hello")
     args = captured["args"]
-    assert args[args.index("--target") + 1] == "abc@im.wechat"
-    # The account travels with it: a send without ``--account`` fails once the
-    # gateway has more than one binding.
-    assert args[args.index("--account") + 1] == "acc-1"
+    assert args[args.index("--target") + 1] == "XiaoJiaJian"
+    assert args[args.index("--account") + 1] == "default"
 
 
-def test_ambiguous_bindings_still_refuse_an_empty_target(captured, monkeypatch) -> None:
-    """Two accounts means no safe default; guessing could deliver elsewhere."""
-    monkeypatch.setattr("btrader.notify._bound_wechat_target", lambda: None)
+def test_an_empty_target_refuses_instead_of_guessing(captured) -> None:
+    """没有 userid 就发不出去：猜一个可能把消息投给别人。"""
     notifier = WeChatNotifier(NotifySettings(enabled=True, target=""), timeout=1.0)
     with pytest.raises(NotifyError):
         notifier.send_now("hello")
@@ -105,9 +95,8 @@ def test_empty_message_is_ignored() -> None:
     assert _notifier().notify("   ") is False
 
 
-def test_task_events_can_be_switched_off(captured, monkeypatch) -> None:
+def test_task_events_can_be_switched_off(captured) -> None:
     """任务通知 is its own toggle: fills can stay on while tasks stay quiet."""
-    monkeypatch.setattr("btrader.notify._bound_wechat_target", lambda: None)
     notifier = _notifier(on_task=False)
     try:
         assert notifier.notify("回测完成", kind="task") is False
@@ -121,20 +110,16 @@ def test_format_task_puts_the_title_first_and_skips_empty_lines() -> None:
     assert text.splitlines() == ["【回测完成】", "BTCUSDT 1h", "收益 +2.10%"]
 
 
-def test_send_now_requires_a_target(monkeypatch) -> None:
-    # Pin "nothing is bound": without this the test would read the real
-    # ``~/.openclaw`` state and pass or fail depending on the developer's own
-    # WeChat binding.
-    monkeypatch.setattr("btrader.notify._bound_wechat_target", lambda: None)
+def test_send_now_requires_a_target() -> None:
     notifier = WeChatNotifier(NotifySettings(enabled=True, target=""))
-    with pytest.raises(NotifyError, match="接收目标"):
+    with pytest.raises(NotifyError, match="接收人"):
         notifier.send_now("hello")
 
 
 def test_send_now_reports_a_missing_cli(monkeypatch) -> None:
     monkeypatch.setattr("btrader.notify.shutil.which", lambda name: None)
     notifier = WeChatNotifier(
-        NotifySettings(enabled=True, target="wxid-123", command="definitely-not-installed")
+        NotifySettings(enabled=True, target="XiaoJiaJian", command="definitely-not-installed")
     )
     with pytest.raises(NotifyError, match="未找到"):
         notifier.send_now("hello")
@@ -142,7 +127,7 @@ def test_send_now_reports_a_missing_cli(monkeypatch) -> None:
 
 def test_send_now_builds_the_openclaw_message_command(captured) -> None:
     notifier = WeChatNotifier(
-        NotifySettings(enabled=True, target="wxid-123", command="openclaw")
+        NotifySettings(enabled=True, target="XiaoJiaJian", command="openclaw")
     )
     # Resolve the command explicitly so the test does not depend on PATH.
     notifier._resolve_command = lambda: "openclaw"  # type: ignore[method-assign]
@@ -150,8 +135,8 @@ def test_send_now_builds_the_openclaw_message_command(captured) -> None:
     assert result["ok"] is True
     args = captured["args"]
     assert args[:3] == ["openclaw", "message", "send"]
-    assert "--channel" in args and args[args.index("--channel") + 1] == "openclaw-weixin"
-    assert args[args.index("--target") + 1] == "wxid-123"
+    assert "--channel" in args and args[args.index("--channel") + 1] == "wecom"
+    assert args[args.index("--target") + 1] == "XiaoJiaJian"
     assert args[args.index("--message") + 1] == "成交了"
     # The worker must never block the caller waiting on a shell.
     assert captured["kwargs"]["shell"] is False
@@ -160,7 +145,7 @@ def test_send_now_builds_the_openclaw_message_command(captured) -> None:
 def test_account_is_only_passed_when_set(captured) -> None:
     """One bound account needs no ``--account``; two do, or the plugin refuses."""
     notifier = WeChatNotifier(
-        NotifySettings(enabled=True, target="wxid-123", command="openclaw")
+        NotifySettings(enabled=True, target="XiaoJiaJian", command="openclaw")
     )
     notifier._resolve_command = lambda: "openclaw"  # type: ignore[method-assign]
     notifier.send_now("hello")
@@ -171,15 +156,15 @@ def test_account_is_only_passed_when_set(captured) -> None:
     assert captured["args"][captured["args"].index("--account") + 1] == "abc-im-bot"
 
 
-def test_target_warning_names_the_expected_suffix() -> None:
+def test_target_warning_catches_a_personal_wechat_id() -> None:
+    """从个人微信迁过来的人最容易把 wxid 当 userid 填进去。"""
     from btrader.notify import normalize_target, target_warning
 
     assert target_warning("") == ""
-    warning = target_warning("wxid-123")
-    assert "@im.wechat" in warning
-    assert target_warning("wxid-123@im.wechat") == ""
-    # A pasted ``weixin:`` prefix is stripped rather than sent as part of the id.
-    assert normalize_target("weixin: wxid-9 ") == "wxid-9"
+    assert target_warning("XiaoJiaJian") == ""
+    assert "userid" in target_warning("wxid-123@im.wechat")
+    # A pasted channel prefix is stripped rather than sent as part of the id.
+    assert normalize_target("wecom: XiaoJiaJian ") == "XiaoJiaJian"
 
 
 

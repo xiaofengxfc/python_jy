@@ -222,7 +222,7 @@ export interface NotifyStatus {
   account: string;
   command: string;
   available: boolean;
-  /** Non-empty when the target cannot match a WeChat conversation. */
+  /** Non-empty when the target does not look like a 企业微信 userid. */
   target_warning: string;
   last_error: string;
   /** Unix seconds of the last failure, 0 when there has not been one. */
@@ -234,12 +234,6 @@ export interface NotifyStatus {
   spooled: number;
   /** Seconds the channel is paused for after repeated failures; 0 = not paused. */
   breaker_seconds: number;
-  /** WeChat login verdict. `expired` means pushes are dropped until a rescan. */
-  session: {
-    state: "ok" | "expired" | "missing" | "unknown" | string;
-    detail: string;
-    account: string;
-  };
 }
 
 /** State of the "install OpenClaw" helper. */
@@ -281,68 +275,28 @@ export interface GatewayStatus {
   started_at: number;
 }
 
-/** One WeChat account bound to the gateway. */
-export interface WeChatAccount {
-  account: string;
-  /** The WeChat id that scanned the QR; also a valid push target. */
-  user: string;
-  base_url: string;
-}
-
-/** A recipient id an outbound message can be addressed to. */
-export interface WeChatTarget {
-  target: string;
-  account: string;
-  /** peer: has messaged the bot; account: the scanner's own id. */
-  source: string;
-}
-
-/** What the gateway says about the WeChat channel itself. */
+/** What the gateway says about the 企业微信 channel itself. */
 export interface ChannelStatus {
   channel: string;
   /** The `openclaw` CLI exists. */
   cli: boolean;
   /** The gateway has the plugin in its catalog (even if not configured). */
   plugin: boolean;
-  /** An account is linked, i.e. the QR scan has been done. */
+  /** Bot ID and Secret are filled in, so the long connection can authenticate. */
   configured: boolean;
-  /** The channel's monitor is live in the gateway. */
+  /** The long connection is live inside the gateway process. */
   running: boolean;
   /** The plugin is enabled. */
   enabled: boolean;
   /** Gateway-reported lifecycle, e.g. "starting" or "running". */
   lifecycle: string;
-  /** Account id currently bound (matches `--account`). */
+  /** Plugin account id currently active. */
   account: string;
-  accounts: WeChatAccount[];
-  targets: WeChatTarget[];
-  /**
-   * A conversation exists (the user has messaged the bot), so a push can
-   * actually reach the phone. A bound account alone is not enough.
-   */
-  has_context: boolean;
   /** missing | installed | ready | unknown */
   state: string;
   /** One-line summary for the card, or the raw CLI excerpt as a fallback. */
   detail: string;
   gateway?: GatewayStatus;
-}
-
-/** The link the WeChat login QR encodes, as printed by the CLI. */
-export interface LoginStatus {
-  /** idle | starting | waiting | done | failed | canceled | expired */
-  state: string;
-  /** The encoded link. Rendered as an image; also offered as a fallback. */
-  url: string;
-  /** A code is available to display right now. */
-  has_qr: boolean;
-  /** Bumped whenever the wizard prints a refreshed code. */
-  revision: number;
-  error: string;
-  command: string[];
-  started_at: number;
-  /** Tail of the CLI's output, for the failure case. */
-  lines: string[];
 }
 
 export interface CredentialItem {
