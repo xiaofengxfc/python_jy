@@ -2432,3 +2432,227 @@ main.main > .auto-head:not(.page-head) {
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+/* ============================================================
+   AI 自主交易 · 量化（交易页内嵌面板）
+   与 .auto-section 同宽：左列控制/概览，右列决策事件，窄屏落成一列。
+   ============================================================ */
+main.main > .ai-section:not(.page-head) {
+  width: 100%;
+  max-width: none;
+  margin-left: 0;
+  margin-right: 0;
+}
+
+.ai-section {
+  display: grid;
+  grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+  margin-top: 12px;
+}
+
+/* The head and the banners are rendered as siblings of the two columns, so
+   they need to span the whole grid instead of landing in one cell. */
+.ai-section > .ai-head,
+.ai-section > .banner {
+  grid-column: 1 / -1;
+}
+
+.ai-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: var(--radius);
+  background: var(--bg);
+}
+
+.ai-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.ai-col {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+/* 急停 is the one red control: it is not a trade direction, it is a stop. */
+.ai-danger {
+  background: var(--down);
+  border-color: var(--down);
+  color: #ffffff;
+}
+
+.ai-danger:not(:disabled):hover {
+  background: var(--down);
+  border-color: var(--down);
+  filter: brightness(0.94);
+}
+
+.ai-badge-halt {
+  border-color: color-mix(in srgb, var(--down) 35%, var(--border));
+  color: var(--down);
+}
+
+.ai-dot-halt {
+  background: var(--down);
+}
+
+.ai-stats {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.ai-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 9px 11px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle);
+}
+
+.ai-stat-label {
+  color: var(--text-3);
+  font-size: 11px;
+}
+
+.ai-stat-value {
+  color: var(--text);
+  font-size: 16px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.ai-stat-value em {
+  color: var(--text-3);
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 400;
+}
+
+.ai-config-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* 事件流：沿用 .feed / .feed-row 的三列网格，只限制高度并给结果上色。 */
+.ai-feed {
+  max-height: 420px;
+  overflow-y: auto;
+}
+
+.ai-tag.order {
+  color: var(--up);
+}
+
+.ai-tag.reject {
+  color: var(--down);
+}
+
+.ai-tag.skip {
+  color: var(--warn);
+}
+
+.ai-tag.info {
+  color: var(--text-3);
+}
+
+.ai-reason {
+  color: var(--text-3);
+  font-size: 11px;
+}
+
+/* 审计抽屉：右侧滑出的整高面板，点遮罩或按 Esc 关闭。 */
+.ai-drawer-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 95;
+  display: flex;
+  justify-content: flex-end;
+  background: rgba(0, 0, 0, 0.28);
+}
+
+.ai-drawer {
+  display: flex;
+  flex-direction: column;
+  width: min(640px, 100%);
+  height: 100%;
+  min-width: 0;
+  background: var(--bg);
+  box-shadow: -12px 0 32px rgba(0, 0, 0, 0.16);
+}
+
+.ai-drawer-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  height: 42px;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.ai-drawer-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.ai-drawer-error {
+  margin: 12px;
+}
+
+.ai-audit-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.ai-audit-row:hover {
+  background: var(--bg-subtle);
+}
+
+.ai-audit-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+
+.ai-audit-time {
+  color: var(--text-3);
+  font-size: 11px;
+}
+
+.ai-audit-meta {
+  color: var(--text-3);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.ai-audit-text {
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 1100px) {
+  .ai-section {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

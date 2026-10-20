@@ -5,6 +5,7 @@ import { foldTick } from "../liveCandle";
 import { useMarketStream } from "../hooks/useMarketStream";
 import type { Account, AILevel, Candle, Health, SymbolInfo } from "../types";
 import AIPanel from "../components/AIPanel";
+import AITradePanel from "../components/AITradePanel";
 import BottomTabs from "../components/BottomTabs";
 import AutoPage from "./AutoPage";
 import Chart, {
@@ -804,10 +805,18 @@ export default function TradingPage({
           timeframe, right under the chart it trades. */}
       <AutoPage embedded market={market} symbol={symbol} timeframe={timeframe} />
 
+      {/* AI 自主交易：模型自己看盘、自己决策，和上面的策略自动交易互斥运行
+          （共用交易权租约）。同样跟随图表上的交易对与周期。 */}
+      <section className="ai-section">
+        <AITradePanel market={market} symbol={symbol} timeframe={timeframe} />
+      </section>
+
       {/* The AI panel used to be the first card of the right rail, where a long
           answer was clipped to two lines and could not be read at all. It is a
           floating window now: draggable, resizable, collapsible, and open by
-          default so the analysis is visible without hunting for it. */}
+          default so the analysis is visible without hunting for it. While the
+          window is open it would cover this section in headless screenshots,
+          so the verification script closes it first. */}
       <FloatingWindow
         title={`AI 分析 · ${symbol || "—"}`}
         open={aiWindowOpen}
