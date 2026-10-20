@@ -39,7 +39,7 @@ GATEWAY_PORT = 18789
 # budget killed the gateway on anything slower than this dev box. The wait runs
 # in the startup thread and never blocks trading, so the cost of being generous
 # is only how long a genuinely broken start takes to report.
-START_TIMEOUT = 60.0
+START_TIMEOUT = 180.0
 PROBE_TIMEOUT = 0.35
 # ``openclaw config get/set`` is a Node process too, so it is not instant.
 CONFIG_TIMEOUT = 30.0
@@ -132,6 +132,12 @@ class GatewaySupervisor:
                 process.wait(timeout=5)
         except Exception:  # pragma: no cover - best effort on exit
             log.debug("停止 OpenClaw 网关失败", exc_info=True)
+        # The socket (and the startup lock) outlive the process for a moment.
+        # Returning immediately makes an immediate restart race that lock and
+        # fail with "gateway-lock", so wait for the port to actually close.
+        deadline = time.time() + 10.0
+        while time.time() < deadline and self._reachable():
+            time.sleep(0.2)
         if owned:
             with self._lock:
                 self._info = _Gateway(state="idle")
@@ -175,6 +181,15 @@ class GatewaySupervisor:
             return self.status()
 
         code = process.poll()
+        # A gateway that was killed (app shutdown, a failed restart, a taskkill)
+        # leaves its startup lock behind for a few seconds. The next launch then
+        # exits 1 right after ``gateway-lock``, which reads like a permanent
+        # failure; wait for the lock to clear and try once more.
+        if not retried and self._died_on_gateway_lock():
+            log.info("网关启动锁尚未释放，等待后重试")
+            self._note("[biTrader] 网关启动锁未释放，3 秒后重试")
+            time.sleep(3.0)
+            return self._spawn(exe, retried=True)
         # A refusal to start because ``gateway.mode`` was never authored is the
         # one failure this app can fix by itself: it already installs OpenClaw
         # and registers the WeChat plugin, and ``openclaw doctor`` prescribes
@@ -187,6 +202,17 @@ class GatewaySupervisor:
                 return self._spawn(exe, retried=True)
 
         return self._report_failure(process, code, args)
+
+    def _died_on_gateway_lock(self) -> bool:
+        """The last launch ended at the gateway-lock startup phase.
+
+        Checked on output rather than exit code alone: every early failure exits
+        1, and only this one is transient (the lock belongs to a process that is
+        still dying).
+        """
+        with self._lock:
+            tail = list(self._output)[-8:]
+        return any("gateway-lock" in line for line in tail)
 
     def _launch(self, args: list[str]) -> subprocess.Popen | None:
         """Spawn ``openclaw gateway run`` with its output captured."""

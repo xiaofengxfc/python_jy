@@ -326,7 +326,7 @@ class WeChatNotifier:
         stdout = (completed.stdout or "").strip()
         if completed.returncode != 0:
             detail = (completed.stderr or stdout or "").strip()
-            raise NotifyError(detail[:500] or f"OpenClaw 返回退出码 {completed.returncode}")
+            raise NotifyError(_explain_failure(detail, completed.returncode))
         # A non-zero exit is not the only failure mode: a suppressed or partially
         # delivered send exits nonzero too, but a gateway that answers with
         # ``{"ok": false}`` and status 0 must not be reported as success.
@@ -495,6 +495,30 @@ def normalize_target(raw: str) -> str:
     if text.lower().startswith("weixin:"):
         text = text.split(":", 1)[1].strip()
     return text
+
+
+def _explain_failure(detail: str, code: int) -> str:
+    """Turn the CLI's generic failure into something actionable.
+
+    ``The CLI command failed. For help, run openclaw doctor`` is what the plugin
+    prints for every early failure — including "no account is bound", which is
+    by far the most common cause after an unbind. Saying so here is the
+    difference between a dead end and "重新扫码".
+    """
+    text = (detail or "").strip()
+    generic = not text or "CLI command failed" in text
+    if generic:
+        try:
+            from .installer import wechat_accounts
+
+            if not wechat_accounts():
+                return (
+                    "当前没有已绑定的微信账号（可能已解绑或尚未扫码）："
+                    "请到「设置 → 微信通道」重新扫码绑定后再发送。"
+                )
+        except Exception:  # pragma: no cover - best effort
+            pass
+    return text[:500] or f"OpenClaw 返回退出码 {code}"
 
 
 def _bound_wechat_target() -> dict | None:

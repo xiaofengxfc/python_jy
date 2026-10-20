@@ -27,7 +27,7 @@ from ..core.credentials import Credentials
 from ..core.types import TIMEFRAME_SECONDS, MarketType, Network, RunMode
 from ..engine.auto import AutoTrader, AutoTraderConfig
 from ..exchange.rest import BinanceREST
-from ..installer import InstallOptions
+from ..installer import InstallOptions, restart_gateway_process
 from ..notify import WeChatNotifier
 from .. import paths
 
@@ -612,6 +612,36 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
     def gateway_start() -> dict[str, Any]:
         """Start the local gateway without restarting the app."""
         return get_state().ctx.gateway.start()
+
+    @router.post("/api/install/openclaw/gateway/restart")
+    def gateway_restart() -> dict[str, Any]:
+        """Restart the gateway process.
+
+        A channel session lives inside that process: after a scan or an unbind,
+        the running gateway still holds the state it booted with, and only a
+        restart makes the new binding (or its removal) take effect.
+
+        A gateway this app did not spawn is not ours to kill, so it is restarted
+        through the CLI instead; otherwise the button would quietly do nothing
+        on exactly the machine where it matters.
+        """
+        ctx = get_state().ctx
+        if ctx.gateway.status().get("managed"):
+            ctx.gateway.stop()
+            return ctx.gateway.start()
+        code, output = restart_gateway_process()
+        status = ctx.gateway.status()
+        if not status.get("reachable"):
+            # The CLI can refuse — "listener changed before restart" is what it
+            # says when its own bookkeeping is stale — so fall back to launching
+            # a gateway ourselves instead of leaving push dead.
+            status = ctx.gateway.start()
+        if not status.get("reachable"):
+            status = {
+                **status,
+                "error": output.strip()[-300:] or f"openclaw 返回退出码 {code}",
+            }
+        return status
 
     @router.post("/api/install/openclaw/channel")
     def channel_register() -> dict[str, Any]:

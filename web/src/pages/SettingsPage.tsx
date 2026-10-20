@@ -287,6 +287,25 @@ export default function SettingsPage({ settings, onSaved }: Props) {
     }
   };
 
+  const restartGateway = async () => {
+    // The channel session lives inside the gateway process: after a fresh scan
+    // or an unbind, only a restart makes that change take effect there.
+    setChannelBusy(true);
+    setChannelNote("");
+    try {
+      const result = await api<{ state: string; error: string }>(
+        "/api/install/openclaw/gateway/restart",
+        { method: "POST" },
+      );
+      setChannelNote(result.error || "网关已重启。");
+      await loadChannel();
+    } catch (error) {
+      setChannelNote(error instanceof Error ? error.message : String(error));
+    } finally {
+      setChannelBusy(false);
+    }
+  };
+
   const loadInstall = useCallback(async () => {
     try {
       const next = await api<InstallStatus>("/api/install/openclaw");
@@ -1306,6 +1325,16 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                       onClick={() => void startGateway()}
                     >
                       启动网关
+                    </button>
+                  )}
+                  {channel?.gateway?.reachable && (
+                    <button
+                      type="button"
+                      className="btn-sm"
+                      disabled={channelBusy}
+                      onClick={() => void restartGateway()}
+                    >
+                      重启网关
                     </button>
                   )}
                 </div>

@@ -918,6 +918,20 @@ def _forget_account(account: str) -> list[str]:
     return removed
 
 
+def restart_gateway_process() -> tuple[int, str]:
+    """Ask the CLI to restart a gateway this app does not own.
+
+    ``GatewaySupervisor.stop`` deliberately only kills its own child: a gateway
+    started from a terminal (which is what the login wizard leaves behind) keeps
+    running, so "重启网关" would silently do nothing. The CLI's own restart is
+    the one command that works for both.
+    """
+    exe = _openclaw_executable()
+    if not exe:
+        return 1, "未找到 openclaw"
+    return _run_command([exe, "gateway", "restart"], timeout=120.0)
+
+
 def _run_command(args: list[str], timeout: float = 60.0) -> tuple[int, str]:
     """Run a short command and return ``(exit_code, combined output)``."""
     try:
