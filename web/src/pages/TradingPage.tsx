@@ -3,7 +3,8 @@ import { api, query } from "../api";
 import { MARKET_LABELS, TIMEFRAMES, TIMEFRAME_MS, fmtCompact, fmtPrice } from "../format";
 import { foldTick } from "../liveCandle";
 import { useMarketStream } from "../hooks/useMarketStream";
-import type { Account, Candle, Health, SymbolInfo } from "../types";
+import type { Account, AILevel, Candle, Health, SymbolInfo } from "../types";
+import AIPanel from "../components/AIPanel";
 import BottomTabs from "../components/BottomTabs";
 import Chart, {
   INDICATOR_SPECS,
@@ -128,10 +129,23 @@ export default function TradingPage({
   const [pickedPrice, setPickedPrice] = useState<number | null>(null);
   const [restTicker, setRestTicker] = useState<{ high: number; low: number } | null>(null);
   const [actionError, setActionError] = useState("");
+  /** Price levels the AI named for the pair on screen, and whether the chart
+   * should draw them. Hiding rather than clearing keeps a second click cheap:
+   * the analysis is already paid for. */
+  const [aiLevels, setAiLevels] = useState<AILevel[]>([]);
+  const [aiLevelsOn, setAiLevelsOn] = useState(true);
 
   const { ticker, book, connected, tradeVolume, tradeWhen, tradePrice, tradeSeq } =
     useMarketStream(market, symbol);
   const requestId = useRef(0);
+
+  /** The AI panel hands its levels up here; the chart reads them from state, so
+   * a redraw (zoom, resize, live tick) never needs to re-ask the model. */
+  const applyAiLevels = useCallback((levels: AILevel[], owner: string) => {
+    // An empty owner means "clear": the panel does that when the pair changes.
+    setAiLevels(owner ? levels : []);
+    if (owner) setAiLevelsOn(true);
+  }, []);
 
   const marketItems = health?.markets ?? [
     { value: "spot" as const, label: MARKET_LABELS.spot },
@@ -655,6 +669,7 @@ export default function TradingPage({
               indicators={indicators}
               onLoadOlder={() => void loadOlder()}
               olderLoading={olderLoading}
+              aiLevels={aiLevelsOn ? aiLevels : []}
             />
           </div>
 
@@ -672,6 +687,15 @@ export default function TradingPage({
         </div>
 
         <div className="trading-rail">
+          <AIPanel
+            market={market}
+            symbol={symbol}
+            timeframe={timeframe}
+            onLevels={applyAiLevels}
+            showLevels={aiLevelsOn}
+            onShowLevels={setAiLevelsOn}
+          />
+
           <div className="card">
             <div className="card-head">
               <span className="card-title">盘口</span>

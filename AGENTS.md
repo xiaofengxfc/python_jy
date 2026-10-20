@@ -74,3 +74,20 @@ Node 不在 PATH 时：`$env:Path = "D:\tool\node;" + $env:Path`。
   否则接口返回 `errcode 93006 invalid chatid`（目标写错也是这个码）。
 - 网关若由终端启动（`state=external`），本程序只能通过
   `openclaw gateway restart` 重启它。
+
+## 6. AI 助手（`btrader/llm.py` + `btrader/ai.py`）
+
+- 密钥在系统密钥环（service `biTrader-ai`），**不进 `config.json`**；
+  `AISettings` 只存供应商/模型/上限/开关。
+- 分工：`llm.py` 只管收发（多供应商、缓存、审计、限额），`ai.py` 只管提示词与解析，
+  两者都不碰交易。改提示词只动 `ai.py`。
+- 不可破坏的约束（改之前先读 README「AI 助手」一节）：
+  - 模型**不进** `strategy.generate()` / `run_backtest()` 的循环，也不下单；
+  - 回测复核只给**开仓前**的 K 线，`ai.entry_window` 是唯一入口；
+  - 模型给的价位必须过 `ai.validate_levels` 才能画到图上；
+  - 调用失败/答案读不懂时默认**保留**交易（不能因为超时就"策略变好"）；
+  - 自动交易简报走 `ai.BriefQueue`（独立线程、队列满即丢弃），不能阻塞 `_tick()`。
+- 网络注意：币安合约域名在本机不可达，AI 端点统一走 `routes._market_frame`，
+  它和 `/api/klines` 一样会回落到 Gate 永续行情。别在 AI 路由里直接调
+  `ctx.klines.fetch`，否则图表能用而"分析"500。
+- 测试在 `tests/test_ai.py`，全部离线：`FakeLLM` 替身 + `monkeypatch` 密钥环。

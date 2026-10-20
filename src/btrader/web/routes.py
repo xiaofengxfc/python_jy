@@ -21,14 +21,18 @@ from typing import Any, Callable
 from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel, Field
 
+import pandas as pd
+
 from ..backtest import BacktestConfig, grid_search, run_backtest
 from ..core.config import RiskSettings
 from ..core.credentials import Credentials
-from ..core.types import TIMEFRAME_SECONDS, MarketType, Network, RunMode
+from ..core.types import TIMEFRAME_SECONDS, MarketType, Network, RunMode, timeframe_seconds
 from ..engine.auto import AutoTrader, AutoTraderConfig
+from ..exchange import mirror
 from ..exchange.rest import BinanceREST
 from ..installer import InstallOptions, restart_gateway_process
 from ..notify import WeChatNotifier
+from .. import ai, llm
 from .. import paths
 
 log = logging.getLogger(__name__)
@@ -57,6 +61,24 @@ def _market(value: str) -> MarketType:
         return MarketType(value)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"未知市场：{value}") from exc
+
+
+def _explain_async(ctx, events, *, kind: str, detail: str, context: str = "") -> None:
+    """Ask the model what probably happened, in a thread, into the event log.
+
+    Deliberately fire-and-forget: the alert has already been sent, so an
+    explanation is a bonus, and waiting for it would delay whatever raised the
+    alert. Silently does nothing when the assistant is off.
+    """
+    if not ctx.settings.ai.enabled:
+        return
+
+    def run() -> None:
+        result = ai.explain_anomaly(ctx.ai, kind=kind, detail=detail, context=context)
+        if result["ok"] and result["text"]:
+            events.add("ai", "AI", result["text"][:600])
+
+    threading.Thread(target=run, name="ai-explain", daemon=True).start()
 
 
 def _network(value: str | None) -> Network | None:
@@ -92,6 +114,7 @@ class SettingsPayload(BaseModel):
     notification_sound: bool | None = None
     risk: dict[str, Any] | None = None
     notify: dict[str, Any] | None = None
+    ai: dict[str, Any] | None = None
 
 
 class NotifyTestPayload(BaseModel):
@@ -130,6 +153,49 @@ class CredentialsPayload(BaseModel):
     verify: bool = True
 
 
+class AIKeyPayload(BaseModel):
+    key: str = ""
+
+
+class AIAnalyzePayload(BaseModel):
+    symbol: str
+    market: str = "spot"
+    timeframes: list[str] = Field(default_factory=lambda: ["15m", "1h", "4h"])
+    bars: int = Field(default=200, ge=50, le=1000)
+
+
+class AINewsPayload(BaseModel):
+    symbol: str = ""
+    limit: int = Field(default=15, ge=3, le=40)
+
+
+class AIReviewPayload(BaseModel):
+    symbol: str
+    market: str = "spot"
+    timeframe: str = "1h"
+    mode: str = "paper"
+
+
+class AIDescribePayload(BaseModel):
+    strategy: str
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+class AISuggestPayload(BaseModel):
+    idea: str
+    symbol: str = ""
+    market: str = "spot"
+    timeframe: str = "1h"
+
+
+class AIPrejudgePayload(BaseModel):
+    symbol: str
+    market: str = "spot"
+    timeframe: str = "1h"
+    side: str = "buy"
+    quote: float = Field(default=0.0, ge=0)
+
+
 class AutoStartPayload(BaseModel):
     symbol: str
     market: str = "spot"
@@ -165,6 +231,16 @@ class OptimizePayload(BacktestPayload):
     grid: dict[str, list[Any]] = Field(default_factory=dict)
     metric: str = "sharpe"
     top_n: int = Field(default=30, ge=1, le=200)
+
+
+class AIFilterPayload(BacktestPayload):
+    """A backtest plus the cap on how many entries the model may review.
+
+    Every review is one paid call, so the cap is part of the request rather than
+    a hidden constant: the page shows the number it is about to spend.
+    """
+
+    limit: int = Field(default=40, ge=1, le=200)
 
 
 # ------------------------------------------------------------------ event log
@@ -207,6 +283,9 @@ class AutoController:
         # Loop errors repeat every poll; the phone should hear about a broken
         # strategy once, not once per tick.
         self._error_notified_at = 0.0
+        # AI briefings run here, never on the trading thread: a model that takes
+        # 20 s must not delay the next candle check.
+        self.briefs = ai.BriefQueue()
 
     @property
     def running(self) -> bool:
@@ -259,6 +338,9 @@ class AutoController:
             trader.on_log(lambda level, message: self._on_log(ctx, level, message))
             trader.on_signal(self._on_signal)
             trader.on_state(lambda running: self._on_state(ctx, running))
+            trader.on_candle(lambda bars, target, changed, price: self._on_candle(
+                ctx, config, bars, target, changed, price
+            ))
             self._trader = trader
             self.config = {
                 "symbol": config.symbol,
@@ -327,6 +409,44 @@ class AutoController:
             return
         self._error_notified_at = now
         _notify_task(ctx, "自动交易异常", [message[:300]])
+        # ...and let the model explain it once, next to the alert.
+        _explain_async(ctx, self.events, kind="自动交易循环异常", detail=message)
+
+    def _on_candle(self, ctx, config, bars, target: float, changed: bool, price: float) -> None:
+        """One AI briefing per closed candle, off the trading thread.
+
+        ``submit`` returns immediately: the queue owns its own worker, so a slow
+        model delays a message, never the next candle check.
+        """
+        settings = ctx.settings.ai
+        if not settings.enabled or not settings.auto_brief:
+            return
+
+        def run() -> None:
+            result = ai.briefing(
+                ctx.ai,
+                symbol=config.symbol,
+                timeframe=config.timeframe,
+                frame=bars,
+                target=target,
+                target_delta=changed,
+                mode=config.mode.label,
+            )
+            if not result["ok"]:
+                log.debug("AI 简报失败：%s", result.get("error"))
+                return
+            self.events.add("ai", "AI", result["text"][:600])
+            safe = target >= 0
+            _notify_task(
+                ctx,
+                "AI 收盘简报",
+                [f"{config.symbol} {config.timeframe} · 收盘价 {price:,.4f}"]
+                + [line for line in result["text"].splitlines() if line.strip()][:6],
+            )
+            _ = safe
+
+        if not self.briefs.submit({"run": run}):
+            log.debug("AI 简报队列已满，跳过这一根")
 
 
 # ------------------------------------------------------------------ backtests
@@ -546,6 +666,10 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
             candidate = replace(settings.notify)
             _apply_notify(candidate, payload.notify)
             settings.notify = candidate
+        if payload.ai is not None:
+            candidate_ai = replace(settings.ai)
+            _apply_ai(candidate_ai, payload.ai)
+            settings.ai = candidate_ai
 
         ctx.save_settings()
         return {"ok": True, "settings": settings.to_dict()}
@@ -573,6 +697,241 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
         risk.clear_halt()
         log.warning("风控熔断已手动解除，日内基准重置")
         return risk.snapshot()
+
+    # --------------------------------------------------------------- ai
+    @router.get("/api/ai/status")
+    def ai_status() -> dict[str, Any]:
+        """Provider, model, whether a key is set, and today's usage."""
+        return get_state().ctx.ai.status()
+
+    @router.post("/api/ai/key")
+    def ai_set_key(payload: AIKeyPayload) -> dict[str, Any]:
+        """Store the API key in the OS keyring, never in ``config.json``."""
+        ctx = get_state().ctx
+        if not ctx.ai.set_key(payload.key):
+            raise HTTPException(
+                status_code=400, detail="写入系统密钥环失败，请检查系统凭据服务是否可用。"
+            )
+        return ctx.ai.status()
+
+    @router.post("/api/ai/test")
+    def ai_test() -> dict[str, Any]:
+        """One tiny round trip, so "配置对不对" is answered before it matters."""
+        ctx = get_state().ctx
+        result = ctx.ai.ask(
+            "只回复两个字：可用", system="你是一个连通性测试，只回复用户要求的内容。", kind="test"
+        )
+        if not result["ok"]:
+            raise HTTPException(status_code=400, detail=result["error"])
+        return result
+
+    @router.post("/api/ai/analyze")
+    def ai_analyze(payload: AIAnalyzePayload) -> dict[str, Any]:
+        """Multi-timeframe read of one symbol, plus the levels the chart draws.
+
+        The levels are range-checked against the same candles that were sent, so
+        a line that appears on the chart is always inside the traded range.
+        """
+        ctx = get_state().ctx
+        state = get_state()
+        market = _market(payload.market)
+        symbol = payload.symbol.strip()
+        if not symbol:
+            raise HTTPException(status_code=400, detail="请先选择交易对")
+        timeframes = payload.timeframes or ["15m", "1h", "4h"]
+        frames: dict[str, Any] = {}
+        for timeframe in timeframes[:3]:
+            if timeframe not in TIMEFRAME_SECONDS:
+                raise HTTPException(status_code=400, detail=f"不支持的周期：{timeframe}")
+            frame = _market_frame(state, ctx, market, symbol, timeframe, payload.bars)
+            if frame is not None and not frame.empty:
+                frames[timeframe] = _closed_only(frame, timeframe)
+        if not frames:
+            raise HTTPException(status_code=400, detail="没有取到 K 线，请检查交易对与周期")
+        result = ai.analyze_klines(
+            ctx.ai, symbol=symbol, frames=frames, market_label=market.label
+        )
+        if not result["ok"]:
+            raise HTTPException(status_code=400, detail=result["error"])
+        result["symbol"] = symbol
+        result["market"] = market.value
+        result["price"] = float(frames[next(iter(frames))]["close"].iloc[-1])
+        return result
+
+    @router.post("/api/ai/news")
+    def ai_news(payload: AINewsPayload) -> dict[str, Any]:
+        """Score the headlines the news panel already fetched."""
+        ctx = get_state().ctx
+        snapshot = ctx.news.snapshot(payload.symbol, limit=payload.limit)
+        result = ai.analyze_news(
+            ctx.ai, symbol=payload.symbol or "市场", items=snapshot.get("items") or []
+        )
+        if not result["ok"]:
+            raise HTTPException(status_code=400, detail=result["error"])
+        return result
+
+    @router.post("/api/ai/review")
+    def ai_review(payload: AIReviewPayload) -> dict[str, Any]:
+        """Is the open position consistent with the risk settings?
+
+        Reading the position is only done when the user allowed it: balances and
+        P/L are private, and this endpoint is a manual click, not a background
+        job.
+        """
+        ctx = get_state().ctx
+        state = get_state()
+        market = _market(payload.market)
+        symbol = payload.symbol.strip()
+        if not symbol:
+            raise HTTPException(status_code=400, detail="请先选择交易对")
+        if not ctx.settings.ai.share_position:
+            raise HTTPException(
+                status_code=400,
+                detail="持仓与盈亏属于隐私数据：请先在设置里允许“把持仓发送给模型”。",
+            )
+        position: dict[str, Any] = {}
+        try:
+            account = ctx.trading.paper.account if payload.mode != "live" else None
+            if account is not None:
+                held = account.positions.get(symbol)
+                if held:
+                    position = {
+                        "side": "long" if held.contracts >= 0 else "short",
+                        "contracts": held.contracts,
+                        "entry_price": held.entry_price,
+                        "mark_price": held.entry_price,
+                        "unrealized_pnl": 0.0,
+                    }
+        except Exception:  # a missing position is not an error
+            log.debug("读取持仓失败", exc_info=True)
+        frame = None
+        try:
+            frame = _closed_only(
+                _market_frame(state, ctx, market, symbol, payload.timeframe, 200),
+                payload.timeframe,
+            )
+        except HTTPException:
+            frame = None
+        result = ai.review_position(
+            ctx.ai,
+            symbol=symbol,
+            position=position,
+            risk=ctx.trading.risk.snapshot(),
+            frame=frame,
+            timeframe=payload.timeframe,
+        )
+        if not result["ok"]:
+            raise HTTPException(status_code=400, detail=result["error"])
+        return result
+
+    @router.post("/api/ai/prejudge")
+    def ai_prejudge(payload: AIPrejudgePayload) -> dict[str, Any]:
+        """A second opinion on one order, cached per candle and size bucket.
+
+        Never in the order path: the ticket has already been filled in when this
+        is clicked, and the order goes out whether or not the model answers.
+        """
+        ctx = get_state().ctx
+        state = get_state()
+        market = _market(payload.market)
+        symbol = payload.symbol.strip()
+        if not symbol:
+            raise HTTPException(status_code=400, detail="请先选择交易对")
+        frame = _closed_only(
+            _market_frame(state, ctx, market, symbol, payload.timeframe, 200),
+            payload.timeframe,
+        )
+        if frame is None or frame.empty:
+            raise HTTPException(status_code=400, detail="没有取到 K 线，请检查交易对与周期")
+        note = ""
+        if ctx.settings.ai.share_position:
+            held = getattr(ctx.trading.paper.account, "positions", {})
+            item = held.get(symbol) if isinstance(held, dict) else None
+            if item:
+                note = (
+                    f"当前持有 {getattr(item, 'contracts', 0):.6f} 份，"
+                    f"开仓价 {getattr(item, 'entry_price', 0):,.4f}。"
+                )
+        result = ai.prejudge_order(
+            ctx.ai,
+            symbol=symbol,
+            timeframe=payload.timeframe,
+            side=payload.side,
+            quote=payload.quote,
+            frame=frame,
+            position_note=note,
+        )
+        if not result["ok"]:
+            raise HTTPException(status_code=400, detail=result["error"])
+        return result
+
+    @router.get("/api/ai/audit")
+    def ai_audit(limit: int = 50) -> dict[str, Any]:
+        """The audit trail, newest first. Backs the 命中率 panel."""
+        return {"items": llm.audit_tail(max(1, min(limit, 200)))}
+
+    @router.post("/api/ai/describe")
+    def ai_describe(payload: AIDescribePayload) -> dict[str, Any]:
+        """Explain one strategy's code: when it earns, when it bleeds."""
+        ctx = get_state().ctx
+        try:
+            strategy = ctx.strategies.get(payload.strategy)
+        except KeyError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        params = strategy.validate_params(payload.params)
+        source = _strategy_source(strategy)
+        result = ai.describe_strategy(
+            ctx.ai,
+            key=strategy.key,
+            name=strategy.meta.name,
+            description=strategy.meta.description,
+            source=source,
+            params=params,
+        )
+        if not result["ok"]:
+            raise HTTPException(status_code=400, detail=result["error"])
+        return result
+
+    @router.post("/api/ai/suggest")
+    def ai_suggest(payload: AISuggestPayload) -> dict[str, Any]:
+        """Turn a plain-language idea into a strategy key + params.
+
+        Never code: the reply is validated against the strategies that already
+        exist, so nothing new is imported into this process.
+        """
+        ctx = get_state().ctx
+        state = get_state()
+        idea = payload.idea.strip()
+        if not idea:
+            raise HTTPException(status_code=400, detail="请先描述你的想法")
+        market = _market(payload.market)
+        frames: dict[str, Any] = {}
+        if payload.symbol:
+            try:
+                frame = _market_frame(
+                    state, ctx, market, payload.symbol, payload.timeframe, 200
+                )
+                frames[payload.timeframe] = _closed_only(frame, payload.timeframe)
+            except HTTPException:
+                frames = {}
+        catalogue = ctx.strategies.meta_list()
+        # The route serves ``params`` (the JSON-friendly form) while the registry
+        # hands back dataclasses; normalise to the shape the prompt expects.
+        for item in catalogue:
+            item["params_spec"] = [asdict(spec) for spec in item.get("params_spec") or []]
+        result = ai.suggest_strategy(
+            ctx.ai, idea=idea, strategies=catalogue, frames=frames
+        )
+        if not result["ok"]:
+            raise HTTPException(status_code=400, detail=result["error"])
+        # Coerce the model's numbers through the strategy's own spec so an
+        # out-of-range value is clamped rather than silently applied.
+        try:
+            strategy = ctx.strategies.get(result["strategy"])
+            result["params"] = strategy.validate_params(result["params"])
+        except KeyError:
+            pass
+        return result
 
     # ------------------------------------------------------- wechat notify
     @router.get("/api/notify")
@@ -839,6 +1198,16 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
     def backtest_optimize(payload: OptimizePayload) -> dict[str, Any]:
         return _start_optimize(get_state(), jobs, payload)
 
+    @router.post("/api/backtest/ai-filter")
+    def backtest_ai_filter(payload: AIFilterPayload) -> dict[str, Any]:
+        """Replay a backtest's entries through the model and compare both runs.
+
+        The backtest itself is re-run (it is deterministic and cheap) instead of
+        caching frames between requests: that keeps this endpoint stateless, and
+        the trades it judges are exactly the trades the original run produced.
+        """
+        return _start_ai_filter(get_state(), jobs, payload)
+
     @router.get("/api/backtest/jobs/{job_id}")
     def backtest_job(job_id: str) -> dict[str, Any]:
         return jobs.get(job_id)
@@ -906,10 +1275,99 @@ def _apply_notify(target: Any, values: dict[str, Any]) -> None:
         raise HTTPException(
             status_code=400,
             detail=(
-                "开启微信通知前，请先完成扫码绑定（会自动填入接收目标），"
-                "或手动填写接收目标。"
+                "开启企业微信通知前，请先填写接收人 userid"
+                "（企业微信通讯录里的成员账号，且该成员要先给机器人发过一条消息）。"
             ),
         )
+
+
+def _apply_ai(target: Any, values: dict[str, Any]) -> None:
+    """Same contract as :func:`_apply_notify`, for the LLM assistant.
+
+    The API key is deliberately *not* one of these fields: it is written to the
+    OS keyring by ``/api/ai/key`` so it never lands in ``config.json``.
+    """
+    for key, value in values.items():
+        if not hasattr(target, key):
+            log.debug("忽略未知 AI 字段: %s", key)
+            continue
+        current = getattr(target, key)
+        if isinstance(current, bool):
+            setattr(target, key, bool(value))
+            continue
+        try:
+            setattr(target, key, type(current)(value))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"AI 字段 {key} 的值无效") from None
+    if target.daily_limit < 0:
+        raise HTTPException(status_code=400, detail="每日调用上限不能为负")
+
+
+def _market_frame(state, ctx, market, symbol: str, timeframe: str, limit: int):
+    """Candles for analysis, with the same fallback the chart uses.
+
+    The AI endpoints must not fail on exactly the network where the chart still
+    works: Binance's futures domains are unreachable on some connections and
+    ``/api/klines`` silently switches to a perpetual mirror. Analysis of an empty
+    result would be worse than analysis of a slightly different feed — the digest
+    states which prices it was given.
+    """
+    try:
+        with state.locks[market]:
+            return ctx.klines.fetch(market, symbol, timeframe, limit=limit)
+    except Exception as primary:
+        if not mirror.supports(market, timeframe):
+            raise HTTPException(status_code=503, detail=str(primary)) from primary
+        log.warning("币安行情不可用，AI 分析改用备用源：%s", primary)
+        try:
+            rows = mirror.fetch_ohlcv(market, symbol, timeframe, limit=limit)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503, detail=f"无法获取 K 线：{primary}；备用源：{exc}"
+            ) from exc
+        frame = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        if frame.empty:
+            return frame
+        frame["timestamp"] = frame["timestamp"].astype("int64")
+        return frame
+
+
+def _closed_only(frame, timeframe: str):
+    """Drop the still-forming candle.
+
+    Everything the model sees must be a finished bar: an open candle's high/low
+    move after the fact, so an analysis that includes it can be contradicted by
+    the next refresh.
+    """
+    if frame is None or getattr(frame, "empty", True):
+        return frame
+    step = timeframe_seconds(timeframe) * 1000
+    last_open = int(frame["timestamp"].iloc[-1])
+    if last_open + step <= int(time.time() * 1000):
+        return frame
+    return frame.iloc[:-1].reset_index(drop=True)
+
+
+def _strategy_source(strategy) -> str:
+    """The strategy's own file, for the "explain this strategy" prompt."""
+    try:
+        import inspect
+
+        path = inspect.getsourcefile(strategy.__class__)
+        if path:
+            return paths_read(path)
+    except Exception:
+        log.debug("读取策略源码失败", exc_info=True)
+    return ""
+
+
+def paths_read(path: str) -> str:
+    try:
+        from pathlib import Path
+
+        return Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
 
 
 def _validate_backtest(state, payload: BacktestPayload):
@@ -1056,3 +1514,118 @@ def _start_optimize(state, jobs: JobStore, payload: OptimizePayload) -> dict[str
 
     threading.Thread(target=work, name=f"optimize-{job_id}", daemon=True).start()
     return {"job_id": job_id, "status": "running"}
+
+
+def _start_ai_filter(state, jobs: JobStore, payload: AIFilterPayload) -> dict[str, Any]:
+    """Backtest, then re-judge each entry with the model, then compare.
+
+    The model never runs inside ``run_backtest``: it only sees the bars *before*
+    each entry, so the two runs are the same strategy on the same data with one
+    difference — which trades are allowed. That is what makes the comparison
+    mean something.
+    """
+    market, strategy, params, config = _validate_backtest(state, payload)
+    ctx = state.ctx
+    if not ctx.settings.ai.enabled:
+        raise HTTPException(status_code=400, detail="AI 助手未启用，请先在设置里打开。")
+    job_id = jobs.create("ai-filter")
+
+    def work() -> None:
+        try:
+            jobs.update(job_id, progress=0.1)
+            frame = _market_frame(
+                state, ctx, market, payload.symbol, payload.timeframe, payload.bars
+            )
+            if frame.empty:
+                raise ValueError("没有取到 K 线，请检查交易对与周期")
+            result = run_backtest(frame, strategy, params, config)
+            original = {key: _number(value) for key, value in result.metrics.items()}
+            jobs.update(job_id, progress=0.35)
+
+            def progress(index: int, total: int) -> None:
+                jobs.update(job_id, progress=0.35 + 0.6 * index / max(1, total))
+
+            judged = ai.filter_trades(
+                ctx.ai,
+                symbol=payload.symbol,
+                timeframe=payload.timeframe,
+                frame=frame,
+                trades=[trade.as_dict() for trade in result.trades],
+                progress=progress,
+                limit=payload.limit,
+            )
+            if not judged["ok"]:
+                raise ValueError(judged.get("error") or "AI 复核失败")
+
+            filtered = ai.trade_metrics(
+                judged["kept"], float(config.initial_capital)
+            )
+            # Same shape as the original metrics so the table lines up; only the
+            # trade-derived numbers are meaningful for the filtered run.
+            filtered_view = {
+                "trades": filtered["trades"],
+                "total_return": filtered["total_return"],
+                "max_drawdown": filtered["max_drawdown"],
+                "win_rate": filtered["win_rate"],
+                "profit_factor": filtered["profit_factor"],
+                "avg_trade": filtered["avg_trade"],
+                "net_pnl": filtered["net_pnl"],
+            }
+            original_view = {
+                "trades": original.get("trades", 0.0),
+                "total_return": original.get("total_return", 0.0),
+                "max_drawdown": original.get("max_drawdown", 0.0),
+                "win_rate": original.get("win_rate", 0.0),
+                "profit_factor": original.get("profit_factor", 0.0),
+                "avg_trade": original.get("avg_trade", 0.0),
+                "net_pnl": filtered_view["net_pnl"] + 0.0,
+            }
+            # ``net_pnl`` is trade-derived on both sides, so compute it the same
+            # way for the original run instead of mixing units.
+            original_view["net_pnl"] = sum(
+                float(trade.pnl) for trade in result.trades
+            )
+            comparison = ai.compare_runs(original_view, filtered_view)
+
+            jobs.update(
+                job_id,
+                status="done",
+                progress=1.0,
+                result={
+                    "symbol": payload.symbol,
+                    "timeframe": payload.timeframe,
+                    "strategy": payload.strategy,
+                    "params": params,
+                    "original": original_view,
+                    "filtered": filtered_view,
+                    "comparison": comparison,
+                    "judged": judged["judged"],
+                    "total": judged["total"],
+                    "kept": judged["kept_count"],
+                    "failures": judged["failures"],
+                    "truncated": judged["truncated"],
+                },
+            )
+            _notify_task(
+                ctx,
+                "AI 过滤回测完成",
+                [
+                    f"{payload.symbol} {payload.timeframe} · {payload.strategy}",
+                    f"复核 {judged['total']} 笔，保留 {judged['kept_count']} 笔",
+                    f"收益 {original_view['total_return']:+.2%} → "
+                    f"{filtered_view['total_return']:+.2%}",
+                    comparison["verdict"],
+                ],
+            )
+        except Exception as exc:
+            log.warning("AI 过滤回测失败: %s", exc, exc_info=True)
+            jobs.update(job_id, status="error", error=str(exc) or exc.__class__.__name__)
+            _notify_task(
+                ctx,
+                "AI 过滤回测失败",
+                [f"{payload.symbol} {payload.timeframe} · {payload.strategy}", str(exc)],
+            )
+
+    threading.Thread(target=work, name=f"ai-filter-{job_id}", daemon=True).start()
+    return {"job_id": job_id, "status": "running"}
+

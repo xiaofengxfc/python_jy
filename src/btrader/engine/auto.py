@@ -30,6 +30,10 @@ log = logging.getLogger(__name__)
 LogListener = Callable[[str, str], None]
 SignalListener = Callable[[float, str], None]
 StateListener = Callable[[bool], None]
+# ``(closed_bars, target, target_changed, price)`` once per newly closed candle.
+# Deliberately called on *every* new candle, not only when the target moves:
+# a briefing is worth having on the quiet bars too.
+CandleListener = Callable[[pd.DataFrame, float, bool, float], None]
 
 
 @dataclass
@@ -75,6 +79,7 @@ class AutoTrader:
         self._log_listeners: list[LogListener] = []
         self._signal_listeners: list[SignalListener] = []
         self._state_listeners: list[StateListener] = []
+        self._candle_listeners: list[CandleListener] = []
 
     # ------------------------------------------------------------- listeners
     def on_log(self, callback: LogListener) -> None:
@@ -88,6 +93,10 @@ class AutoTrader:
     def on_state(self, callback: StateListener) -> None:
         with self._listener_lock:
             self._state_listeners.append(callback)
+
+    def on_candle(self, callback: CandleListener) -> None:
+        with self._listener_lock:
+            self._candle_listeners.append(callback)
 
     def _emit(self, listeners, *args) -> None:
         with self._listener_lock:
@@ -177,7 +186,11 @@ class AutoTrader:
             f"新收盘 K 线 {pd.Timestamp(last_ts, unit='ms'):%m-%d %H:%M} "
             f"策略目标 {target:+.0%}（当前 {self._current_target:+.0%}）",
         )
-        if target == self._current_target:
+        changed = target != self._current_target
+        # Announced before the rebalance so a listener that takes seconds (an AI
+        # briefing) never sits between the signal and the order.
+        self._emit(self._candle_listeners, closed, target, changed, price)
+        if not changed:
             return
         self._current_target = target
         self._emit_signal(target, f"收盘价 {price:,.4f}")

@@ -16,6 +16,7 @@ from .exchange.klines import KlineStore
 from .exchange.rest import BinanceREST
 from .gateway import GatewaySupervisor
 from .installer import OpenClawInstaller
+from .llm import LLMService
 from .news import NewsService
 from .notify import WeChatNotifier
 from .strategy.registry import StrategyRegistry
@@ -56,6 +57,9 @@ class AppContext:
         # Outbound WeChat push. Constructed even when disabled so the settings
         # page can report whether the OpenClaw CLI is actually reachable.
         self.notifier = WeChatNotifier(self.settings.notify)
+        # Optional LLM assistant. Built even when disabled so the settings page
+        # can report the provider, the key and today's usage.
+        self.ai = LLMService(self.settings.ai)
         # Both services hold their nested settings by reference; bind them to
         # the live objects now that both exist.
         self._attach_settings()
@@ -201,6 +205,7 @@ class AppContext:
         """
         self.risk.settings = self.settings.risk
         self.notifier.settings = self.settings.notify
+        self.ai.settings = self.settings.ai
 
     def shutdown(self) -> None:
         try:

@@ -188,6 +188,81 @@ export interface NotifySettings {
   preflight: boolean;
 }
 
+/** Optional LLM assistant. The API key is not here: it lives in the keyring. */
+export interface AISettings {
+  enabled: boolean;
+  provider: string;
+  model: string;
+  base_url: string;
+  temperature: number;
+  max_tokens: number;
+  timeout: number;
+  /** 0 disables the per-day budget. */
+  daily_limit: number;
+  cache_seconds: number;
+  /** Positions and P/L are private; sending them to a model is opt-in. */
+  share_position: boolean;
+  /** Write a briefing after every closed candle in the auto-trader. */
+  auto_brief: boolean;
+}
+
+/** One price level the model named, already range-checked by the backend. */
+export interface AILevel {
+  price: number;
+  kind: "support" | "resistance" | "stop";
+  label: string;
+  /** (price - last) / last, so the legend can say 上方 1.2%. */
+  distance: number;
+}
+
+export interface AIProviderInfo {
+  key: string;
+  label: string;
+  model: string;
+  base_url: string;
+  needs_key: boolean;
+  help: string;
+}
+
+export interface AIStatus extends AISettings {
+  provider_label: string;
+  provider_help: string;
+  needs_key: boolean;
+  has_key: boolean;
+  key_hint: string;
+  configured: boolean;
+  providers: AIProviderInfo[];
+  calls_today: number;
+  audit: AIAuditItem[];
+}
+
+export interface AIAuditItem {
+  at: number;
+  kind: string;
+  provider: string;
+  model: string;
+  ok: boolean;
+  tokens?: number;
+  elapsed?: number;
+  error?: string;
+  text?: string;
+}
+
+/** Result of one multi-timeframe analysis. */
+export interface AIAnalysis {
+  ok: boolean;
+  text: string;
+  levels: AILevel[];
+  timeframes: string[];
+  symbol: string;
+  market: string;
+  price: number;
+  cached: boolean;
+  tokens: number;
+  elapsed: number;
+  model: string;
+}
+
 export interface AppSettings {
   network: string;
   market_type: string;
@@ -211,6 +286,50 @@ export interface AppSettings {
   notification_sound: boolean;
   theme: string;
   notify: NotifySettings;
+  ai: AISettings;
+}
+
+/** One entry the model ruled on during an AI-filtered backtest. */
+export interface AIFilterJudged {
+  entry_time: number;
+  exit_time?: number;
+  side: string;
+  entry_price?: number;
+  exit_price?: number;
+  pnl?: number;
+  verdict: "yes" | "no" | "keep";
+  reason: string;
+}
+
+/** Metrics of one side of an AI-filtered comparison. */
+export interface AIFilterMetrics {
+  trades: number;
+  total_return: number;
+  max_drawdown: number;
+  win_rate: number;
+  profit_factor: number;
+  avg_trade: number;
+  net_pnl: number;
+}
+
+export interface AIFilterResult {
+  symbol: string;
+  timeframe: string;
+  strategy: string;
+  params: Record<string, unknown>;
+  original: AIFilterMetrics;
+  filtered: AIFilterMetrics;
+  comparison: {
+    delta_return: number;
+    delta_drawdown: number;
+    dropped: number;
+    verdict: string;
+  };
+  judged: AIFilterJudged[];
+  total: number;
+  kept: number;
+  failures: number;
+  truncated: boolean;
 }
 
 /** Reachability of the local OpenClaw gateway, as reported by the backend. */

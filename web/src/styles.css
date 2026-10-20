@@ -2186,3 +2186,200 @@ input[type="range"].input:focus {
   gap: 8px;
   align-items: center;
 }
+
+/* ------------------------------------------------------------- AI panel
+   Sits at the top of the trading rail. The text is model output, so it is
+   allowed to wrap freely and scrolls inside a capped box: an analysis that runs
+   long must not push the order ticket off the screen. */
+.ai-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 0 12px 10px;
+}
+
+.ai-actions .btn {
+  flex: 1 1 auto;
+  min-width: 96px;
+  font-size: 12px;
+  padding: 6px 10px;
+}
+
+.ai-meta {
+  padding: 0 12px 6px;
+  font-size: 11px;
+}
+
+.ai-text {
+  padding: 0 12px 10px;
+  font-size: 12px;
+  line-height: 1.65;
+  color: var(--text-2);
+  white-space: pre-wrap;
+  max-height: 240px;
+  overflow-y: auto;
+  word-break: break-word;
+}
+
+.ai-levels {
+  border-top: 1px solid var(--border);
+  padding: 8px 12px 10px;
+}
+
+.ai-levels-head {
+  display: flex;
+  align-items: center;
+  padding-bottom: 4px;
+}
+
+.ai-level-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.ai-level {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+  padding: 2px 6px;
+  border-left: 2px solid transparent;
+  border-radius: 3px;
+  background: var(--bg-hover);
+}
+
+.ai-level.support {
+  border-left-color: var(--up);
+}
+
+.ai-level.resistance {
+  border-left-color: var(--down);
+}
+
+.ai-level.stop {
+  border-left-color: var(--warn);
+}
+
+.ai-level-kind {
+  min-width: 28px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.ai-level-note {
+  margin-left: auto;
+  font-size: 11px;
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ai-block {
+  border-top: 1px solid var(--border);
+}
+
+.ai-block-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px 4px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+.ai-score {
+  margin-left: auto;
+  font-family: var(--font-num, monospace);
+  font-size: 12px;
+}
+
+.ai-score.up {
+  color: var(--up);
+}
+
+.ai-score.down {
+  color: var(--down);
+}
+
+/* Audit trail in the settings card: one line per recent model call, so a
+   surprising bill has a visible origin. */
+.ai-audit {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+}
+
+.ai-audit-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 6px;
+  border-radius: 3px;
+  background: var(--bg-hover);
+  overflow: hidden;
+}
+
+.ai-audit-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+
+.ai-audit-dot.ok {
+  background: var(--up);
+}
+
+.ai-audit-dot.err {
+  background: var(--down);
+}
+
+.ai-audit-err {
+  margin-left: auto;
+  color: var(--down);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 45%;
+}
+
+/* "描述想法 → 匹配策略" row under the parameter editor. */
+.ai-suggest {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-top: 10px;
+}
+
+.ai-suggest .input {
+  flex: 1 1 auto;
+}
+
+.ai-suggest .btn-sm {
+  flex: 0 0 auto;
+}
+
+/* Order-ticket second opinion: quiet until asked, never in the way of the
+   submit button. */
+.ai-prejudge {
+  padding: 4px 12px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ai-prejudge-text {
+  padding: 0;
+  max-height: 140px;
+  font-size: 11.5px;
+}

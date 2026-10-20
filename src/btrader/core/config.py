@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import paths
+from ..llm import AISettings
 from ..notify import NotifySettings
 from .types import MarketType, Network
 
@@ -50,6 +51,10 @@ class AppSettings:
     theme: str = "light"
     # WeChat push via the local OpenClaw gateway (see ``btrader.notify``).
     notify: NotifySettings = field(default_factory=NotifySettings)
+    # Optional LLM assistant (see ``btrader.llm``). The API key is not here: it
+    # lives in the OS keyring, so a settings file that gets copied or shared
+    # never carries a credential.
+    ai: AISettings = field(default_factory=AISettings)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -73,6 +78,7 @@ class ConfigStore:
 
         risk_raw = raw.pop("risk", {}) or {}
         notify_raw = raw.pop("notify", {}) or {}
+        ai_raw = raw.pop("ai", {}) or {}
         known = {f for f in AppSettings.__dataclass_fields__}
         settings = AppSettings(**{k: v for k, v in raw.items() if k in known})
         risk_known = {f for f in RiskSettings.__dataclass_fields__}
@@ -83,6 +89,8 @@ class ConfigStore:
         settings.notify = NotifySettings(
             **{k: v for k, v in notify_raw.items() if k in notify_known}
         )
+        ai_known = {f for f in AISettings.__dataclass_fields__}
+        settings.ai = AISettings(**{k: v for k, v in ai_raw.items() if k in ai_known})
         return settings
 
     def save(self) -> None:

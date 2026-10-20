@@ -86,6 +86,11 @@ export default function OrderTicket({
   const [previewError, setPreviewError] = useState("");
   const [flash, setFlash] = useState<Flash | null>(null);
   const [busy, setBusy] = useState(false);
+  /** Second opinion on the pending order. Cache lives on the server, keyed by
+   * candle and size bucket, so clicking twice on the same bar is free. */
+  const [prejudgeText, setPrejudgeText] = useState("");
+  const [prejudgeError, setPrejudgeError] = useState("");
+  const [prejudgeBusy, setPrejudgeBusy] = useState(false);
   const requestId = useRef(0);
 
   // A click on the ladder fills the limit price; the parent clears the signal
@@ -212,6 +217,37 @@ export default function OrderTicket({
 
     return () => window.clearTimeout(timer);
   }, [market, symbol, side, orderType, sizeMode, size, referencePrice]);
+
+  /** Ask the assistant whether this order makes sense right now. Deliberately
+   * separate from `submit`: it must be possible to ignore it, and it must never
+   * be able to block the order. */
+  const askPrejudge = async () => {
+    if (!preview) return;
+    setPrejudgeBusy(true);
+    setPrejudgeError("");
+    setPrejudgeText("");
+    try {
+      const result = await api<{ text: string; cached: boolean }>("/api/ai/prejudge", {
+        method: "POST",
+        body: JSON.stringify({
+          market,
+          symbol,
+          timeframe: "1h",
+          side,
+          quote: Number(preview.quote_notional ?? 0),
+        }),
+      });
+      setPrejudgeText(result.text + (result.cached ? "\n（同一根 K 线的缓存结论）" : ""));
+    } catch (error) {
+      setPrejudgeError(
+        error instanceof Error
+          ? error.message
+          : String(error),
+      );
+    } finally {
+      setPrejudgeBusy(false);
+    }
+  };
 
   /** Budget the ratio is applied against: cash when buying, the held coin
    * when selling. This is the fix for "100%" meaning different things
@@ -718,6 +754,22 @@ export default function OrderTicket({
       </div>
 
       {flash && <div className={`flash ${flash.tone}`}>{flash.text}</div>}
+
+      {/* Step 4.5 — an optional second opinion. Advisory only: the button below
+          submits whether or not this ever returns, and a failure here must not
+          block an order. */}
+      <div className="ai-prejudge">
+        <button
+          type="button"
+          className="link-btn"
+          disabled={prejudgeBusy || !preview}
+          onClick={() => void askPrejudge()}
+        >
+          {prejudgeBusy ? "AI 预判中…" : "AI 预判这笔委托"}
+        </button>
+        {prejudgeText && <div className="ai-text ai-prejudge-text">{prejudgeText}</div>}
+        {prejudgeError && <div className="faint">{prejudgeError}</div>}
+      </div>
 
       {/* Step 5 — one button, coloured by direction. */}
       <div className="actions">

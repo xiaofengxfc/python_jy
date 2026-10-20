@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
-import type { Candle } from "../types";
+import type { AILevel, Candle } from "../types";
 import { fmtPrice, shortTime } from "../format";
 import { cssVar, useThemeRevision } from "../hooks/useThemeRevision";
 
+/** Levels the AI named, drawn as labelled horizontal lines over the candles.
+ * They are validated against the traded range on the backend, so anything that
+ * arrives here belongs inside the visible price band. */
 /** Indicators the user can switch on. Several may be active at once: overlays
  * draw on the price panel, oscillators each get a panel below it. */
 export type Indicator =
@@ -163,6 +166,8 @@ interface Props {
   onLoadOlder?: () => void;
   /** A history request is in flight; shown as a hint and used to rate-limit. */
   olderLoading?: boolean;
+  /** Support/resistance/stop lines the AI proposed for this symbol. */
+  aiLevels?: AILevel[];
 }
 
 /** Colours are read from the active theme's tokens at paint time, so switching
@@ -189,6 +194,11 @@ function colors() {
     kdjD: cssVar("--warn", "#b45309"),
     kdjJ: cssVar("--down", "#e5484d"),
     hover: cssVar("--bg-hover", "#f4f4f4"),
+    // AI levels get their own hues so they never read as one of the indicator
+    // lines: support sits with the up colour, resistance with the down one.
+    aiSupport: cssVar("--up", "#16a34a"),
+    aiResistance: cssVar("--down", "#e11d48"),
+    aiStop: cssVar("--warn", "#b45309"),
   };
 }
 
@@ -237,6 +247,7 @@ export default function Chart({
   indicators,
   onLoadOlder,
   olderLoading = false,
+  aiLevels = [],
 }: Props) {
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -330,6 +341,7 @@ export default function Chart({
         hover,
         indicators,
         colors(),
+        aiLevels,
       );
     };
     paint();
@@ -337,7 +349,17 @@ export default function Chart({
     const observer = new ResizeObserver(paint);
     observer.observe(wrap);
     return () => observer.disconnect();
-  }, [candles, timeframe, lastPrice, offset, visibleBars, hover, indicators, themeRevision]);
+  }, [
+    candles,
+    timeframe,
+    lastPrice,
+    offset,
+    visibleBars,
+    hover,
+    indicators,
+    aiLevels,
+    themeRevision,
+  ]);
 
   const onPointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     if (event.button !== 0) return;
@@ -531,6 +553,7 @@ function draw(
   hover: { x: number; y: number } | null,
   indicators: IndicatorConfig[],
   COLORS: ReturnType<typeof colors>,
+  aiLevels: AILevel[] = [],
 ) {
   const rect = wrap.getBoundingClientRect();
   // Never inflate the canvas past its container: a hard 240px floor made the
@@ -736,6 +759,18 @@ function draw(
   }
   ctx.restore();
 
+  // The AI's levels sit on top of everything in the price panel: they are the
+  // conclusion the trader is reading, so a candle body must never hide one.
+  drawAILevels(ctx, aiLevels, yOf, {
+    left,
+    right,
+    min,
+    max,
+    top: padding.top,
+    bottom: padding.top + priceH,
+    colors: COLORS,
+  });
+
   const reference = referencePrice;
   const refY = yOf(reference);
   ctx.strokeStyle = COLORS.crosshair;
@@ -840,6 +875,67 @@ function bands(values: number[], period: number, mult = 2) {
   }
   return { middle, upper, lower };
 }
+
+function drawAILevels(
+  ctx: CanvasRenderingContext2D,
+  levels: AILevel[],
+  yOf: (value: number) => number,
+  box: {
+    left: number;
+    right: number;
+    min: number;
+    max: number;
+    top: number;
+    bottom: number;
+    colors: ReturnType<typeof colors>;
+  },
+) {
+  if (!levels.length) return;
+  const colour = (kind: AILevel["kind"]) =>
+    kind === "support"
+      ? box.colors.aiSupport
+      : kind === "resistance"
+        ? box.colors.aiResistance
+        : box.colors.aiStop;
+
+  // Labels are only drawn when they do not collide: three supports stacked in a
+  // 20px band would otherwise overprint each other into a black smear.
+  const placed: number[] = [];
+  for (const level of levels) {
+    // Off-screen levels are skipped rather than clamped to the edge: a line
+    // pinned to the border would read as a real level at that price.
+    if (level.price < box.min || level.price > box.max) continue;
+    const y = Math.round(yOf(level.price)) + 0.5;
+    if (y < box.top || y > box.bottom) continue;
+
+    ctx.strokeStyle = colour(level.kind);
+    ctx.lineWidth = 1;
+    ctx.setLineDash(level.kind === "stop" ? [5, 3] : [2, 4]);
+    ctx.beginPath();
+    ctx.moveTo(box.left, y);
+    ctx.lineTo(box.right, y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    if (placed.some((used) => Math.abs(used - y) < 13)) continue;
+    placed.push(y);
+
+    const text = level.label
+      ? `${level.label} ${fmtPrice(level.price)}`
+      : fmtPrice(level.price);
+    ctx.font = "10px Inter, sans-serif";
+    const textW = ctx.measureText(text).width + 8;
+    ctx.fillStyle = colour(level.kind);
+    ctx.globalAlpha = 0.92;
+    ctx.fillRect(box.left + 2, y - 8, Math.min(textW, box.right - box.left - 4), 14);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = box.colors.tagText;
+    ctx.textAlign = "left";
+    ctx.fillText(text, box.left + 6, y + 2);
+  }
+  ctx.textAlign = "center";
+}
+
 
 function drawLine(
   ctx: CanvasRenderingContext2D,

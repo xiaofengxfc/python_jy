@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { api, query } from "../api";
 import { TIMEFRAMES, fmt, fmtPrice } from "../format";
 import type {
+  AIFilterResult,
   BacktestJob,
   BacktestResult,
   BacktestRun,
@@ -88,6 +89,15 @@ export default function BacktestPage() {
   const [optimizeRows, setOptimizeRows] = useState<Record<string, unknown>[]>([]);
 
   const [runs, setRuns] = useState<BacktestRun[]>([]);
+  /** Original vs AI-filtered run, once a filter job finishes. */
+  const [aiFilter, setAiFilter] = useState<AIFilterResult | null>(null);
+  const [aiLimit, setAiLimit] = useState(40);
+  const [aiDescribe, setAiDescribe] = useState("");
+  const [aiBusy, setAiBusy] = useState<"filter" | "describe" | "suggest" | "">("");
+  /** Plain-language strategy picking: the model may only choose one of the
+   * strategies that already exist and fill its params — never write code. */
+  const [idea, setIdea] = useState("");
+  const [suggestNote, setSuggestNote] = useState("");
 
   const strategy = useMemo(
     () => strategies.find((item) => item.key === config.strategy) ?? null,
@@ -135,7 +145,7 @@ export default function BacktestPage() {
 
   const patch = (values: Partial<Config>) => setConfig((current) => ({ ...current, ...values }));
 
-  const poll = (jobId: string, label: string, kind: "backtest" | "optimize") => {
+  const poll = (jobId: string, label: string, kind: "backtest" | "optimize" | "ai-filter") => {
     window.clearInterval(pollRef.current);
     pollRef.current = window.setInterval(async () => {
       try {
@@ -144,6 +154,7 @@ export default function BacktestPage() {
         if (job.status === "running") return;
         window.clearInterval(pollRef.current);
         setBusy(false);
+        setAiBusy("");
         if (job.status === "error") {
           setError(job.error ?? "任务失败");
           return;
@@ -153,6 +164,8 @@ export default function BacktestPage() {
           setResultLabel(label);
         } else if (kind === "optimize" && job.result && "rows" in job.result) {
           setOptimizeRows(job.result.rows);
+        } else if (kind === "ai-filter" && job.result && "comparison" in job.result) {
+          setAiFilter(job.result as unknown as AIFilterResult);
         }
         api<{ items: BacktestRun[] }>("/api/backtest/runs?limit=50")
           .then((data) => setRuns(data.items))
@@ -160,6 +173,7 @@ export default function BacktestPage() {
       } catch (caught) {
         window.clearInterval(pollRef.current);
         setBusy(false);
+        setAiBusy("");
         setError(caught instanceof Error ? caught.message : String(caught));
       }
     }, 700);
@@ -231,6 +245,86 @@ export default function BacktestPage() {
     } catch (caught) {
       setBusy(false);
       setError(caught instanceof Error ? caught.message : String(caught));
+    }
+  };
+
+  /** Re-run the same backtest, then let the model veto entries one by one. */
+  const runAiFilter = async () => {
+    setBusy(true);
+    setAiBusy("filter");
+    setError("");
+    setAiFilter(null);
+    setProgress(0.05);
+    try {
+      const started = await api<{ job_id: string }>("/api/backtest/ai-filter", {
+        method: "POST",
+        body: JSON.stringify(body({ limit: aiLimit })),
+      });
+      poll(started.job_id, "", "ai-filter");
+    } catch (caught) {
+      setBusy(false);
+      setAiBusy("");
+      setError(caught instanceof Error ? caught.message : String(caught));
+    }
+  };
+
+  /** Plain-language read of the strategy's code, in the same card. */
+  const describeStrategy = async () => {
+    if (!strategy) return;
+    setAiBusy("describe");
+    setError("");
+    setAiDescribe("");
+    try {
+      const result = await api<{ text: string }>("/api/ai/describe", {
+        method: "POST",
+        body: JSON.stringify({ strategy: strategy.key, params: config.params }),
+      });
+      setAiDescribe(result.text);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setAiBusy("");
+    }
+  };
+
+  /** Pick an existing strategy from a description, then apply it.
+
+   * The reply is a strategy key plus params, never source code: user strategy
+   * files are imported into the backend process, so "generate me a strategy"
+   * would be "run arbitrary code". This only ever selects from what ships.
+   */
+  const suggestStrategy = async () => {
+    const text = idea.trim();
+    if (!text) return;
+    setAiBusy("suggest");
+    setError("");
+    setSuggestNote("");
+    try {
+      const result = await api<{
+        strategy: string;
+        params: Record<string, number>;
+        reason: string;
+      }>("/api/ai/suggest", {
+        method: "POST",
+        body: JSON.stringify({
+          idea: text,
+          symbol: config.symbol,
+          market: config.market,
+          timeframe: config.timeframe,
+        }),
+      });
+      const picked = strategies.find((item) => item.key === result.strategy);
+      patch({
+        strategy: result.strategy,
+        params: { ...(picked?.defaults ?? {}), ...result.params },
+      });
+      setSuggestNote(
+        `已切换到「${picked?.name ?? result.strategy}」并填入参数。${result.reason}`,
+      );
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setAiBusy("");
     }
   };
 
@@ -427,6 +521,30 @@ export default function BacktestPage() {
                       patch({ params: { ...config.params, [name]: value } })
                     }
                   />
+                  <div className="ai-suggest">
+                    <input
+                      className="input"
+                      placeholder="用一句话描述你的想法，例如「横盘时低买高卖，趋势里不要乱动」"
+                      value={idea}
+                      onChange={(event) => setIdea(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") void suggestStrategy();
+                      }}
+                    />
+                    <button
+                      type="button"
+                      className="btn-sm"
+                      disabled={!idea.trim() || aiBusy !== ""}
+                      onClick={() => void suggestStrategy()}
+                    >
+                      {aiBusy === "suggest" ? "匹配中…" : "匹配策略"}
+                    </button>
+                  </div>
+                  {suggestNote && (
+                    <div className="hint" style={{ marginTop: 6 }}>
+                      {suggestNote}
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -719,6 +837,158 @@ export default function BacktestPage() {
                     })}
                     empty="策略在这段时间内没有成交"
                   />
+                </div>
+
+                <div className="card">
+                  <div className="card-head">
+                    <span className="card-title">AI 过滤</span>
+                    <span className="spacer" />
+                    <span className="faint" style={{ fontSize: 11 }}>
+                      原版 vs 模型复核后
+                    </span>
+                  </div>
+                  <div className="card-body">
+                    <div className="hint" style={{ marginBottom: 10 }}>
+                      重跑同一次回测，再把每个开仓点交给模型复核：只给它开仓<em>之前</em>
+                      的 K 线，看不到结果，所以偷不到答案。被否掉的交易整笔剔除，
+                      两边的数字可直接对比。每个开仓点是一次付费调用，按下面的上限截断。
+                    </div>
+                    <div className="row" style={{ gap: 8, alignItems: "flex-end" }}>
+                      <div className="field" style={{ maxWidth: 140 }}>
+                        <label className="field-label" htmlFor="ai-limit">
+                          <span>最多复核</span>
+                        </label>
+                        <input
+                          id="ai-limit"
+                          className="input"
+                          type="number"
+                          min={1}
+                          max={200}
+                          value={aiLimit}
+                          onChange={(event) => setAiLimit(Number(event.target.value) || 40)}
+                        />
+                      </div>
+                      <button
+                        type="button"
+                        className="btn-sm"
+                        onClick={() => void runAiFilter()}
+                        disabled={busy}
+                      >
+                        {aiBusy === "filter"
+                          ? `复核中 ${(progress * 100).toFixed(0)}%`
+                          : "运行 AI 过滤"}
+                      </button>
+                      <button
+                        type="button"
+                        className="btn-sm"
+                        onClick={() => void describeStrategy()}
+                        disabled={!strategy || aiBusy !== ""}
+                      >
+                        {aiBusy === "describe" ? "解读中…" : "解读这个策略"}
+                      </button>
+                    </div>
+
+                    {aiDescribe && (
+                      <div className="ai-text" style={{ padding: "10px 0 0" }}>
+                        {aiDescribe}
+                      </div>
+                    )}
+
+                    {aiFilter && (
+                      <>
+                        <div
+                          className={`banner ${aiFilter.comparison.delta_return >= 0 ? "" : "warn"}`}
+                          style={{ marginTop: 10 }}
+                        >
+                          {aiFilter.comparison.verdict}
+                        </div>
+                        <Table
+                          headers={["指标", "原版", "AI 过滤后", "差值"]}
+                          rightFrom={1}
+                          rows={[
+                            [
+                              "总收益",
+                              <span className={aiFilter.original.total_return >= 0 ? "up" : "down"}>
+                                {fmt(aiFilter.original.total_return * 100, 2)}%
+                              </span>,
+                              <span className={aiFilter.filtered.total_return >= 0 ? "up" : "down"}>
+                                {fmt(aiFilter.filtered.total_return * 100, 2)}%
+                              </span>,
+                              <span className={aiFilter.comparison.delta_return >= 0 ? "up" : "down"}>
+                                {fmt(aiFilter.comparison.delta_return * 100, 2)}%
+                              </span>,
+                            ],
+                            [
+                              "最大回撤",
+                              <span className="down">
+                                {fmt(aiFilter.original.max_drawdown * 100, 2)}%
+                              </span>,
+                              <span className="down">
+                                {fmt(aiFilter.filtered.max_drawdown * 100, 2)}%
+                              </span>,
+                              <span
+                                className={aiFilter.comparison.delta_drawdown >= 0 ? "down" : "up"}
+                              >
+                                {fmt(aiFilter.comparison.delta_drawdown * 100, 2)}%
+                              </span>,
+                            ],
+                            [
+                              "胜率",
+                              `${fmt(aiFilter.original.win_rate * 100, 1)}%`,
+                              `${fmt(aiFilter.filtered.win_rate * 100, 1)}%`,
+                              "—",
+                            ],
+                            [
+                              "盈亏比",
+                              fmt(aiFilter.original.profit_factor, 2),
+                              fmt(aiFilter.filtered.profit_factor, 2),
+                              "—",
+                            ],
+                            [
+                              "成交笔数",
+                              fmt(aiFilter.original.trades, 0),
+                              fmt(aiFilter.filtered.trades, 0),
+                              `${aiFilter.comparison.dropped > 0 ? "-" : ""}${fmt(
+                                Math.abs(aiFilter.comparison.dropped),
+                                0,
+                              )}`,
+                            ],
+                          ]}
+                          empty="没有对比数据"
+                        />
+                        <div className="hint" style={{ marginTop: 8 }}>
+                          复核 {aiFilter.total} 笔，保留 {aiFilter.kept} 笔
+                          {aiFilter.failures > 0
+                            ? `，${aiFilter.failures} 笔调用失败已默认保留`
+                            : ""}
+                          {aiFilter.truncated ? "，超出上限的交易未复核（按保留处理）" : ""}
+                          。过滤后的数字按成交序列重算，不含逐 K 线的浮动权益。
+                        </div>
+                        <Table
+                          headers={["开仓时间", "方向", "结果", "理由"]}
+                          rightFrom={3}
+                          rows={aiFilter.judged
+                            .slice(-40)
+                            .reverse()
+                            .map((item) => [
+                              new Date(item.entry_time).toLocaleString("zh-CN", {
+                                hour12: false,
+                              }),
+                              item.side === "short" ? "空" : "多",
+                              item.verdict === "no" ? (
+                                <span className="down">否掉</span>
+                              ) : item.verdict === "keep" ? (
+                                <span className="faint">保留</span>
+                              ) : (
+                                <span className="up">通过</span>
+                              ),
+                              <span className="faint">{item.reason}</span>,
+                            ])}
+                          empty="没有复核记录"
+                        />
+                      </>
+                    )}
+                  </div>
                 </div>
               </>
             ) : (

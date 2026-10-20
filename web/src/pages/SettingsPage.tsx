@@ -2,6 +2,8 @@ import { useCallback, useEffect, useState } from "react";
 import { api } from "../api";
 import { TIMEFRAMES } from "../format";
 import type {
+  AISettings,
+  AIStatus,
   AppSettings,
   ChannelStatus,
   CredentialItem,
@@ -66,6 +68,24 @@ export default function SettingsPage({ settings, onSaved }: Props) {
   const [channel, setChannel] = useState<ChannelStatus | null>(null);
   const [channelBusy, setChannelBusy] = useState(false);
   const [channelNote, setChannelNote] = useState("");
+  const [aiStatus, setAiStatus] = useState<AIStatus | null>(null);
+  const [aiKey, setAiKey] = useState("");
+  const [aiBusy, setAiBusy] = useState<"key" | "test" | "">("");
+  const [aiNote, setAiNote] = useState<{ tone: "ok" | "err"; text: string } | null>(null);
+
+  const loadAI = useCallback(async () => {
+    try {
+      const next = await api<AIStatus>("/api/ai/status");
+      setAiStatus(next);
+      return next;
+    } catch {
+      return null;
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadAI();
+  }, [loadAI]);
 
   const loadChannel = useCallback(async () => {
     try {
@@ -322,6 +342,59 @@ export default function SettingsPage({ settings, onSaved }: Props) {
     );
   };
 
+  const patchAI = (values: Partial<AISettings>) => {
+    setDraft((current) => (current ? { ...current, ai: { ...current.ai, ...values } } : current));
+  };
+
+  /** Switching provider also moves the model and endpoint: keeping DeepSeek's
+   * model name while switching to OpenAI would send an unknown model id. */
+  const pickProvider = (key: string) => {
+    const info = aiStatus?.providers.find((item) => item.key === key);
+    patchAI({ provider: key, model: info?.model ?? "", base_url: info?.base_url ?? "" });
+  };
+
+  const saveAIKey = async () => {
+    if (!aiKey.trim()) {
+      setAiNote({ tone: "err", text: "请先填入 API Key。" });
+      return;
+    }
+    setAiBusy("key");
+    setAiNote(null);
+    try {
+      const next = await api<AIStatus>("/api/ai/key", {
+        method: "POST",
+        body: JSON.stringify({ key: aiKey.trim() }),
+      });
+      setAiStatus(next);
+      setAiKey("");
+      setAiNote({ tone: "ok", text: "API Key 已存入系统密钥环。" });
+    } catch (error) {
+      setAiNote({ tone: "err", text: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setAiBusy("");
+    }
+  };
+
+  const testAI = async () => {
+    setAiBusy("test");
+    setAiNote(null);
+    try {
+      const result = await api<{ text: string; model: string; elapsed: number }>(
+        "/api/ai/test",
+        { method: "POST" },
+      );
+      setAiNote({
+        tone: "ok",
+        text: `连通正常：${result.model} 用时 ${result.elapsed.toFixed(1)}s，返回「${result.text.trim()}」。`,
+      });
+      await loadAI();
+    } catch (error) {
+      setAiNote({ tone: "err", text: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setAiBusy("");
+    }
+  };
+
   const save = async () => {
     if (!draft) return;
     setSaving(true);
@@ -341,12 +414,14 @@ export default function SettingsPage({ settings, onSaved }: Props) {
           notification_sound: draft.notification_sound,
           risk: draft.risk,
           notify: draft.notify,
+          ai: draft.ai,
         }),
       });
       onSaved(result.settings);
       setNetwork(result.settings.network);
       setFlash({ tone: "ok", text: "设置已保存。" });
       await loadCredentials();
+      await loadAI();
     } catch (error) {
       setFlash({ tone: "err", text: error instanceof Error ? error.message : String(error) });
     } finally {
@@ -543,6 +618,208 @@ export default function SettingsPage({ settings, onSaved }: Props) {
               币安公告不会按币种过滤（上币、下架、维护都会影响交易），
               CoinTelegraph 与 Decrypt 只保留标题提及当前币种的内容。不再需要任何 Token。
             </div>
+          </div>
+        </div>
+
+        <div className="card">
+          <div className="card-head">
+            <span className="card-title">AI 助手</span>
+            <span className="spacer" />
+            <span className="faint" style={{ fontSize: 11 }}>
+              {aiStatus?.provider_label ?? "未配置"}
+              {aiStatus?.calls_today ? ` · 今日 ${aiStatus.calls_today} 次` : ""}
+            </span>
+          </div>
+          <div className="card-body">
+            <div className="hint" style={{ marginBottom: 12 }}>
+              让模型读多周期 K 线、标关键价位、给收盘简报。它只给判断，不会下单：
+              所有订单仍然只由策略和风控产生，模型无法进入策略循环。
+              数字指标都在本地算好后作为文本发给模型，不传截图。
+            </div>
+
+            <div className="form-grid">
+              <div className="field">
+                <label className="field-label" htmlFor="set-ai-enabled">
+                  <span>启用 AI 助手</span>
+                </label>
+                <label className="check">
+                  <input
+                    id="set-ai-enabled"
+                    type="checkbox"
+                    checked={draft.ai.enabled}
+                    onChange={(event) => patchAI({ enabled: event.target.checked })}
+                  />
+                  <span>打开后交易页出现「AI 分析」面板</span>
+                </label>
+              </div>
+
+              <div className="field">
+                <label className="field-label" htmlFor="set-ai-provider">
+                  <span>模型供应商</span>
+                </label>
+                <select
+                  id="set-ai-provider"
+                  className="select"
+                  value={draft.ai.provider}
+                  onChange={(event) => pickProvider(event.target.value)}
+                >
+                  {(aiStatus?.providers ?? []).map((item) => (
+                    <option key={item.key} value={item.key}>
+                      {item.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="field">
+                <label className="field-label" htmlFor="set-ai-model">
+                  <span>模型</span>
+                </label>
+                <input
+                  id="set-ai-model"
+                  className="input"
+                  value={draft.ai.model}
+                  placeholder="deepseek-chat"
+                  onChange={(event) => patchAI({ model: event.target.value })}
+                />
+              </div>
+
+              <div className="field">
+                <label className="field-label" htmlFor="set-ai-base">
+                  <span>接口地址</span>
+                </label>
+                <input
+                  id="set-ai-base"
+                  className="input"
+                  value={draft.ai.base_url}
+                  placeholder="https://api.deepseek.com"
+                  onChange={(event) => patchAI({ base_url: event.target.value })}
+                />
+              </div>
+
+              <div className="field">
+                <label className="field-label" htmlFor="set-ai-limit">
+                  <span>每日调用上限</span>
+                </label>
+                <input
+                  id="set-ai-limit"
+                  className="input"
+                  type="number"
+                  min={0}
+                  step={10}
+                  value={draft.ai.daily_limit}
+                  onChange={(event) => patchAI({ daily_limit: Number(event.target.value) })}
+                />
+                <span className="field-hint">0 表示不限制；超出后所有 AI 调用直接返回失败，不会偷偷花钱。</span>
+              </div>
+
+              <div className="field">
+                <label className="field-label" htmlFor="set-ai-cache">
+                  <span>结果缓存</span>
+                </label>
+                <input
+                  id="set-ai-cache"
+                  className="input"
+                  type="number"
+                  min={0}
+                  step={60}
+                  value={draft.ai.cache_seconds}
+                  onChange={(event) => patchAI({ cache_seconds: Number(event.target.value) })}
+                />
+                <span className="field-hint">秒。同一根已收盘 K 线在缓存期内重复问，不再计费。</span>
+              </div>
+            </div>
+
+            <div className="field" style={{ marginTop: 12 }}>
+              <label className="field-label" htmlFor="set-ai-key">
+                <span>API Key</span>
+              </label>
+              <div className="row" style={{ gap: 8 }}>
+                <input
+                  id="set-ai-key"
+                  className="input"
+                  type="password"
+                  value={aiKey}
+                  placeholder={aiStatus?.has_key ? `已保存：${aiStatus.key_hint}` : "粘贴 API Key"}
+                  onChange={(event) => setAiKey(event.target.value)}
+                />
+                <button
+                  type="button"
+                  className="btn-sm"
+                  onClick={() => void saveAIKey()}
+                  disabled={aiBusy !== ""}
+                >
+                  {aiBusy === "key" ? "保存中…" : "保存 Key"}
+                </button>
+                <button
+                  type="button"
+                  className="btn-sm"
+                  onClick={() => void testAI()}
+                  disabled={aiBusy !== "" || !aiStatus?.has_key}
+                >
+                  {aiBusy === "test" ? "测试中…" : "测试连通"}
+                </button>
+              </div>
+              <span className="field-hint">
+                存在系统凭据库（Windows 凭据管理器 / macOS 钥匙串），不写进配置文件。
+                {aiStatus?.provider_help ? ` ${aiStatus.provider_help}` : ""}
+                {aiStatus && aiStatus.needs_key && !aiStatus.has_key ? " 该供应商需要 Key。" : ""}
+              </span>
+            </div>
+
+            {aiNote && <div className={`banner ${aiNote.tone === "ok" ? "" : "error"}`}>{aiNote.text}</div>}
+
+            <div className="form-grid" style={{ marginTop: 12 }}>
+              <div className="field">
+                <label className="check">
+                  <input
+                    type="checkbox"
+                    checked={draft.ai.share_position}
+                    onChange={(event) => patchAI({ share_position: event.target.checked })}
+                  />
+                  <span>允许把持仓和盈亏发给模型（持仓复核需要）</span>
+                </label>
+                <span className="field-hint">
+                  默认关闭。持仓数量、开仓价、未实现盈亏属于隐私数据，只有打开后才会出现在请求里。
+                </span>
+              </div>
+
+              <div className="field">
+                <label className="check">
+                  <input
+                    type="checkbox"
+                    checked={draft.ai.auto_brief}
+                    onChange={(event) => patchAI({ auto_brief: event.target.checked })}
+                  />
+                  <span>自动交易每根收盘 K 线推一条 AI 简报</span>
+                </label>
+                <span className="field-hint">
+                  简报在独立线程生成，不会拖慢下单；生成失败只记日志，不影响交易。
+                </span>
+              </div>
+            </div>
+
+            {aiStatus && aiStatus.audit.length > 0 && (
+              <div style={{ marginTop: 12 }}>
+                <div className="faint" style={{ fontSize: 11, marginBottom: 4 }}>
+                  最近调用
+                </div>
+                <ul className="ai-audit">
+                  {aiStatus.audit.slice(0, 6).map((item, index) => (
+                    <li key={`${item.at}-${index}`} className="ai-audit-row">
+                      <span className={`ai-audit-dot ${item.ok ? "ok" : "err"}`} />
+                      <span>{new Date(item.at * 1000).toLocaleTimeString()}</span>
+                      <span className="faint">{item.kind}</span>
+                      <span className="faint">{item.model}</span>
+                      {typeof item.elapsed === "number" && (
+                        <span className="faint num">{item.elapsed.toFixed(1)}s</span>
+                      )}
+                      {item.error && <span className="ai-audit-err">{item.error}</span>}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
           </div>
         </div>
 

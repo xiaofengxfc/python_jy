@@ -19,7 +19,7 @@ from btrader.web.routes import _apply_notify
 
 def test_enabling_without_a_target_is_rejected() -> None:
     candidate = replace(NotifySettings(enabled=False, target=""), enabled=True)
-    with pytest.raises(HTTPException, match="接收目标"):
+    with pytest.raises(HTTPException, match="userid"):
         _apply_notify(candidate, {})
 
 
