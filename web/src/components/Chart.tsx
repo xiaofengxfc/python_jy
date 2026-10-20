@@ -349,7 +349,7 @@ export default function Chart({
   const geomRef = useRef<ChartGeometry | null>(null);
   /** The rubber-band line while a trend line is being dragged out. */
   const [preview, setPreview] = useState<{ a: DrawingPoint; b: DrawingPoint } | null>(null);
-  const trendDraft = useRef<{ a: DrawingPoint } | null>(null);
+  const trendDraft = useRef<{ a: DrawingPoint; startX: number; startY: number } | null>(null);
   const lineDrag = useRef<
     | { mode: "move-hline"; id: string; startY: number; startPrice: number }
     | {
@@ -508,10 +508,11 @@ export default function Chart({
   const xOfTime = (geom: ChartGeometry, t: number): number =>
     geom.plotX + (indexOfTime(candles, t) - geom.start + 0.5) * geom.step;
 
-  /** Topmost drawing within the grab tolerance of a canvas point. */
+  /** Topmost drawing within the grab tolerance of a canvas point. Hidden lines
+   * are not hit-testable: the user cannot grab what they cannot see. */
   const hitTest = (x: number, y: number): Drawing | null => {
     const geom = geomRef.current;
-    if (!geom) return null;
+    if (!geom || !drawingsVisible) return null;
     for (let index = drawings.length - 1; index >= 0; index -= 1) {
       const item = drawings[index]!;
       if (item.kind === "hline") {
@@ -542,6 +543,9 @@ export default function Chart({
     const { x, y } = localPoint(event);
 
     if (drawingTool === "hline") {
+      // Only the price panel places lines: a click on the price axis or the
+      // time strip must not create a level at a price nobody chose.
+      if (x < geom.left || x > geom.right) return;
       const price = priceAt(geom, y);
       if (price == null || !onDrawingsChange) return;
       const item: Drawing = {
@@ -557,10 +561,15 @@ export default function Chart({
     }
 
     if (drawingTool === "trend") {
+      if (x < geom.left || x > geom.right) return;
       const t = barAt(geom, x);
       const price = priceAt(geom, y);
       if (t == null || price == null) return;
-      trendDraft.current = { a: { t, price } };
+      // Remember where the pointer actually went down: the "did the user drag
+      // at all?" test must use that point, not the snapped bar centre (which
+      // can be up to half a bar away and would turn a plain click into a
+      // zero-length trend line).
+      trendDraft.current = { a: { t, price }, startX: x, startY: y };
       setPreview({ a: { t, price }, b: { t, price } });
       capture(event);
       return;
@@ -647,6 +656,13 @@ export default function Chart({
     const geom = geomRef.current;
     if (!geom) return;
 
+    // A pointer whose buttons were released outside the canvas must not keep
+    // dragging: without this the line follows the cursor until the next click.
+    if (event.buttons === 0 && (drag.current || lineDrag.current || trendDraft.current)) {
+      abortDrag(event);
+      return;
+    }
+
     if (trendDraft.current) {
       const t = barAt(geom, x);
       const price = priceAt(geom, y);
@@ -660,7 +676,7 @@ export default function Chart({
     if (state && onDrawingsChange) {
       const pricePerPixel = (geom.max - geom.min) / Math.max(1, geom.priceH);
       if (state.mode === "move-hline") {
-        const price = state.startPrice + (state.startY - y) * pricePerPixel;
+        const price = Math.max(0, state.startPrice + (state.startY - y) * pricePerPixel);
         onDrawingsChange(
           drawings.map((item) =>
             item.id === state.id && item.kind === "hline" ? { ...item, price } : item,
@@ -676,11 +692,11 @@ export default function Chart({
               ...item,
               a: {
                 t: shiftTime(candles, state.a.t, deltaBars),
-                price: state.a.price + deltaPrice,
+                price: Math.max(0, state.a.price + deltaPrice),
               },
               b: {
                 t: shiftTime(candles, state.b.t, deltaBars),
-                price: state.b.price + deltaPrice,
+                price: Math.max(0, state.b.price + deltaPrice),
               },
             };
           }),
@@ -692,7 +708,7 @@ export default function Chart({
           onDrawingsChange(
             drawings.map((item) =>
               item.id === state.id && item.kind === "trend"
-                ? { ...item, [state.which]: { t, price } }
+                ? { ...item, [state.which]: { t, price: Math.max(0, price) } }
                 : item,
             ),
           );
@@ -727,14 +743,18 @@ export default function Chart({
       const rect = event.currentTarget.getBoundingClientRect();
       const x = event.clientX - rect.left;
       const y = event.clientY - rect.top;
-      const start = trendDraft.current.a;
+      const draft = trendDraft.current;
+      const start = draft.a;
       trendDraft.current = null;
       setPreview(null);
-      if (geom && onDrawingsChange) {
+      // A plain click (no drag) must not leave a zero-length line behind. The
+      // distance is measured from where the pointer went down, not from the
+      // snapped bar centre: at full zoom those differ by up to 11px.
+      const moved = Math.hypot(x - draft.startX, y - draft.startY);
+      if (geom && onDrawingsChange && moved >= 8) {
         const t = barAt(geom, x);
         const price = priceAt(geom, y);
-        const moved = Math.hypot(xOfTime(geom, start.t) - x, yOfPrice(geom, start.price) - y);
-        if (t != null && price != null && moved >= 8) {
+        if (t != null && price != null) {
           const item: Drawing = {
             id: newDrawingId("trend"),
             kind: "trend",
@@ -759,9 +779,25 @@ export default function Chart({
     drag.current = null;
   };
 
-  // Delete removes the selected line; Escape abandons a half-drawn trend line
-  // and the selection. Ignored while an input has focus so typing a price is
-  // never mistaken for a chart shortcut.
+  /** Abandon an in-flight gesture without committing anything. A cancelled
+   * pointer (browser gesture, OS touch handling) is not a user click. */
+  const abortDrag = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    trendDraft.current = null;
+    setPreview(null);
+    lineDrag.current = null;
+    drag.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      try {
+        event.currentTarget.releasePointerCapture(event.pointerId);
+      } catch {
+        // Already released; nothing to do.
+      }
+    }
+  };
+
+  // Delete removes the selected line; Escape abandons a half-drawn trend line,
+  // the selection, and an armed drawing tool. Ignored while an input has focus
+  // so typing a price is never mistaken for a chart shortcut.
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
@@ -771,6 +807,8 @@ export default function Chart({
       }
       if ((event.key === "Delete" || event.key === "Backspace") && selectedId) {
         event.preventDefault();
+        // Filter the *full* list: when drawings are hidden the render list is
+        // empty, and filtering that would wipe every line instead of one.
         onDrawingsChange?.(drawings.filter((item) => item.id !== selectedId));
         onSelect?.(null);
       } else if (event.key === "Escape") {
@@ -778,11 +816,12 @@ export default function Chart({
         setPreview(null);
         lineDrag.current = null;
         onSelect?.(null);
+        if (drawingTool !== "select") onToolDone?.();
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [drawings, selectedId, onDrawingsChange, onSelect]);
+  }, [drawings, selectedId, onDrawingsChange, onSelect, drawingTool, onToolDone]);
 
   /** Wheel zooms around the pointer. Registered natively below so the page
    * behind the chart does not scroll at the same time (React's onWheel is a
@@ -865,9 +904,12 @@ export default function Chart({
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={endDrag}
-        onPointerCancel={endDrag}
-        onPointerLeave={() => {
+        onPointerCancel={abortDrag}
+        onPointerLeave={(event) => {
           setHover(null);
+          // While a pointer is captured the canvas still receives the moves;
+          // clearing state on a captured leave would silently drop the drag.
+          if (event.currentTarget.hasPointerCapture(event.pointerId)) return;
           drag.current = null;
           lineDrag.current = null;
           if (trendDraft.current) {
@@ -1210,6 +1252,9 @@ function draw(
   ctx.fillStyle = COLORS.tagBg;
   ctx.fillRect(right + 4, refY - 8, Math.min(tagW, padding.right - 6), 16);
   ctx.fillStyle = COLORS.tagText;
+  // The axis tick loop leaves textAlign centred; the tag starts at its box's
+  // left edge, so set it explicitly instead of inheriting a stale alignment.
+  ctx.textAlign = "left";
   ctx.fillText(tag, right + 9, refY);
 
   ctx.fillStyle = COLORS.axis;
@@ -1468,7 +1513,9 @@ function drawDrawings(
 
   ctx.restore();
   ctx.setLineDash([]);
-  ctx.textAlign = "center";
+  // Restore the left alignment the rest of the price panel expects (the
+  // reference-price tag draws from its box's left edge).
+  ctx.textAlign = "left";
 }
 
 /** The rubber-band line while a trend is being drawn: dashed, no handles. */

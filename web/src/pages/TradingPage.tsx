@@ -200,7 +200,13 @@ export default function TradingPage({
       skipDrawingSave.current = false;
       return;
     }
-    saveDrawings(market, symbol, timeframe, drawings);
+    // Dragging a line fires on every pointer move; writing localStorage that
+    // often is wasted work (and the write is synchronous). A short debounce
+    // still survives a reload right after the drag.
+    const timer = window.setTimeout(() => {
+      saveDrawings(market, symbol, timeframe, drawings);
+    }, 250);
+    return () => window.clearTimeout(timer);
   }, [drawings, market, symbol, timeframe]);
 
   /* ---------------------------------------------------------- symbols */
@@ -734,7 +740,7 @@ export default function TradingPage({
               indicators={indicators}
               onLoadOlder={() => void loadOlder()}
               olderLoading={olderLoading}
-              drawings={drawingsVisible ? drawings : []}
+              drawings={drawings}
               onDrawingsChange={setDrawings}
               drawingTool={drawingTool}
               selectedId={selectedDrawing}
