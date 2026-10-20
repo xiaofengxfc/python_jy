@@ -208,10 +208,15 @@ class AppContext:
         except Exception:  # pragma: no cover - best effort on exit
             log.debug("停止安装进程失败", exc_info=True)
         try:
-            # Only stops a gateway we started; an external one keeps running.
-            self.gateway.stop()
+            # The gateway is deliberately left running. Restarting it costs the
+            # WeChat login: the ilink bot token is tied to the running plugin, so
+            # a restart makes it answer ``errcode -14 session timeout`` and the
+            # user has to scan the QR again. Keeping the process alive across
+            # app restarts is what stops "放久一点就要重新扫码".
+            self.gateway.detach()
+            log.info("OpenClaw 网关保持运行（避免微信重新扫码）")
         except Exception:  # pragma: no cover - best effort on exit
-            log.debug("停止 OpenClaw 网关失败", exc_info=True)
+            log.debug("保留 OpenClaw 网关失败", exc_info=True)
         try:
             self.notifier.stop()
         except Exception:  # pragma: no cover - best effort on exit

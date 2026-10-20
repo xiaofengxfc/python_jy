@@ -29,6 +29,8 @@ import time
 from collections import deque
 from dataclasses import dataclass
 
+from . import paths
+
 log = logging.getLogger(__name__)
 
 GATEWAY_HOST = "127.0.0.1"
@@ -106,6 +108,19 @@ class GatewaySupervisor:
         finally:
             with self._lock:
                 self._starting = False
+
+    def detach(self) -> None:
+        """Forget the child process *without* stopping it.
+
+        Used on app shutdown. Killing the gateway costs the WeChat login: the
+        ilink bot token belongs to the running plugin, and after a restart it
+        answers ``errcode -14 session timeout`` until the user scans the QR
+        again. Leaving the process alive keeps pushes working across app
+        restarts, and the next ``start()`` simply adopts it (``_reachable``).
+        """
+        with self._lock:
+            self._process = None
+            self._info = _Gateway(state="external")
 
     def stop(self) -> None:
         """Stop the gateway, but only the one we started."""
@@ -215,24 +230,39 @@ class GatewaySupervisor:
         return any("gateway-lock" in line for line in tail)
 
     def _launch(self, args: list[str]) -> subprocess.Popen | None:
-        """Spawn ``openclaw gateway run`` with its output captured."""
+        """Spawn ``openclaw gateway run`` fully detached, logging to a file.
+
+        Not a pipe: a pipe ties the gateway's life to this process. When the app
+        restarts, the reader closes, the child's next write fails, and the
+        gateway dies — which in turn invalidates the WeChat bot session and
+        forces a new QR scan. A log file has no such coupling, and the tail of
+        it still feeds the failure messages the settings page shows.
+        """
+        handle = None
         kwargs: dict = {
-            "stdout": subprocess.PIPE,
-            "stderr": subprocess.STDOUT,
             "stdin": subprocess.DEVNULL,
-            # Decoding here, not in the reader: a non-UTF-8 byte from Node's
-            # diagnostics must not turn into a UnicodeDecodeError later.
-            "text": True,
-            "encoding": "utf-8",
-            "errors": "replace",
-            "bufsize": 1,
             "shell": False,
         }
+        try:
+            handle = open(self._log_path(), "ab", buffering=0)
+            try:
+                handle.write(
+                    f"\n[biTrader {time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                    f"启动网关：{' '.join(args)}\n".encode("utf-8")
+                )
+            except OSError:
+                pass
+            kwargs["stdout"] = handle
+            kwargs["stderr"] = subprocess.STDOUT
+        except OSError:  # pragma: no cover - unwritable data dir
+            kwargs["stdout"] = subprocess.DEVNULL
+            kwargs["stderr"] = subprocess.DEVNULL
         if os.name == "nt":
-            # A new group lets ``stop`` take the whole tree down; the gateway
-            # is a Node process that may spawn workers of its own.
-            kwargs["creationflags"] = getattr(
-                subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200
+            # A new group lets ``stop`` take the whole tree down; DETACHED_PROCESS
+            # keeps it alive when the console that started it goes away.
+            kwargs["creationflags"] = (
+                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+                | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
             )
         else:
             kwargs["start_new_session"] = True
@@ -247,28 +277,66 @@ class GatewaySupervisor:
                 )
             log.warning("启动 OpenClaw 网关失败", exc_info=True)
             return None
-        # Unconditional: a full pipe would block the gateway mid-bootstrap, and
-        # the reader is what makes the failure message readable.
+        finally:
+            if handle is not None:
+                handle.close()
+        # The reader is what makes a failed bootstrap readable; it tails the log
+        # file instead of a pipe.
         threading.Thread(
             target=self._pump, args=(process,), name="openclaw-gateway", daemon=True
         ).start()
         return process
 
+    def _log_path(self):
+        return paths.logs_dir() / "openclaw-gateway.log"
+
     def _pump(self, process: subprocess.Popen) -> None:
-        """Drain the child's output into the bounded buffer until it closes."""
-        stream = process.stdout
-        if stream is None:
-            return
-        try:
-            for line in stream:
-                self._note(line)
-        except Exception:  # pragma: no cover - a closed pipe during shutdown
-            log.debug("读取网关输出失败", exc_info=True)
-        finally:
+        """Feed the child's diagnostics into the bounded buffer.
+
+        Production writes to a log file (see ``_launch``) and this tails it. A
+        plain iterable stdout is still honoured so a caller — or a test — can
+        hand over a pipe instead.
+        """
+        stream = getattr(process, "stdout", None)
+        if stream is not None:
             try:
-                stream.close()
-            except Exception:  # pragma: no cover - already closed
-                pass
+                for line in stream:
+                    self._note(line)
+            except Exception:  # pragma: no cover - closed pipe
+                log.debug("读取网关输出失败", exc_info=True)
+            return
+        path = self._log_path()
+        offset = 0
+        try:
+            offset = max(0, path.stat().st_size - 64_000)
+        except OSError:
+            offset = 0
+        try:
+            while True:
+                try:
+                    with open(path, "rb") as handle:
+                        handle.seek(offset)
+                        chunk = handle.read()
+                        offset = handle.tell()
+                except OSError:
+                    chunk = b""
+                if chunk:
+                    for line in chunk.decode("utf-8", "replace").splitlines():
+                        self._note(line)
+                if process.poll() is not None:
+                    # One last read after exit catches the final diagnostic.
+                    try:
+                        with open(path, "rb") as handle:
+                            handle.seek(offset)
+                            rest = handle.read().decode("utf-8", "replace")
+                    except OSError:
+                        rest = ""
+                    for line in rest.splitlines():
+                        self._note(line)
+                    return
+                time.sleep(0.25)
+        except Exception:  # pragma: no cover - shutdown race
+            log.debug("读取网关日志失败", exc_info=True)
 
     def _await_ready(self, process: subprocess.Popen) -> bool:
         deadline = time.time() + self.timeout

@@ -20,7 +20,7 @@ import argparse
 import sys
 
 from .core.config import ConfigStore
-from .notify import NotifyError, WeChatNotifier
+from .notify import NotifyError, WeChatNotifier, spool_message
 
 USAGE_HINT = '需要一条消息：btrader-notify --title 任务完成 "回测结束"'
 
@@ -65,7 +65,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         notifier.send_now(text)
     except NotifyError as exc:
-        print(f"发送失败：{exc}", file=sys.stderr)
+        # This process is about to exit, so an unsent report would be lost.
+        # Leave it on disk: the app's worker replays the spool once the channel
+        # is back (a re-scan, a restarted gateway, a flaky network).
+        waiting = spool_message(text)
+        hint = f"（已暂存 {waiting} 条，恢复后自动补发）" if waiting else ""
+        print(f"发送失败：{exc}{hint}", file=sys.stderr)
         return 1
     print("已发送")
     return 0

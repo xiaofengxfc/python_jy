@@ -25,6 +25,8 @@ import shutil
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -855,9 +857,76 @@ def wechat_accounts() -> list[dict]:
     return items
 
 
+def wechat_session_state(account: str = "") -> dict:
+    """Is the bot's login still valid? ``{"state", "detail", "account"}``.
+
+    WeChat's ilink bot token is not permanent: the server answers
+    ``{"errcode": -14, "errmsg": "session timeout"}`` once it expires, and the
+    plugin has no refresh path — only a new QR scan mints a token. Probing it
+    here is what turns "notifications silently stopped working" into a prompt
+    that says "重新扫码".
+
+    The probe is a one-shot ``getUpdates`` with an empty buffer: cheap, and it
+    does not consume any message. Failures other than a stale token are reported
+    as ``unknown`` — a flaky network must not ask the user to scan again.
+    """
+    folder = _state_dir() / "openclaw-weixin" / "accounts"
+    candidates = [account] if account else []
+    for item in wechat_accounts():
+        candidates.append(item["account"])
+    token = ""
+    used = ""
+    for name in candidates:
+        path = folder / f"{name}.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        raw = str(data.get("token") or "").strip()
+        if raw:
+            token = raw
+            used = name
+            base = str(data.get("baseUrl") or "").strip() or "https://ilinkai.weixin.qq.com"
+            break
+    if not token:
+        return {"state": "missing", "detail": "还没有绑定微信账号", "account": ""}
+
+    body = json.dumps(
+        {"get_updates_buf": "", "base_info": {"channel_version": "1.0.0"}}
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        f"{base.rstrip('/')}/ilink/bot/getupdates",
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=8.0) as response:
+            payload = json.loads(response.read().decode("utf-8", "replace"))
+    except Exception as exc:  # network trouble is not an expired login
+        return {"state": "unknown", "detail": f"无法确认登录状态：{exc}", "account": used}
+    code = payload.get("errcode", payload.get("ret", 0)) if isinstance(payload, dict) else 0
+    if code == 0:
+        return {"state": "ok", "detail": "", "account": used}
+    message = str(payload.get("errmsg") or "") if isinstance(payload, dict) else ""
+    if code == -14:
+        return {
+            "state": "expired",
+            "detail": f"微信登录已过期（{message or 'session timeout'}），需要重新扫码",
+            "account": used,
+        }
+    return {
+        "state": "unknown",
+        "detail": f"微信接口返回 errcode={code} {message}".strip(),
+        "account": used,
+    }
+
+
 def wechat_targets() -> list[dict]:
     """Recipient ids a push can be addressed to, best first.
-
     Two sources, both written by the plugin itself: the scanning account's
     ``userId`` (always present once bound) and the peers that have messaged the
     bot (each key in ``<accountId>.context-tokens.json``). A peer that has

@@ -234,6 +234,12 @@ export interface NotifyStatus {
   spooled: number;
   /** Seconds the channel is paused for after repeated failures; 0 = not paused. */
   breaker_seconds: number;
+  /** WeChat login verdict. `expired` means pushes are dropped until a rescan. */
+  session: {
+    state: "ok" | "expired" | "missing" | "unknown" | string;
+    detail: string;
+    account: string;
+  };
 }
 
 /** State of the "install OpenClaw" helper. */

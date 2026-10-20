@@ -111,6 +111,31 @@ def test_stop_only_kills_a_gateway_we_started(monkeypatch) -> None:
     assert killed, "自己启动的网关应在退出时停止"
 
 
+def test_detach_leaves_the_gateway_running(monkeypatch) -> None:
+    """App shutdown must not kill the gateway: a restart costs the WeChat login.
+
+    The ilink bot token is bound to the running plugin, so stopping the process
+    forces the user to scan a new QR. ``detach`` forgets the handle instead.
+    """
+    supervisor = GatewaySupervisor()
+    killed = []
+    monkeypatch.setattr("btrader.gateway.subprocess.run", lambda *a, **k: killed.append(a))
+    monkeypatch.setattr(supervisor, "_reachable", lambda: True)
+
+    # A managed, running gateway: ``stop`` would taskkill this pid.
+    supervisor._process = FakeProcess()
+    supervisor._info.state = "running"
+    supervisor._info.managed = True
+
+    supervisor.detach()
+
+    assert killed == [], "退出时不应该杀掉网关"
+    assert supervisor.status()["state"] == "external"
+    assert supervisor.status()["managed"] is False
+    # The next start adopts whatever is listening instead of spawning a second one.
+    assert supervisor.start()["state"] == "external"
+
+
 def test_status_before_start_is_idle(monkeypatch) -> None:
     supervisor = GatewaySupervisor()
     monkeypatch.setattr(supervisor, "_reachable", lambda: False)

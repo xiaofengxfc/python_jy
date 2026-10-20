@@ -150,6 +150,9 @@ class WeChatNotifier:
         # until which sends fail fast instead of waiting out the CLI.
         self._failures: int = 0
         self._open_until: float = 0.0
+        # Cached probe of the WeChat login (``session_state``).
+        self._session: dict = {"state": "unknown", "detail": "", "account": ""}
+        self._session_at: float = 0.0
 
     # ------------------------------------------------------------------- public
     def notify(self, text: str, *, kind: str = "") -> bool:
@@ -193,6 +196,9 @@ class WeChatNotifier:
             raise NotifyError("消息内容为空")
         if not self._resolve_target()[0]:
             raise NotifyError("尚未填写微信接收目标，无法发送。")
+        # An explicit test is the moment to re-ask WeChat: the user may have just
+        # scanned a new QR and the cached verdict would still say "expired".
+        self.session_state(refresh=True)
         try:
             return self._run(text, respect_breaker=False)
         except NotifyError as exc:
@@ -220,7 +226,30 @@ class WeChatNotifier:
             # channel looks idle while messages are stacking up off-screen.
             "spooled": len(_spool_load()),
             "breaker_seconds": max(0, int(self._open_until - time.time())),
+            # WeChat's bot login expires on its own schedule and only a new QR
+            # scan renews it. Reporting it here is what lets the page say
+            # "重新扫码" instead of letting pushes fail silently.
+            "session": self.session_state(),
         }
+
+    def session_state(self, *, refresh: bool = False) -> dict:
+        """Cached verdict on the WeChat login (probed at most once a minute)."""
+        now = time.time()
+        with self._lock:
+            if not refresh and self._session_at and now - self._session_at < 60.0:
+                return dict(self._session)
+        state = {"state": "unknown", "detail": "", "account": ""}
+        if self.settings.enabled and (self.settings.channel or "") == DEFAULT_CHANNEL:
+            try:
+                from .installer import wechat_session_state
+
+                state = wechat_session_state(self.settings.account)
+            except Exception as exc:  # pragma: no cover - best effort
+                state = {"state": "unknown", "detail": str(exc), "account": ""}
+        with self._lock:
+            self._session = state
+            self._session_at = now
+        return dict(state)
 
     def stop(self) -> None:
         self._stop.set()
@@ -386,6 +415,13 @@ class WeChatNotifier:
         target, account = self._resolve_target()
         if not target:
             raise NotifyError("尚未填写微信接收目标，无法发送。")
+        # A dead WeChat login cannot be revived by the CLI: skip the 30 s call and
+        # say what to do. The verdict is cached for a minute, so a fresh scan is
+        # picked up almost immediately.
+        if channel == DEFAULT_CHANNEL and self.session_state().get("state") == "expired":
+            raise NotifyError(
+                "微信登录已过期（session timeout），消息已暂存，重新扫码后会自动补发。"
+            )
         self._preflight()
         args = [
             command,
@@ -816,6 +852,24 @@ def _spool_add(text: str) -> None:
         return
     items.append({"text": text, "at": time.time()})
     _spool_save(items)
+
+
+def spool_message(text: str) -> int:
+    """Keep a message for later delivery; returns how many are waiting.
+
+    Used by the one-shot CLI (``btrader.notify_cli``): that process dies right
+    after the send, so a failure would otherwise lose the report entirely. The
+    app's worker replays whatever is here once the channel recovers.
+    """
+    try:
+        _spool_add(_prepare(text))
+    except Exception:  # pragma: no cover - a broken data dir must not raise
+        log.debug("暂存消息失败", exc_info=True)
+        return 0
+    try:
+        return len(_spool_load())
+    except Exception:  # pragma: no cover
+        return 0
 
 
 def _spool_text(item: dict) -> str:

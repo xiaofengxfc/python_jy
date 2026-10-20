@@ -901,6 +901,21 @@ export default function SettingsPage({ settings, onSaved }: Props) {
               </button>
             </div>
             <div className="card-body stack">
+              {/* The bot login expires on WeChat's schedule; only a new scan
+                  renews it. Say so here, with the scan right next to it. */}
+              {notifyStatus?.session?.state === "expired" && (
+                <div className="banner error" role="alert">
+                  <span>{notifyStatus.session.detail || "微信登录已过期，需要重新扫码。"}</span>
+                  <span className="spacer" />
+                  <button
+                    type="button"
+                    className="btn-sm"
+                    onClick={() => void openLogin(true)}
+                  >
+                    重新扫码
+                  </button>
+                </div>
+              )}
               <label className="check">
                 <input
                   type="checkbox"

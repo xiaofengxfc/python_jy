@@ -82,3 +82,22 @@ def test_a_failed_send_exits_1(sent, capsys) -> None:
     sent["fail"] = True
     assert notify_cli.main(["回测完成"]) == 1
     assert "网关没响应" in capsys.readouterr().err
+
+
+def test_a_failed_send_is_spooled_for_a_later_replay(sent, capsys, monkeypatch) -> None:
+    """The CLI exits right after this call, so an unsent report must be kept.
+
+    The app's worker replays the spool once the channel recovers — which is how
+    a report sent while WeChat was asking for a new QR still arrives afterwards.
+    """
+    spooled: list[str] = []
+    monkeypatch.setattr(
+        notify_cli, "spool_message", lambda text: spooled.append(text) or 1
+    )
+    sent["fail"] = True
+
+    assert notify_cli.main(["--title", "任务完成", "回测跑完了"]) == 1
+
+    assert len(spooled) == 1
+    assert "【任务完成】" in spooled[0]
+    assert "已暂存" in capsys.readouterr().err
