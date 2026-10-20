@@ -36,6 +36,32 @@ class RiskSettings:
 
 
 @dataclass
+class AIAutoSettings:
+    """AI 自主交易的持久化配置（默认关闭、纸面模式）。
+
+    ``live_enabled`` 只是“允许实盘”的一半条件：每次启动仍要显式传
+    ``confirm_live``，并且必须主网 + 未急停（见 ``engine/ai_trader.py``）。
+    """
+
+    enabled: bool = False
+    mode: str = "paper"
+    live_enabled: bool = False
+    symbol: str = ""
+    timeframe: str = ""
+    leverage: float = 1.0
+    max_order_quote: float = 50.0
+    max_position_quote: float = 200.0
+    max_decisions_per_day: int = 96
+    max_orders_per_hour: int = 12
+    min_confidence: float = 0.6
+    decision_ttl_sec: float = 120.0
+    max_price_drift_pct: float = 0.005
+    cooldown_sec: float = 30.0
+    poll_sec: float = 60.0
+    require_stop: bool = True
+
+
+@dataclass
 class AppSettings:
     network: str = Network.MAINNET.value
     market_type: str = MarketType.SPOT.value
@@ -55,6 +81,8 @@ class AppSettings:
     # lives in the OS keyring, so a settings file that gets copied or shared
     # never carries a credential.
     ai: AISettings = field(default_factory=AISettings)
+    # AI 自主交易（Phase 3）：默认关闭，实盘另有显式开关。
+    ai_auto: AIAutoSettings = field(default_factory=AIAutoSettings)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -79,6 +107,7 @@ class ConfigStore:
         risk_raw = raw.pop("risk", {}) or {}
         notify_raw = raw.pop("notify", {}) or {}
         ai_raw = raw.pop("ai", {}) or {}
+        ai_auto_raw = raw.pop("ai_auto", {}) or {}
         known = {f for f in AppSettings.__dataclass_fields__}
         settings = AppSettings(**{k: v for k, v in raw.items() if k in known})
         risk_known = {f for f in RiskSettings.__dataclass_fields__}
@@ -91,6 +120,10 @@ class ConfigStore:
         )
         ai_known = {f for f in AISettings.__dataclass_fields__}
         settings.ai = AISettings(**{k: v for k, v in ai_raw.items() if k in ai_known})
+        ai_auto_known = {f for f in AIAutoSettings.__dataclass_fields__}
+        settings.ai_auto = AIAutoSettings(
+            **{k: v for k, v in ai_auto_raw.items() if k in ai_auto_known}
+        )
         return settings
 
     def save(self) -> None:

@@ -24,9 +24,10 @@ from pydantic import BaseModel, Field
 import pandas as pd
 
 from ..backtest import BacktestConfig, grid_search, run_backtest
-from ..core.config import RiskSettings
+from ..core.config import AIAutoSettings, RiskSettings
 from ..core.credentials import Credentials
 from ..core.types import TIMEFRAME_SECONDS, MarketType, Network, RunMode, timeframe_seconds
+from ..engine.ai_trader import AITrader, AITraderConfig, TradeLease
 from ..engine.auto import AutoTrader, AutoTraderConfig
 from ..exchange import mirror
 from ..exchange.rest import BinanceREST
@@ -115,6 +116,27 @@ class SettingsPayload(BaseModel):
     risk: dict[str, Any] | None = None
     notify: dict[str, Any] | None = None
     ai: dict[str, Any] | None = None
+    ai_auto: dict[str, Any] | None = None
+
+
+class AITraderStartPayload(BaseModel):
+    """启动 AI 自主交易。实盘必须显式 ``confirm_live``。"""
+
+    mode: str = ""
+    market: str = ""
+    symbol: str = ""
+    timeframe: str = ""
+    confirm_live: bool = False
+    max_order_quote: float | None = Field(default=None, ge=0)
+    max_position_quote: float | None = Field(default=None, ge=0)
+
+
+class AITraderPausePayload(BaseModel):
+    paused: bool = True
+
+
+class AITraderHaltPayload(BaseModel):
+    reason: str = "人工干预"
 
 
 class NotifyTestPayload(BaseModel):
@@ -545,9 +567,142 @@ def _install_options(payload: InstallPayload) -> InstallOptions:
     )
 
 
+class AITraderController:
+    """单例：同一时刻只允许一个 AI 自主交易实例（INV-14）。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._trader: AITrader | None = None
+        self.lease = TradeLease()
+
+    @property
+    def trader(self) -> AITrader | None:
+        with self._lock:
+            return self._trader
+
+    def start(self, state, payload: AITraderStartPayload) -> dict[str, Any]:
+        ctx = state.ctx
+        cfg = ctx.settings.ai_auto
+        mode = payload.mode or cfg.mode or "paper"
+        if mode not in ("paper", "live"):
+            raise HTTPException(status_code=400, detail="模式必须是 paper 或 live")
+        market = _market(payload.market) if payload.market else ctx.market_type
+        symbol = (payload.symbol or cfg.symbol or ctx.settings.last_symbol).strip()
+        timeframe = payload.timeframe or cfg.timeframe or ctx.settings.timeframe
+        if not symbol:
+            raise HTTPException(status_code=400, detail="请先选择交易对")
+        if timeframe not in TIMEFRAME_SECONDS:
+            raise HTTPException(status_code=400, detail=f"不支持的周期：{timeframe}")
+        if not ctx.settings.ai.enabled:
+            raise HTTPException(status_code=400, detail="请先在设置中启用 AI 助手")
+        if mode == "live":
+            if not cfg.live_enabled:
+                raise HTTPException(
+                    status_code=400, detail="实盘未在设置中显式开启（ai_auto.live_enabled）"
+                )
+            if not payload.confirm_live:
+                raise HTTPException(
+                    status_code=400, detail="实盘需要显式确认（confirm_live=true）"
+                )
+            if ctx.network is not Network.MAINNET:
+                raise HTTPException(status_code=400, detail="实盘必须使用主网")
+            if not ctx.rest_for(market).has_credentials:
+                raise HTTPException(status_code=400, detail="实盘需要配置 API Key")
+
+        config = AITraderConfig(
+            enabled=True,
+            mode=mode,
+            live_enabled=cfg.live_enabled,
+            confirm_live=payload.confirm_live,
+            network=ctx.network.value,
+            symbol=symbol,
+            market_type=market.value,
+            timeframe=timeframe,
+            leverage=cfg.leverage,
+            max_order_quote=(
+                cfg.max_order_quote if payload.max_order_quote is None else payload.max_order_quote
+            ),
+            max_position_quote=(
+                cfg.max_position_quote
+                if payload.max_position_quote is None
+                else payload.max_position_quote
+            ),
+            max_decisions_per_day=cfg.max_decisions_per_day,
+            max_orders_per_hour=cfg.max_orders_per_hour,
+            min_confidence=cfg.min_confidence,
+            decision_ttl_sec=cfg.decision_ttl_sec,
+            max_price_drift_pct=cfg.max_price_drift_pct,
+            cooldown_sec=cfg.cooldown_sec,
+            poll_sec=cfg.poll_sec,
+            require_stop=cfg.require_stop,
+        )
+        trader = AITrader(
+            config,
+            trading=ctx.trading,
+            llm=ctx.ai,
+            risk=ctx.trading.risk,
+            lease=self.lease,
+            frame_provider=lambda: _closed_only(
+                _market_frame(state, ctx, market, symbol, timeframe, 300), timeframe
+            ),
+            portfolio_provider=lambda: _ai_portfolio(state, symbol),
+        )
+        ok, message = trader.start()
+        if not ok:
+            raise HTTPException(status_code=400, detail=message)
+        with self._lock:
+            previous = self._trader
+            self._trader = trader
+        if previous is not None and previous is not trader:
+            previous.stop()
+        return trader.status()
+
+    def stop(self) -> dict[str, Any]:
+        with self._lock:
+            trader, self._trader = self._trader, None
+        if trader is not None:
+            trader.stop()
+        return self.status()
+
+    def pause(self, paused: bool) -> dict[str, Any]:
+        trader = self.trader
+        if trader is not None:
+            trader.pause(paused)
+        return self.status()
+
+    def halt(self, reason: str) -> dict[str, Any]:
+        trader = self.trader
+        if trader is not None:
+            trader.halt(reason)
+        return self.status()
+
+    def kill(self, reason: str = "急停") -> dict[str, Any]:
+        with self._lock:
+            trader, self._trader = self._trader, None
+        if trader is not None:
+            trader.kill(reason)
+        return {"state": "halted", "reason": reason}
+
+    def status(self, since: int = 0) -> dict[str, Any]:
+        trader = self.trader
+        if trader is None:
+            return {
+                "state": "stopped",
+                "paused": False,
+                "halted_reason": "",
+                "config": {},
+                "counters": {},
+                "last_decision": None,
+                "events": [],
+                "seq": 0,
+            }
+        return trader.status(since)
+
+
 def build_router(get_state: Callable[[], Any]) -> APIRouter:
     router = APIRouter()
     auto = AutoController()
+    ai_ctl = AITraderController()
     jobs = JobStore()
 
     # ------------------------------------------------------------ portfolio
@@ -670,6 +825,10 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
             candidate_ai = replace(settings.ai)
             _apply_ai(candidate_ai, payload.ai)
             settings.ai = candidate_ai
+        if payload.ai_auto is not None:
+            candidate_auto = replace(settings.ai_auto)
+            _apply_ai_auto(candidate_auto, payload.ai_auto)
+            settings.ai_auto = candidate_auto
 
         ctx.save_settings()
         return {"ok": True, "settings": settings.to_dict()}
@@ -697,6 +856,22 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
         risk.clear_halt()
         log.warning("风控熔断已手动解除，日内基准重置")
         return risk.snapshot()
+
+    @router.post("/api/risk/kill")
+    def risk_kill(payload: AITraderHaltPayload) -> dict[str, Any]:
+        """一键急停：打开全局风控开关，并停掉 AI/自动交易（INV-8）。"""
+        state = get_state()
+        ctx = state.ctx
+        ctx.settings.risk.kill_switch = True
+        ctx.save_settings()
+        auto.stop()
+        ai_ctl.kill(payload.reason or "急停")
+        log.warning("全局急停已开启")
+        return {
+            "ok": True,
+            "risk": ctx.trading.risk.snapshot(),
+            "ai_trader": ai_ctl.status(),
+        }
 
     # --------------------------------------------------------------- ai
     @router.get("/api/ai/status")
@@ -1189,6 +1364,58 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
         auto.stop()
         return {"ok": True, "status": auto.status()}
 
+    # ------------------------------------------------------- AI 自主交易
+    @router.get("/api/ai/trader/status")
+    def ai_trader_status(since: int = 0) -> dict[str, Any]:
+        return ai_ctl.status(since)
+
+    @router.post("/api/ai/trader/start")
+    def ai_trader_start(payload: AITraderStartPayload) -> dict[str, Any]:
+        return {"ok": True, "status": ai_ctl.start(get_state(), payload)}
+
+    @router.post("/api/ai/trader/stop")
+    def ai_trader_stop() -> dict[str, Any]:
+        return {"ok": True, "status": ai_ctl.stop()}
+
+    @router.post("/api/ai/trader/pause")
+    def ai_trader_pause(payload: AITraderPausePayload) -> dict[str, Any]:
+        return {"ok": True, "status": ai_ctl.pause(payload.paused)}
+
+    @router.post("/api/ai/trader/halt")
+    def ai_trader_halt(payload: AITraderHaltPayload) -> dict[str, Any]:
+        return {"ok": True, "status": ai_ctl.halt(payload.reason or "人工干预")}
+
+    @router.post("/api/ai/trader/kill")
+    def ai_trader_kill(payload: AITraderHaltPayload) -> dict[str, Any]:
+        """急停：AI 交易 + 自动交易全部停止，并打开全局风控急停。"""
+        state = get_state()
+        ctx = state.ctx
+        ctx.settings.risk.kill_switch = True
+        ctx.save_settings()
+        auto.stop()
+        result = ai_ctl.kill(payload.reason or "急停")
+        log.warning("AI 自主交易急停：%s", result.get("reason"))
+        return {"ok": True, "ai_trader": result, "risk": ctx.trading.risk.snapshot()}
+
+    @router.get("/api/ai/trader/audit")
+    def ai_trader_audit(limit: int = 100) -> dict[str, Any]:
+        path = paths.logs_dir() / "ai-trade-audit.jsonl"
+        if not path.exists():
+            return {"items": []}
+        count = max(1, min(limit, 500))
+        rows: deque[dict[str, Any]] = deque(maxlen=count)
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    continue
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"读取审计日志失败：{exc}") from exc
+        return {"items": list(rows)}
+
     # ------------------------------------------------------------- backtest
     @router.post("/api/backtest/run")
     def backtest_run(payload: BacktestPayload) -> dict[str, Any]:
@@ -1301,6 +1528,60 @@ def _apply_ai(target: Any, values: dict[str, Any]) -> None:
             raise HTTPException(status_code=400, detail=f"AI 字段 {key} 的值无效") from None
     if target.daily_limit < 0:
         raise HTTPException(status_code=400, detail="每日调用上限不能为负")
+
+
+def _apply_ai_auto(target: AIAutoSettings, values: dict[str, Any]) -> None:
+    """AI 自主交易设置：只接受 dataclass 声明的字段，类型就地转换。"""
+    for key, value in values.items():
+        if not hasattr(target, key):
+            log.debug("忽略未知 AI 自动交易字段: %s", key)
+            continue
+        current = getattr(target, key)
+        if isinstance(current, bool):
+            setattr(target, key, bool(value))
+            continue
+        try:
+            setattr(target, key, type(current)(value))
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400, detail=f"AI 自动交易字段 {key} 的值无效"
+            ) from None
+    if target.mode not in ("paper", "live"):
+        raise HTTPException(status_code=400, detail="ai_auto.mode 必须是 paper 或 live")
+    for name in ("max_order_quote", "max_position_quote", "max_price_drift_pct"):
+        if getattr(target, name) < 0:
+            raise HTTPException(status_code=400, detail=f"ai_auto.{name} 不能为负")
+    if not (0.0 <= target.min_confidence <= 1.0):
+        raise HTTPException(status_code=400, detail="ai_auto.min_confidence 必须在 0 到 1 之间")
+
+
+def _ai_portfolio(state, symbol: str) -> dict[str, Any]:
+    """AI 交易用的组合视图：权益、该交易对持仓、最新价、风控状态。"""
+    ctx = state.ctx
+    market = ctx.market_type
+    price = _last_price(state, market, symbol)
+    with state.account_lock:
+        account = ctx.paper.account
+        position = account.positions.get(symbol)
+        position_quote = 0.0
+        if position is not None and abs(position.contracts) > 1e-12:
+            last = price or position.entry_price
+            position_quote = abs(position.contracts) * last
+        holdings = 0.0
+        for item in account.positions.values():
+            if abs(item.contracts) <= 1e-12:
+                continue
+            last = price if item.symbol == symbol and price else item.entry_price
+            holdings += abs(item.contracts) * last
+        equity = account.cash + holdings
+    risk = ctx.trading.risk
+    return {
+        "price": price,
+        "position_quote": position_quote,
+        "equity": equity,
+        "kill_switch": bool(risk.settings.kill_switch),
+        "halted_reason": risk.state.halted_reason,
+    }
 
 
 def _market_frame(state, ctx, market, symbol: str, timeframe: str, limit: int):
