@@ -36,6 +36,20 @@ log = logging.getLogger(__name__)
 # Backtest jobs are short-lived; keep the newest N so a long session cannot
 # grow the process without bound.
 MAX_JOBS = 40
+# A repeating loop error must not become a stream of push messages.
+ERROR_NOTIFY_INTERVAL = 600.0
+
+
+def _notify_task(ctx, title: str, lines: list[str] | None = None) -> None:
+    """Push a task event (启动/结束/失败) to WeChat. Never raises.
+
+    A task notification must not be able to fail the task itself: the gateway
+    can be down, the CLI can be missing, and the backtest still has to finish.
+    """
+    try:
+        ctx.notifier.notify(WeChatNotifier.format_task(title, lines), kind="task")
+    except Exception:  # pragma: no cover - defensive
+        log.debug("任务通知发送失败", exc_info=True)
 
 
 def _market(value: str) -> MarketType:
@@ -189,6 +203,9 @@ class AutoController:
         self.events = EventLog()
         self.last_signal: dict[str, Any] | None = None
         self.config: dict[str, Any] | None = None
+        # Loop errors repeat every poll; the phone should hear about a broken
+        # strategy once, not once per tick.
+        self._error_notified_at = 0.0
 
     @property
     def running(self) -> bool:
@@ -238,13 +255,9 @@ class AutoController:
                 poll_seconds=payload.poll_seconds,
             )
             trader = AutoTrader(config, strategy, ctx.trading, ctx.klines)
-            trader.on_log(lambda level, message: self.events.add("log", level, message))
+            trader.on_log(lambda level, message: self._on_log(ctx, level, message))
             trader.on_signal(self._on_signal)
-            trader.on_state(
-                lambda running: self.events.add(
-                    "state", "INFO", "自动交易已启动" if running else "自动交易已停止"
-                )
-            )
+            trader.on_state(lambda running: self._on_state(ctx, running))
             self._trader = trader
             self.config = {
                 "symbol": config.symbol,
@@ -282,6 +295,37 @@ class AutoController:
             "seq": seq,
             "events": items,
         }
+
+    # ------------------------------------------------------------- notifications
+    def _on_state(self, ctx, running: bool) -> None:
+        """自动交易启停：写事件日志，同时推送手机。"""
+        self.events.add(
+            "state", "INFO", "自动交易已启动" if running else "自动交易已停止"
+        )
+        config = self.config or {}
+        label = (
+            f"{config.get('symbol', '')} {config.get('timeframe', '')}"
+            f" · {config.get('strategy', '')}"
+        ).strip()
+        mode = "实盘" if config.get("mode") == "live" else "纸面"
+        _notify_task(
+            ctx,
+            "自动交易已启动" if running else "自动交易已停止",
+            [label, f"模式：{mode}"],
+        )
+        if not running:
+            self._error_notified_at = 0.0
+
+    def _on_log(self, ctx, level: str, message: str) -> None:
+        """循环异常写日志；同一条错误只推一次，避免刷屏。"""
+        self.events.add("log", level, message)
+        if level != "ERROR":
+            return
+        now = time.time()
+        if now - self._error_notified_at < ERROR_NOTIFY_INTERVAL:
+            return
+        self._error_notified_at = now
+        _notify_task(ctx, "自动交易异常", [message[:300]])
 
 
 # ------------------------------------------------------------------ backtests
@@ -322,6 +366,23 @@ class JobStore:
             if job is None:
                 raise HTTPException(status_code=404, detail="任务不存在或已过期")
             return dict(job)
+
+
+def _metric_text(
+    metrics: dict, key: str, unit: str = "", *, signed: bool = True
+) -> str:
+    """Format one backtest metric for a phone screen: short and honest.
+
+    A missing metric prints ``—`` rather than ``0``: "回测完成 · 收益 0%" is a
+    claim, while "—" says the run had nothing to report.
+    """
+    try:
+        value = float(metrics.get(key))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return "—"
+    if unit == "%":
+        return f"{value * 100:+.2f}%" if signed else f"{value * 100:.2f}%"
+    return f"{value:g}{unit}"
 
 
 def _serialize_result(result, params: dict[str, Any], limit_points: int = 1200) -> dict:
@@ -1043,9 +1104,26 @@ def _start_backtest(state, jobs: JobStore, payload: BacktestPayload) -> dict[str
                 except Exception:  # a failed history write must not lose the result
                     log.warning("保存回测记录失败", exc_info=True)
             jobs.update(job_id, status="done", progress=1.0, result=serialized)
+            metrics = serialized.get("metrics") or {}
+            _notify_task(
+                state.ctx,
+                "回测完成",
+                [
+                    f"{payload.symbol} {payload.timeframe} · {payload.strategy}",
+                    f"收益 {_metric_text(metrics, 'total_return', '%')}"
+                    f" · 回撤 {_metric_text(metrics, 'max_drawdown', '%', signed=False)}"
+                    f" · 胜率 {_metric_text(metrics, 'win_rate', '%', signed=False)}",
+                    f"交易 {int(metrics.get('trades') or 0)} 笔",
+                ],
+            )
         except Exception as exc:
             log.warning("回测失败: %s", exc, exc_info=True)
             jobs.update(job_id, status="error", error=str(exc) or exc.__class__.__name__)
+            _notify_task(
+                state.ctx,
+                "回测失败",
+                [f"{payload.symbol} {payload.timeframe} · {payload.strategy}", str(exc)],
+            )
 
     threading.Thread(target=work, name=f"backtest-{job_id}", daemon=True).start()
     return {"job_id": job_id, "status": "running"}
@@ -1083,9 +1161,27 @@ def _start_optimize(state, jobs: JobStore, payload: OptimizePayload) -> dict[str
                 for row in table.to_dict(orient="records")
             ]
             jobs.update(job_id, status="done", progress=1.0, result={"rows": rows})
+            best = rows[0] if rows else {}
+            best_text = ", ".join(
+                f"{key}={best[key]}" for key in list(best)[:4]
+            )
+            _notify_task(
+                state.ctx,
+                "参数优化完成",
+                [
+                    f"{payload.symbol} {payload.timeframe} · {payload.strategy}",
+                    f"共 {len(rows)} 组参数，最优：{best_text or '无结果'}",
+                    f"目标指标：{payload.metric}",
+                ],
+            )
         except Exception as exc:
             log.warning("参数优化失败: %s", exc, exc_info=True)
             jobs.update(job_id, status="error", error=str(exc) or exc.__class__.__name__)
+            _notify_task(
+                state.ctx,
+                "参数优化失败",
+                [f"{payload.symbol} {payload.timeframe} · {payload.strategy}", str(exc)],
+            )
 
     threading.Thread(target=work, name=f"optimize-{job_id}", daemon=True).start()
     return {"job_id": job_id, "status": "running"}

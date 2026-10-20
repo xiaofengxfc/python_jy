@@ -105,6 +105,22 @@ def test_empty_message_is_ignored() -> None:
     assert _notifier().notify("   ") is False
 
 
+def test_task_events_can_be_switched_off(captured, monkeypatch) -> None:
+    """任务通知 is its own toggle: fills can stay on while tasks stay quiet."""
+    monkeypatch.setattr("btrader.notify._bound_wechat_target", lambda: None)
+    notifier = _notifier(on_task=False)
+    try:
+        assert notifier.notify("回测完成", kind="task") is False
+        assert notifier.notify("成交", kind="fill") is True
+    finally:
+        notifier.stop()
+
+
+def test_format_task_puts_the_title_first_and_skips_empty_lines() -> None:
+    text = WeChatNotifier.format_task("回测完成", ["BTCUSDT 1h", "", "收益 +2.10%"])
+    assert text.splitlines() == ["【回测完成】", "BTCUSDT 1h", "收益 +2.10%"]
+
+
 def test_send_now_requires_a_target(monkeypatch) -> None:
     # Pin "nothing is bound": without this the test would read the real
     # ``~/.openclaw`` state and pass or fail depending on the developer's own

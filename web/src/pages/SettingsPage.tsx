@@ -1016,6 +1016,14 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                   />
                   实盘保护单告警
                 </label>
+                <label className="check">
+                  <input
+                    type="checkbox"
+                    checked={draft.notify.on_task}
+                    onChange={(event) => patchNotify({ on_task: event.target.checked })}
+                  />
+                  任务状态（自动交易启停 / 回测完成或失败）
+                </label>
               </div>
               {notifyStatus && !notifyStatus.available && (
                 <div className="verdict bad">

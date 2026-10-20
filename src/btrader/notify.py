@@ -80,6 +80,9 @@ class NotifySettings:
     on_protection: bool = True
     on_risk_halt: bool = True
     on_live_warning: bool = True
+    # Long-running work (自动交易启停、回测/优化完成) reports progress here too,
+    # so the phone is not only about fills.
+    on_task: bool = True
 
 
 @dataclass
@@ -238,6 +241,7 @@ class WeChatNotifier:
             "protection": s.on_protection,
             "risk": s.on_risk_halt,
             "warning": s.on_live_warning,
+            "task": s.on_task,
             "manual": True,
         }.get(kind, True)
 
@@ -417,6 +421,17 @@ class WeChatNotifier:
             f"当日盈亏：{day_pnl:+,.4f} USDT\n"
             "平仓与撤单不受影响。"
         )
+
+    @staticmethod
+    def format_task(title: str, lines: list[str] | None = None) -> str:
+        """A 任务 message: what started, stopped, or finished.
+
+        Kept separate from the trading formatters because these are not trading
+        events: an optimisation that took an hour is the reason someone walks
+        away from the desk, and the phone is how they learn it ended.
+        """
+        body = [line for line in (lines or []) if line]
+        return "\n".join([f"【{title}】", *body])
 
     @staticmethod
     def format_warning(*, title: str, detail: str = "") -> str:

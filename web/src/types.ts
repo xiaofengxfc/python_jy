@@ -182,6 +182,8 @@ export interface NotifySettings {
   on_protection: boolean;
   on_risk_halt: boolean;
   on_live_warning: boolean;
+  /** 自动交易启停、回测/优化完成或失败。 */
+  on_task: boolean;
 }
 
 export interface AppSettings {
