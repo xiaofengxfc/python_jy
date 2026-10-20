@@ -184,6 +184,8 @@ export interface NotifySettings {
   on_live_warning: boolean;
   /** 自动交易启停、回测/优化完成或失败。 */
   on_task: boolean;
+  /** Probe the gateway port before spawning the CLI. */
+  preflight: boolean;
 }
 
 export interface AppSettings {
@@ -226,6 +228,10 @@ export interface NotifyStatus {
   last_success_at: number;
   dropped: number;
   pending: number;
+  /** Messages kept on disk after a failed send, waiting to be replayed. */
+  spooled: number;
+  /** Seconds the channel is paused for after repeated failures; 0 = not paused. */
+  breaker_seconds: number;
 }
 
 /** State of the "install OpenClaw" helper. */

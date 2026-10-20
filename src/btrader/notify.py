@@ -26,10 +26,14 @@ import os
 import queue
 import re
 import shutil
+import socket
 import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
+
+from . import paths
 
 log = logging.getLogger(__name__)
 
@@ -52,6 +56,23 @@ WECHAT_ID_SUFFIX = "@im.wechat"
 # ``"%dp0%\node_modules\openclaw\openclaw.mjs" %*``. Lifting that out lets the
 # notifier call node directly instead of handing the text to cmd.exe.
 _SHIM_SCRIPT_RE = re.compile(r'"([^"]+\.(?:js|mjs|cjs))"', re.IGNORECASE)
+
+# A dead gateway costs one CLI round trip per message (~30 s) because the CLI
+# waits for a gateway that is not there. Three failures in a row open the
+# breaker for a few minutes, so the queue drains instead of stacking timeouts —
+# which used to mean ten notifications took five minutes to all fail.
+BREAKER_THRESHOLD = 3
+BREAKER_COOLDOWN = 300.0
+# The CLI's own failure takes ~30 s; a TCP probe answers "is anything listening"
+# in a fraction of that, so a down gateway is reported before the wait starts.
+PREFLIGHT_TIMEOUT = 0.4
+# Failed messages are kept on disk and replayed once the channel is back: losing
+# a 熔断 warning because the gateway restarted mid-send is not acceptable.
+SPOOL_LIMIT = 200
+SPOOL_MAX_AGE = 6 * 3600.0
+SPOOL_BATCH = 5
+SPOOL_FILE = "notify-spool.jsonl"
+SPOOL_PREFIX = "【补发】"
 
 
 class NotifyError(RuntimeError):
@@ -83,6 +104,9 @@ class NotifySettings:
     # Long-running work (自动交易启停、回测/优化完成) reports progress here too,
     # so the phone is not only about fills.
     on_task: bool = True
+    # Probe the gateway port before spawning the CLI. Turn off only for a
+    # gateway on a non-default port, where the probe would be a false negative.
+    preflight: bool = True
 
 
 @dataclass
@@ -122,6 +146,10 @@ class WeChatNotifier:
         self.last_error_at: float = 0.0
         self.last_success_at: float = 0.0
         self.dropped: int = 0
+        # Circuit breaker state: consecutive failures and the wall-clock time
+        # until which sends fail fast instead of waiting out the CLI.
+        self._failures: int = 0
+        self._open_until: float = 0.0
 
     # ------------------------------------------------------------------- public
     def notify(self, text: str, *, kind: str = "") -> bool:
@@ -157,7 +185,8 @@ class WeChatNotifier:
         This checks the target and the CLI but deliberately *not*
         ``settings.enabled``: the button exists to verify the wiring before the
         user trusts the stream with real fills, and a successful test is what
-        justifies turning the stream on.
+        justifies turning the stream on. It also ignores an open breaker: an
+        explicit click is how the user proves the channel recovered.
         """
         text = _prepare(text)
         if not text:
@@ -165,9 +194,10 @@ class WeChatNotifier:
         if not self._resolve_target()[0]:
             raise NotifyError("尚未填写微信接收目标，无法发送。")
         try:
-            return self._run(text)
+            return self._run(text, respect_breaker=False)
         except NotifyError as exc:
             self._record_failure(str(exc))
+            self._note_failure()
             raise
 
     def status(self) -> dict:
@@ -186,6 +216,10 @@ class WeChatNotifier:
             "last_success_at": self.last_success_at,
             "dropped": self.dropped,
             "pending": self._queue.qsize(),
+            # Spooled + paused are states the page must show: without them the
+            # channel looks idle while messages are stacking up off-screen.
+            "spooled": len(_spool_load()),
+            "breaker_seconds": max(0, int(self._open_until - time.time())),
         }
 
     def stop(self) -> None:
@@ -228,10 +262,67 @@ class WeChatNotifier:
                 self._run(job.text, from_queue=True)
             except NotifyError as exc:
                 self._record_failure(str(exc))
+                self._note_failure()
+                # Keep the message: the gateway being down is exactly when a
+                # 熔断 warning matters, and it is worth replaying later.
+                _spool_add(job.text)
                 log.warning("微信通知发送失败：%s", exc)
             except Exception as exc:  # pragma: no cover - defensive
                 self._record_failure(f"发送异常：{exc}")
+                self._note_failure()
+                _spool_add(job.text)
                 log.warning("微信通知异常", exc_info=True)
+            else:
+                # Proof the channel works again: drain what piled up meanwhile.
+                self._replay_spool()
+
+    # -------------------------------------------------------------------- guard
+    def _check_breaker(self) -> None:
+        """Refuse instantly while the channel is known to be broken."""
+        remaining = self._open_until - time.time()
+        if remaining > 0:
+            raise NotifyError(
+                f"通道连续发送失败，已暂停 {int(remaining)} 秒。请检查网关或 OpenClaw 后重试。"
+            )
+
+    def _note_success(self) -> None:
+        self._failures = 0
+        self._open_until = 0.0
+
+    def _note_failure(self) -> None:
+        self._failures += 1
+        if self._failures >= BREAKER_THRESHOLD:
+            self._failures = 0
+            self._open_until = time.time() + BREAKER_COOLDOWN
+            log.warning("微信通道连续失败，暂停发送 %g 秒", BREAKER_COOLDOWN)
+
+    def _preflight(self) -> None:
+        """Fail in 0.4 s when nothing is listening on the gateway port.
+
+        The CLI cannot tell us quickly: it starts Node, then waits for a gateway
+        that is not there, then exits — about 30 s per message. A TCP probe on
+        the port the app itself starts the gateway on answers the same question
+        immediately, so the user gets "先启动网关" instead of a 30 s stall.
+        """
+        if not self.settings.preflight:
+            return
+        _probe_gateway()
+
+    def _replay_spool(self) -> None:
+        """Send what failed earlier, oldest first, a few at a time."""
+        items = _spool_load()
+        if not items:
+            return
+        batch, rest = items[:SPOOL_BATCH], items[SPOOL_BATCH:]
+        _spool_save(rest)
+        for index, item in enumerate(batch):
+            try:
+                self._run(_spool_text(item), from_queue=True)
+            except NotifyError as exc:
+                # Put this one and the untouched remainder back, in order.
+                _spool_save([item, *batch[index + 1:], *rest])
+                log.warning("补发失败：%s", exc)
+                return
 
     # -------------------------------------------------------------------- send
     def _event_enabled(self, kind: str) -> bool:
@@ -280,7 +371,11 @@ class WeChatNotifier:
             return "", account
         return bound["target"], account or bound["account"]
 
-    def _run(self, text: str, *, from_queue: bool = False) -> dict:
+    def _run(
+        self, text: str, *, from_queue: bool = False, respect_breaker: bool = True
+    ) -> dict:
+        if respect_breaker:
+            self._check_breaker()
         command = self._resolve_command()
         if not command:
             raise NotifyError(
@@ -291,6 +386,7 @@ class WeChatNotifier:
         target, account = self._resolve_target()
         if not target:
             raise NotifyError("尚未填写微信接收目标，无法发送。")
+        self._preflight()
         args = [
             command,
             "message",
@@ -343,6 +439,7 @@ class WeChatNotifier:
         self.last_error = ""
         self.last_error_at = 0.0
         self.last_success_at = time.time()
+        self._note_success()
         return {"ok": True, "stdout": stdout[:2000]}
 
     def _record_failure(self, message: str) -> None:
@@ -612,6 +709,108 @@ def _quote_for_cmd(arg: str) -> str:
     clean = str(arg).replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
     return '"' + clean.replace('"', '""') + '"'
 
+
+
+def _probe_gateway() -> None:
+    """Raise :class:`NotifyError` when nothing listens on the gateway port.
+
+    Module-level so the check can be exercised directly (and disabled wholesale
+    in tests) without constructing a notifier around it.
+    """
+    try:
+        # Imported lazily: ``gateway`` pulls in the supervisor machinery.
+        from .gateway import GATEWAY_HOST, GATEWAY_PORT
+    except Exception:  # pragma: no cover - defensive
+        return
+    try:
+        with socket.create_connection((GATEWAY_HOST, GATEWAY_PORT), PREFLIGHT_TIMEOUT):
+            return
+    except OSError:
+        pass
+    raise NotifyError(
+        f"网关没有在 {GATEWAY_HOST}:{GATEWAY_PORT} 监听，请到设置页启动网关后再试"
+        "（若你用自定义端口，可关闭「发送前检查网关」）。"
+    )
+
+
+# ---------------------------------------------------------------------- spool
+def _spool_path() -> Path:
+    """Where undeliverable messages are kept between attempts."""
+    return paths.data_dir() / SPOOL_FILE
+
+
+def _spool_load() -> list[dict]:
+    """Read the spool, dropping entries too old to be worth sending.
+
+    A fill from six hours ago is not news; replaying it would be worse than the
+    silence that preceded it. Corruption is treated as "nothing to replay" —
+    a bad spool must never block a new send.
+    """
+    try:
+        raw = _spool_path().read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return []
+    now = time.time()
+    items: list[dict] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(item, dict) or not str(item.get("text") or "").strip():
+            continue
+        try:
+            at = float(item.get("at") or 0.0)
+        except (TypeError, ValueError):
+            at = 0.0
+        if now - at > SPOOL_MAX_AGE:
+            continue
+        items.append({"text": str(item["text"]), "at": at})
+    return items[-SPOOL_LIMIT:]
+
+
+def _spool_save(items: list[dict]) -> None:
+    """Replace the spool atomically: a half-written file loses messages."""
+    path = _spool_path()
+    trimmed = items[-SPOOL_LIMIT:]
+    if not trimmed:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return
+    body = "".join(
+        json.dumps({"text": item["text"], "at": item.get("at", time.time())}, ensure_ascii=False)
+        + "\n"
+        for item in trimmed
+    )
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        tmp.write_text(body, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        log.debug("写入通知暂存失败", exc_info=True)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def _spool_add(text: str) -> None:
+    items = _spool_load()
+    if any(item["text"] == text for item in items):
+        return
+    items.append({"text": text, "at": time.time()})
+    _spool_save(items)
+
+
+def _spool_text(item: dict) -> str:
+    """Mark a replayed message so it reads as late news, not a fresh event."""
+    text = str(item.get("text") or "")
+    return text if text.startswith(SPOOL_PREFIX) else f"{SPOOL_PREFIX}\n{text}"
 
 
 def _parse_json(stdout: str) -> dict | None:

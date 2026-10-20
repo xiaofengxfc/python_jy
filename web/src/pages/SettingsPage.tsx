@@ -1024,6 +1024,14 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                   />
                   任务状态（自动交易启停 / 回测完成或失败）
                 </label>
+                <label className="check">
+                  <input
+                    type="checkbox"
+                    checked={draft.notify.preflight}
+                    onChange={(event) => patchNotify({ preflight: event.target.checked })}
+                  />
+                  发送前检查网关（连不上就立即报错，不必等 30 秒）
+                </label>
               </div>
               {notifyStatus && !notifyStatus.available && (
                 <div className="verdict bad">
@@ -1377,6 +1385,18 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                       （{new Date(notifyStatus.last_error_at * 1000).toLocaleTimeString()}）
                     </span>
                   )}
+                </div>
+              )}
+              {notifyStatus && notifyStatus.breaker_seconds > 0 && (
+                <div className="verdict bad">
+                  通道连续发送失败，已暂停 {notifyStatus.breaker_seconds} 秒。
+                  请先检查网关是否在运行；“发送测试”可随时手动探活并恢复。
+                </div>
+              )}
+              {notifyStatus && notifyStatus.spooled > 0 && (
+                <div className="verdict bad">
+                  有 {notifyStatus.spooled} 条消息因发送失败暂存在本地，
+                  通道恢复后会自动补发（标注【补发】，超过 6 小时的会丢弃）。
                 </div>
               )}
               {notifyStatus && notifyStatus.last_success_at > 0 && (
