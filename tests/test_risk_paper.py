@@ -156,7 +156,10 @@ def test_paper_short_and_flip():
     position = broker.account.position_for("BTC/USDT")
     assert position.contracts == 1.0
     assert position.entry_price == 90.0
-    assert position.realized_pnl == 10.0
+    # A flip leaves a brand-new position on the other side, so its own tally
+    # starts at zero; the closed short's +10 lives in the account ledger.
+    assert position.realized_pnl == 0.0
+    assert broker.realized_pnl() == pytest.approx(10.0)
 
 
 def test_paper_reset():
@@ -728,3 +731,38 @@ def test_paper_position_tally_is_repaired_on_restore():
     position = restored.account.positions["BTC/USDT"]
     assert position.realized_pnl == pytest.approx(0.0)
     assert restored.account.realized_by_symbol["BTC/USDT"] == pytest.approx(30.0)
+
+
+def test_paper_position_tally_is_net_of_both_fees():
+    """The row must deduct the commission on both sides of the trade.
+
+    A round trip that ends where it started is not a zero: it cost the entry
+    fee plus the exit fee, and the position has to report that.
+    """
+    broker = PaperBroker(starting_balance=1_000, fee_rate=0.001, slippage_bps=0)
+    broker.place_order("BTC/USDT", "buy", "market", 1.0, price=100.0)
+    position = broker.account.positions["BTC/USDT"]
+    assert position.realized_pnl == pytest.approx(0.0)  # nothing closed yet
+
+    broker.place_order("BTC/USDT", "sell", "market", 1.0, price=100.0)
+    assert position.realized_pnl == pytest.approx(-0.2)  # 0.1 in + 0.1 out
+
+
+def test_paper_partial_closes_deduct_their_share_of_the_entry_fee():
+    """Splitting the exit must not lose or double count the entry commission.
+
+    Half out at 110 then the rest at 100: the fees are 0.1 in, 0.055 and 0.05
+    out, so the position reports +5 and then -0.105, and the two add up to the
+    net result of the whole leg.
+    """
+    broker = PaperBroker(starting_balance=1_000, fee_rate=0.001, slippage_bps=0)
+    broker.place_order("BTC/USDT", "buy", "market", 1.0, price=100.0)
+    broker.place_order("BTC/USDT", "sell", "market", 0.5, price=110.0)
+    position = broker.account.positions["BTC/USDT"]
+    assert position.realized_pnl == pytest.approx(4.895)
+    assert position.entry_fees == pytest.approx(0.05)
+
+    broker.place_order("BTC/USDT", "sell", "market", 0.5, price=100.0)
+    assert position.realized_pnl == pytest.approx(4.895 - 0.1)
+    # Account ledger: the price move minus every fee paid (5 - 0.205).
+    assert broker.realized_pnl() == pytest.approx(4.795)
