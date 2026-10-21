@@ -16,6 +16,7 @@ from btrader.core.types import MarketType
 from btrader.strategy.base import IntParam, Strategy
 from btrader.strategy.candidates import CandidateStore
 from btrader.web.routes_lab import (
+    CandidateBacktestPayload,
     CandidateGeneratePayload,
     CandidateReviewPayload,
     LabController,
@@ -173,3 +174,24 @@ def test_unknown_job_is_404(tmp_path: Path):
         assert exc.status_code == 404
     else:  # pragma: no cover
         raise AssertionError("expected HTTPException")
+
+
+def test_record_candidate_backtest(tmp_path: Path):
+    controller = make_controller({"params": {}}, tmp_path)
+    candidate = controller.candidates.create(
+        SAFE_CODE, strategy_key="gen_strategy", name="生成策略"
+    )
+    result = controller.record_backtest(
+        candidate.id,
+        CandidateBacktestPayload(
+            metrics={"trades": 4, "total_return": 0.12, "max_drawdown": 0.05},
+            symbol="BTC/USDT",
+            timeframe="1h",
+            source="btrader",
+        ),
+    )
+    stored = result["candidate"]["backtest"]
+    assert stored["trades"] == 4
+    assert stored["total_return"] == 0.12
+    assert stored["symbol"] == "BTC/USDT"
+    assert stored["source"] == "btrader"

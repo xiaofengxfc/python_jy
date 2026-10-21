@@ -266,6 +266,7 @@ class AITrader:
         llm: Any,
         frame_provider: Callable[[], Any] | None = None,
         portfolio_provider: Callable[[], dict[str, Any]] | None = None,
+        signal_provider: Callable[[], float] | None = None,
         audit_path: Path | None = None,
         clock: Callable[[], float] = time.time,
         lease: TradeLease | None = None,
@@ -276,6 +277,8 @@ class AITrader:
         self.llm = llm
         self.frame_provider = frame_provider
         self.portfolio_provider = portfolio_provider
+        self.signal_provider = signal_provider
+        self._last_signal: float | None = None
         self.audit_path = audit_path or (paths.logs_dir() / "ai-trade-audit.jsonl")
         self.clock = clock
         self.lease = lease or TradeLease()
@@ -414,13 +417,29 @@ class AITrader:
         if frame is None or getattr(frame, "empty", True):
             return self._record("skip", reason="行情数据不可用", decision=None, now=now)
 
+        # Strategy first: the model may only confirm or veto the direction that
+        # the selected strategy already produced. It never invents an entry.
+        signal_target: float | None = None
+        if self.signal_provider is not None:
+            try:
+                signal_target = float(self.signal_provider())
+            except Exception as exc:
+                return self._record(
+                    "skip", reason=f"策略信号不可用：{exc}", decision=None, now=now
+                )
+            if abs(signal_target) < 1e-9:
+                return self._record(
+                    "skip", reason="策略无信号（空仓）", decision=None, now=now
+                )
+        self._last_signal = signal_target
+
         # 决策次数是模型调用预算：先判上限，避免为一个注定被拒的请求付钱。
         if self.config.max_decisions_per_day and self._decisions_today >= self.config.max_decisions_per_day:
             return self._record(
                 "skip", reason="已达 AI 当日决策次数上限", decision=None, now=now
             )
 
-        prompt = self._build_prompt(frame, portfolio)
+        prompt = self._build_prompt(frame, portfolio, signal_target)
         answer = self.llm.ask(prompt, system="", cache_key="", kind="ai_trader") or {}
         if not answer.get("ok"):
             return self._record(
@@ -434,6 +453,28 @@ class AITrader:
         errors = validate_decision(decision, self.config)
         if errors:
             return self._record("reject", reason="；".join(errors), decision=decision, now=now)
+        if signal_target is not None:
+            if signal_target > 0 and decision.action == "open_short":
+                return self._record(
+                    "reject",
+                    reason="策略信号为多，AI 不得反向开空",
+                    decision=decision,
+                    now=now,
+                )
+            if signal_target < 0 and decision.action == "open_long":
+                return self._record(
+                    "reject",
+                    reason="策略信号为空，AI 不得反向开多",
+                    decision=decision,
+                    now=now,
+                )
+            if decision.is_entry and signal_target == 0:
+                return self._record(
+                    "reject",
+                    reason="策略无信号，AI 不得开仓",
+                    decision=decision,
+                    now=now,
+                )
 
         guard = self.guard.check(
             decision,
@@ -500,7 +541,12 @@ class AITrader:
             log.warning("读取 AI 组合视图失败", exc_info=True)
             return {}
 
-    def _build_prompt(self, frame: Any, portfolio: dict[str, Any]) -> str:
+    def _build_prompt(
+        self,
+        frame: Any,
+        portfolio: dict[str, Any],
+        signal_target: float | None = None,
+    ) -> str:
         block = ""
         try:
             block = ai.digest(frame, timeframe=self.config.timeframe, label=self.config.symbol)
@@ -509,8 +555,17 @@ class AITrader:
         position = float(portfolio.get("position_quote") or 0.0)
         equity = float(portfolio.get("equity") or 0.0)
         price = portfolio.get("price")
+        signal_line = ""
+        if signal_target is not None:
+            direction = "做多" if signal_target > 0 else "做空" if signal_target < 0 else "空仓"
+            signal_line = (
+                f"【策略信号】目标仓位 {signal_target:+.0%}（{direction}）。"
+                "你只做复核：同意该方向才可开对应方向；不同意就 hold。"
+                "不得反向开仓，不得在空仓信号下开新仓。\n"
+            )
         return (
-            f"{DECISION_PROMPT}\n\n【账户】权益 {equity:.2f} USDT，"
+            f"{DECISION_PROMPT}\n\n{signal_line}"
+            f"【账户】权益 {equity:.2f} USDT，"
             f"当前持仓 {position:.2f} USDT，最新价 {price}。\n"
             f"【上限】单笔 {self.config.max_order_quote:.2f} USDT，"
             f"最大持仓 {self.config.max_position_quote:.2f} USDT，"
@@ -545,6 +600,7 @@ class AITrader:
             "quote": decision.quote if decision else 0.0,
             "price": decision.price if decision else None,
             "confidence": decision.confidence if decision else 0.0,
+            "signal_target": self._last_signal,
             "stop_loss": decision.stop_loss if decision else None,
             "rationale": decision.rationale if decision else "",
             "order_id": (order_row or {}).get("id") if isinstance(order_row, dict) else None,

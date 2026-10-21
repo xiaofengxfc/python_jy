@@ -5,8 +5,8 @@ import { foldTick } from "../liveCandle";
 import { useMarketStream } from "../hooks/useMarketStream";
 import type { Account, AILevel, Candle, Health, SymbolInfo } from "../types";
 import AIPanel from "../components/AIPanel";
-import AITradePanel from "../components/AITradePanel";
-import BottomTabs from "../components/BottomTabs";
+import AITradingPanel from "../components/AITradingPanel";
+import BottomTabs, { type BottomTab } from "../components/BottomTabs";
 import AutoPage from "./AutoPage";
 import Chart, {
   INDICATOR_SPECS,
@@ -17,7 +17,6 @@ import Chart, {
   type IndicatorParams,
 } from "../components/Chart";
 import DrawingToolbar from "../components/DrawingToolbar";
-import FloatingWindow from "../components/FloatingWindow";
 import type { Drawing, DrawingTool } from "../components/drawings";
 import { levelsToDrawings, loadDrawings, saveDrawings } from "../components/drawingsStore";
 import OrderBook from "../components/OrderBook";
@@ -29,6 +28,7 @@ interface Props {
   healthError: string;
   onMarketChange: (market: string) => void;
   onAccountChange: (equity: number) => void;
+  onNavigate?: (page: "lab" | "backtest") => void;
 }
 
 const FEE_RATE = 0.0004;
@@ -106,6 +106,7 @@ export default function TradingPage({
   healthError,
   onMarketChange,
   onAccountChange,
+  onNavigate,
 }: Props) {
   const [market, setMarket] = useState("spot");
   const [symbol, setSymbol] = useState("");
@@ -144,9 +145,7 @@ export default function TradingPage({
   const [drawingTool, setDrawingTool] = useState<DrawingTool>("select");
   const [selectedDrawing, setSelectedDrawing] = useState<string | null>(null);
   const [drawingsVisible, setDrawingsVisible] = useState(true);
-  /** The AI window floats over the chart; open on first visit so the analysis
-   * is visible instead of clipped in the rail. */
-  const [aiWindowOpen, setAiWindowOpen] = useState(true);
+  const [bottomTab, setBottomTab] = useState<BottomTab>("open");
 
   const { ticker, book, connected, tradeVolume, tradeWhen, tradePrice, tradeSeq } =
     useMarketStream(market, symbol);
@@ -539,7 +538,7 @@ export default function TradingPage({
 
       {banner && <div className="banner error">{banner}</div>}
 
-      <div className="trading">
+      <div className={`trading${bottomTab === "ai" ? " ai-open" : ""}`}>
         <div className="trading-main">
           <div className="symbol-strip">
             <SymbolPicker
@@ -596,8 +595,8 @@ export default function TradingPage({
               <button
                 type="button"
                 className="link-btn"
-                onClick={() => setAiWindowOpen(true)}
-                title="打开 AI 分析窗口（可拖动、可缩放）"
+                onClick={() => setBottomTab("ai")}
+                title="在下方打开 AI 分析（内嵌，不遮挡图表）"
               >
                 AI 分析
               </button>
@@ -761,6 +760,18 @@ export default function TradingPage({
               void refreshAccount();
             }}
             onError={(message) => setActionError(message)}
+            activeTab={bottomTab}
+            onTabChange={setBottomTab}
+            aiPanel={
+              <AIPanel
+                market={market}
+                symbol={symbol}
+                timeframe={timeframe}
+                onLevels={applyAiLevels}
+                showLevels={aiLevelsOn}
+                onShowLevels={setAiLevelsOn}
+              />
+            }
           />
         </div>
 
@@ -807,39 +818,13 @@ export default function TradingPage({
 
       {/* AI 自主交易：模型自己看盘、自己决策，和上面的策略自动交易互斥运行
           （共用交易权租约）。同样跟随图表上的交易对与周期。 */}
-      <section className="ai-section">
-        <AITradePanel market={market} symbol={symbol} timeframe={timeframe} />
-      </section>
-
-      {/* The AI panel used to be the first card of the right rail, where a long
-          answer was clipped to two lines and could not be read at all. It is a
-          floating window now: draggable, resizable, collapsible, and open by
-          default so the analysis is visible without hunting for it. While the
-          window is open it would cover this section in headless screenshots,
-          so the verification script closes it first. */}
-      <FloatingWindow
-        title={`AI 分析 · ${symbol || "—"}`}
-        open={aiWindowOpen}
-        onClose={() => setAiWindowOpen(false)}
-        storageKey="btrader.ai.window.v1"
-        defaultRect={{ x: 980, y: 96, w: 600, h: 560 }}
-        minWidth={360}
-        minHeight={280}
-        footer={
-          <span className="faint" style={{ fontSize: 11 }}>
-            拖动标题栏移动，右下角缩放；价位会以可编辑画线出现在图上
-          </span>
-        }
-      >
-        <AIPanel
-          market={market}
-          symbol={symbol}
-          timeframe={timeframe}
-          onLevels={applyAiLevels}
-          showLevels={aiLevelsOn}
-          onShowLevels={setAiLevelsOn}
-        />
-      </FloatingWindow>
+      {/* AI 自主交易 / AI 自主量化：两个独立流程，共用交易权租约。 */}
+      <AITradingPanel
+        market={market}
+        symbol={symbol}
+        timeframe={timeframe}
+        onNavigate={onNavigate}
+      />
     </>
   );
 }

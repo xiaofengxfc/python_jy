@@ -64,6 +64,16 @@ def _market(value: str) -> MarketType:
         raise HTTPException(status_code=400, detail=f"未知市场：{value}") from exc
 
 
+def _reject_if_freqtrade_running(ctx) -> None:
+    """Keep the sidecar and the in-process engine from trading the same account."""
+    freqtrade = getattr(ctx, "freqtrade", None)
+    if freqtrade is not None and freqtrade.running:
+        raise HTTPException(
+            status_code=409,
+            detail="Freqtrade 正在运行，请先停止它再启动旧引擎或 AI 自主交易",
+        )
+
+
 def _explain_async(ctx, events, *, kind: str, detail: str, context: str = "") -> None:
     """Ask the model what probably happened, in a thread, into the event log.
 
@@ -126,6 +136,8 @@ class AITraderStartPayload(BaseModel):
     market: str = ""
     symbol: str = ""
     timeframe: str = ""
+    strategy: str = ""
+    params: dict[str, Any] = Field(default_factory=dict)
     confirm_live: bool = False
     max_order_quote: float | None = Field(default=None, ge=0)
     max_position_quote: float | None = Field(default=None, ge=0)
@@ -595,6 +607,16 @@ class AITraderController:
             raise HTTPException(status_code=400, detail=f"不支持的周期：{timeframe}")
         if not ctx.settings.ai.enabled:
             raise HTTPException(status_code=400, detail="请先在设置中启用 AI 助手")
+        strategy_key = (payload.strategy or "").strip()
+        if not strategy_key:
+            keys = ctx.strategies.keys
+            strategy_key = keys[0] if keys else ""
+        if not strategy_key:
+            raise HTTPException(status_code=400, detail="AI 自主交易需要先选择一个策略")
+        try:
+            signal_strategy = ctx.strategies.get(strategy_key)
+        except KeyError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         if mode == "live":
             if not cfg.live_enabled:
                 raise HTTPException(
@@ -646,6 +668,15 @@ class AITraderController:
                 _market_frame(state, ctx, market, symbol, timeframe, 300), timeframe
             ),
             portfolio_provider=lambda: _ai_portfolio(state, symbol),
+            signal_provider=lambda: _strategy_signal(
+                state,
+                ctx,
+                market,
+                symbol,
+                timeframe,
+                signal_strategy,
+                signal_strategy.validate_params(payload.params or {}),
+            ),
         )
         ok, message = trader.start()
         if not ok:
@@ -1356,7 +1387,9 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
 
     @router.post("/api/auto/start")
     def auto_start(payload: AutoStartPayload) -> dict[str, Any]:
-        auto.start(get_state().ctx, payload)
+        state = get_state()
+        _reject_if_freqtrade_running(state.ctx)
+        auto.start(state.ctx, payload)
         return {"ok": True, "status": auto.status()}
 
     @router.post("/api/auto/stop")
@@ -1371,7 +1404,9 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
 
     @router.post("/api/ai/trader/start")
     def ai_trader_start(payload: AITraderStartPayload) -> dict[str, Any]:
-        return {"ok": True, "status": ai_ctl.start(get_state(), payload)}
+        state = get_state()
+        _reject_if_freqtrade_running(state.ctx)
+        return {"ok": True, "status": ai_ctl.start(state, payload)}
 
     @router.post("/api/ai/trader/stop")
     def ai_trader_stop() -> dict[str, Any]:
@@ -1582,6 +1617,37 @@ def _ai_portfolio(state, symbol: str) -> dict[str, Any]:
         "kill_switch": bool(risk.settings.kill_switch),
         "halted_reason": risk.state.halted_reason,
     }
+
+
+def _strategy_signal(
+    state,
+    ctx,
+    market,
+    symbol: str,
+    timeframe: str,
+    strategy,
+    params: dict[str, Any],
+) -> float:
+    """Latest target of the selected strategy on closed candles.
+
+    Positive means long, negative means short, zero means stay flat. The AI
+    layer is only allowed to confirm/veto this direction; it cannot originate
+    a trade without a signal.
+    """
+    frame = _closed_only(_market_frame(state, ctx, market, symbol, timeframe, 300), timeframe)
+    if frame is None or getattr(frame, "empty", True):
+        return 0.0
+    result = strategy.generate(frame, params)
+    if result is None or getattr(result, "empty", True) or "target" not in result:
+        return 0.0
+    try:
+        target = float(result["target"].iloc[-1])
+    except (TypeError, ValueError, IndexError):
+        return 0.0
+    # Spot cannot hold a negative position; treat a short signal as flat.
+    if target < 0 and not getattr(market, "is_futures", False):
+        return 0.0
+    return max(-1.0, min(1.0, target))
 
 
 def _market_frame(state, ctx, market, symbol: str, timeframe: str, limit: int):

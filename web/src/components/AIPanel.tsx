@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api";
+import MarkdownText from "./MarkdownText";
 import type { AIAnalysis, AILevel, AIStatus } from "../types";
 
 interface Props {
@@ -198,7 +199,7 @@ export default function AIPanel({
             {analysis.cached ? " · 缓存结果" : ""}
             {analysis.tokens ? ` · ${analysis.tokens} tokens` : ""}
           </div>
-          <div className="ai-text">{analysis.text}</div>
+          <MarkdownText text={analysis.text} />
           {levels.length > 0 && (
             <div className="ai-levels">
               <div className="ai-levels-head">
@@ -234,14 +235,14 @@ export default function AIPanel({
               {news.overall.toFixed(2)}
             </span>
           </div>
-          <div className="ai-text">{news.text}</div>
+          <MarkdownText text={news.text} />
         </div>
       )}
 
       {review && (
         <div className="ai-block">
           <div className="ai-block-head">持仓复核</div>
-          <div className="ai-text">{review}</div>
+          <MarkdownText text={review} />
         </div>
       )}
     </div>

@@ -45,6 +45,13 @@ class CandidateReviewPayload(BaseModel):
     reviewer: str = ""
 
 
+class CandidateBacktestPayload(BaseModel):
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    symbol: str = ""
+    timeframe: str = ""
+    source: str = "btrader"
+
+
 class OptimizePayload(BaseModel):
     base_key: str
     market: str = "spot"
@@ -141,6 +148,25 @@ class LabController:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"ok": True, "candidate": candidate.to_dict()}
 
+    def record_backtest(
+        self, candidate_id: str, payload: CandidateBacktestPayload
+    ) -> dict[str, Any]:
+        if not payload.metrics:
+            raise HTTPException(status_code=400, detail="回测指标不能为空")
+        metrics = dict(payload.metrics)
+        metrics.update(
+            {
+                "symbol": payload.symbol,
+                "timeframe": payload.timeframe,
+                "source": payload.source,
+            }
+        )
+        try:
+            candidate = self.candidates.record_backtest(candidate_id, metrics)
+        except CandidateError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"ok": True, "candidate": candidate.to_dict()}
+
     # --------------------------------------------------------------- optimize
     def start_optimize(self, payload: OptimizePayload) -> dict[str, Any]:
         state = self.get_state()
@@ -226,6 +252,11 @@ def build_lab_router(
     router.add_api_route(
         "/api/ai/strategies/candidates/{candidate_id}/review",
         controller.review,
+        methods=["POST"],
+    )
+    router.add_api_route(
+        "/api/ai/strategies/candidates/{candidate_id}/backtest",
+        controller.record_backtest,
         methods=["POST"],
     )
     router.add_api_route("/api/ai/lab/optimize", controller.start_optimize, methods=["POST"])

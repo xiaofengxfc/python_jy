@@ -109,6 +109,7 @@ def make_trader(
     answer: str = "",
     llm_ok: bool = True,
     portfolio: dict | None = None,
+    signal_target: float | None = None,
     **cfg,
 ) -> tuple[AITrader, FakeLLM, FakeTrading, FakeRisk]:
     cfg.setdefault("enabled", True)
@@ -126,6 +127,7 @@ def make_trader(
         llm=llm,
         frame_provider=make_frame,
         portfolio_provider=lambda: dict(view),
+        signal_provider=(lambda: signal_target) if signal_target is not None else None,
         audit_path=tmp_path / "audit.jsonl",
         clock=lambda: 1_800_000_000.0,
         risk=risk,
@@ -340,4 +342,35 @@ def test_trade_lease_is_exclusive():
     assert lease.acquire("ai")
     assert not lease.acquire("auto")
     lease.release("ai")
-    assert lease.acquire("auto")
+
+
+def test_strategy_signal_is_in_prompt_and_allows_same_direction(tmp_path):
+    trader, llm, trading, _risk = make_trader(tmp_path, signal_target=0.6)
+    record = trader.decide_once()
+    assert record is not None and record["outcome"] == "order"
+    assert "策略信号" in llm.calls[0]
+    assert "+60%" in llm.calls[0]
+    assert len(trading.requests) == 1
+
+
+def test_strategy_signal_vetoes_opposite_entry(tmp_path):
+    trader, _llm, trading, _risk = make_trader(
+        tmp_path,
+        answer=decision_json(
+            action="open_short", stop_loss=102.0, take_profit=96.0
+        ),
+        signal_target=0.6,
+    )
+    record = trader.decide_once()
+    assert record is not None and record["outcome"] == "reject"
+    assert "反向" in record["reason"]
+    assert trading.requests == []
+
+
+def test_zero_strategy_signal_skips_before_calling_model(tmp_path):
+    trader, llm, trading, _risk = make_trader(tmp_path, signal_target=0.0)
+    record = trader.decide_once()
+    assert record is not None and record["outcome"] == "skip"
+    assert "策略无信号" in record["reason"]
+    assert llm.calls == []
+    assert trading.requests == []

@@ -87,6 +87,7 @@ export default function App() {
             healthError={healthError}
             onMarketChange={setMarket}
             onAccountChange={handleAccountChange}
+            onNavigate={setPage}
           />
         )}
         {page === "portfolio" && <PortfolioPage onEquity={handleAccountChange} />}

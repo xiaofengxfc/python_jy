@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, query } from "../api";
 import { fmt, fmtPrice } from "../format";
+import type { Strategy } from "../types";
 
 interface Props {
   market: string;
@@ -23,6 +24,7 @@ interface AIDecisionRecord {
   quote?: number;
   price?: number | null;
   confidence?: number;
+  signal_target?: number | null;
   stop_loss?: number | null;
   rationale?: string;
   order_id?: string | null;
@@ -227,7 +229,9 @@ function NumberField(props: {
   );
 }
 
-/** AI 自主交易 / 量化面板。
+/** AI 自主交易面板：模型看盘、复核并决定是否下单/仓位。
+ * 「AI 自主量化」（生成/调参策略 → 回测 → 自动执行）是独立流程，后续接入
+ * Freqtrade 策略与回测管线，不复用本面板的逐笔决策。
  *
  * The backend owns the run: this panel only starts, stops and reports. Status
  * is polled every 4 seconds with `since=seq`, so the event feed is appended
@@ -242,6 +246,8 @@ export default function AITradePanel({ market, symbol, timeframe }: Props) {
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState("");
   const [mode, setMode] = useState<"paper" | "live">("paper");
+  const [strategies, setStrategies] = useState<Strategy[]>([]);
+  const [strategyKey, setStrategyKey] = useState("");
   /** null while unknown; false is worth a banner because start would 400. */
   const [aiEnabled, setAiEnabled] = useState<boolean | null>(null);
 
@@ -330,6 +336,19 @@ export default function AITradePanel({ market, symbol, timeframe }: Props) {
       .catch(() => setAiEnabled(null));
   }, []);
 
+  // Strategy first: the AI is only allowed to review the direction emitted by
+  // this strategy, so the panel must know which one is selected before start.
+  useEffect(() => {
+    api<{ items: Strategy[] }>("/api/strategies")
+      .then((data) => {
+        setStrategies(data.items);
+        setStrategyKey((current) => current || data.items[0]?.key || "");
+      })
+      .catch((caught) =>
+        setError(caught instanceof Error ? caught.message : String(caught)),
+      );
+  }, []);
+
   useEffect(() => {
     if (!auditOpen) return;
     const onKey = (event: KeyboardEvent) => {
@@ -388,6 +407,11 @@ export default function AITradePanel({ market, symbol, timeframe }: Props) {
       setError("请先在图表上选择交易对。");
       return;
     }
+    const selected = strategies.find((item) => item.key === strategyKey);
+    if (!selected) {
+      setError("请先选择产生信号的策略。");
+      return;
+    }
     if (mode === "live") {
       if (!auto.live_enabled) {
         setError(
@@ -413,12 +437,16 @@ export default function AITradePanel({ market, symbol, timeframe }: Props) {
           market,
           symbol,
           timeframe,
+          strategy: strategyKey,
+          params: { ...selected.defaults },
           max_order_quote: auto.max_order_quote,
           max_position_quote: auto.max_position_quote,
         }),
       });
       applyStatus(result.status, true);
-      setNotice(`已启动：${mode === "live" ? "实盘" : "纸面"} · ${symbol} · ${timeframe}`);
+      setNotice(
+        `已启动：${mode === "live" ? "实盘" : "纸面"} · ${symbol} · ${timeframe} · 策略 ${selected.name}`,
+      );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -548,7 +576,7 @@ export default function AITradePanel({ market, symbol, timeframe }: Props) {
   return (
     <>
       <div className="ai-head">
-        <span className="card-title">AI 自主交易 · 量化</span>
+        <span className="card-title">AI 自主交易</span>
         <span className={`live-badge ${state === "stopped" ? "idle" : ""} ${halted ? "ai-badge-halt" : ""}`}>
           <span
             className={`dot ${state === "running" ? "live" : paused ? "off" : halted ? "ai-dot-halt" : ""}`}
@@ -558,6 +586,20 @@ export default function AITradePanel({ market, symbol, timeframe }: Props) {
         <span className="faint" style={{ fontSize: 11 }}>
           {shownMode === "live" ? "实盘" : "纸面"} · {shownSymbol} · {shownTimeframe}
         </span>
+        <select
+          className="select ai-strategy-select"
+          aria-label="信号策略"
+          value={strategyKey}
+          disabled={running || busy !== ""}
+          onChange={(event) => setStrategyKey(event.target.value)}
+        >
+          {strategies.length === 0 && <option value="">（无策略）</option>}
+          {strategies.map((item) => (
+            <option key={item.key} value={item.key}>
+              {item.name}
+            </option>
+          ))}
+        </select>
         <span className="spacer" />
         <div className="segmented" role="group" aria-label="AI 交易模式">
           {MODES.map(([value, label]) => (
@@ -633,7 +675,7 @@ export default function AITradePanel({ market, symbol, timeframe }: Props) {
       <div className="ai-col">
         <div className="card">
           <div className="card-head">
-            <span className="card-title">量化配置</span>
+            <span className="card-title">交易配置</span>
             <span className="spacer" />
             <span className="faint" style={{ fontSize: 11 }}>
               {auto.enabled ? "已启用" : "未启用"}

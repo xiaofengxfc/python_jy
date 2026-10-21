@@ -153,6 +153,10 @@ export interface Strategy {
   allow_short: boolean;
   params: ParamSpec[];
   defaults: Record<string, unknown>;
+  /** User-plugin filename; empty for built-ins. */
+  source_name?: string;
+  /** True only for files in the per-user strategy directory. */
+  editable?: boolean;
 }
 
 export interface Portfolio {
@@ -502,6 +506,8 @@ export interface BacktestResult {
   params: Record<string, unknown>;
   equity: EquityPoint[];
   trades: Record<string, unknown>[];
+  /** "freqtrade" when produced by the sidecar; legacy engine omits it. */
+  source?: string;
 }
 
 export interface BacktestJob {

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import type { ReactNode } from "react";
 import { api, query } from "../api";
 import { fmt, fmtPrice, parseNumber } from "../format";
 import type { Account, PaperConditional, PaperOrder, PaperPosition } from "../types";
@@ -17,14 +18,22 @@ interface Props {
   /** Reload the account after a cancel or close. */
   onChanged?: () => void;
   onError?: (message: string) => void;
+  /** The AI panel is owned by the trading page (it needs chart levels and the
+   * current timeframe), but it is rendered here so the analysis is inline and
+   * never floats over the chart. */
+  aiPanel?: ReactNode;
+  /** Optional controlled tab, so a chart-toolbar button can jump to AI 分析. */
+  activeTab?: BottomTab;
+  onTabChange?: (tab: BottomTab) => void;
 }
 
-type Tab = "open" | "trades" | "positions" | "news";
+export type BottomTab = "open" | "trades" | "positions" | "ai" | "news";
 
-const TABS: [Tab, string][] = [
+const TABS: [BottomTab, string][] = [
   ["open", "委托"],
   ["trades", "成交"],
   ["positions", "持仓"],
+  ["ai", "AI 分析"],
   ["news", "新闻"],
 ];
 
@@ -37,8 +46,16 @@ export default function BottomTabs({
   mode = "paper",
   onChanged,
   onError,
+  aiPanel,
+  activeTab,
+  onTabChange,
 }: Props) {
-  const [tab, setTab] = useState<Tab>("open");
+  const [internalTab, setInternalTab] = useState<BottomTab>("open");
+  const tab = activeTab ?? internalTab;
+  const setTab = (next: BottomTab) => {
+    setInternalTab(next);
+    onTabChange?.(next);
+  };
   const [collapsed, setCollapsed] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   // Per-position exit size in base coins; empty means "the whole position".
@@ -113,7 +130,9 @@ export default function BottomTabs({
   };
 
   return (
-    <div className={`panel${collapsed ? " collapsed" : ""}`}>
+    <div
+      className={`panel${collapsed ? " collapsed" : ""}${tab === "ai" ? " ai-panel" : ""}`}
+    >
       <div className="tabs" role="tablist">
         {TABS.map(([key, label]) => (
           <button
@@ -125,7 +144,7 @@ export default function BottomTabs({
             onClick={() => setTab(key)}
           >
             {label}
-            {key !== "news" && (
+            {key !== "news" && key !== "ai" && (
               <span className="count num" style={{ marginLeft: 6 }}>
                 {key === "open"
                   ? orders.length + conditionals.length
@@ -313,6 +332,7 @@ export default function BottomTabs({
           />
         )}
 
+        {tab === "ai" && aiPanel}
         {tab === "news" && <NewsPanel symbol={symbol} />}
       </div>
     </div>

@@ -62,6 +62,28 @@ class AIAutoSettings:
 
 
 @dataclass
+class FreqtradeSettings:
+    """Optional Freqtrade sidecar (auto trading / backtesting).
+
+    ``python`` points at a separate virtualenv; leaving it empty means
+    ``%APPDATA%/biTrader/freqtrade/venv``. Credentials for the local REST API
+    are generated on first start and stored next to the config, not here.
+    """
+
+    enabled: bool = True
+    python: str = ""
+    exchange: str = "gate"
+    trade_port: int = 18081
+    username: str = "btrader"
+    dry_run: bool = True
+    stake_amount: float = 50.0
+    max_open_trades: int = 3
+    strategy: str = ""
+    timeframe: str = "15m"
+    pairs: list[str] = field(default_factory=lambda: ["BTC/USDT"])
+
+
+@dataclass
 class AppSettings:
     network: str = Network.MAINNET.value
     market_type: str = MarketType.SPOT.value
@@ -83,6 +105,8 @@ class AppSettings:
     ai: AISettings = field(default_factory=AISettings)
     # AI 自主交易（Phase 3）：默认关闭，实盘另有显式开关。
     ai_auto: AIAutoSettings = field(default_factory=AIAutoSettings)
+    # Freqtrade 独立进程（Phase 5）：交易/回测迁移目标。
+    freqtrade: FreqtradeSettings = field(default_factory=FreqtradeSettings)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -108,6 +132,7 @@ class ConfigStore:
         notify_raw = raw.pop("notify", {}) or {}
         ai_raw = raw.pop("ai", {}) or {}
         ai_auto_raw = raw.pop("ai_auto", {}) or {}
+        freqtrade_raw = raw.pop("freqtrade", {}) or {}
         known = {f for f in AppSettings.__dataclass_fields__}
         settings = AppSettings(**{k: v for k, v in raw.items() if k in known})
         risk_known = {f for f in RiskSettings.__dataclass_fields__}
@@ -123,6 +148,10 @@ class ConfigStore:
         ai_auto_known = {f for f in AIAutoSettings.__dataclass_fields__}
         settings.ai_auto = AIAutoSettings(
             **{k: v for k, v in ai_auto_raw.items() if k in ai_auto_known}
+        )
+        freqtrade_known = {f for f in FreqtradeSettings.__dataclass_fields__}
+        settings.freqtrade = FreqtradeSettings(
+            **{k: v for k, v in freqtrade_raw.items() if k in freqtrade_known}
         )
         return settings
 

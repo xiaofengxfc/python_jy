@@ -10,15 +10,18 @@ import type {
   SymbolInfo,
 } from "../types";
 import { ParamFields } from "../components/ParamFields";
+import StrategyEditor from "../components/StrategyEditor";
+import FreqtradeBacktestPanel from "../components/FreqtradeBacktestPanel";
 import LineChart, { Legend, type Series } from "../components/LineChart";
 import Table from "../components/Table";
 
-type Tab = "single" | "optimize" | "history";
+type Tab = "single" | "optimize" | "history" | "freqtrade";
 
 const TABS: [Tab, string][] = [
   ["single", "单次回测"],
   ["optimize", "参数优化"],
   ["history", "历史记录"],
+  ["freqtrade", "Freqtrade"],
 ];
 
 const METRIC_LABELS: [string, string, "pct" | "num"][] = [
@@ -94,6 +97,7 @@ export default function BacktestPage() {
   const [aiLimit, setAiLimit] = useState(40);
   const [aiDescribe, setAiDescribe] = useState("");
   const [aiBusy, setAiBusy] = useState<"filter" | "describe" | "suggest" | "">("");
+  const [editorOpen, setEditorOpen] = useState(false);
   /** Plain-language strategy picking: the model may only choose one of the
    * strategies that already exist and fill its params — never write code. */
   const [idea, setIdea] = useState("");
@@ -103,6 +107,29 @@ export default function BacktestPage() {
     () => strategies.find((item) => item.key === config.strategy) ?? null,
     [strategies, config.strategy],
   );
+
+  /** Re-read the registry after the source editor saves. Selecting the new key
+   * also refreshes the parameter form; built-ins keep their current params. */
+  const reloadStrategies = (selectKey?: string) => {
+    api<{ items: Strategy[] }>("/api/strategies")
+      .then((data) => {
+        setStrategies(data.items);
+        const target = data.items.find((item) => item.key === (selectKey ?? config.strategy));
+        if (target) {
+          setConfig((current) => ({
+            ...current,
+            strategy: target.key,
+            params:
+              selectKey && selectKey !== current.strategy
+                ? { ...target.defaults }
+                : current.params,
+          }));
+        }
+      })
+      .catch((caught) =>
+        setError(caught instanceof Error ? caught.message : String(caught)),
+      );
+  };
 
   const pollRef = useRef<number | undefined>(undefined);
   useEffect(() => () => window.clearInterval(pollRef.current), []);
@@ -347,6 +374,29 @@ export default function BacktestPage() {
     });
   };
 
+  if (tab === "freqtrade") {
+    return (
+      <>
+        <div className="page-head">
+          <h1 className="page-title">回测</h1>
+          <div className="segmented">
+            {TABS.map(([key, label]) => (
+              <button
+                key={key}
+                type="button"
+                aria-pressed={tab === key}
+                onClick={() => setTab(key)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+        <FreqtradeBacktestPanel />
+      </>
+    );
+  }
+
   return (
     <>
       <div className="page-head">
@@ -475,6 +525,20 @@ export default function BacktestPage() {
                     </option>
                   ))}
                 </select>
+                <div className="strategy-editor-trigger">
+                  <span className="faint">
+                    {strategy?.editable
+                      ? `用户策略 · ${strategy.source_name || `${strategy.key}.py`}`
+                      : "内置策略 · 只读"}
+                  </span>
+                  <button
+                    type="button"
+                    className="btn-sm"
+                    onClick={() => setEditorOpen(true)}
+                  >
+                    编辑源码
+                  </button>
+                </div>
               </div>
 
               {tab === "optimize" ? (
@@ -1002,6 +1066,41 @@ export default function BacktestPage() {
           </div>
         </div>
       </div>
+
+      {editorOpen && (
+        <div
+          className="modal-mask"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setEditorOpen(false);
+          }}
+        >
+          <div className="card strategy-editor-modal" onMouseDown={(event) => event.stopPropagation()}>
+            <div className="card-head">
+              <span className="card-title">策略源码</span>
+              <span className="spacer" />
+              <span className="faint" style={{ fontSize: 11 }}>
+                保存后自动热加载，可直接回测
+              </span>
+            </div>
+            <div style={{ padding: 14 }}>
+              <StrategyEditor
+                strategies={strategies}
+                value={config.strategy}
+                onSelect={(key) => {
+                  const found = strategies.find((item) => item.key === key);
+                  setConfig((current) => ({
+                    ...current,
+                    strategy: key,
+                    params: found ? { ...found.defaults } : current.params,
+                  }));
+                }}
+                onSaved={(key) => reloadStrategies(key)}
+                onClose={() => setEditorOpen(false)}
+              />
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 }

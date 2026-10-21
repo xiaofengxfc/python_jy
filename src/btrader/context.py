@@ -14,6 +14,7 @@ from .engine.risk import RiskManager
 from .engine.trading import TradingService
 from .exchange.klines import KlineStore
 from .exchange.rest import BinanceREST
+from .freqtrade import FreqtradeBridge
 from .gateway import GatewaySupervisor
 from .installer import OpenClawInstaller
 from .llm import LLMService
@@ -80,6 +81,11 @@ class AppContext:
 
         self.strategies = StrategyRegistry()
         self.strategies.discover([paths.user_strategies_dir()])
+
+        # Optional Freqtrade sidecar. Constructing the bridge does not start a
+        # process; the UI decides when to launch it. This keeps manual/paper
+        # trading usable when Freqtrade is not installed.
+        self.freqtrade = FreqtradeBridge(self.settings.freqtrade)
 
         self._market_rest: dict[MarketType, BinanceREST] = {self.market_type: self.rest}
         self._data_rest: dict[MarketType, BinanceREST] = {self.market_type: self.market_rest}

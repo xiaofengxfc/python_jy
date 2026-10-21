@@ -3,6 +3,7 @@ import { api, query } from "../api";
 import { TIMEFRAMES, fmt, fmtPrice } from "../format";
 import type { AutoStatus, SymbolInfo, Strategy } from "../types";
 import { ParamFields } from "../components/ParamFields";
+import FreqtradeCard from "../components/FreqtradeCard";
 
 const MODES: [string, string][] = [
   ["paper", "纸面"],
@@ -40,6 +41,7 @@ export default function AutoPage({
   const [pollSeconds, setPollSeconds] = useState(10);
   const [mode, setMode] = useState("paper");
   const [busy, setBusy] = useState(false);
+  const [engine, setEngine] = useState<"freqtrade" | "legacy">("freqtrade");
   const seq = useRef(0);
 
   const strategy = useMemo(
@@ -170,58 +172,110 @@ export default function AutoPage({
       {embedded ? (
         <div className="card-head auto-head">
           <span className="card-title">自动交易</span>
-          <span className={`live-badge ${running ? "" : "idle"}`}>
-            <span className={`dot ${running ? "live" : ""}`} />
-            {running ? "运行中" : "未运行"}
-          </span>
-          <span className="faint" style={{ fontSize: 11 }}>
-            跟随图表：{market} · {symbol || "—"} · {timeframe}
-          </span>
-          <span className="spacer" />
-          {running ? (
-            <button type="button" className="btn-sm" disabled={busy} onClick={stop}>
-              {busy ? "处理中…" : "停止"}
-            </button>
-          ) : (
+          <div className="engine-switch" role="tablist" aria-label="交易引擎">
             <button
               type="button"
-              className="btn-sm primary"
-              disabled={busy || !strategyKey}
-              onClick={start}
+              role="tab"
+              aria-selected={engine === "freqtrade"}
+              className={engine === "freqtrade" ? "active" : ""}
+              onClick={() => setEngine("freqtrade")}
             >
-              {busy ? "启动中…" : "启动"}
+              Freqtrade
             </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={engine === "legacy"}
+              className={engine === "legacy" ? "active" : ""}
+              onClick={() => setEngine("legacy")}
+            >
+              旧引擎
+            </button>
+          </div>
+          {engine === "legacy" && (
+            <span className={`live-badge ${running ? "" : "idle"}`}>
+              <span className={`dot ${running ? "live" : ""}`} />
+              {running ? "运行中" : "未运行"}
+            </span>
           )}
+          <span className="faint" style={{ fontSize: 11 }}>
+            {engine === "freqtrade"
+              ? "独立 sidecar · 配置见下方"
+              : `跟随图表：${market} · ${symbol || "—"} · ${timeframe}`}
+          </span>
+          <span className="spacer" />
+          {engine === "legacy" &&
+            (running ? (
+              <button type="button" className="btn-sm" disabled={busy} onClick={stop}>
+                {busy ? "处理中…" : "停止"}
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="btn-sm primary"
+                disabled={busy || !strategyKey}
+                onClick={start}
+              >
+                {busy ? "启动中…" : "启动"}
+              </button>
+            ))}
         </div>
       ) : (
         <div className="page-head">
           <h1 className="page-title">自动交易</h1>
-          <span className={`live-badge ${running ? "" : "idle"}`}>
-            <span className={`dot ${running ? "live" : ""}`} />
-            {running ? "运行中" : "未运行"}
-          </span>
-          <span className="spacer" />
-          {running ? (
-            <button type="button" className="btn-sm" disabled={busy} onClick={stop}>
-              {busy ? "处理中…" : "停止"}
-            </button>
-          ) : (
+          <div className="engine-switch" role="tablist" aria-label="交易引擎">
             <button
               type="button"
-              className="btn-sm primary"
-              disabled={busy || !strategyKey}
-              onClick={start}
+              role="tab"
+              aria-selected={engine === "freqtrade"}
+              className={engine === "freqtrade" ? "active" : ""}
+              onClick={() => setEngine("freqtrade")}
             >
-              {busy ? "启动中…" : "启动"}
+              Freqtrade
             </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={engine === "legacy"}
+              className={engine === "legacy" ? "active" : ""}
+              onClick={() => setEngine("legacy")}
+            >
+              旧引擎
+            </button>
+          </div>
+          {engine === "legacy" && (
+            <span className={`live-badge ${running ? "" : "idle"}`}>
+              <span className={`dot ${running ? "live" : ""}`} />
+              {running ? "运行中" : "未运行"}
+            </span>
           )}
+          <span className="spacer" />
+          {engine === "legacy" &&
+            (running ? (
+              <button type="button" className="btn-sm" disabled={busy} onClick={stop}>
+                {busy ? "处理中…" : "停止"}
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="btn-sm primary"
+                disabled={busy || !strategyKey}
+                onClick={start}
+              >
+                {busy ? "启动中…" : "启动"}
+              </button>
+            ))}
         </div>
       )}
 
-      {error && <div className="banner error">{error}</div>}
-      {notice && <div className="banner">{notice}</div>}
+      {engine === "freqtrade" ? (
+        <FreqtradeCard />
+      ) : (
+        <>
+          {error && <div className="banner error">{error}</div>}
+          {notice && <div className="banner">{notice}</div>}
 
-      <div className={embedded ? "auto-section" : "stack"}>
+          <div className={embedded ? "auto-section" : "stack"}>
         <div className="stack">
           <div className="card">
             <div className="card-head">
@@ -494,6 +548,8 @@ export default function AutoPage({
           </div>
         </div>
       </div>
+        </>
+      )}
     </>
   );
 }
