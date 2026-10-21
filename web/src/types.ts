@@ -75,10 +75,20 @@ export interface PaperOrder {
 export interface PaperTrade {
   id: string;
   symbol: string;
+  /** The order this fill came from, so the detail dialog can trace it. */
+  order?: string;
+  market?: string;
+  type?: OrderType;
   side: Side;
   price: number;
   amount: number;
+  /** Price × amount actually exchanged on this fill. */
+  cost?: number;
   fee: number;
+  /** PnL booked by this fill: the price move of the closed part, minus fee. */
+  realized?: number;
+  /** Base coins closed by this fill (0 for a pure entry). */
+  closedQty?: number;
   timestamp: number;
 }
 

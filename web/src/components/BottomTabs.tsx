@@ -2,9 +2,18 @@ import { useState } from "react";
 import type { ReactNode } from "react";
 import { api, query } from "../api";
 import { fmt, fmtPrice, parseNumber } from "../format";
-import type { Account, PaperConditional, PaperOrder, PaperPosition } from "../types";
+import type {
+  Account,
+  PaperConditional,
+  PaperOrder,
+  PaperPosition,
+  PaperProtection,
+  PaperTrade,
+} from "../types";
 import NewsPanel from "./NewsPanel";
+import ProtectionDialog from "./ProtectionDialog";
 import Table from "./Table";
+import TradeDetailDialog from "./TradeDetailDialog";
 
 interface Props {
   account: Account | null;
@@ -60,6 +69,11 @@ export default function BottomTabs({
   const [busy, setBusy] = useState<string | null>(null);
   // Per-position exit size in base coins; empty means "the whole position".
   const [closeSizes, setCloseSizes] = useState<Record<string, string>>({});
+  // Pair whose stop-loss / take-profit dialog is open. Kept as a symbol so the
+  // dialog keeps reading the live position (price, size) after every refresh.
+  const [protectSymbol, setProtectSymbol] = useState<string | null>(null);
+  // Fill whose full record is open.
+  const [tradeDetail, setTradeDetail] = useState<PaperTrade | null>(null);
 
   const orders = (account?.orders ?? []).filter((order) => order.status === "open");
   const conditionals = (account?.conditional ?? []).filter(
@@ -67,6 +81,10 @@ export default function BottomTabs({
   );
   const trades = account?.trades ?? [];
   const positions = account?.positions ?? [];
+  const guards = account?.protections ?? [];
+  /** The guard armed for a pair, if the position carries one. */
+  const guardFor = (pair: string): PaperProtection | null =>
+    guards.find((guard) => guard.symbol === pair) ?? null;
   const count =
     tab === "open"
       ? orders.length + conditionals.length
@@ -129,228 +147,283 @@ export default function BottomTabs({
     });
   };
 
+  const protectTarget = protectSymbol
+    ? (positions.find((item) => item.symbol === protectSymbol) ?? null)
+    : null;
+
   return (
-    <div
-      className={`panel${collapsed ? " collapsed" : ""}${tab === "ai" ? " ai-panel" : ""}`}
-    >
-      <div className="tabs" role="tablist">
-        {TABS.map(([key, label]) => (
+    <>
+      <div
+        className={`panel${collapsed ? " collapsed" : ""}${tab === "ai" ? " ai-panel" : ""}`}
+      >
+        <div className="tabs" role="tablist">
+          {TABS.map(([key, label]) => (
+            <button
+              key={key}
+              type="button"
+              role="tab"
+              className="tab"
+              aria-selected={tab === key}
+              onClick={() => setTab(key)}
+            >
+              {label}
+              {key !== "news" && key !== "ai" && (
+                <span className="count num" style={{ marginLeft: 6 }}>
+                  {key === "open"
+                    ? orders.length + conditionals.length
+                    : key === "trades"
+                      ? trades.length
+                      : positions.length}
+                </span>
+              )}
+            </button>
+          ))}
+          <span className="spacer" />
+          {tab === "positions" && positions.length > 1 && (
+            <button
+              type="button"
+              className="link-btn"
+              style={{ marginRight: 12, alignSelf: "center" }}
+              disabled={busy !== null}
+              onClick={() =>
+                run("close:all", async () => {
+                  for (const position of positions) {
+                    await api("/api/positions/close", {
+                      method: "POST",
+                      body: JSON.stringify({
+                        symbol: position.symbol,
+                        mode,
+                        confirm_live: mode === "live",
+                      }),
+                    });
+                  }
+                })
+              }
+            >
+              全部平仓
+            </button>
+          )}
+          {count !== null && (
+            <span className="faint num" style={{ fontSize: 11, alignSelf: "center" }}>
+              {count} 条
+            </span>
+          )}
           <button
-            key={key}
             type="button"
-            role="tab"
-            className="tab"
-            aria-selected={tab === key}
-            onClick={() => setTab(key)}
+            className="panel-toggle"
+            aria-label={collapsed ? "展开委托面板" : "收起委托面板"}
+            aria-expanded={!collapsed}
+            onClick={() => setCollapsed((value) => !value)}
           >
-            {label}
-            {key !== "news" && key !== "ai" && (
-              <span className="count num" style={{ marginLeft: 6 }}>
-                {key === "open"
-                  ? orders.length + conditionals.length
-                  : key === "trades"
-                    ? trades.length
-                    : positions.length}
-              </span>
-            )}
+            <svg
+              viewBox="0 0 16 16"
+              width="14"
+              height="14"
+              fill="none"
+              style={{ transform: collapsed ? "rotate(180deg)" : undefined }}
+            >
+              <path
+                d="m4 10 4-4 4 4"
+                stroke="currentColor"
+                strokeWidth="1.5"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            </svg>
           </button>
-        ))}
-        <span className="spacer" />
-        {tab === "positions" && positions.length > 1 && (
-          <button
-            type="button"
-            className="link-btn"
-            style={{ marginRight: 12, alignSelf: "center" }}
-            disabled={busy !== null}
-            onClick={() =>
-              run("close:all", async () => {
-                for (const position of positions) {
-                  await api("/api/positions/close", {
-                    method: "POST",
-                    body: JSON.stringify({
-                      symbol: position.symbol,
-                      mode,
-                      confirm_live: mode === "live",
-                    }),
-                  });
-                }
-              })
-            }
-          >
-            全部平仓
-          </button>
-        )}
-        {count !== null && (
-          <span className="faint num" style={{ fontSize: 11, alignSelf: "center" }}>
-            {count} 条
-          </span>
-        )}
-        <button
-          type="button"
-          className="panel-toggle"
-          aria-label={collapsed ? "展开委托面板" : "收起委托面板"}
-          aria-expanded={!collapsed}
-          onClick={() => setCollapsed((value) => !value)}
-        >
-          <svg
-            viewBox="0 0 16 16"
-            width="14"
-            height="14"
-            fill="none"
-            style={{ transform: collapsed ? "rotate(180deg)" : undefined }}
-          >
-            <path
-              d="m4 10 4-4 4 4"
-              stroke="currentColor"
-              strokeWidth="1.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
+        </div>
+
+        <div className="panel-body" hidden={collapsed}>
+          {tab === "open" && (
+            <Table
+              headers={["交易对", "方向", "类型", "数量", "触发/价格", "状态", "时间", "操作"]}
+              rightFrom={3}
+              rows={[
+                ...conditionals.map((item) => [
+                  item.symbol,
+                  <span className={item.side === "buy" ? "up" : "down"}>
+                    {item.side === "buy" ? "买入" : "卖出"}
+                  </span>,
+                  <span className="faint">
+                    条件{item.type === "limit" ? "限价" : "市价"}
+                  </span>,
+                  fmt(item.amount, 6),
+                  <span>
+                    {item.direction === "below" ? "跌破" : "涨破"}{" "}
+                    <b className="num">{fmtPrice(item.trigger)}</b>
+                  </span>,
+                  "等待触发",
+                  new Date(item.createdAt).toLocaleTimeString("zh-CN", { hour12: false }),
+                  <button
+                    type="button"
+                    className="btn-sm"
+                    disabled={busy !== null}
+                    onClick={() => cancelConditional(item)}
+                  >
+                    {busy === `cancel:${item.id}` ? "撤销中…" : "撤单"}
+                  </button>,
+                ]),
+                ...orders.map((order) => [
+                  order.symbol,
+                  <span className={order.side === "buy" ? "up" : "down"}>
+                    {order.side === "buy" ? "买入" : "卖出"}
+                  </span>,
+                  order.type === "limit" ? "限价" : "市价",
+                  fmt(order.amount, 6),
+                  order.price ? fmtPrice(order.price) : "市价",
+                  "未成交",
+                  new Date(order.timestamp).toLocaleTimeString("zh-CN", { hour12: false }),
+                  <button
+                    type="button"
+                    className="btn-sm"
+                    disabled={busy !== null}
+                    onClick={() => cancel(order)}
+                  >
+                    {busy === `cancel:${order.id}` ? "撤销中…" : "撤单"}
+                  </button>,
+                ]),
+              ]}
+              empty="没有未成交的委托"
             />
-          </svg>
-        </button>
+          )}
+
+          {tab === "trades" && (
+            <Table
+              headers={["交易对", "方向", "价格", "数量", "成交额", "手续费", "已实现盈亏", "时间"]}
+              rightFrom={2}
+              rows={trades.map((trade) => [
+                trade.symbol,
+                <span className={trade.side === "buy" ? "up" : "down"}>
+                  {trade.side === "buy" ? "买入" : "卖出"}
+                </span>,
+                fmtPrice(trade.price),
+                fmt(trade.amount, 6),
+                trade.cost === undefined ? "—" : fmt(trade.cost, 2),
+                <span className="down">{fmt(trade.fee, 4)}</span>,
+                <span className={(trade.realized ?? 0) >= 0 ? "up" : "down"}>
+                  {trade.realized ? fmt(trade.realized, 2) : "—"}
+                </span>,
+                new Date(trade.timestamp).toLocaleTimeString("zh-CN", { hour12: false }),
+              ])}
+              // A row is a fill; clicking it opens everything the account keeps
+              // about that fill (fees, booked PnL, both ids, full timestamp).
+              onRowClick={(index) => setTradeDetail(trades[index] ?? null)}
+              empty="暂无成交"
+            />
+          )}
+
+          {tab === "positions" && (
+            <Table
+              headers={[
+                "交易对",
+                "方向",
+                "数量",
+                "开仓价",
+                "最新价",
+                "浮动盈亏",
+                "已实现盈亏",
+                "止损 / 止盈",
+                "平仓数量",
+                "操作",
+              ]}
+              rightFrom={2}
+              rows={positions.map((position) => [
+                position.symbol,
+                <span
+                  className={
+                    position.side === "long" ? "up" : position.side === "short" ? "down" : ""
+                  }
+                >
+                  {position.side === "long" ? "多头" : position.side === "short" ? "空头" : "—"}
+                </span>,
+                fmt(position.contracts, 6),
+                fmtPrice(position.entry_price),
+                position.last ? fmtPrice(position.last) : "—",
+                // Marked by the same server call the 资产 page uses, so the two
+                // pages cannot show a different PnL for one position.
+                <span className={(position.unrealized ?? 0) >= 0 ? "up" : "down"}>
+                  {position.unrealized === undefined ? "—" : fmt(position.unrealized, 2)}
+                </span>,
+                <span className={position.realized_pnl >= 0 ? "up" : "down"}>
+                  {fmt(position.realized_pnl, 2)}
+                </span>,
+                // The armed guard, so a position's protection is visible without
+                // opening the dialog.
+                <span className="num">
+                  {(() => {
+                    const guard = guardFor(position.symbol);
+                    if (!guard || (guard.stopLoss <= 0 && guard.takeProfit <= 0)) {
+                      return <span className="faint">未设置</span>;
+                    }
+                    return (
+                      <>
+                        <b className="down">{guard.stopLoss > 0 ? fmtPrice(guard.stopLoss) : "—"}</b>
+                        {" / "}
+                        <b className="up">{guard.takeProfit > 0 ? fmtPrice(guard.takeProfit) : "—"}</b>
+                      </>
+                    );
+                  })()}
+                </span>,
+                <input
+                  className="input input-xs"
+                  type="text"
+                  inputMode="decimal"
+                  autoComplete="off"
+                  aria-label={`平仓数量 ${position.symbol}`}
+                  placeholder={fmt(Math.abs(position.contracts), 6)}
+                  value={closeSizes[position.symbol] ?? ""}
+                  onChange={(event) =>
+                    setCloseSizes((current) => ({
+                      ...current,
+                      [position.symbol]: event.target.value,
+                    }))
+                  }
+                />,
+                <div className="row-actions">
+                  <button
+                    type="button"
+                    className="btn-sm"
+                    disabled={busy !== null}
+                    onClick={() => setProtectSymbol(position.symbol)}
+                  >
+                    止损/止盈
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-sm"
+                    disabled={busy !== null}
+                    onClick={() => void close(position)}
+                  >
+                    {busy === `close:${position.symbol}`
+                      ? "平仓中…"
+                      : parseNumber(closeSizes[position.symbol] ?? "") > 0
+                        ? "部分平仓"
+                        : "平仓"}
+                  </button>
+                </div>,
+              ])}
+              empty="当前没有持仓"
+            />
+          )}
+
+          {tab === "ai" && aiPanel}
+          {tab === "news" && <NewsPanel symbol={symbol} />}
+        </div>
       </div>
 
-      <div className="panel-body" hidden={collapsed}>
-        {tab === "open" && (
-          <Table
-            headers={["交易对", "方向", "类型", "数量", "触发/价格", "状态", "时间", "操作"]}
-            rightFrom={3}
-            rows={[
-              ...conditionals.map((item) => [
-                item.symbol,
-                <span className={item.side === "buy" ? "up" : "down"}>
-                  {item.side === "buy" ? "买入" : "卖出"}
-                </span>,
-                <span className="faint">
-                  条件{item.type === "limit" ? "限价" : "市价"}
-                </span>,
-                fmt(item.amount, 6),
-                <span>
-                  {item.direction === "below" ? "跌破" : "涨破"}{" "}
-                  <b className="num">{fmtPrice(item.trigger)}</b>
-                </span>,
-                "等待触发",
-                new Date(item.createdAt).toLocaleTimeString("zh-CN", { hour12: false }),
-                <button
-                  type="button"
-                  className="btn-sm"
-                  disabled={busy !== null}
-                  onClick={() => cancelConditional(item)}
-                >
-                  {busy === `cancel:${item.id}` ? "撤销中…" : "撤单"}
-                </button>,
-              ]),
-              ...orders.map((order) => [
-                order.symbol,
-                <span className={order.side === "buy" ? "up" : "down"}>
-                  {order.side === "buy" ? "买入" : "卖出"}
-                </span>,
-                order.type === "limit" ? "限价" : "市价",
-                fmt(order.amount, 6),
-                order.price ? fmtPrice(order.price) : "市价",
-                "未成交",
-                new Date(order.timestamp).toLocaleTimeString("zh-CN", { hour12: false }),
-                <button
-                  type="button"
-                  className="btn-sm"
-                  disabled={busy !== null}
-                  onClick={() => cancel(order)}
-                >
-                  {busy === `cancel:${order.id}` ? "撤销中…" : "撤单"}
-                </button>,
-              ]),
-            ]}
-            empty="没有未成交的委托"
-          />
-        )}
-
-        {tab === "trades" && (
-          <Table
-            headers={["交易对", "方向", "价格", "数量", "手续费", "时间"]}
-            rightFrom={2}
-            rows={trades.map((trade) => [
-              trade.symbol,
-              <span className={trade.side === "buy" ? "up" : "down"}>
-                {trade.side === "buy" ? "买入" : "卖出"}
-              </span>,
-              fmtPrice(trade.price),
-              fmt(trade.amount, 6),
-              fmt(trade.fee, 4),
-              new Date(trade.timestamp).toLocaleTimeString("zh-CN", { hour12: false }),
-            ])}
-            empty="暂无成交"
-          />
-        )}
-
-        {tab === "positions" && (
-          <Table
-            headers={[
-              "交易对",
-              "方向",
-              "数量",
-              "开仓价",
-              "最新价",
-              "浮动盈亏",
-              "已实现盈亏",
-              "平仓数量",
-              "操作",
-            ]}
-            rightFrom={2}
-            rows={positions.map((position) => [
-              position.symbol,
-              <span
-                className={
-                  position.side === "long" ? "up" : position.side === "short" ? "down" : ""
-                }
-              >
-                {position.side === "long" ? "多头" : position.side === "short" ? "空头" : "—"}
-              </span>,
-              fmt(position.contracts, 6),
-              fmtPrice(position.entry_price),
-              position.last ? fmtPrice(position.last) : "—",
-              // Marked by the same server call the 资产 page uses, so the two
-              // pages cannot show a different PnL for one position.
-              <span className={(position.unrealized ?? 0) >= 0 ? "up" : "down"}>
-                {position.unrealized === undefined ? "—" : fmt(position.unrealized, 2)}
-              </span>,
-              <span className={position.realized_pnl >= 0 ? "up" : "down"}>
-                {fmt(position.realized_pnl, 2)}
-              </span>,
-              <input
-                className="input input-xs"
-                type="text"
-                inputMode="decimal"
-                autoComplete="off"
-                aria-label={`平仓数量 ${position.symbol}`}
-                placeholder={fmt(Math.abs(position.contracts), 6)}
-                value={closeSizes[position.symbol] ?? ""}
-                onChange={(event) =>
-                  setCloseSizes((current) => ({
-                    ...current,
-                    [position.symbol]: event.target.value,
-                  }))
-                }
-              />,
-              <button
-                type="button"
-                className="btn-sm"
-                disabled={busy !== null}
-                onClick={() => void close(position)}
-              >
-                {busy === `close:${position.symbol}`
-                  ? "平仓中…"
-                  : parseNumber(closeSizes[position.symbol] ?? "") > 0
-                    ? "部分平仓"
-                    : "平仓"}
-              </button>,
-            ])}
-            empty="当前没有持仓"
-          />
-        )}
-
-        {tab === "ai" && aiPanel}
-        {tab === "news" && <NewsPanel symbol={symbol} />}
-      </div>
-    </div>
+    {protectTarget && (
+      <ProtectionDialog
+        position={protectTarget}
+        protection={guardFor(protectTarget.symbol)}
+        mode={mode}
+        onClose={() => setProtectSymbol(null)}
+        // Reload the account so the 止损/止盈 column shows the new levels.
+        onSaved={onChanged}
+      />
+    )}
+    {tradeDetail && (
+      <TradeDetailDialog trade={tradeDetail} onClose={() => setTradeDetail(null)} />
+    )}
+    </>
   );
 }

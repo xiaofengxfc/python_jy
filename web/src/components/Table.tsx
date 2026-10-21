@@ -5,9 +5,17 @@ interface Props {
   rows: ReactNode[][];
   empty: string;
   rightFrom?: number;
+  /** Optional row activation, e.g. opening a detail dialog for that row. */
+  onRowClick?: (index: number) => void;
 }
 
-export default function Table({ headers, rows, empty, rightFrom = 3 }: Props) {
+export default function Table({
+  headers,
+  rows,
+  empty,
+  rightFrom = 3,
+  onRowClick,
+}: Props) {
   if (!rows.length) return <div className="empty">{empty}</div>;
   return (
     <div className="table-wrap">
@@ -23,7 +31,11 @@ export default function Table({ headers, rows, empty, rightFrom = 3 }: Props) {
         </thead>
         <tbody>
           {rows.map((row, rowIndex) => (
-            <tr key={rowIndex}>
+            <tr
+              key={rowIndex}
+              className={onRowClick ? "clickable" : undefined}
+              onClick={onRowClick ? () => onRowClick(rowIndex) : undefined}
+            >
               {row.map((cell, cellIndex) => (
                 <td key={cellIndex} className={cellIndex >= rightFrom ? "right" : undefined}>
                   {cell}

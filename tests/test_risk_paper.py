@@ -770,3 +770,26 @@ def test_paper_partial_closes_deduct_their_share_of_the_entry_fee():
     assert position.realized_pnl == pytest.approx(4.795)
     # Fully closed: the position's own figure and the account agree exactly.
     assert broker.realized_pnl() == pytest.approx(4.795)
+
+
+def test_paper_trade_record_carries_the_fill_details():
+    """The 成交 detail dialog reads these fields, so the fill must keep them.
+
+    Without the market, the order type and the closed size, a fill opened from
+    the dialog described almost nothing about itself.
+    """
+    broker = PaperBroker(starting_balance=1_000, fee_rate=0.001, slippage_bps=0)
+    broker.place_order(
+        "BTC/USDT", "buy", "market", 1.0, price=100.0, market="usdm"
+    )
+    broker.place_order(
+        "BTC/USDT", "sell", "market", 0.4, price=110.0, market="usdm"
+    )
+
+    entry, exit_ = broker.account.trades
+    assert entry["market"] == "usdm"
+    assert entry["type"] == "market"
+    assert entry["closedQty"] == 0.0
+    assert entry["cost"] == pytest.approx(100.0)
+    assert exit_["closedQty"] == pytest.approx(0.4)
+    assert exit_["realized"] == pytest.approx(4.0 - 0.044)

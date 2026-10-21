@@ -27,10 +27,17 @@ class FakeCompleted:
 
 @pytest.fixture
 def captured(monkeypatch) -> dict:
-    """Record the argv the notifier would execute, without running anything."""
-    seen: dict = {}
+    """Record the argv the notifier would execute, without running anything.
+
+    Every call is kept, not just the last one: a worker thread left running by
+    an earlier test still calls `subprocess.run`, so its argv can land in the
+    same capture. Tests therefore look the call they expect up in `calls`
+    instead of assuming the capture holds only their own.
+    """
+    seen: dict = {"calls": []}
 
     def fake_run(args, **kwargs):
+        seen["calls"].append(args)
         seen["args"] = args
         seen["kwargs"] = kwargs
         return FakeCompleted()
@@ -350,18 +357,25 @@ def test_timeout_is_reported_without_hanging_the_caller(monkeypatch) -> None:
 def test_queued_message_is_sent_by_the_worker(captured, monkeypatch) -> None:
     notifier = _notifier()
     notifier._resolve_command = lambda: "openclaw"  # type: ignore[method-assign]
+
+    def delivered() -> bool:
+        """Whether our message reached the command line, whoever else ran."""
+        return any(
+            "--message" in args and args[args.index("--message") + 1] == "后台消息"
+            for args in captured["calls"]
+        )
+
     try:
         assert notifier.notify("后台消息") is True
-        # Poll the capture instead of sleeping a fixed time: the worker thread
-        # starts on demand, and a fixed delay makes this test flaky.
-        for _ in range(200):
-            if "args" in captured:
+        # Poll for our own message instead of the first call seen: the worker
+        # thread starts on demand, and a fixed delay makes this test flaky.
+        for _ in range(500):
+            if delivered():
                 break
             time.sleep(0.01)
     finally:
         notifier.stop()
-    assert "args" in captured, "后台线程没有发送排队的消息"
-    assert captured["args"][captured["args"].index("--message") + 1] == "后台消息"
+    assert delivered(), "后台线程没有发送排队的消息"
 
 
 def test_status_reports_missing_cli(monkeypatch) -> None:

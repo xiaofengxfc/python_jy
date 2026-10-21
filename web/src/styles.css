@@ -2230,6 +2230,74 @@ input[type="range"].input:focus {
   margin-top: 16px;
 }
 
+/* A wider modal for the position/detail dialogs: they carry a two-column
+   record plus inputs, which does not fit the 420px confirm dialog. */
+.modal-wide {
+  width: min(520px, 100%);
+}
+
+/* Label/value rows, used by the guard and fill dialogs. */
+.detail-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: baseline;
+  gap: 7px 16px;
+  margin-bottom: 14px;
+  font-size: 12px;
+}
+
+.detail-grid > span {
+  color: var(--text-3);
+}
+
+.detail-grid > b {
+  text-align: right;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+/* One-click levels inside a dialog. */
+.chip-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  font-size: 11px;
+}
+
+.chip-row .spacer {
+  flex: 1 1 auto;
+}
+
+.chip {
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg);
+  color: var(--text-2);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.chip:hover {
+  background: var(--bg-hover);
+  border-color: var(--text-3);
+  color: var(--text);
+}
+
+/* Two buttons in one table cell. */
+.row-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+/* A row that opens a dialog. */
+.table tbody tr.clickable {
+  cursor: pointer;
+}
+
+
 /* ------------------------------------------------------------ news feed */
 .news-wrap {
   display: flex;
