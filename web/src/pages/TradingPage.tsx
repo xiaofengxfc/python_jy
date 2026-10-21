@@ -837,13 +837,11 @@ export default function TradingPage({
         </div>
       </div>
 
-      {/* The old standalone "自动交易" page is merged here: same pair, same
-          timeframe, right under the chart it trades. */}
+      {/* AI 量化的执行引擎：策略信号 → 自动下单。跟随图表的交易对与周期，
+          与下面的 AI 交易互斥运行（共用交易权租约）。 */}
       <AutoPage embedded market={market} symbol={symbol} timeframe={timeframe} />
 
-      {/* AI 自主交易：模型自己看盘、自己决策，和上面的策略自动交易互斥运行
-          （共用交易权租约）。同样跟随图表上的交易对与周期。 */}
-      {/* AI 自主交易 / AI 自主量化：两个独立流程，共用交易权租约。 */}
+      {/* AI 交易（模型逐根 K 线决策）/ AI 量化（策略生命周期），两个独立流程。 */}
       <AITradingPanel
         market={market}
         symbol={symbol}

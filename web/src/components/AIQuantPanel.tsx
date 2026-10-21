@@ -33,8 +33,17 @@ interface Props {
   onNavigate?: (page: "lab" | "backtest") => void;
 }
 
-/** AI 自主量化：候选策略 → 回测/优化 → 人工批准 → 部署并自动执行。
- * This is deliberately separate from AI 自主交易: that panel reviews a
+/** Candidate states come from the store in English; the list is Chinese. */
+const STATUS_LABEL: Record<string, string> = {
+  pending: "待批准",
+  approved: "已批准",
+  rejected: "已拒绝",
+};
+
+const statusLabel = (status: string) => STATUS_LABEL[status] ?? status;
+
+/** AI 量化：候选策略 → 回测/优化 → 人工批准 → 部署并自动执行。
+ * This is deliberately separate from AI 交易: that panel reviews a
  * strategy signal per candle, while this one owns the strategy lifecycle. */
 export default function AIQuantPanel({ market, symbol, timeframe, onNavigate }: Props) {
   const [candidates, setCandidates] = useState<Candidate[]>([]);
@@ -221,7 +230,7 @@ export default function AIQuantPanel({ market, symbol, timeframe, onNavigate }: 
   return (
     <div className="stack ai-quant">
       <div className="ai-head">
-        <span className="card-title">AI 自主量化</span>
+        <span className="card-title">AI 量化</span>
         <span className="faint" style={{ fontSize: 11 }}>
           生成策略 → 回测/优化 → 人工批准 → 自动执行
         </span>
@@ -265,7 +274,9 @@ export default function AIQuantPanel({ market, symbol, timeframe, onNavigate }: 
                       onClick={() => setSelectedId(item.id)}
                     >
                       <span className="ai-quant-name">{item.name || item.strategy_key}</span>
-                      <span className={`ai-quant-state ${item.status}`}>{item.status}</span>
+                      <span className={`ai-quant-state ${item.status}`}>
+                        {statusLabel(item.status)}
+                      </span>
                       <span className="faint">
                         {item.backtest && Object.keys(item.backtest).length
                           ? `回测收益 ${fmt(Number(item.backtest.total_return ?? 0) * 100, 2)}%`
@@ -350,6 +361,33 @@ export default function AIQuantPanel({ market, symbol, timeframe, onNavigate }: 
               <div className="preview-row">
                 <span className="faint">市场</span>
                 <b>{market} · {symbol} · {timeframe}</b>
+              </div>
+              <div className="preview-row">
+                <span className="faint">回测收益</span>
+                <b className={Number(selected?.backtest?.total_return ?? 0) >= 0 ? "up" : "down"}>
+                  {backtested
+                    ? `${fmt(Number(selected?.backtest?.total_return ?? 0) * 100, 2)}%`
+                    : "未回测"}
+                </b>
+              </div>
+              <div className="preview-row">
+                <span className="faint">最大回撤</span>
+                <b>
+                  {backtested
+                    ? `${fmt(Number(selected?.backtest?.max_drawdown ?? 0) * 100, 2)}%`
+                    : "—"}
+                </b>
+              </div>
+              <div className="preview-row">
+                <span className="faint">夏普 / 成交</span>
+                <b>
+                  {backtested
+                    ? `${fmt(Number(selected?.backtest?.sharpe ?? 0), 2)} / ${fmt(
+                        Number(selected?.backtest?.trades ?? 0),
+                        0,
+                      )}`
+                    : "—"}
+                </b>
               </div>
               <div className="preview-row">
                 <span className="faint">审核备注</span>

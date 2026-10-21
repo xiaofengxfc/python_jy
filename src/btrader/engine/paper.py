@@ -352,6 +352,16 @@ class PaperBroker:
             return []
 
         long = position.contracts > 0
+        # A guard belongs to one direction. If the position reversed without
+        # passing through an entry order (a resting limit that filled across
+        # zero, say), the old levels would fire on the new position in the
+        # wrong direction — a long's stop sits *below* the price and therefore
+        # looks already crossed to a short. Disarm instead of closing.
+        guard_side = str(guard.get("side") or "")
+        if guard_side in ("long", "short") and (guard_side == "long") != long:
+            self.account.protections.pop(symbol, None)
+            log.info("纸面保护单方向已失效，撤销 %s（%s → %s）", symbol, guard_side, position.side)
+            return []
         stop = float(guard.get("stopLoss") or 0.0)
         take = float(guard.get("takeProfit") or 0.0)
         reason = ""
@@ -369,10 +379,17 @@ class PaperBroker:
             return []
 
         qty = abs(position.contracts)
+        # The exit belongs to the same venue as the entry, so a futures guard
+        # is not reported as a spot fill in the trade list.
+        market = "spot"
+        for filled in reversed(self.account.orders):
+            if filled["symbol"] == symbol and filled.get("market"):
+                market = filled["market"]
+                break
         order = {
             "id": f"paper-{uuid.uuid4().hex[:12]}",
             "symbol": symbol,
-            "market": "spot",
+            "market": market,
             "side": "sell" if long else "buy",
             "type": "market",
             "amount": qty,

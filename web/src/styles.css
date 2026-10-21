@@ -2174,7 +2174,6 @@ input[type="range"].input:focus {
   border-bottom: 1px solid var(--border);
 }
 
-
 /* ------------------------------------------------- paper / live switch */
 /* A live session is the exception, so the page says so once, plainly, and
    the confirmation asks before the first order leaves the machine. */
@@ -2296,7 +2295,6 @@ input[type="range"].input:focus {
 .table tbody tr.clickable {
   cursor: pointer;
 }
-
 
 /* ------------------------------------------------------------ news feed */
 .news-wrap {
@@ -2731,103 +2729,13 @@ main.main > .auto-head:not(.page-head) {
   }
 }
 
-/* ------------------------------------------------------ Freqtrade sidecar */
-main.main > .ft-card:not(.page-head) {
-  flex: 0 0 auto;
-  width: 100%;
-  max-width: none;
-  margin-top: 12px;
-  margin-left: 0;
-  margin-right: 0;
-}
-
 main.main > .auto-section,
 main.main > .ai-section {
   flex: 0 0 auto;
 }
 
-.ft-body {
-  gap: 10px;
-}
-
-.ft-grid {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 8px 16px;
-}
-
-.ft-grid > div {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  font-size: 12px;
-}
-
-.ft-grid b {
-  font-weight: 500;
-}
-
-.ft-row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-end;
-  gap: 8px;
-}
-
-.ft-row .field-label {
-  flex: 1 1 240px;
-  min-width: 200px;
-}
-
-.ft-row .select {
-  flex: 1 1 220px;
-}
-
-.ft-path {
-  padding: 1px 4px;
-  border-radius: 4px;
-  background: var(--bg-hover);
-  font-family: var(--mono);
-  font-size: 11px;
-  word-break: break-all;
-}
-
-.ft-log {
-  max-height: 220px;
-  margin: 0;
-  padding: 10px;
-  overflow: auto;
-  border-radius: 6px;
-  background: var(--bg-subtle);
-  font-family: var(--mono);
-  font-size: 11px;
-  line-height: 1.5;
-  white-space: pre-wrap;
-}
-
-.ft-positions {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  margin-top: 2px;
-}
-
-.ft-pos-head {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 12px;
-  font-size: 12px;
-}
-
-@media (max-width: 900px) {
-  .ft-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-}
-
 /* ============================================================
-   AI 自主交易 · 量化（交易页内嵌面板）
+   AI 交易 · 量化（交易页内嵌面板）
    与 .auto-section 同宽：左列控制/概览，右列决策事件，窄屏落成一列。
    ============================================================ */
 main.main > .ai-section:not(.page-head) {
@@ -2875,30 +2783,6 @@ main.main > .ai-workspace:not(.page-head) {
 main.main > .ai-workspace .ai-head,
 main.main > .ai-workspace .ai-col {
   width: 100%;
-}
-
-.engine-switch {
-  display: inline-flex;
-  gap: 2px;
-  padding: 2px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--bg);
-}
-
-.engine-switch button {
-  border: 0;
-  border-radius: 4px;
-  padding: 3px 9px;
-  background: transparent;
-  color: var(--text-2);
-  font-size: 11px;
-  cursor: pointer;
-}
-
-.engine-switch button.active {
-  background: var(--text);
-  color: var(--bg);
 }
 
 .ai-mode-switch {
@@ -3235,23 +3119,6 @@ main.main > .lab-page:not(.page-head) {
   flex-direction: column;
   gap: 12px;
   min-width: 0;
-}
-
-/* Freqtrade compatibility card below the AI/optimizer grid. */
-.ft-strategy-lab {
-  min-width: 0;
-}
-
-.ft-context {
-  display: flex;
-  align-items: center;
-  min-height: 32px;
-  padding: 0 9px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--bg-hover);
-  color: var(--text-2);
-  font-size: 12px;
 }
 
 .lab-grid {

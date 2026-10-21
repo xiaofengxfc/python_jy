@@ -374,3 +374,50 @@ def test_zero_strategy_signal_skips_before_calling_model(tmp_path):
     assert "策略无信号" in record["reason"]
     assert llm.calls == []
     assert trading.requests == []
+
+def test_closing_a_short_buys_and_closing_a_long_sells(tmp_path):
+    """平空必须是买、平多是卖：方向写错时卖单会把空头做得更大。"""
+    short = make_trader(
+        tmp_path,
+        answer=decision_json(action="close_short", quote=400.0, stop_loss=None),
+        portfolio={"equity": 1000.0, "position_quote": -400.0, "price": 100.0},
+        market_type="usdm",
+    )[0]
+    record = short.decide_once()
+    assert record is not None
+    assert short.trading.requests[-1].side == "buy"
+    assert short.trading.requests[-1].reduce_only is True
+
+    long_only = make_trader(
+        tmp_path,
+        answer=decision_json(action="close_long", quote=400.0, stop_loss=None),
+        portfolio={"equity": 1000.0, "position_quote": 400.0, "price": 100.0},
+    )[0]
+    long_only.decide_once()
+    assert long_only.trading.requests[-1].side == "sell"
+    assert long_only.trading.requests[-1].reduce_only is True
+
+
+def test_stop_between_decision_and_submit_blocks_the_order(tmp_path):
+    """停止信号在模型调用期间到达时，这一单不能再发出去。"""
+    trader, _llm, trading, _risk = make_trader(tmp_path)
+    trader._stop_event.set()  # 相当于用户在这几秒里按了停止
+    record = trader.decide_once()
+    assert record is not None and record["outcome"] == "error"
+    assert trading.requests == []
+
+
+def test_status_config_carries_the_strategy_key(tmp_path):
+    trader, _llm, _trading, _risk = make_trader(tmp_path, strategy_key="ma_cross")
+    assert trader.status()["config"]["strategy"] == "ma_cross"
+
+
+def test_start_refuses_while_the_previous_poller_is_still_exiting(tmp_path):
+    class StuckThread:
+        def is_alive(self):
+            return True
+
+    trader, _llm, _trading, _risk = make_trader(tmp_path)
+    trader._thread = StuckThread()
+    ok, message = trader.start()
+    assert not ok and "仍在退出" in message

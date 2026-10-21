@@ -10,7 +10,8 @@ import BacktestPage from "./pages/BacktestPage";
 import StrategyLabPage from "./pages/StrategyLabPage";
 import type { AppSettings, Health } from "./types";
 
-export type PageKey = "trading" | "portfolio" | "auto" | "backtest" | "lab" | "settings";
+/** 「自动交易」页已经合并进交易页（AI 量化执行引擎），没有独立的 auto 页。 */
+export type PageKey = "trading" | "portfolio" | "backtest" | "lab" | "settings";
 
 export default function App() {
   const [page, setPage] = useState<PageKey>("trading");

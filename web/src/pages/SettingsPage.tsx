@@ -47,7 +47,6 @@ const PCT_FIELDS: [keyof AppSettings["risk"], string, string][] = [
 
 export default function SettingsPage({ settings, onSaved }: Props) {
   const [draft, setDraft] = useState<AppSettings | null>(settings);
-  const [ftPairsText, setFtPairsText] = useState("");
   const [credentials, setCredentials] = useState<CredentialItem[]>([]);
   const [credentialsError, setCredentialsError] = useState("");
   const [saving, setSaving] = useState(false);
@@ -352,7 +351,6 @@ export default function SettingsPage({ settings, onSaved }: Props) {
     if (settings) {
       setDraft(settings);
       setNetwork(settings.network);
-      setFtPairsText(settings.freqtrade.pairs.join(", "));
     }
   }, [settings]);
 
@@ -386,14 +384,6 @@ export default function SettingsPage({ settings, onSaved }: Props) {
 
   const patchAI = (values: Partial<AISettings>) => {
     setDraft((current) => (current ? { ...current, ai: { ...current.ai, ...values } } : current));
-  };
-
-  const patchFreqtrade = (values: Partial<AppSettings["freqtrade"]>) => {
-    setDraft((current) =>
-      current
-        ? { ...current, freqtrade: { ...current.freqtrade, ...values } }
-        : current,
-    );
   };
 
   /** Switching provider also moves the model and endpoint: keeping DeepSeek's
@@ -488,13 +478,6 @@ export default function SettingsPage({ settings, onSaved }: Props) {
           risk: draft.risk,
           notify: draft.notify,
           ai: draft.ai,
-          freqtrade: {
-            ...draft.freqtrade,
-            pairs: ftPairsText
-              .split(",")
-              .map((item) => item.trim())
-              .filter(Boolean),
-          },
         }),
       });
       // The secret is deliberately not part of the settings JSON; when the
@@ -912,183 +895,6 @@ export default function SettingsPage({ settings, onSaved }: Props) {
           </div>
         </div>
 
-        <div className="card">
-          <div className="card-head">
-            <span className="card-title">Freqtrade 引擎</span>
-            <span className="spacer" />
-            <span className="faint" style={{ fontSize: 11 }}>
-              独立 sidecar · 保存后下次启动生效
-            </span>
-          </div>
-          <div className="card-body">
-            <div className="hint" style={{ marginBottom: 12 }}>
-              Freqtrade 运行在独立 Python 环境中，biTrader 只通过本地 REST/WS 通信。
-              修改配置前请先停止引擎。
-            </div>
-            <div className="form-grid">
-              <div className="field">
-                <label className="field-label" htmlFor="set-ft-enabled">
-                  <span>启用 Freqtrade</span>
-                </label>
-                <label className="check">
-                  <input
-                    id="set-ft-enabled"
-                    type="checkbox"
-                    checked={draft.freqtrade.enabled}
-                    onChange={(event) =>
-                      patchFreqtrade({ enabled: event.target.checked })
-                    }
-                  />
-                  <span>自动交易页显示 Freqtrade 引擎</span>
-                </label>
-              </div>
-              <div className="field">
-                <label className="field-label" htmlFor="set-ft-dry">
-                  <span>纸面模式</span>
-                </label>
-                <label className="check">
-                  <input
-                    id="set-ft-dry"
-                    type="checkbox"
-                    checked={draft.freqtrade.dry_run}
-                    onChange={(event) =>
-                      patchFreqtrade({ dry_run: event.target.checked })
-                    }
-                  />
-                  <span>关闭前请确认 API Key 权限</span>
-                </label>
-              </div>
-              <div className="field" style={{ gridColumn: "1 / -1" }}>
-                <label className="field-label" htmlFor="set-ft-python">
-                  <span>Python / venv 路径</span>
-                </label>
-                <input
-                  id="set-ft-python"
-                  className="input"
-                  value={draft.freqtrade.python}
-                  placeholder="留空使用 %APPDATA%\\biTrader\\freqtrade\\venv"
-                  onChange={(event) =>
-                    patchFreqtrade({ python: event.target.value })
-                  }
-                />
-              </div>
-              <div className="field">
-                <label className="field-label" htmlFor="set-ft-exchange">
-                  <span>交易所</span>
-                  <em>新安装默认 binance；已保存的 gate 不会被迁移</em>
-                </label>
-                <input
-                  id="set-ft-exchange"
-                  className="input"
-                  list="ft-exchange-options"
-                  value={draft.freqtrade.exchange}
-                  onChange={(event) =>
-                    patchFreqtrade({ exchange: event.target.value })
-                  }
-                />
-                <datalist id="ft-exchange-options">
-                  <option value="binance" />
-                  <option value="gate" />
-                  <option value="okx" />
-                  <option value="bybit" />
-                </datalist>
-              </div>
-              <div className="field">
-                <label className="field-label" htmlFor="set-ft-port">
-                  <span>REST 端口</span>
-                </label>
-                <input
-                  id="set-ft-port"
-                  className="input"
-                  type="number"
-                  min={1024}
-                  max={65535}
-                  value={draft.freqtrade.trade_port}
-                  onChange={(event) =>
-                    patchFreqtrade({ trade_port: Number(event.target.value) })
-                  }
-                />
-              </div>
-              <div className="field">
-                <label className="field-label" htmlFor="set-ft-stake">
-                  <span>单笔投入（USDT）</span>
-                </label>
-                <input
-                  id="set-ft-stake"
-                  className="input"
-                  type="number"
-                  min={1}
-                  value={draft.freqtrade.stake_amount}
-                  onChange={(event) =>
-                    patchFreqtrade({ stake_amount: Number(event.target.value) })
-                  }
-                />
-              </div>
-              <div className="field">
-                <label className="field-label" htmlFor="set-ft-max">
-                  <span>最大同时持仓</span>
-                </label>
-                <input
-                  id="set-ft-max"
-                  className="input"
-                  type="number"
-                  min={1}
-                  max={100}
-                  value={draft.freqtrade.max_open_trades}
-                  onChange={(event) =>
-                    patchFreqtrade({ max_open_trades: Number(event.target.value) })
-                  }
-                />
-              </div>
-              <div className="field">
-                <label className="field-label" htmlFor="set-ft-timeframe">
-                  <span>K 线周期</span>
-                </label>
-                <select
-                  id="set-ft-timeframe"
-                  className="select"
-                  value={draft.freqtrade.timeframe}
-                  onChange={(event) =>
-                    patchFreqtrade({ timeframe: event.target.value })
-                  }
-                >
-                  {TIMEFRAMES.map(([value, label]) => (
-                    <option key={value} value={value}>
-                      {label}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div className="field">
-                <label className="field-label" htmlFor="set-ft-strategy">
-                  <span>默认策略</span>
-                </label>
-                <input
-                  id="set-ft-strategy"
-                  className="input"
-                  value={draft.freqtrade.strategy}
-                  placeholder="SampleStrategy"
-                  onChange={(event) =>
-                    patchFreqtrade({ strategy: event.target.value })
-                  }
-                />
-              </div>
-              <div className="field" style={{ gridColumn: "1 / -1" }}>
-                <label className="field-label" htmlFor="set-ft-pairs">
-                  <span>交易对</span>
-                </label>
-                <input
-                  id="set-ft-pairs"
-                  className="input"
-                  value={ftPairsText}
-                  placeholder="BTC/USDT, ETH/USDT"
-                  onChange={(event) => setFtPairsText(event.target.value)}
-                />
-                <span className="hint">用英文逗号分隔；最多 20 个。</span>
-              </div>
-            </div>
-          </div>
-        </div>
 
         <div className="stack">
           <div className="card">

@@ -11,7 +11,6 @@ import math
 from dataclasses import dataclass, field
 
 from ..core.config import AppSettings
-from ..core.models import now_ms
 from ..core.storage import Database
 from ..core.types import MarketType, Network, OrderSide, OrderType, RunMode
 from ..exchange.rest import BinanceREST, ExchangeError

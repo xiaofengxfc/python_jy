@@ -18,7 +18,7 @@ from dataclasses import asdict, replace
 from datetime import datetime
 from typing import Any, Callable
 
-from fastapi import APIRouter, HTTPException, Response
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 import pandas as pd
@@ -42,7 +42,6 @@ from ..installer import InstallOptions, restart_gateway_process
 from ..notify import WeChatNotifier, load_wecom_secret, save_wecom_secret
 from ..strategy.candidates import CandidateError, default_store
 from ..strategy.source import StrategySourceError, rename_source
-from ..freqtrade_compat import remove_adapter
 from .. import ai, llm
 from .. import paths
 
@@ -123,19 +122,22 @@ def _strategy_in_use(auto, ai_ctl, key: str) -> str:
         ai_status = ai_ctl.status() or {}
     except Exception:  # pragma: no cover - defensive
         ai_status = {}
-    if str(ai_status.get("state") or "stopped") != "stopped":
+    if str(ai_status.get("state") or "stopped") in ("running", "paused"):
         if str((ai_status.get("config") or {}).get("strategy") or "") == key:
-            return "AI 自主交易正在使用该策略，请先停止再重命名"
+            return "AI 交易正在使用该策略，请先停止再重命名"
     return ""
 
-def _reject_if_freqtrade_running(ctx) -> None:
-    """Keep the sidecar and the in-process engine from trading the same account."""
-    freqtrade = getattr(ctx, "freqtrade", None)
-    if freqtrade is not None and freqtrade.running:
-        raise HTTPException(
-            status_code=409,
-            detail="Freqtrade 正在运行，请先停止它再启动旧引擎或 AI 自主交易",
-        )
+def _engine_clash(auto_running: bool, ai_state: str, *, starting: str) -> str:
+    """另一个引擎占着账户的原因，没有冲突时返回空串。
+
+    量化执行引擎（auto）和 AI 交易共用同一个纸面/实盘账户：两个 poller
+    同时下单只会互相把仓位改回去，所以启动前互斥（INV-14）。
+    """
+    if starting == "auto" and ai_state in ("running", "paused"):
+        return "AI 交易正在运行，请先停止再启动量化引擎"
+    if starting == "ai" and auto_running:
+        return "量化执行引擎正在运行，请先停止再启动 AI 交易"
+    return ""
 
 
 def _explain_async(ctx, events, *, kind: str, detail: str, context: str = "") -> None:
@@ -191,11 +193,10 @@ class SettingsPayload(BaseModel):
     notify: dict[str, Any] | None = None
     ai: dict[str, Any] | None = None
     ai_auto: dict[str, Any] | None = None
-    freqtrade: dict[str, Any] | None = None
 
 
 class AITraderStartPayload(BaseModel):
-    """启动 AI 自主交易。实盘必须显式 ``confirm_live``。"""
+    """启动 AI 交易。实盘必须显式 ``confirm_live``。"""
 
     mode: str = ""
     market: str = ""
@@ -671,7 +672,7 @@ def _install_options(payload: InstallPayload) -> InstallOptions:
 
 
 class AITraderController:
-    """单例：同一时刻只允许一个 AI 自主交易实例（INV-14）。"""
+    """单例：同一时刻只允许一个 AI 交易实例（INV-14）。"""
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -683,7 +684,12 @@ class AITraderController:
         with self._lock:
             return self._trader
 
-    def start(self, state, payload: AITraderStartPayload) -> dict[str, Any]:
+    def _build(self, state, payload: AITraderStartPayload) -> AITrader:
+        """把请求 + 已保存设置变成一个「还没启动」的实例。
+
+        start（轮询）和 decide（立即决策一次）共用这一段：启用检查、实盘条件、
+        策略参数校验只写一份，两个入口就不会慢慢长出两套规则。
+        """
         ctx = state.ctx
         cfg = ctx.settings.ai_auto
         mode = payload.mode or cfg.mode or "paper"
@@ -703,7 +709,7 @@ class AITraderController:
             keys = ctx.strategies.keys
             strategy_key = keys[0] if keys else ""
         if not strategy_key:
-            raise HTTPException(status_code=400, detail="AI 自主交易需要先选择一个策略")
+            raise HTTPException(status_code=400, detail="AI 交易需要先选择一个策略")
         try:
             signal_strategy = ctx.strategies.get(strategy_key)
         except KeyError as exc:
@@ -729,6 +735,7 @@ class AITraderController:
             confirm_live=payload.confirm_live,
             network=ctx.network.value,
             symbol=symbol,
+            strategy_key=strategy_key,
             market_type=market.value,
             timeframe=timeframe,
             leverage=cfg.leverage,
@@ -769,15 +776,39 @@ class AITraderController:
                 signal_strategy.validate_params(payload.params or {}),
             ),
         )
+        # 改参数重启是常规操作：旧实例握着共享租约，必须先停掉，否则新实例的
+        # acquire 会失败，用户看到的是「交易权已被占用」这种莫名其妙的报错。
+        return trader
+
+    def start(self, state, payload: AITraderStartPayload) -> dict[str, Any]:
+        trader = self._build(state, payload)
+        with self._lock:
+            previous = self._trader
+        if previous is not None and previous is not trader:
+            previous.stop()
         ok, message = trader.start()
         if not ok:
             raise HTTPException(status_code=400, detail=message)
         with self._lock:
-            previous = self._trader
             self._trader = trader
-        if previous is not None and previous is not trader:
-            previous.stop()
         return trader.status()
+
+    def decide(self, state, payload: AITraderStartPayload) -> dict[str, Any]:
+        """立即决策一次：同样的闸门和账，但不启动轮询线程。
+
+        AITrader.decide_once 从 Phase 3-A 起就为这个入口准备着（测试和
+        「立即决策」共用），只是之前没有对外的路由。
+        """
+        with self._lock:
+            trader_in_use = (
+                self._trader is not None and self._trader.state in ("running", "paused")
+            )
+        if trader_in_use:
+            raise HTTPException(
+                status_code=409, detail="AI 交易正在运行，请先停止再用「立即决策」"
+            )
+        trader = self._build(state, payload)
+        return trader.decide_once() or {}
 
     def stop(self) -> dict[str, Any]:
         with self._lock:
@@ -972,13 +1003,6 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
             candidate_auto = replace(settings.ai_auto)
             _apply_ai_auto(candidate_auto, payload.ai_auto)
             settings.ai_auto = candidate_auto
-        if payload.freqtrade is not None:
-            candidate_ft = replace(settings.freqtrade)
-            _apply_freqtrade(candidate_ft, payload.freqtrade)
-            # FreqtradeBridge keeps a reference to this dataclass. Mutate it in
-            # place after validation so the running backend sees new values.
-            for name in candidate_ft.__dataclass_fields__:
-                setattr(settings.freqtrade, name, getattr(candidate_ft, name))
 
         ctx.save_settings()
         return {"ok": True, "settings": settings.to_dict()}
@@ -1583,19 +1607,10 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
                 saved[new_key] = saved.pop(key)
                 ctx.settings.ai_auto.strategy_params = saved
                 touched = True
-            # The sidecar remembers its strategy by name too; leaving the old
-            # name there would make the next start fail on a missing class.
-            if getattr(ctx.settings.freqtrade, "strategy", "") == key:
-                ctx.settings.freqtrade.strategy = new_key
-                touched = True
             if touched:
                 ctx.save_settings()
         except Exception:
             log.warning("迁移策略引用失败", exc_info=True)
-        try:
-            remove_adapter(ctx.freqtrade, key)
-        except Exception:
-            log.debug("删除 Freqtrade 适配器失败", exc_info=True)
         return {**result, "candidates_updated": moved}
 
     # ------------------------------------------------------- automated trade
@@ -1606,7 +1621,11 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
     @router.post("/api/auto/start")
     def auto_start(payload: AutoStartPayload) -> dict[str, Any]:
         state = get_state()
-        _reject_if_freqtrade_running(state.ctx)
+        clash = _engine_clash(
+            auto.running, str(ai_ctl.status().get("state") or ""), starting="auto"
+        )
+        if clash:
+            raise HTTPException(status_code=409, detail=clash)
         auto.start(state.ctx, payload)
         return {"ok": True, "status": auto.status()}
 
@@ -1615,7 +1634,7 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
         auto.stop()
         return {"ok": True, "status": auto.status()}
 
-    # ------------------------------------------------------- AI 自主交易
+    # ------------------------------------------------------------ AI 交易
     @router.get("/api/ai/trader/status")
     def ai_trader_status(since: int = 0) -> dict[str, Any]:
         return ai_ctl.status(since)
@@ -1623,8 +1642,19 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
     @router.post("/api/ai/trader/start")
     def ai_trader_start(payload: AITraderStartPayload) -> dict[str, Any]:
         state = get_state()
-        _reject_if_freqtrade_running(state.ctx)
+        clash = _engine_clash(auto.running, "", starting="ai")
+        if clash:
+            raise HTTPException(status_code=409, detail=clash)
         return {"ok": True, "status": ai_ctl.start(state, payload)}
+
+    @router.post("/api/ai/trader/decide")
+    def ai_trader_decide(payload: AITraderStartPayload) -> dict[str, Any]:
+        """立即决策一次（不启动轮询），用于人工催促或验证配置。"""
+        state = get_state()
+        clash = _engine_clash(auto.running, "", starting="ai")
+        if clash:
+            raise HTTPException(status_code=409, detail=clash)
+        return {"ok": True, "decision": ai_ctl.decide(state, payload)}
 
     @router.post("/api/ai/trader/stop")
     def ai_trader_stop() -> dict[str, Any]:
@@ -1647,7 +1677,7 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
         ctx.save_settings()
         auto.stop()
         result = ai_ctl.kill(payload.reason or "急停")
-        log.warning("AI 自主交易急停：%s", result.get("reason"))
+        log.warning("AI 交易急停：%s", result.get("reason"))
         return {"ok": True, "ai_trader": result, "risk": ctx.trading.risk.snapshot()}
 
     @router.get("/api/ai/trader/audit")
@@ -1814,7 +1844,7 @@ def _apply_ai(target: Any, values: dict[str, Any]) -> None:
 
 
 def _apply_ai_auto(target: AIAutoSettings, values: dict[str, Any]) -> None:
-    """AI 自主交易设置：只接受 dataclass 声明的字段，类型就地转换。"""
+    """AI 交易设置：只接受 dataclass 声明的字段，类型就地转换。"""
     for key, value in values.items():
         if not hasattr(target, key):
             log.debug("忽略未知 AI 自动交易字段: %s", key)
@@ -1852,47 +1882,6 @@ def _apply_ai_auto(target: AIAutoSettings, values: dict[str, Any]) -> None:
             raise HTTPException(status_code=400, detail=f"ai_auto.{name} 不能为负")
     if not (0.0 <= target.min_confidence <= 1.0):
         raise HTTPException(status_code=400, detail="ai_auto.min_confidence 必须在 0 到 1 之间")
-
-
-def _apply_freqtrade(target: Any, values: dict[str, Any]) -> None:
-    """Validate Freqtrade sidecar settings without touching the live bridge."""
-    for key in ("enabled", "dry_run"):
-        if key in values:
-            setattr(target, key, bool(values[key]))
-    for key in ("trade_port", "max_open_trades"):
-        if key in values:
-            try:
-                setattr(target, key, int(values[key]))
-            except (TypeError, ValueError):
-                raise HTTPException(status_code=400, detail=f"freqtrade.{key} 必须是整数") from None
-    for key in ("stake_amount",):
-        if key in values:
-            try:
-                setattr(target, key, float(values[key]))
-            except (TypeError, ValueError):
-                raise HTTPException(status_code=400, detail=f"freqtrade.{key} 必须是数字") from None
-    for key in ("python", "exchange", "username", "strategy"):
-        if key in values:
-            setattr(target, key, str(values[key] or ""))
-    if "timeframe" in values:
-        timeframe = str(values["timeframe"] or "")
-        if timeframe not in TIMEFRAME_SECONDS:
-            raise HTTPException(status_code=400, detail=f"不支持的周期：{timeframe}")
-        target.timeframe = timeframe
-    if "pairs" in values:
-        pairs = values["pairs"]
-        if not isinstance(pairs, list):
-            raise HTTPException(status_code=400, detail="freqtrade.pairs 必须是交易对数组")
-        cleaned = [str(item).strip() for item in pairs if str(item).strip()]
-        if not cleaned:
-            raise HTTPException(status_code=400, detail="freqtrade.pairs 至少需要一个交易对")
-        target.pairs = cleaned[:20]
-    if target.trade_port < 1024 or target.trade_port > 65535:
-        raise HTTPException(status_code=400, detail="freqtrade.trade_port 必须在 1024 到 65535 之间")
-    if target.stake_amount <= 0:
-        raise HTTPException(status_code=400, detail="freqtrade.stake_amount 必须大于 0")
-    if target.max_open_trades < 1:
-        raise HTTPException(status_code=400, detail="freqtrade.max_open_trades 至少为 1")
 
 
 def _ai_portfolio(state, symbol: str) -> dict[str, Any]:

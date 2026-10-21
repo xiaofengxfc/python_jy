@@ -16,17 +16,13 @@ follow from it:
 
 from __future__ import annotations
 
-import io
 import json
 import logging
 import os
-import re
 import shutil
 import subprocess
 import threading
 import time
-import urllib.error
-import urllib.request
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path

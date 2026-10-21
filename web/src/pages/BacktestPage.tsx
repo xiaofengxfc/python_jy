@@ -11,17 +11,15 @@ import type {
 } from "../types";
 import { ParamFields } from "../components/ParamFields";
 import StrategyEditor from "../components/StrategyEditor";
-import FreqtradeBacktestPanel from "../components/FreqtradeBacktestPanel";
 import LineChart, { Legend, type Series } from "../components/LineChart";
 import Table from "../components/Table";
 
-type Tab = "single" | "optimize" | "history" | "freqtrade";
+type Tab = "single" | "optimize" | "history";
 
 const TABS: [Tab, string][] = [
   ["single", "单次回测"],
   ["optimize", "参数优化"],
   ["history", "历史记录"],
-  ["freqtrade", "Freqtrade"],
 ];
 
 const METRIC_LABELS: [string, string, "pct" | "num"][] = [
@@ -443,29 +441,6 @@ export default function BacktestPage() {
       return [...rest, { label: resultLabel, result }].slice(-4);
     });
   };
-
-  if (tab === "freqtrade") {
-    return (
-      <>
-        <div className="page-head">
-          <h1 className="page-title">回测</h1>
-          <div className="segmented">
-            {TABS.map(([key, label]) => (
-              <button
-                key={key}
-                type="button"
-                aria-pressed={tab === key}
-                onClick={() => setTab(key)}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-        </div>
-        <FreqtradeBacktestPanel />
-      </>
-    );
-  }
 
   return (
     <>

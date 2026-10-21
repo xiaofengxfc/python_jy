@@ -3,7 +3,6 @@ import type { ReactNode } from "react";
 import { api, query } from "../api";
 import { TIMEFRAMES, fmt } from "../format";
 import type { Strategy, SymbolInfo } from "../types";
-import FreqtradeStrategyLab from "../components/FreqtradeStrategyLab";
 
 /* --------------------------------------------------------------- types */
 /* The lab endpoints live outside `types.ts` because they are still new: only
@@ -182,7 +181,7 @@ export default function StrategyLabPage() {
 
   useEffect(() => () => window.clearInterval(pollRef.current), []);
 
-  // "优化策略" from AI 自主交易 carries the signal strategy and chart context.
+  // "优化策略" from AI 交易 carries the signal strategy and chart context.
   // It is one-shot: remove it after reading so a later sidebar visit is clean.
   useEffect(() => {
     if (handoffApplied.current) return;
@@ -482,7 +481,7 @@ export default function StrategyLabPage() {
   };
 
   /** Explicit human hand-off: save the optimizer's best params for this
-   * strategy. AI 自主交易 reads them on its next start; nothing is applied to
+   * strategy. AI 交易 reads them on its next start; nothing is applied to
    * a running trader and no code is generated. */
   const applyBest = async () => {
     if (!baseKey || !result?.best) return;
@@ -490,7 +489,7 @@ export default function StrategyLabPage() {
     if (
       !window.confirm(
         `将最优参数应用到「${label}」？\n\n` +
-          "只会写入 AI 自主交易的参数配置，不会自动启动或修改正在运行的策略。",
+          "只会写入 AI 交易的参数配置，不会自动启动或修改正在运行的策略。",
       )
     ) {
       return;
@@ -511,7 +510,7 @@ export default function StrategyLabPage() {
           },
         }),
       });
-      setNotice(`已保存「${label}」的最优参数。下次启动 AI 自主交易时生效。`);
+      setNotice(`已保存「${label}」的最优参数。下次启动 AI 交易时生效。`);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -996,7 +995,7 @@ export default function StrategyLabPage() {
                       ))}
                     </div>
                     <div className="hint">
-                      参数不会自动写入正在运行的交易：点「应用到 AI 交易」后，下次启动 AI 自主交易时使用；
+                      参数不会自动写入正在运行的交易：点「应用到 AI 交易」后，下次启动 AI 交易时使用；
                       也可复制 JSON 手动填写。
                     </div>
                   </div>
@@ -1006,7 +1005,6 @@ export default function StrategyLabPage() {
           </div>
         </div>
 
-        <FreqtradeStrategyLab market={market} symbol={symbol} timeframe={timeframe} />
       </div>
     </>
   );

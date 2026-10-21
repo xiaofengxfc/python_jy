@@ -1,4 +1,4 @@
-"""AI 自主交易核心（Phase 3-A）。
+"""AI 交易核心（Phase 3-A）。
 
 设计依据：``docs/ai-autonomy-plan.md`` §5.2/§5.4/§5.5/§5.6/§5.9。
 
@@ -19,9 +19,9 @@ import threading
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable
 
 from .. import ai, paths
 from ..core.types import MarketType, OrderSide, OrderType, RunMode
@@ -84,6 +84,8 @@ class AITraderConfig:
     confirm_live: bool = False
     network: str = "mainnet"
     symbol: str = "BTC/USDT"
+    # 策略只是「复核方向」的来源，但重命名/删除策略时后端要能认出它。
+    strategy_key: str = ""
     market_type: str = MarketType.SPOT.value
     timeframe: str = "15m"
     leverage: float = 1.0
@@ -309,7 +311,7 @@ class AITrader:
     def start(self) -> tuple[bool, str]:
         c = self.config
         if not c.enabled:
-            return False, "AI 自主交易未启用"
+            return False, "AI 交易未启用"
         if c.mode == RunMode.LIVE.value:
             if not c.live_enabled:
                 return False, "实盘未显式开启"
@@ -319,6 +321,10 @@ class AITrader:
                 return False, "实盘必须使用主网"
             if c.market_type == MarketType.SPOT.value and c.require_stop:
                 return False, "现货实盘无法挂交易所侧止损，请使用合约或关闭止损要求"
+        if self._thread is not None and self._thread.is_alive():
+            # 上一轮还在退出（卡在模型调用）。此时清 _stop_event 会让它复活，
+            # 变成两个 poller 同时决策。
+            return False, "上一轮决策线程仍在退出，请稍后再试"
         with self._lock:
             if self._state == STATE_HALTED:
                 return False, f"已熔断：{self._halted_reason}"
@@ -332,13 +338,24 @@ class AITrader:
         self._audit({"kind": "lifecycle", "event": "start", "mode": c.mode})
         self._thread = threading.Thread(target=self._loop, name="ai-trader", daemon=True)
         self._thread.start()
-        return True, "AI 自主交易已启动"
+        return True, "AI 交易已启动"
 
     def stop(self) -> None:
         self._stop_event.set()
         thread = self._thread
         if thread is not None and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=3.0)
+            if thread.is_alive():
+                # 一轮决策可能卡在模型调用上；保留引用，避免紧接着 start()
+                # 开出第二个 poller 和新旧两轮决策同时下单。
+                log.warning("AI 交易线程未在超时内退出，保留引用")
+                self._thread = thread
+                self.lease.release(self._owner_name)
+                with self._lock:
+                    if self._state != STATE_HALTED:
+                        self._state = STATE_STOPPED
+                self._audit({"kind": "lifecycle", "event": "stop", "slow": True})
+                return
         self._thread = None
         with self._lock:
             if self._state != STATE_HALTED:
@@ -511,7 +528,13 @@ class AITrader:
             raise ValueError("没有可用的参考价")
         quote = decision.quote
         amount = quote / price
-        side = OrderSide.BUY if decision.action == "open_long" else OrderSide.SELL
+        # 平空是买入、平多是卖出：方向只由「开/平 + 多/空」决定，漏掉平空就会
+        # 用卖单去平空仓——reduce_only 卖单在空头上会被交易所拒单，或者把空头做大。
+        side = (
+            OrderSide.BUY
+            if decision.action in ("open_long", "close_short")
+            else OrderSide.SELL
+        )
         reduce_only = decision.is_close
         req = OrderRequest(
             symbol=c.symbol,
@@ -527,6 +550,10 @@ class AITrader:
             stop_loss=decision.stop_loss,
             take_profit=decision.take_profit,
         )
+        # 停止/急停发生在模型调用的那几秒里时，这一单不能再发出去：用户按了
+        # 停止之后还冒出一笔成交是最不能接受的一种 bug。
+        if self._stop_event.is_set():
+            raise RuntimeError("已停止，取消本次下单")
         # 唯一下单出口（INV-1）：任何 broker/交易所调用都不得出现在本模块。
         return self.trading.submit(req)
 
@@ -633,6 +660,7 @@ class AITrader:
             "config": {
                 "mode": self.config.mode,
                 "symbol": self.config.symbol,
+                "strategy": self.config.strategy_key,
                 "market_type": self.config.market_type,
                 "timeframe": self.config.timeframe,
                 "live_enabled": self.config.live_enabled,

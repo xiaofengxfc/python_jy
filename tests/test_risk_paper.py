@@ -793,3 +793,27 @@ def test_paper_trade_record_carries_the_fill_details():
     assert entry["cost"] == pytest.approx(100.0)
     assert exit_["closedQty"] == pytest.approx(0.4)
     assert exit_["realized"] == pytest.approx(4.0 - 0.044)
+
+
+def test_paper_guard_of_the_other_side_never_fires():
+    """一笔多单的止损不能被拿来平掉反手后的空单。"""
+    broker = PaperBroker(starting_balance=1_000, fee_rate=0.0, slippage_bps=0)
+    broker.place_order("BTC/USDT:USDT", "buy", "market", 1.0, price=100.0, stop_loss=95.0)
+    # 直接把仓位翻成空头（绕开下单路径），旧的多单保护单还挂在账上。
+    broker.account.position_for("BTC/USDT:USDT").contracts = -1.0
+    assert broker.protections()["BTC/USDT:USDT"]["side"] == "long"
+    # 空头视角下 95 早就「跌破」了：旧保护单若触发就会立刻平掉新空单。
+    assert broker.check_protections("BTC/USDT:USDT", 94.0) == []
+    assert broker.protections() == {}
+    assert broker.account.position_for("BTC/USDT:USDT").contracts == -1.0
+
+
+def test_paper_protection_exit_keeps_the_market_of_the_entry():
+    """保护单成交要记在与开仓同一个市场上（不是硬编码的现货）。"""
+    broker = PaperBroker(starting_balance=1_000, fee_rate=0.0, slippage_bps=0)
+    broker.place_order(
+        "BTC/USDT:USDT", "buy", "market", 1.0, price=100.0, stop_loss=95.0, market="usdm"
+    )
+    exits = broker.check_protections("BTC/USDT:USDT", 94.0)
+    assert exits and exits[0]["market"] == "usdm"
+    assert broker.account.trades[-1]["market"] == "usdm"

@@ -7,7 +7,6 @@ The controller is a plain class so the logic can be tested without HTTP.
 
 from __future__ import annotations
 
-import json
 import re
 import threading
 from pathlib import Path

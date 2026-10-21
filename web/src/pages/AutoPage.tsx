@@ -3,7 +3,6 @@ import { api, query } from "../api";
 import { TIMEFRAMES, fmt, fmtPrice } from "../format";
 import type { AutoStatus, SymbolInfo, Strategy } from "../types";
 import { ParamFields } from "../components/ParamFields";
-import FreqtradeCard from "../components/FreqtradeCard";
 
 const MODES: [string, string][] = [
   ["paper", "纸面"],
@@ -41,7 +40,6 @@ export default function AutoPage({
   const [pollSeconds, setPollSeconds] = useState(10);
   const [mode, setMode] = useState("paper");
   const [busy, setBusy] = useState(false);
-  const [engine, setEngine] = useState<"freqtrade" | "legacy">("freqtrade");
   const seq = useRef(0);
 
   const strategy = useMemo(
@@ -137,7 +135,7 @@ export default function AutoPage({
           confirm_live: mode === "live",
         }),
       });
-      setNotice(`已启动：${strategy?.name ?? strategyKey} · ${symbol}`);
+      setNotice(`量化执行引擎已启动：${strategy?.name ?? strategyKey} · ${symbol}`);
       seq.current = 0;
       await refresh(false);
     } catch (caught) {
@@ -151,7 +149,7 @@ export default function AutoPage({
     setBusy(true);
     try {
       await api("/api/auto/stop", { method: "POST" });
-      setNotice("已停止自动交易。");
+      setNotice("已停止量化执行引擎。");
       seq.current = 0;
       await refresh(false);
     } catch (caught) {
@@ -171,107 +169,56 @@ export default function AutoPage({
     <>
       {embedded ? (
         <div className="card-head auto-head">
-          <span className="card-title">自动交易</span>
-          <div className="engine-switch" role="tablist" aria-label="交易引擎">
-            <button
-              type="button"
-              role="tab"
-              aria-selected={engine === "freqtrade"}
-              className={engine === "freqtrade" ? "active" : ""}
-              onClick={() => setEngine("freqtrade")}
-            >
-              Freqtrade
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={engine === "legacy"}
-              className={engine === "legacy" ? "active" : ""}
-              onClick={() => setEngine("legacy")}
-            >
-              旧引擎
-            </button>
-          </div>
-          {engine === "legacy" && (
-            <span className={`live-badge ${running ? "" : "idle"}`}>
-              <span className={`dot ${running ? "live" : ""}`} />
-              {running ? "运行中" : "未运行"}
-            </span>
-          )}
+          <span className="card-title">量化执行引擎</span>
+          <span className={`live-badge ${running ? "" : "idle"}`}>
+            <span className={`dot ${running ? "live" : ""}`} />
+            {running ? "运行中" : "未运行"}
+          </span>
           <span className="faint" style={{ fontSize: 11 }}>
-            {engine === "freqtrade"
-              ? "独立 sidecar · 配置见下方"
-              : `跟随图表：${market} · ${symbol || "—"} · ${timeframe}`}
+            跟随图表：{market} · {symbol || "—"} · {timeframe}
           </span>
           <span className="spacer" />
-          {engine === "legacy" &&
-            (running ? (
-              <button type="button" className="btn-sm" disabled={busy} onClick={stop}>
-                {busy ? "处理中…" : "停止"}
-              </button>
-            ) : (
-              <button
-                type="button"
-                className="btn-sm primary"
-                disabled={busy || !strategyKey}
-                onClick={start}
-              >
-                {busy ? "启动中…" : "启动"}
-              </button>
-            ))}
+          {running ? (
+            <button type="button" className="btn-sm" disabled={busy} onClick={stop}>
+              {busy ? "处理中…" : "停止"}
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="btn-sm primary"
+              disabled={busy || !strategyKey}
+              onClick={start}
+            >
+              {busy ? "启动中…" : "启动"}
+            </button>
+          )}
         </div>
       ) : (
         <div className="page-head">
-          <h1 className="page-title">自动交易</h1>
-          <div className="engine-switch" role="tablist" aria-label="交易引擎">
-            <button
-              type="button"
-              role="tab"
-              aria-selected={engine === "freqtrade"}
-              className={engine === "freqtrade" ? "active" : ""}
-              onClick={() => setEngine("freqtrade")}
-            >
-              Freqtrade
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={engine === "legacy"}
-              className={engine === "legacy" ? "active" : ""}
-              onClick={() => setEngine("legacy")}
-            >
-              旧引擎
-            </button>
-          </div>
-          {engine === "legacy" && (
-            <span className={`live-badge ${running ? "" : "idle"}`}>
-              <span className={`dot ${running ? "live" : ""}`} />
-              {running ? "运行中" : "未运行"}
-            </span>
-          )}
+          <h1 className="page-title">量化执行引擎</h1>
+          <span className={`live-badge ${running ? "" : "idle"}`}>
+            <span className={`dot ${running ? "live" : ""}`} />
+            {running ? "运行中" : "未运行"}
+          </span>
           <span className="spacer" />
-          {engine === "legacy" &&
-            (running ? (
-              <button type="button" className="btn-sm" disabled={busy} onClick={stop}>
-                {busy ? "处理中…" : "停止"}
-              </button>
-            ) : (
-              <button
-                type="button"
-                className="btn-sm primary"
-                disabled={busy || !strategyKey}
-                onClick={start}
-              >
-                {busy ? "启动中…" : "启动"}
-              </button>
-            ))}
+          {running ? (
+            <button type="button" className="btn-sm" disabled={busy} onClick={stop}>
+              {busy ? "处理中…" : "停止"}
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="btn-sm primary"
+              disabled={busy || !strategyKey}
+              onClick={start}
+            >
+              {busy ? "启动中…" : "启动"}
+            </button>
+          )}
         </div>
       )}
 
-      {engine === "freqtrade" ? (
-        <FreqtradeCard />
-      ) : (
-        <>
+      <>
           {error && <div className="banner error">{error}</div>}
           {notice && <div className="banner">{notice}</div>}
 
@@ -549,7 +496,6 @@ export default function AutoPage({
         </div>
       </div>
         </>
-      )}
     </>
   );
 }

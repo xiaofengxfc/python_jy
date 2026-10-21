@@ -67,12 +67,5 @@ def strategy_candidates_dir() -> Path:
     return path
 
 
-def freqtrade_dir() -> Path:
-    """Freqtrade sidecar root: venv, config, user_data and logs."""
-    path = data_dir() / "freqtrade"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
 def project_root() -> Path:
     return Path(__file__).resolve().parents[2]

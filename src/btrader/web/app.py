@@ -31,11 +31,9 @@ from ..exchange.symbols import format_amount, load_symbols
 from ..exchange import mirror
 from ..logging_setup import error_buffer
 from .routes import build_router
-from .routes_freqtrade import build_freqtrade_router
 from .routes_lab import build_lab_router
 from .routes_strategy import build_strategy_router
 from .stream import StreamHub
-from .ws_freqtrade import build_freqtrade_ws_router
 
 log = logging.getLogger(__name__)
 
@@ -537,9 +535,6 @@ def create_app() -> FastAPI:
     app.include_router(build_lab_router(get_state))
     # Phase 5-A: source editor for user strategy plugins.
     app.include_router(build_strategy_router(get_state))
-    # Phase 5-B: Freqtrade sidecar status/lifecycle/backtest facade.
-    app.include_router(build_freqtrade_router(get_state))
-    app.include_router(build_freqtrade_ws_router(get_state))
 
     if STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

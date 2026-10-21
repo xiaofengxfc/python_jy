@@ -136,7 +136,13 @@ class AutoTrader:
             return
         self._stop.set()
         self._thread.join(timeout=5)
-        self._thread = None
+        if self._thread.is_alive():
+            # 一轮 tick 卡在行情或下单上：保留引用，start() 会因此拒绝开新线程，
+            # 旧线程拿到新 _stop 之后自己退出，不会出现两个 poller 同时调仓。
+            log.warning("自动交易线程未在超时内退出，保留引用")
+            self._emit_log("WARN", "交易线程仍在退出，请稍后再启动")
+        else:
+            self._thread = None
         self._emit_state(False)
         self._emit_log("INFO", "自动交易已停止")
 

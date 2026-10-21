@@ -37,18 +37,6 @@ const ICONS: Record<PageKey, ReactNode> = {
       <path d="M2.5 6.5h11" stroke="currentColor" strokeWidth="1.4" />
     </>
   ),
-  auto: (
-    <>
-      <circle cx="8" cy="8" r="5.5" stroke="currentColor" strokeWidth="1.4" />
-      <path
-        d="M8 5v3.2l2 1.2"
-        stroke="currentColor"
-        strokeWidth="1.4"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-    </>
-  ),
   backtest: (
     <path
       d="M3 13V8M8 13V3M13 13V6"

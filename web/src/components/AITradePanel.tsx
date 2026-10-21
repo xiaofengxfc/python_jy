@@ -114,6 +114,7 @@ const OUTCOME_LABEL: Record<string, string> = {
   order: "下单",
   reject: "拒绝",
   skip: "跳过",
+  error: "下单失败",
 };
 
 const ACTION_LABEL: Record<string, string> = {
@@ -233,9 +234,9 @@ function NumberField(props: {
   );
 }
 
-/** AI 自主交易面板：模型看盘、复核并决定是否下单/仓位。
- * 「AI 自主量化」（生成/调参策略 → 回测 → 自动执行）是独立流程，后续接入
- * Freqtrade 策略与回测管线，不复用本面板的逐笔决策。
+/** AI 交易面板：模型看盘、复核并决定是否下单/仓位。
+ * 「AI 量化」（生成/调参策略 → 回测 → 自动执行）是独立流程，走策略实验室
+ * 与回测管线，不复用本面板的逐笔决策。
  *
  * The backend owns the run: this panel only starts, stops and reports. Status
  * is polled every 4 seconds with `since=seq`, so the event feed is appended
@@ -424,7 +425,7 @@ export default function AITradePanel({ market, symbol, timeframe, onNavigate }: 
         return;
       }
       const ok = window.confirm(
-        `即将以【实盘】启动 AI 自主交易\n\n${symbol} · ${timeframe}\n\n` +
+        `即将以【实盘】启动 AI 交易\n\n${symbol} · ${timeframe}\n\n` +
           "模型会真实下单，成交使用真实资金，盈亏由交易所结算。确认继续？",
       );
       if (!ok) return;
@@ -469,7 +470,65 @@ export default function AITradePanel({ market, symbol, timeframe, onNavigate }: 
         method: "POST",
       });
       applyStatus(result.status, true);
-      setNotice("已停止 AI 自主交易。");
+      setNotice("已停止 AI 交易。");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  /** One decision on demand: same guards, same account, no poller.
+   *
+   * Useful to check that model + signal + risk actually line up before leaving
+   * a loop running (and to nudge the model once on a quiet bar). */
+  const decideOnce = async () => {
+    if (busy) return;
+    const picked = strategies.find((item) => item.key === strategyKey);
+    if (!picked) {
+      setError("请先选择产生信号的策略。");
+      return;
+    }
+    if (mode === "live") {
+      const ok = window.confirm(
+        `即将以【实盘】让模型决策一次\n\n${symbol} · ${timeframe}\n\n` +
+          "如果模型给出开仓且通过闸门，会真的下单。确认继续？",
+      );
+      if (!ok) return;
+    }
+    setBusy("decide");
+    setError("");
+    setNotice("");
+    try {
+      const result = await api<{ ok: boolean; decision: AIDecisionRecord | null }>(
+        "/api/ai/trader/decide",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            mode,
+            confirm_live: mode === "live",
+            market,
+            symbol,
+            timeframe,
+            strategy: strategyKey,
+            params: auto.strategy_params?.[strategyKey] ?? { ...picked.defaults },
+            max_order_quote: auto.max_order_quote,
+            max_position_quote: auto.max_position_quote,
+          }),
+        },
+      );
+      const record = result.decision;
+      if (!record) {
+        setNotice("这次没有产生决策记录（行情或策略信号不可用）。");
+      } else {
+        const label = OUTCOME_LABEL[record.outcome ?? ""] ?? record.outcome ?? "";
+        const action = record.action
+          ? ` · ${ACTION_LABEL[record.action] ?? record.action}`
+          : "";
+        const reason = record.reason ? ` · ${record.reason}` : "";
+        setNotice(`本次决策：${label}${action}${reason}`);
+      }
+      await refresh(false);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -523,7 +582,7 @@ export default function AITradePanel({ market, symbol, timeframe, onNavigate }: 
     const ok = window.confirm(
       "急停会立即执行：\n\n" +
         "· 打开全局风控急停（之后所有下单都会被拒绝）\n" +
-        "· 停止 AI 自主交易\n" +
+        "· 停止 AI 交易\n" +
         "· 停止策略自动交易\n\n" +
         "确认急停？",
     );
@@ -598,7 +657,7 @@ export default function AITradePanel({ market, symbol, timeframe, onNavigate }: 
   return (
     <>
       <div className="ai-head">
-        <span className="card-title">AI 自主交易</span>
+        <span className="card-title">AI 交易</span>
         <span className={`live-badge ${state === "stopped" ? "idle" : ""} ${halted ? "ai-badge-halt" : ""}`}>
           <span
             className={`dot ${state === "running" ? "live" : paused ? "off" : halted ? "ai-dot-halt" : ""}`}
@@ -659,6 +718,15 @@ export default function AITradePanel({ market, symbol, timeframe, onNavigate }: 
             onClick={() => handoff("backtest")}
           >
             回测
+          </button>
+          <button
+            type="button"
+            className="btn-sm"
+            disabled={busy !== "" || running || !symbol || aiEnabled === false}
+            title="按当前策略信号与配置，让模型立即决策一次（不启动轮询）"
+            onClick={() => void decideOnce()}
+          >
+            {busy === "decide" ? "决策中…" : "决策一次"}
           </button>
           <button
             type="button"
@@ -747,7 +815,7 @@ export default function AITradePanel({ market, symbol, timeframe, onNavigate }: 
                           checked={draft.enabled}
                           onChange={(event) => patch({ enabled: event.target.checked })}
                         />
-                        <span>启用 AI 自主交易</span>
+                        <span>启用 AI 交易</span>
                       </label>
                     </div>
                     <div className="field">

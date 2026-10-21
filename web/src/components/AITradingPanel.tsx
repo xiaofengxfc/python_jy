@@ -10,8 +10,8 @@ interface Props {
 }
 
 /** One bottom tab, two independent products:
- * - AI 自主交易: strategy emits a signal, AI reviews/vetoes and sizes it.
- * - AI 自主量化: AI generates/tunes a strategy, backtest, approve, execute.
+ * - AI 交易: strategy emits a signal, AI reviews/vetoes and sizes it.
+ * - AI 量化: AI generates/tunes a strategy, backtest, approve, execute.
  */
 export default function AITradingPanel({ market, symbol, timeframe, onNavigate }: Props) {
   const [tab, setTab] = useState<"trade" | "quant">("trade");
@@ -26,7 +26,7 @@ export default function AITradingPanel({ market, symbol, timeframe, onNavigate }
           className={tab === "trade" ? "active" : ""}
           onClick={() => setTab("trade")}
         >
-          AI 自主交易
+          AI 交易
         </button>
         <button
           type="button"
@@ -35,7 +35,7 @@ export default function AITradingPanel({ market, symbol, timeframe, onNavigate }
           className={tab === "quant" ? "active" : ""}
           onClick={() => setTab("quant")}
         >
-          AI 自主量化
+          AI 量化
         </button>
       </div>
       {tab === "trade" ? (
