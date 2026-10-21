@@ -21,7 +21,7 @@
 | 表单/校验 | 手写 state | react-hook-form + zod | MIT | 设置页与回测参数页逐步替换 |
 | 状态/请求 | 手写 fetch + useState | TanStack Query | MIT | 自动交易轮询与回测任务缓存 |
 | 桌面壳 | Electron | Electron | MIT | 保持 |
-| 企业微信通知 | 自研 OpenClaw 网关 | — | — | 保持 |
+| 企业微信通知 | 自研 OpenClaw 网关 + 自建应用 API | — | — | 保持 OpenClaw，新增 Corpid/AgentId/Secret 直连 |
 
 ### 选型理由
 
@@ -166,22 +166,24 @@ Freqtrade 进程。
 
 ## 8. 先做的无争议项
 
-1. AI 分析从悬浮窗改为交易页底部「AI 分析」Tab，正文宽度随面板，Markdown 渲染。
-2. 下单区取消固定视口高度裁切，订单簿固定高度、下单卡片按内容展开，买入按钮
-   永远在文档流内。
+1. AI 分析从悬浮窗改为交易页底部「AI 分析」Tab，正文宽度随面板，Markdown 渲染；
+   面板固定 208px，内容在面板内滚动，不再压缩图表。
+2. 下单区按视口高度自适应：常规屏幕展示完整订单簿/预览；短屏订单簿压缩，
+   下单卡片自身滚动且买入按钮固定在卡片底部，避免按钮被挤出视口。
 3. 策略源码 API + 编辑器（P2），这是回测/Freqtrade 迁移的前置能力。
 
 ## 9. 本轮已完成（2026-10-21）
 
 - `web/src/components/BottomTabs.tsx`：新增 `AI 分析` Tab；`aiPanel` 由交易页注入，
-  不再使用悬浮窗；面板高度随 Tab 扩展，正文可滚动。
+  不再使用悬浮窗；面板与其他底部 Tab 一样固定 208px，正文在面板内滚动。
 - `web/src/pages/TradingPage.tsx`：移除 `FloatingWindow`；图工具栏「AI 分析」按钮
   改为跳转底部 Tab；AI 价位仍以可编辑画线叠加到图上。
 - `web/src/components/MarkdownText.tsx` + `react-markdown` + `remark-gfm`：
   AI 分析/新闻/持仓复核按 Markdown 渲染，代码块、列表、表格可读。
-- `web/src/styles.css`：`.trading` 取消固定视口高度；`.trading-rail` 不再
-  `overflow:hidden`；订单簿固定 232px，下单卡片按内容展开，页面滚动；AI Tab
-  打开时图表让出高度。
+- `web/src/styles.css`：底部面板统一固定 208px，AI 内容在面板内滚动；切换
+  AI Tab 不再压缩上方 K 线。短屏（≤860px 高）订单簿缩到 120px，下单卡片
+  自身滚动且买入/卖出按钮固定在卡片底部，条件单行和按钮不再被挤出视口。
+  K 线下方标签与工具栏「AI 分析」按钮使用同一套 28px 胶囊样式。
 - `src/btrader/strategy/source.py` + `src/btrader/web/routes_strategy.py`：
   用户策略源码读取/校验/新建/保存/热加载；内置策略只读，可复制为绝对导入的
   新用户策略；所有写入限制在 `%APPDATA%\biTrader\strategies`。
@@ -222,6 +224,22 @@ Freqtrade 进程。
   成交且总收益为正 → 记录指标 → 才启动纸面自动交易；否则阻止并显示原因。
 - Freqtrade 策略编辑：回测页可直接读取/保存 `user_data/strategies/*.py`，
   保存做 Python 语法和 `IStrategy` 继承检查，重启 sidecar 后生效。
+- 交易页按交易对显示已实现盈亏（`realized_pnl_by_symbol`），已平仓持仓也保留
+  累计值；下单卡片“已实现”不再显示全账户合计。
+- 策略实验室批准候选时直接写入 `%APPDATA%\biTrader\strategies\<key>.py`，
+  热加载后出现在策略列表；AI 量化部署复用该本地策略，避免只批准不落盘。
+- AI 自主交易支持读取策略实验室人工确认后的参数
+  （`ai_auto.strategy_params`），启动时按策略 key 取参数；实验室显示
+  “应用到 AI 交易”，不会自动启动交易。
+- 设置页企业微信支持两种通道：
+  - **自建应用 API（直连）**：填写 CorpID、AgentId、Secret 和成员 userid，
+    Secret 只存入系统密钥环，直接调用 `qyapi.weixin.qq.com`，不依赖 OpenClaw。
+  - **OpenClaw 智能机器人**：保留 Bot ID + Secret 的长连接模式。
+  两种模式共用启用开关、事件开关、测试发送和失败补发队列。
+- 设置页“最近调用”审计列表改为紧凑单行，限制高度和错误文本宽度。
+- 回测页新增 `Freqtrade 策略兼容` 卡片：列出、编辑、同步 K 线并回测
+  `IStrategy` 策略；本轮不做 Hyperopt，参数优化保留给 Freqtrade 自身工作流。
+- 新安装 Freqtrade 交易所默认 `binance`；已保存的 `gate` 配置不回写、不迁移。
 
 ## 10. 下一步（P4）
 

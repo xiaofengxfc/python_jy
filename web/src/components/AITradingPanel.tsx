@@ -39,7 +39,12 @@ export default function AITradingPanel({ market, symbol, timeframe, onNavigate }
         </button>
       </div>
       {tab === "trade" ? (
-        <AITradePanel market={market} symbol={symbol} timeframe={timeframe} />
+        <AITradePanel
+          market={market}
+          symbol={symbol}
+          timeframe={timeframe}
+          onNavigate={onNavigate}
+        />
       ) : (
         <AIQuantPanel
           market={market}

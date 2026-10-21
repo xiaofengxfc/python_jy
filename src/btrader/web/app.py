@@ -692,6 +692,10 @@ def create_app() -> FastAPI:
                 "cash": account.cash,
                 "starting_balance": account.starting_balance,
                 "realized_pnl": sum(p.realized_pnl for p in account.positions.values()),
+                "realized_pnl_by_symbol": {
+                    position.symbol: position.realized_pnl
+                    for position in account.positions.values()
+                },
                 "positions": positions,
                 "orders": orders,
                 "trades": trades,
@@ -804,6 +808,9 @@ def create_app() -> FastAPI:
             result["positions"] = positions
             result["orders"] = orders
             result["trades"] = []
+            result["realized_pnl_by_symbol"] = {
+                item["symbol"]: item["realized_pnl"] for item in positions
+            }
             return result
 
     @app.post("/api/orders/preview")

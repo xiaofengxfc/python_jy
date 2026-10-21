@@ -59,6 +59,8 @@ export default function SettingsPage({ settings, onSaved }: Props) {
   const [riskBusy, setRiskBusy] = useState(false);
   const [notifyStatus, setNotifyStatus] = useState<NotifyStatus | null>(null);
   const [notifyBusy, setNotifyBusy] = useState(false);
+  const [wecomApiSecret, setWecomApiSecret] = useState("");
+  const [wecomSecretBusy, setWecomSecretBusy] = useState(false);
   const [install, setInstall] = useState<InstallStatus | null>(null);
   const [installBusy, setInstallBusy] = useState(false);
   const [installError, setInstallError] = useState("");
@@ -69,6 +71,8 @@ export default function SettingsPage({ settings, onSaved }: Props) {
   const [channel, setChannel] = useState<ChannelStatus | null>(null);
   const [channelBusy, setChannelBusy] = useState(false);
   const [channelNote, setChannelNote] = useState("");
+  const [wecomBotId, setWecomBotId] = useState("");
+  const [wecomSecret, setWecomSecret] = useState("");
   const [aiStatus, setAiStatus] = useState<AIStatus | null>(null);
   const [aiKey, setAiKey] = useState("");
   const [aiBusy, setAiBusy] = useState<"key" | "test" | "">("");
@@ -92,6 +96,7 @@ export default function SettingsPage({ settings, onSaved }: Props) {
     try {
       const next = await api<ChannelStatus>("/api/install/openclaw/channel");
       setChannel(next);
+      if (next.bot_id) setWecomBotId((current) => current || next.bot_id || "");
       return next;
     } catch {
       return null;
@@ -115,6 +120,37 @@ export default function SettingsPage({ settings, onSaved }: Props) {
     setChannelNote("");
     try {
       setInstall(await api<InstallStatus>("/api/install/openclaw/channel", { method: "POST" }));
+    } catch (error) {
+      setChannelNote(error instanceof Error ? error.message : String(error));
+    } finally {
+      setChannelBusy(false);
+    }
+  };
+
+  const saveChannelCredentials = async (restartAfter = false) => {
+    setChannelBusy(true);
+    setChannelNote("");
+    try {
+      const result = await api<{ note?: string; bot_id?: string }>(
+        "/api/install/openclaw/channel/config",
+        {
+          method: "PUT",
+          body: JSON.stringify({ bot_id: wecomBotId, secret: wecomSecret }),
+        },
+      );
+      setWecomSecret("");
+      if (restartAfter) {
+        const restarted = await api<{ state: string; error: string }>(
+          "/api/install/openclaw/gateway/restart",
+          { method: "POST" },
+        );
+        setChannelNote(
+          restarted.error || "API 凭证已保存，网关已重启，长连接会使用新凭证。",
+        );
+      } else {
+        setChannelNote(result.note || "API 凭证已保存。");
+      }
+      await loadChannel();
     } catch (error) {
       setChannelNote(error instanceof Error ? error.message : String(error));
     } finally {
@@ -258,10 +294,14 @@ export default function SettingsPage({ settings, onSaved }: Props) {
         method: "POST",
         body: JSON.stringify({
           message: "",
+          mode: draft.notify.mode,
           channel: draft.notify.channel,
           target: draft.notify.target,
           account: draft.notify.account,
           command: draft.notify.command,
+          corp_id: draft.notify.corp_id,
+          agent_id: draft.notify.agent_id,
+          api_base: draft.notify.api_base,
         }),
       });
       // ``ok`` only means the gateway accepted the message. WeChat delivers
@@ -405,6 +445,29 @@ export default function SettingsPage({ settings, onSaved }: Props) {
     }
   };
 
+  const saveWecomSecret = async () => {
+    if (!draft) return;
+    if (!wecomApiSecret.trim()) {
+      setFlash({ tone: "err", text: "请先填写企业微信应用 Secret。" });
+      return;
+    }
+    setWecomSecretBusy(true);
+    setFlash(null);
+    try {
+      await api("/api/notify/wecom/secret", {
+        method: "PUT",
+        body: JSON.stringify({ secret: wecomApiSecret.trim() }),
+      });
+      setWecomApiSecret("");
+      setFlash({ tone: "ok", text: "企业微信应用 Secret 已存入系统密钥环。" });
+      await loadNotify();
+    } catch (error) {
+      setFlash({ tone: "err", text: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setWecomSecretBusy(false);
+    }
+  };
+
   const save = async () => {
     if (!draft) return;
     setSaving(true);
@@ -434,6 +497,15 @@ export default function SettingsPage({ settings, onSaved }: Props) {
           },
         }),
       });
+      // The secret is deliberately not part of the settings JSON; when the
+      // user pasted a new one, store it in the keyring in the same save click.
+      if (draft.notify.mode === "wecom_api" && wecomApiSecret.trim()) {
+        await api("/api/notify/wecom/secret", {
+          method: "PUT",
+          body: JSON.stringify({ secret: wecomApiSecret.trim() }),
+        });
+        setWecomApiSecret("");
+      }
       onSaved(result.settings);
       setNetwork(result.settings.network);
       setFlash({ tone: "ok", text: "设置已保存。" });
@@ -821,7 +893,7 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                 <div className="faint" style={{ fontSize: 11, marginBottom: 4 }}>
                   最近调用
                 </div>
-                <ul className="ai-audit">
+                <ul className="ai-audit settings-ai-audit">
                   {aiStatus.audit.slice(0, 6).map((item, index) => (
                     <li key={`${item.at}-${index}`} className="ai-audit-row">
                       <span className={`ai-audit-dot ${item.ok ? "ok" : "err"}`} />
@@ -903,15 +975,23 @@ export default function SettingsPage({ settings, onSaved }: Props) {
               <div className="field">
                 <label className="field-label" htmlFor="set-ft-exchange">
                   <span>交易所</span>
+                  <em>新安装默认 binance；已保存的 gate 不会被迁移</em>
                 </label>
                 <input
                   id="set-ft-exchange"
                   className="input"
+                  list="ft-exchange-options"
                   value={draft.freqtrade.exchange}
                   onChange={(event) =>
                     patchFreqtrade({ exchange: event.target.value })
                   }
                 />
+                <datalist id="ft-exchange-options">
+                  <option value="binance" />
+                  <option value="gate" />
+                  <option value="okx" />
+                  <option value="bybit" />
+                </datalist>
               </div>
               <div className="field">
                 <label className="field-label" htmlFor="set-ft-port">
@@ -1174,13 +1254,17 @@ export default function SettingsPage({ settings, onSaved }: Props) {
 
           <div className="card">
             <div className="card-head">
-              <span className="card-title">企业微信通知（智能机器人）</span>
+              <span className="card-title">企业微信通知</span>
               <span className="spacer" />
               <span className="faint" style={{ fontSize: 11 }}>
                 {notifyStatus
-                  ? notifyStatus.available
-                    ? "OpenClaw 已找到"
-                    : "未找到 OpenClaw"
+                  ? notifyStatus.mode === "wecom_api"
+                    ? notifyStatus.available
+                      ? "自建应用 API 已配置"
+                      : "API 配置不完整"
+                    : notifyStatus.available
+                      ? "OpenClaw 已找到"
+                      : "未找到 OpenClaw"
                   : "检测中…"}
               </span>
               <button
@@ -1193,6 +1277,28 @@ export default function SettingsPage({ settings, onSaved }: Props) {
               </button>
             </div>
             <div className="card-body stack">
+              <div className="field">
+                <label className="field-label">
+                  <span>推送通道</span>
+                  <em>自建应用 API 不依赖 OpenClaw，适合企业微信管理员直接配置</em>
+                </label>
+                <div className="segmented" role="group" aria-label="企业微信通知模式">
+                  <button
+                    type="button"
+                    aria-pressed={draft.notify.mode === "wecom_api"}
+                    onClick={() => patchNotify({ mode: "wecom_api" })}
+                  >
+                    自建应用 API
+                  </button>
+                  <button
+                    type="button"
+                    aria-pressed={draft.notify.mode !== "wecom_api"}
+                    onClick={() => patchNotify({ mode: "openclaw" })}
+                  >
+                    OpenClaw 智能机器人
+                  </button>
+                </div>
+              </div>
               <label className="check">
                 <input
                   type="checkbox"
@@ -1204,7 +1310,7 @@ export default function SettingsPage({ settings, onSaved }: Props) {
               {/* A bound channel plus a closed master switch is the state that
                   looks like "已经登录但收不到通知"; say it instead of leaving
                   the user to discover a checkbox. */}
-              {channel?.configured && !draft.notify.enabled && (
+              {draft.notify.mode !== "wecom_api" && channel?.configured && !draft.notify.enabled && (
                 <div className="hint" style={{ color: "var(--warn, #b45309)" }}>
                   企业微信渠道已配置，但推送总开关是关的：成交、风控通知都不会发出。
                   勾选上面的“启用企业微信推送”并保存后生效。
@@ -1214,15 +1320,38 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                 <div className="field">
                   <label className="field-label" htmlFor="notify-target">
                     <span>接收人 userid</span>
-                    <em>企业微信通讯录里的成员账号</em>
+                    <em>
+                      {draft.notify.mode === "wecom_api"
+                        ? "企业微信通讯录里的成员账号，多个用 | 分隔"
+                        : "企业微信通讯录里的成员账号"}
+                    </em>
                   </label>
                   <input
                     id="notify-target"
                     value={draft.notify.target}
                     onChange={(event) => patchNotify({ target: event.target.value })}
-                    placeholder="例：XiaoJiaJian（先给机器人发过消息的那个账号）"
+                    placeholder={
+                      draft.notify.mode === "wecom_api"
+                        ? "例：XiaoJiaJian"
+                        : "例：XiaoJiaJian（先给机器人发过消息的那个账号）"
+                    }
                   />
                 </div>
+              {draft.notify.mode === "wecom_api" ? (
+                <div className="field">
+                  <label className="field-label" htmlFor="notify-agent-id">
+                    <span>AgentId</span>
+                    <em>企业微信自建应用的 AgentId</em>
+                  </label>
+                  <input
+                    id="notify-agent-id"
+                    value={draft.notify.agent_id}
+                    onChange={(event) => patchNotify({ agent_id: event.target.value })}
+                    placeholder="例：1000002"
+                    inputMode="numeric"
+                  />
+                </div>
+              ) : (
                 <div className="field">
                   <label className="field-label" htmlFor="notify-channel">
                     <span>通道名</span>
@@ -1235,36 +1364,104 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                     placeholder="wecom"
                   />
                 </div>
+              )}
               </div>
               {notifyStatus?.target_warning && (
                 <div className="hint" style={{ color: "var(--warn, #b45309)" }}>
                   {notifyStatus.target_warning}
                 </div>
               )}
-              <div className="field">
-                <label className="field-label" htmlFor="notify-account">
-                  <span>账号</span>
-                  <em>插件内的账号标识，留空用 default</em>
-                </label>
-                <input
-                  id="notify-account"
-                  value={draft.notify.account}
-                  onChange={(event) => patchNotify({ account: event.target.value })}
-                  placeholder="default"
-                />
-              </div>
-              <div className="field">
-                <label className="field-label" htmlFor="notify-command">
-                  <span>OpenClaw 路径</span>
-                  <em>可留空，默认从 PATH 查找</em>
-                </label>
-                <input
-                  id="notify-command"
-                  value={draft.notify.command}
-                  onChange={(event) => patchNotify({ command: event.target.value })}
-                  placeholder="openclaw"
-                />
-              </div>
+              {draft.notify.mode === "wecom_api" ? (
+                <>
+                  <div className="form-grid">
+                    <div className="field">
+                      <label className="field-label" htmlFor="notify-corp-id">
+                        <span>CorpID</span>
+                        <em>企业微信“我的企业”里的企业 ID</em>
+                      </label>
+                      <input
+                        id="notify-corp-id"
+                        value={draft.notify.corp_id}
+                        onChange={(event) => patchNotify({ corp_id: event.target.value })}
+                        placeholder="例：ww1234567890abcdef"
+                      />
+                    </div>
+                    <div className="field">
+                      <label className="field-label" htmlFor="notify-api-base">
+                        <span>API 地址</span>
+                        <em>一般不用改；代理环境可填内网地址</em>
+                      </label>
+                      <input
+                        id="notify-api-base"
+                        value={draft.notify.api_base}
+                        onChange={(event) => patchNotify({ api_base: event.target.value })}
+                        placeholder="https://qyapi.weixin.qq.com"
+                      />
+                    </div>
+                  </div>
+                  <div className="form-grid">
+                    <div className="field">
+                      <label className="field-label" htmlFor="notify-wecom-secret">
+                        <span>Secret</span>
+                        <em>
+                          {notifyStatus?.secret_saved
+                            ? "已保存，留空保持不变"
+                            : "只存入系统密钥环，不写入配置文件"}
+                        </em>
+                      </label>
+                      <div className="ticket-row">
+                        <input
+                          id="notify-wecom-secret"
+                          type="password"
+                          value={wecomApiSecret}
+                          onChange={(event) => setWecomApiSecret(event.target.value)}
+                          placeholder={notifyStatus?.secret_saved ? "••••••••（留空不修改）" : "输入自建应用 Secret"}
+                          autoComplete="new-password"
+                        />
+                        <button
+                          type="button"
+                          className="btn-sm"
+                          disabled={wecomSecretBusy || !wecomApiSecret.trim()}
+                          onClick={() => void saveWecomSecret()}
+                        >
+                          {wecomSecretBusy ? "保存中…" : "保存 Secret"}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="hint">
+                    企业微信后台 → 应用管理 → 自建应用，获取 CorpID、AgentId 和 Secret；
+                    “接收人”填应用可见范围内的成员 userid。Secret 只进系统密钥环。
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="field">
+                    <label className="field-label" htmlFor="notify-account">
+                      <span>账号</span>
+                      <em>插件内的账号标识，留空用 default</em>
+                    </label>
+                    <input
+                      id="notify-account"
+                      value={draft.notify.account}
+                      onChange={(event) => patchNotify({ account: event.target.value })}
+                      placeholder="default"
+                    />
+                  </div>
+                  <div className="field">
+                    <label className="field-label" htmlFor="notify-command">
+                      <span>OpenClaw 路径</span>
+                      <em>可留空，默认从 PATH 查找</em>
+                    </label>
+                    <input
+                      id="notify-command"
+                      value={draft.notify.command}
+                      onChange={(event) => patchNotify({ command: event.target.value })}
+                      placeholder="openclaw"
+                    />
+                  </div>
+                </>
+              )}
               <div className="form-grid">
                 <label className="check">
                   <input
@@ -1306,21 +1503,28 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                   />
                   任务状态（自动交易启停 / 回测完成或失败）
                 </label>
-                <label className="check">
-                  <input
-                    type="checkbox"
-                    checked={draft.notify.preflight}
-                    onChange={(event) => patchNotify({ preflight: event.target.checked })}
-                  />
-                  发送前检查网关（连不上就立即报错，不必等 30 秒）
-                </label>
+                {draft.notify.mode !== "wecom_api" && (
+                  <label className="check">
+                    <input
+                      type="checkbox"
+                      checked={draft.notify.preflight}
+                      onChange={(event) => patchNotify({ preflight: event.target.checked })}
+                    />
+                    发送前检查网关（连不上就立即报错，不必等 30 秒）
+                  </label>
+                )}
               </div>
               {notifyStatus && !notifyStatus.available && (
                 <div className="verdict bad">
-                  未找到 OpenClaw：可点下方的“自动安装 OpenClaw”，或在上方填写 openclaw 的完整路径。
+                  {draft.notify.mode === "wecom_api"
+                    ? "自建应用 API 配置不完整：请填写 CorpID、AgentId、Secret 和接收人。"
+                    : "未找到 OpenClaw：可点下方的“自动安装 OpenClaw”，或在上方填写 openclaw 的完整路径。"}
                 </div>
               )}
-              <div className="install-box">
+              <div
+                className="install-box"
+                style={{ display: draft.notify.mode === "wecom_api" ? "none" : undefined }}
+              >
                 <div className="install-head">
                   <span className="card-title" style={{ fontSize: 12 }}>
                     OpenClaw 环境
@@ -1490,10 +1694,68 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                 )}
                 {channel?.state === "installed" && (
                   <div className="verdict bad">
-                    插件已装，但还没有 Bot ID / Secret：在
-                    ~/.openclaw/openclaw.json 的 channels.wecom 里填上，再重启网关。
+                    插件已装，但还没有 Bot ID / Secret。请在下方填写 API 模式凭证。
                   </div>
                 )}
+                <div className="install-head" style={{ marginTop: 8 }}>
+                  <span className="card-title" style={{ fontSize: 12 }}>
+                    API 模式凭证
+                  </span>
+                  <span className="faint" style={{ fontSize: 11 }}>
+                    Bot ID + Secret · 长连接，无需回调地址
+                  </span>
+                </div>
+                <div className="form-grid">
+                  <div className="field">
+                    <label className="field-label" htmlFor="wecom-bot-id">
+                      <span>Bot ID</span>
+                      <em>企业微信智能机器人后台的机器人 ID</em>
+                    </label>
+                    <input
+                      id="wecom-bot-id"
+                      value={wecomBotId}
+                      disabled={channelBusy}
+                      onChange={(event) => setWecomBotId(event.target.value)}
+                      placeholder="aibp..."
+                    />
+                  </div>
+                  <div className="field">
+                    <label className="field-label" htmlFor="wecom-secret">
+                      <span>Secret</span>
+                      <em>{channel?.configured ? "已保存，留空保持不变" : "只保存在 OpenClaw 配置中"}</em>
+                    </label>
+                    <input
+                      id="wecom-secret"
+                      type="password"
+                      value={wecomSecret}
+                      disabled={channelBusy}
+                      onChange={(event) => setWecomSecret(event.target.value)}
+                      placeholder={channel?.configured ? "••••••••（留空不修改）" : "输入机器人 Secret"}
+                      autoComplete="new-password"
+                    />
+                  </div>
+                </div>
+                <div className="install-head">
+                  <button
+                    type="button"
+                    className="btn-sm primary"
+                    disabled={channelBusy || !wecomBotId.trim()}
+                    onClick={() => void saveChannelCredentials()}
+                  >
+                    {channelBusy ? "保存中…" : "保存 API 凭证"}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-sm"
+                    disabled={channelBusy || !wecomBotId.trim()}
+                    onClick={() => void saveChannelCredentials(true)}
+                  >
+                    保存并重启
+                  </button>
+                  <span className="faint" style={{ fontSize: 11 }}>
+                    保存后需重启网关，长连接才会使用新凭证。
+                  </span>
+                </div>
                 {channelNote && <div className="hint">{channelNote}</div>}
                 {/* The gateway is its own process: the long connection lives
                     inside it, so a configured channel still delivers nothing
@@ -1566,9 +1828,9 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                 </div>
               )}
               <div className="hint">
-                推送经由本机 OpenClaw 网关的长连接直接送到企业微信智能机器人，没有二维码、
-                也不会过期；“接收人”填企业微信里的成员 userid，对方先给机器人发过消息，
-                推送才送得进去。“发送测试”用的就是上面填写的内容，无需先保存。
+                {draft.notify.mode === "wecom_api"
+                  ? "自建应用 API 直接调用 qyapi.weixin.qq.com，不需要 OpenClaw。接收人填应用可见范围内的成员 userid；Secret 存系统密钥环，保存设置时生效。"
+                  : "推送经由本机 OpenClaw 网关的长连接直接送到企业微信智能机器人，没有二维码、也不会过期；“接收人”填企业微信里的成员 userid，对方先给机器人发过消息，推送才送得进去。“发送测试”用的就是上面填写的内容，无需先保存。"}
               </div>
             </div>
           </div>

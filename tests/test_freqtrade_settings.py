@@ -3,8 +3,30 @@
 import pytest
 from fastapi import HTTPException
 
-from btrader.core.config import FreqtradeSettings
-from btrader.web.routes import _apply_freqtrade
+from btrader.core.config import AIAutoSettings, FreqtradeSettings
+from btrader.web.routes import _apply_ai_auto, _apply_freqtrade
+
+
+def test_default_exchange_is_binance_but_gate_is_preserved() -> None:
+    assert FreqtradeSettings().exchange == "binance"
+    target = FreqtradeSettings(exchange="gate")
+    _apply_freqtrade(target, {"exchange": "gate"})
+    assert target.exchange == "gate"
+
+
+def test_apply_ai_auto_saves_optimized_strategy_params() -> None:
+    target = AIAutoSettings()
+    _apply_ai_auto(
+        target,
+        {"strategy_params": {"ma_cross": {"fast": 8, "slow": 21}}},
+    )
+    assert target.strategy_params == {"ma_cross": {"fast": 8, "slow": 21}}
+
+
+def test_apply_ai_auto_rejects_non_object_strategy_params() -> None:
+    with pytest.raises(HTTPException) as exc:
+        _apply_ai_auto(AIAutoSettings(), {"strategy_params": []})
+    assert exc.value.status_code == 400
 
 
 def test_apply_freqtrade_updates_supported_fields() -> None:

@@ -15,6 +15,7 @@ from fastapi import HTTPException
 from btrader.core.types import MarketType
 from btrader.strategy.base import IntParam, Strategy
 from btrader.strategy.candidates import CandidateStore
+from btrader.strategy.registry import StrategyRegistry
 from btrader.web.routes_lab import (
     CandidateBacktestPayload,
     CandidateGeneratePayload,
@@ -75,10 +76,23 @@ class FakeLLM:
 
 
 class FakeStrategies:
+    def __init__(self, directory: Path | None = None) -> None:
+        self.registry = StrategyRegistry()
+        self.registry.discover([directory] if directory else None)
+
     def get(self, key: str) -> Strategy:
-        if key != "toy":
-            raise KeyError(key)
-        return ToyStrategy()
+        if key == "toy":
+            return ToyStrategy()
+        return self.registry.get(key)
+
+    def source_path(self, key: str):
+        return self.registry.source_path(key)
+
+    def discover(self, directories: list[Path] | None = None) -> None:
+        self.registry.discover(directories)
+
+    def __contains__(self, key: str) -> bool:
+        return key in self.registry
 
 
 class FakeKlines:
@@ -87,14 +101,20 @@ class FakeKlines:
 
 
 def make_controller(payload: dict | None, tmp_path: Path, *, text: str | None = None, enabled=True) -> LabController:
+    strategy_dir = tmp_path / "strategies"
+    strategy_dir.mkdir(parents=True, exist_ok=True)
     ctx = SimpleNamespace(
         settings=SimpleNamespace(ai=SimpleNamespace(enabled=enabled)),
         ai=FakeLLM(payload, text),
-        strategies=FakeStrategies(),
+        strategies=FakeStrategies(strategy_dir),
         klines=FakeKlines(),
     )
     state = SimpleNamespace(ctx=ctx, locks={MarketType.SPOT: threading.RLock()})
-    return LabController(lambda: state, CandidateStore(tmp_path))
+    return LabController(
+        lambda: state,
+        CandidateStore(tmp_path),
+        strategy_dir=strategy_dir,
+    )
 
 
 def test_generate_stores_candidate(tmp_path: Path):
@@ -114,7 +134,11 @@ def test_review_approves_candidate(tmp_path: Path):
     controller = make_controller({"strategy_key": "gen_strategy", "code": SAFE_CODE}, tmp_path)
     candidate_id = controller.generate(CandidateGeneratePayload())["candidate"]["id"]
     result = controller.review(candidate_id, CandidateReviewPayload(approve=True, note="可以"))
-    assert result["candidate"]["status"] == "approved"
+    candidate = result["candidate"]
+    assert candidate["status"] == "approved"
+    assert candidate["registered_key"] == "gen_strategy"
+    assert (tmp_path / "strategies" / "gen_strategy.py").exists()
+    assert "gen_strategy" in controller.get_state().ctx.strategies
 
 
 def test_generate_rejects_unparsable_answer(tmp_path: Path):

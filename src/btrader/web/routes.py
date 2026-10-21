@@ -32,7 +32,7 @@ from ..engine.auto import AutoTrader, AutoTraderConfig
 from ..exchange import mirror
 from ..exchange.rest import BinanceREST
 from ..installer import InstallOptions, restart_gateway_process
-from ..notify import WeChatNotifier
+from ..notify import WeChatNotifier, load_wecom_secret, save_wecom_secret
 from .. import ai, llm
 from .. import paths
 
@@ -160,10 +160,24 @@ class NotifyTestPayload(BaseModel):
     """
 
     message: str = ""
+    mode: str = ""
     channel: str = ""
     target: str = ""
     account: str = ""
     command: str = ""
+    corp_id: str = ""
+    agent_id: str = ""
+    api_base: str = ""
+
+
+class WeComApiSecretPayload(BaseModel):
+    """Secret for the direct 企业微信 self-built-app API.
+
+    The secret is posted once and stored in the OS keyring; it is never echoed
+    back by status endpoints or written to ``config.json``.
+    """
+
+    secret: str = ""
 
 
 class InstallPayload(BaseModel):
@@ -178,6 +192,13 @@ class InstallPayload(BaseModel):
     registry: str = ""
     node_path: str = ""
     npm_path: str = ""
+
+
+class WeComChannelPayload(BaseModel):
+    """API-mode credentials for the 企业微信 smart-bot long connection."""
+
+    bot_id: str = ""
+    secret: str = ""
 
 
 class CredentialsPayload(BaseModel):
@@ -790,6 +811,10 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
                 "starting_balance": account.starting_balance,
                 "equity": equity,
                 "realized_pnl": sum(p.realized_pnl for p in account.positions.values()),
+                "realized_pnl_by_symbol": {
+                    position.symbol: position.realized_pnl
+                    for position in account.positions.values()
+                },
                 "positions": positions,
                 "orders": orders,
                 "trades": trades,
@@ -1173,10 +1198,14 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
         )
         candidate = replace(
             notifier.settings,
+            mode=(payload.mode or "").strip() or notifier.settings.mode,
             channel=(payload.channel or "").strip() or notifier.settings.channel,
             target=(payload.target or "").strip() or notifier.settings.target,
             account=(payload.account or "").strip() or notifier.settings.account,
             command=(payload.command or "").strip() or notifier.settings.command,
+            corp_id=(payload.corp_id or "").strip() or notifier.settings.corp_id,
+            agent_id=(payload.agent_id or "").strip() or notifier.settings.agent_id,
+            api_base=(payload.api_base or "").strip() or notifier.settings.api_base,
         )
         scratch = WeChatNotifier(
             candidate, timeout=notifier.timeout, queue_size=1
@@ -1190,6 +1219,34 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
         notifier.last_error_at = 0.0
         notifier.last_success_at = scratch.last_success_at
         return result
+
+    @router.put("/api/notify/wecom/secret")
+    def notify_wecom_secret(payload: WeComApiSecretPayload) -> dict[str, Any]:
+        """Store the direct-API Secret in the OS keyring.
+
+        Deliberately separate from ``PUT /api/settings``: the rest of the
+        credentials are safe to serialize into ``config.json``, but this one is
+        not. An empty value clears the saved secret.
+        """
+        secret = payload.secret.strip()
+        if not save_wecom_secret(secret):
+            raise HTTPException(
+                status_code=503,
+                detail="无法写入系统凭据库（keyring），请检查系统钥匙串是否可用。",
+            )
+        return {"ok": True, "secret_saved": bool(secret)}
+
+    @router.get("/api/notify/wecom")
+    def notify_wecom_status() -> dict[str, Any]:
+        """Non-secret direct-API configuration, for the settings page."""
+        settings = get_state().ctx.settings.notify
+        return {
+            "mode": settings.mode,
+            "corp_id": settings.corp_id,
+            "agent_id": settings.agent_id,
+            "api_base": settings.api_base,
+            "secret_saved": bool(load_wecom_secret()),
+        }
 
     # ------------------------------------------------------ openclaw install
     @router.get("/api/install/openclaw")
@@ -1247,6 +1304,22 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
         status = ctx.installer.channel_status()
         status["gateway"] = ctx.gateway.status()
         return status
+
+    @router.put("/api/install/openclaw/channel/config")
+    def channel_configure(payload: WeComChannelPayload) -> dict[str, Any]:
+        """Save API-mode Bot ID/Secret into OpenClaw's channel config.
+
+        This is intentionally not part of the settings PUT: the secret belongs
+        to OpenClaw's own config, not biTrader's config.json, and saving it
+        should not be able to fail because an unrelated risk setting is invalid.
+        """
+        try:
+            result = get_state().ctx.installer.configure_channel(
+                payload.bot_id, payload.secret
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return result
 
     @router.post("/api/install/openclaw/channel")
     def channel_register() -> dict[str, Any]:
@@ -1536,19 +1609,32 @@ def _apply_notify(target: Any, values: dict[str, Any]) -> None:
         if not hasattr(target, key):
             log.debug("忽略未知通知字段: %s", key)
             continue
+        if key == "mode":
+            mode = str(value or "").strip().lower()
+            if mode not in {"openclaw", "wecom_api"}:
+                raise HTTPException(status_code=400, detail="通知模式必须是 openclaw 或 wecom_api")
+            target.mode = mode
+            continue
         current = getattr(target, key)
         try:
             setattr(target, key, bool(value) if isinstance(current, bool) else type(current)(value))
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail=f"通知字段 {key} 的值无效")
+    mode = str(target.mode or "openclaw").strip().lower()
+    if mode not in {"openclaw", "wecom_api"}:
+        raise HTTPException(status_code=400, detail="通知模式必须是 openclaw 或 wecom_api")
     if target.enabled and not str(target.target or "").strip():
         raise HTTPException(
             status_code=400,
-            detail=(
-                "开启企业微信通知前，请先填写接收人 userid"
-                "（企业微信通讯录里的成员账号，且该成员要先给机器人发过一条消息）。"
-            ),
+            detail="开启企业微信通知前，请先填写接收人 userid（企业微信通讯录里的成员账号）。",
         )
+    if target.enabled and mode == "wecom_api":
+        if not str(target.corp_id or "").strip():
+            raise HTTPException(status_code=400, detail="API 模式需要填写企业微信 CorpID")
+        if not str(target.agent_id or "").strip():
+            raise HTTPException(status_code=400, detail="API 模式需要填写 AgentId")
+        if not str(target.agent_id).strip().isdigit():
+            raise HTTPException(status_code=400, detail="企业微信 AgentId 必须是数字")
 
 
 def _apply_ai(target: Any, values: dict[str, Any]) -> None:
@@ -1578,6 +1664,22 @@ def _apply_ai_auto(target: AIAutoSettings, values: dict[str, Any]) -> None:
     for key, value in values.items():
         if not hasattr(target, key):
             log.debug("忽略未知 AI 自动交易字段: %s", key)
+            continue
+        if key == "strategy_params":
+            if not isinstance(value, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail="ai_auto.strategy_params 必须是对象",
+                )
+            cleaned: dict[str, dict[str, Any]] = {}
+            for strategy_key, params in value.items():
+                if not isinstance(params, dict):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"ai_auto.strategy_params.{strategy_key} 必须是对象",
+                    )
+                cleaned[str(strategy_key)] = dict(params)
+            target.strategy_params = cleaned
             continue
         current = getattr(target, key)
         if isinstance(current, bool):

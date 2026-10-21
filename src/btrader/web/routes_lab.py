@@ -8,17 +8,20 @@ The controller is a plain class so the logic can be tested without HTTP.
 from __future__ import annotations
 
 import json
+import re
 import threading
+from pathlib import Path
 from typing import Any, Callable
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from .. import ai
+from .. import ai, paths
 from ..ai_optimize import optimize_params
 from ..backtest import BacktestConfig
 from ..core.types import MarketType
-from ..strategy.candidates import CandidateError, CandidateStore
+from ..strategy.candidates import Candidate, CandidateError, CandidateStore
+from ..strategy.source import StrategySourceError, save_source
 from .routes import JobStore, _closed_only, _market_frame, _strategy_source
 
 GENERATE_SYSTEM = (
@@ -71,9 +74,16 @@ def _market(value: str) -> MarketType:
 
 
 class LabController:
-    def __init__(self, get_state: Callable[[], Any], store: CandidateStore | None = None) -> None:
+    def __init__(
+        self,
+        get_state: Callable[[], Any],
+        store: CandidateStore | None = None,
+        *,
+        strategy_dir: Path | None = None,
+    ) -> None:
         self.get_state = get_state
         self.candidates = store or CandidateStore()
+        self.strategy_dir = strategy_dir
         self.jobs = JobStore()
         self._cancels: dict[str, threading.Event] = {}
         self._lock = threading.Lock()
@@ -138,6 +148,8 @@ class LabController:
 
     def review(self, candidate_id: str, payload: CandidateReviewPayload) -> dict[str, Any]:
         try:
+            if payload.approve:
+                self._register_candidate(candidate_id)
             candidate = self.candidates.review(
                 candidate_id,
                 approve=payload.approve,
@@ -146,7 +158,58 @@ class LabController:
             )
         except CandidateError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except StrategySourceError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
         return {"ok": True, "candidate": candidate.to_dict()}
+
+    def _register_candidate(self, candidate_id: str) -> Candidate:
+        """Create a real user strategy when a candidate is approved.
+
+        Approval previously only flipped the candidate status; the deploy
+        button wrote a differently named file later. Keep approval as the
+        single hand-off point so the lab, backtest page and AI trader all see
+        the same strategy.
+        """
+        candidate = self.candidates.get(candidate_id)
+        if candidate.registered_key:
+            return candidate
+        if not candidate.checks.get("ok"):
+            raise CandidateError("静态检查未通过，不能批准")
+
+        ctx = self.get_state().ctx
+        base = re.sub(r"[^a-z0-9_]", "_", (candidate.strategy_key or "ai_strategy").lower())
+        base = base[:48] or "ai_strategy"
+        if not base[0].isalpha():
+            base = f"ai_{base}"
+        key = base
+        user_dir = self.strategy_dir or paths.user_strategies_dir()
+        taken = key in ctx.strategies or ctx.strategies.source_path(key) is not None
+        if taken or (user_dir / f"{key}.py").exists():
+            suffix = re.sub(r"[^a-z0-9]", "", candidate.id.lower())[-8:] or "candidate"
+            key = f"{base[:48]}_{suffix}"
+
+        code = self.candidates.read_code(candidate_id)
+        rewritten, count = re.subn(
+            r'(?m)^(\s*key\s*=\s*)["\'][^"\']*["\']',
+            lambda match: f'{match.group(1)}"{key}"',
+            code,
+            count=1,
+        )
+        if not count:
+            raise CandidateError("候选源码缺少类属性 key，无法注册为策略")
+        result = save_source(
+            ctx.strategies,
+            code=rewritten,
+            key=key,
+            directory=user_dir,
+            create=not (user_dir / f"{key}.py").exists(),
+        )
+        source_path = ctx.strategies.source_path(result["key"])
+        return self.candidates.mark_registered(
+            candidate_id,
+            key=result["key"],
+            strategy_path=str(source_path or result["filename"]),
+        )
 
     def record_backtest(
         self, candidate_id: str, payload: CandidateBacktestPayload

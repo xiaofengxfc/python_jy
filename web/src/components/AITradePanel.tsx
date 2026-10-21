@@ -7,6 +7,7 @@ interface Props {
   market: string;
   symbol: string;
   timeframe: string;
+  onNavigate?: (page: "lab" | "backtest") => void;
 }
 
 /** One record written by `engine/ai_trader.py::_record`. The audit file also
@@ -78,6 +79,8 @@ interface AIAutoSettings {
   cooldown_sec: number;
   poll_sec: number;
   require_stop: boolean;
+  /** Best params explicitly applied from the strategy lab, by strategy key. */
+  strategy_params?: Record<string, Record<string, unknown>>;
 }
 
 const DEFAULT_AUTO: AIAutoSettings = {
@@ -97,6 +100,7 @@ const DEFAULT_AUTO: AIAutoSettings = {
   cooldown_sec: 30,
   poll_sec: 60,
   require_stop: true,
+  strategy_params: {},
 };
 
 const STATE_LABEL: Record<string, string> = {
@@ -237,7 +241,7 @@ function NumberField(props: {
  * is polled every 4 seconds with `since=seq`, so the event feed is appended
  * incrementally instead of re-downloading the whole ring buffer each tick.
  */
-export default function AITradePanel({ market, symbol, timeframe }: Props) {
+export default function AITradePanel({ market, symbol, timeframe, onNavigate }: Props) {
   const [status, setStatus] = useState<AITraderStatus | null>(null);
   const [events, setEvents] = useState<AIDecisionRecord[]>([]);
   const [loading, setLoading] = useState(true);
@@ -438,7 +442,8 @@ export default function AITradePanel({ market, symbol, timeframe }: Props) {
           symbol,
           timeframe,
           strategy: strategyKey,
-          params: { ...selected.defaults },
+          params:
+            auto.strategy_params?.[strategyKey] ?? { ...selected.defaults },
           max_order_quote: auto.max_order_quote,
           max_position_quote: auto.max_position_quote,
         }),
@@ -572,6 +577,23 @@ export default function AITradePanel({ market, symbol, timeframe }: Props) {
 
   const visible = events.slice(-20).reverse();
   const auditRows = [...audit].reverse();
+  const selected = strategies.find((item) => item.key === strategyKey);
+
+  /** Carry the currently selected signal strategy and chart context into the
+   * lab/backtest page. Both pages read these one-shot handoffs on mount, so a
+   * normal navigation from the sidebar stays untouched. */
+  const handoff = (page: "lab" | "backtest") => {
+    if (!selected) return;
+    const payload = {
+      strategy: selected.key,
+      symbol,
+      timeframe,
+      market,
+      at: Date.now(),
+    };
+    window.sessionStorage.setItem(`bitrader.${page}.handoff`, JSON.stringify(payload));
+    onNavigate?.(page);
+  };
 
   return (
     <>
@@ -601,6 +623,11 @@ export default function AITradePanel({ market, symbol, timeframe }: Props) {
           ))}
         </select>
         <span className="spacer" />
+        {strategyKey && auto.strategy_params?.[strategyKey] && (
+          <span className="lab-chip approved" title="来自策略实验室，人工确认后保存">
+            已应用优化参数
+          </span>
+        )}
         <div className="segmented" role="group" aria-label="AI 交易模式">
           {MODES.map(([value, label]) => (
             <button
@@ -615,6 +642,24 @@ export default function AITradePanel({ market, symbol, timeframe }: Props) {
           ))}
         </div>
         <div className="ai-head-actions">
+          <button
+            type="button"
+            className="btn-sm"
+            disabled={!strategyKey || busy !== ""}
+            title="带着当前策略和图表参数打开策略实验室"
+            onClick={() => handoff("lab")}
+          >
+            优化策略
+          </button>
+          <button
+            type="button"
+            className="btn-sm"
+            disabled={!strategyKey || busy !== ""}
+            title="带着当前策略和图表参数打开回测"
+            onClick={() => handoff("backtest")}
+          >
+            回测
+          </button>
           <button
             type="button"
             className="btn-sm primary"

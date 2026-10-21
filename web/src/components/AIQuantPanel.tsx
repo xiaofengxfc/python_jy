@@ -11,6 +11,8 @@ interface Candidate {
   backtest?: Record<string, number>;
   created_at?: number;
   note?: string;
+  registered_key?: string;
+  strategy_path?: string;
 }
 
 interface AutoStatus {
@@ -86,29 +88,33 @@ export default function AIQuantPanel({ market, symbol, timeframe, onNavigate }: 
     setError("");
     setNotice("");
     try {
-      const key = `ai_${selected.strategy_key}_${selected.id.slice(-6)}`
-        .toLowerCase()
-        .replace(/[^a-z0-9_]/g, "_")
-        .slice(0, 64);
-      // The registry requires the file's `key` attribute to match the
-      // filename. Candidates are generated with their own key, so rewrite the
-      // class attribute to the deployment key before registering.
-      const patched = code.replace(
-        /key\s*=\s*["'][^"']*["']/,
-        `key = "${key}"`,
-      );
-      if (patched === code) {
-        throw new Error("候选源码缺少 key 属性，无法部署");
+      const key =
+        selected.registered_key ||
+        `ai_${selected.strategy_key}_${selected.id.slice(-6)}`
+          .toLowerCase()
+          .replace(/[^a-z0-9_]/g, "_")
+          .slice(0, 64);
+      if (!selected.registered_key) {
+        // Legacy candidates were approved before the lab wrote local strategy
+        // files. Register them once, using the same key transformation.
+        const patched = code.replace(
+          /key\s*=\s*["'][^"']*["']/,
+          `key = "${key}"`,
+        );
+        if (patched === code) {
+          throw new Error("候选源码缺少 key 属性，无法部署");
+        }
+        await api("/api/strategies", {
+          method: "POST",
+          body: JSON.stringify({ key, code: patched, create: true }),
+        });
       }
-      await api("/api/strategies", {
-        method: "POST",
-        body: JSON.stringify({ key, code: patched, create: true }),
-      });
 
-      // Deployment is gated by a real backtest. Save/reload happens first so
-      // the backtester can resolve the new strategy key; auto trading only
-      // starts if the candidate traded and made money over the sample.
-      setNotice("已注册策略，正在回测…");
+      setNotice(
+        selected.registered_key
+          ? "使用批准时生成的本地策略，正在回测…"
+          : "已注册策略，正在回测…",
+      );
       const job = await api<{ job_id: string }>("/api/backtest/run", {
         method: "POST",
         body: JSON.stringify({

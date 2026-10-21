@@ -996,11 +996,8 @@ input[type="range"].input:focus {
   min-height: 320px;
 }
 
-/* AI 分析 is a reading panel: give it room and let the chart give some back,
-   so the answer and the action buttons stay on one screen. */
-.trading.ai-open .trading-main > .card:nth-child(2) {
-  height: clamp(280px, calc(100vh - 560px), 560px);
-}
+/* The chart keeps its height on every bottom tab. AI content scrolls inside
+   the fixed-height panel; it must not shrink the candles when selected. */
 
 .trading-rail {
   display: flex;
@@ -1400,6 +1397,35 @@ input[type="range"].input:focus {
   gap: 6px;
 }
 
+/* Trigger order: segmented direction + one price input. The old two-equal-
+   column grid squeezed both controls and overflowed the narrow order rail. */
+.conditional-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.conditional-row .segmented {
+  min-width: 0;
+}
+
+.conditional-row .input {
+  width: 100%;
+  min-width: 0;
+}
+
+@media (max-width: 1180px) {
+  .conditional-row {
+    grid-template-columns: 1fr;
+  }
+
+  .conditional-row .segmented {
+    justify-self: start;
+  }
+}
+
 .protect-hint {
   display: flex;
   align-items: center;
@@ -1533,6 +1559,59 @@ input[type="range"].input:focus {
 
 .actions .btn {
   flex: 1 1 0;
+}
+
+/* Short laptop screens: keep the primary buy/sell button above the fold.
+   The order book and optional AI pre-judge give up space first; all order
+   fields and the balance/realized PnL line remain visible. */
+@media (max-height: 860px) {
+  .trading-rail {
+    height: calc(100vh - 78px);
+    max-height: calc(100vh - 78px);
+    overflow: hidden;
+    padding-right: 2px;
+  }
+
+  .trading-rail > .card:first-child {
+    flex: 0 0 120px;
+    min-height: 120px;
+    max-height: 140px;
+  }
+
+  .trading-rail > .card:last-child {
+    flex: 1 1 auto;
+    min-height: 0;
+  }
+
+  .trading-rail > .card:last-child .ticket-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+  }
+
+  .preview {
+    display: none !important;
+  }
+
+  .ticket-body {
+    gap: 7px;
+    padding: 8px 11px 9px;
+  }
+
+  .ai-prejudge {
+    display: none !important;
+  }
+
+  .actions {
+    flex: none;
+    padding: 8px 11px;
+    border-top: 1px solid var(--border);
+  }
+
+  .ticket-note {
+    flex: none;
+    padding: 0 11px 8px;
+  }
 }
 
 /* ------------------------------------------------- openclaw install panel */
@@ -1678,35 +1757,56 @@ input[type="range"].input:focus {
 
 .tabs {
   display: flex;
-  gap: 2px;
+  align-items: center;
+  gap: 4px;
   flex: none;
-  padding: 6px 10px 0;
+  height: 38px;
+  padding: 0 13px;
   border-bottom: 1px solid var(--border);
 }
 
 .tab {
-  height: 30px;
+  height: 28px;
   padding: 0 10px;
   border: 0;
-  border-bottom: 2px solid transparent;
+  border-radius: 5px;
   background: transparent;
   color: var(--text-3);
   font-size: 12px;
-  transition: color 0.12s ease, border-color 0.12s ease;
+  transition: color 0.12s ease, background 0.12s ease;
 }
 
 .tab:hover {
   color: var(--text-2);
+  background: var(--bg-hover);
 }
 
 .tab[aria-selected="true"] {
   color: var(--text);
-  border-bottom-color: var(--ink);
+  background: var(--bg-hover);
   font-weight: 500;
 }
 
-/* Bottom panel of the trading page: fixed height, own scroll. The header
-   collapses it to a single row so the chart can take the whole height. */
+/* The chart toolbar's AI shortcut and the bottom AI tab share one selected
+   treatment, so clicking it never looks like a different control. */
+.chart-ai-link {
+  height: 28px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 12px;
+}
+
+.chart-ai-link:hover,
+.chart-ai-link.active {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+/* Bottom panel of the trading page: fixed height, own scroll. Every tab uses
+   the same height; AI is scrollable inside instead of resizing the chart. */
 .panel {
   display: flex;
   flex-direction: column;
@@ -1745,8 +1845,10 @@ input[type="range"].input:focus {
   overflow: auto;
 }
 
+/* The AI tab keeps the same panel height as the tables. Its body scrolls
+   instead of stealing vertical space from the chart above. */
 .panel.ai-panel:not(.collapsed) {
-  flex-basis: clamp(300px, 42vh, 460px);
+  flex-basis: 208px;
 }
 
 .panel.ai-panel .panel-body > .card {
@@ -2455,6 +2557,36 @@ input[type="range"].input:focus {
   max-width: 45%;
 }
 
+/* Settings audit is a compact diagnostic strip, not the roomy AI drawer
+   cards. These selectors intentionally outrank the later global
+   .ai-audit-row rules used by the drawer. */
+.settings-ai-audit {
+  gap: 2px;
+  max-height: 156px;
+  overflow-y: auto;
+}
+
+.settings-ai-audit .ai-audit-row {
+  flex-direction: row;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 7px;
+  padding: 4px 6px;
+  border-bottom: 0;
+  border-radius: 3px;
+  background: var(--bg-hover);
+}
+
+.settings-ai-audit .ai-audit-row:hover {
+  background: var(--bg-hover);
+}
+
+.settings-ai-audit .ai-audit-err {
+  flex: 1 1 auto;
+  max-width: 42%;
+  font-size: 11px;
+}
+
 /* "描述想法 → 匹配策略" row under the parameter editor. */
 .ai-suggest {
   display: flex;
@@ -3035,6 +3167,23 @@ main.main > .lab-page:not(.page-head) {
   flex-direction: column;
   gap: 12px;
   min-width: 0;
+}
+
+/* Freqtrade compatibility card below the AI/optimizer grid. */
+.ft-strategy-lab {
+  min-width: 0;
+}
+
+.ft-context {
+  display: flex;
+  align-items: center;
+  min-height: 32px;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-hover);
+  color: var(--text-2);
+  font-size: 12px;
 }
 
 .lab-grid {

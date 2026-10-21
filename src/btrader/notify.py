@@ -1,4 +1,15 @@
-"""Outbound 企业微信 notifications through a local OpenClaw gateway.
+"""Outbound 企业微信 notifications.
+
+Two transports are supported:
+
+* **Direct self-built-app API** — ``wecom_api`` mode calls
+  ``qyapi.weixin.qq.com`` with Corpid / AgentId / a keyring-stored Secret.
+* **OpenClaw smart bot** — ``openclaw`` mode uses the local gateway's outbound
+  WebSocket and its message CLI.
+
+The direct API is useful when the user has a 企业微信 administrator-created app
+but does not want to install OpenClaw. The openclaw bridge remains the default
+for compatibility with existing installations.
 
 The 企业微信 smart-bot plugin (``@wecom/wecom-openclaw-plugin``) keeps an
 outbound WebSocket (long connection) from the gateway on this machine to
@@ -34,12 +45,22 @@ import socket
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import paths
 
 log = logging.getLogger(__name__)
+
+# Direct 企业微信 self-built-app API. The secret is kept in the OS keyring, not
+# in config.json, for the same reason the AI key is.
+WECOM_API_BASE = "https://qyapi.weixin.qq.com"
+WECOM_KEYRING_SERVICE = "biTrader-wecom"
+WECOM_KEYRING_USER = "corp_secret"
+
 
 # Both forms are used in the wild: the plugin's manifest id carries no scope
 # prefix, while older guides spell the channel after the npm package. The
@@ -79,17 +100,116 @@ class NotifyError(RuntimeError):
     """A message could not be handed to the WeChat channel."""
 
 
+def load_wecom_secret() -> str:
+    """Read the self-built-app Secret from the OS keyring, never config.json."""
+    try:
+        import keyring
+
+        return keyring.get_password(WECOM_KEYRING_SERVICE, WECOM_KEYRING_USER) or ""
+    except Exception as exc:  # a broken keyring must not break the page
+        log.warning("读取企业微信 Secret 失败: %s", exc)
+        return ""
+
+
+def save_wecom_secret(value: str) -> bool:
+    """Store (or clear) the self-built-app Secret in the OS keyring."""
+    try:
+        import keyring
+
+        if value:
+            keyring.set_password(WECOM_KEYRING_SERVICE, WECOM_KEYRING_USER, value)
+        else:
+            try:
+                keyring.delete_password(WECOM_KEYRING_SERVICE, WECOM_KEYRING_USER)
+            except Exception:
+                pass
+        return True
+    except Exception as exc:
+        log.warning("保存企业微信 Secret 失败: %s", exc)
+        return False
+
+
+def _wecom_http_json(
+    url: str,
+    *,
+    params: dict | None = None,
+    body: dict | None = None,
+    timeout: float = 15.0,
+) -> dict:
+    """Minimal JSON client for qyapi.weixin.qq.com.
+
+    ``urllib`` is used deliberately: it is part of the standard library and
+    honours the same HTTPS proxy environment as the rest of the process, so a
+    desktop proxy setup does not need an extra dependency just for notifications.
+    """
+    if params:
+        url = f"{url}?{urllib.parse.urlencode(params)}"
+    data = None
+    headers = {"User-Agent": "biTrader/0.5"}
+    if body is not None:
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json; charset=utf-8"
+    request = urllib.request.Request(url, data=data, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+        raise NotifyError(f"企业微信接口 HTTP {exc.code}：{detail[:300]}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise NotifyError(f"连接企业微信接口失败：{exc}") from exc
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise NotifyError(f"企业微信接口返回了非 JSON 内容：{raw[:300]}") from exc
+    if not isinstance(payload, dict):
+        raise NotifyError("企业微信接口返回格式不正确")
+    return payload
+
+
+def _wecom_error(payload: dict) -> str:
+    code = str(payload.get("errcode") or "")
+    message = str(payload.get("errmsg") or "").strip()
+    if code in {"40001", "40014", "42001"}:
+        return "企业微信 Secret 无效或 access_token 已过期，请重新保存 Secret。"
+    if code == "60020":
+        return "企业微信接口提示 IP 不在可信 IP 范围，请在应用后台配置可信 IP。"
+    if code == "81013":
+        return "企业微信接收人不存在或不在应用可见范围内。"
+    return f"企业微信接口错误 {code or '未知'}：{message or '未返回原因'}"
+
+
+def _wecom_errcode(payload: dict) -> int:
+    try:
+        return int(payload.get("errcode") or 0)
+    except (TypeError, ValueError) as exc:
+        raise NotifyError("企业微信接口返回了无法识别的错误码") from exc
+
+
 @dataclass
 class NotifySettings:
     """Where and whether to push notifications.
 
-    ``target`` is the 企业微信 userid OpenClaw should deliver to. An empty value
-    makes the send refuse with an explanation instead of guessing a recipient.
+    Two transports are supported:
+
+    * ``wecom_api`` — direct 企业微信 self-built-app HTTP API using
+      Corpid / AgentId / Secret. The secret lives in the OS keyring.
+    * ``openclaw`` — the existing smart-bot long connection through the local
+      OpenClaw gateway, addressed by a conversation/userid.
+
+    ``target`` is the 企业微信 userid in either mode. An empty value makes the
+    send refuse with an explanation instead of guessing a recipient.
     """
 
     enabled: bool = False
+    mode: str = "openclaw"
     channel: str = DEFAULT_CHANNEL
     target: str = ""
+    # Direct self-built-app credentials. The secret is not a dataclass field:
+    # it is stored in the OS keyring (see load_wecom_secret/save_wecom_secret).
+    corp_id: str = ""
+    agent_id: str = ""
+    api_base: str = WECOM_API_BASE
     # The plugin's own account id inside the gateway. Empty means "the default
     # account", which is what a single-bot setup should leave alone.
     account: str = ""
@@ -105,6 +225,7 @@ class NotifySettings:
     # Probe the gateway port before spawning the CLI. Turn off only for a
     # gateway on a non-default port, where the probe would be a false negative.
     preflight: bool = True
+
 
 
 @dataclass
@@ -148,6 +269,10 @@ class WeChatNotifier:
         # until which sends fail fast instead of waiting out the CLI.
         self._failures: int = 0
         self._open_until: float = 0.0
+        # Cached self-built-app access token. WeCom tokens last ~2 hours; a
+        # notification should not pay a gettoken round trip every time.
+        self._wecom_token: str = ""
+        self._wecom_token_until: float = 0.0
 
     # ------------------------------------------------------------------- public
     def notify(self, text: str, *, kind: str = "") -> bool:
@@ -199,13 +324,28 @@ class WeChatNotifier:
             raise
 
     def status(self) -> dict:
+        mode = self._mode()
+        secret_saved = bool(load_wecom_secret()) if mode == "wecom_api" else False
+        if mode == "wecom_api":
+            available = bool(
+                str(self.settings.corp_id or "").strip()
+                and str(self.settings.agent_id or "").strip()
+                and secret_saved
+            )
+        else:
+            available = bool(self._resolve_command())
         return {
             "enabled": self.settings.enabled,
+            "mode": mode,
             "channel": self.settings.channel,
             "target": self.settings.target,
             "account": self.settings.account,
             "command": self.settings.command,
-            "available": bool(self._resolve_command()),
+            "corp_id": self.settings.corp_id,
+            "agent_id": self.settings.agent_id,
+            "api_base": self.settings.api_base,
+            "secret_saved": secret_saved,
+            "available": available,
             # Surface a target the plugin cannot match before the user saves it;
             # an empty string means "no complaint".
             "target_warning": target_warning(self.settings.target) if self.settings.enabled else "",
@@ -344,6 +484,10 @@ class WeChatNotifier:
             "manual": True,
         }.get(kind, True)
 
+    def _mode(self) -> str:
+        mode = str(self.settings.mode or "").strip().lower()
+        return "wecom_api" if mode == "wecom_api" else "openclaw"
+
     def _resolve_command(self) -> str | None:
         command = (self.settings.command or DEFAULT_COMMAND).strip()
         if not command:
@@ -377,6 +521,15 @@ class WeChatNotifier:
     ) -> dict:
         if respect_breaker:
             self._check_breaker()
+        if self._mode() == "wecom_api":
+            payload = self._run_wecom_api(text)
+            if from_queue:
+                log.info("企业微信 API 通知已发出")
+            self.last_error = ""
+            self.last_error_at = 0.0
+            self.last_success_at = time.time()
+            self._note_success()
+            return payload
         command = self._resolve_command()
         if not command:
             raise NotifyError(
@@ -442,6 +595,80 @@ class WeChatNotifier:
         self.last_success_at = time.time()
         self._note_success()
         return {"ok": True, "stdout": stdout[:2000]}
+
+    def _run_wecom_api(self, text: str) -> dict:
+        """Send one text message through the 企业微信 self-built-app API."""
+        settings = self.settings
+        target, _ = self._resolve_target()
+        if not target:
+            raise NotifyError("尚未填写企业微信接收人（userid），无法发送。")
+        corp_id = str(settings.corp_id or "").strip()
+        if not corp_id:
+            raise NotifyError("尚未填写企业微信 CorpID。")
+        agent_raw = str(settings.agent_id or "").strip()
+        if not agent_raw:
+            raise NotifyError("尚未填写企业微信 AgentId。")
+        try:
+            agent_id = int(agent_raw)
+        except ValueError as exc:
+            raise NotifyError("企业微信 AgentId 必须是数字。") from exc
+        if agent_id <= 0:
+            raise NotifyError("企业微信 AgentId 必须是正整数。")
+        secret = load_wecom_secret()
+        if not secret:
+            raise NotifyError("尚未保存企业微信应用 Secret。")
+
+        base = (str(settings.api_base or "").strip() or WECOM_API_BASE).rstrip("/")
+        token = self._wecom_access_token(base, corp_id, secret)
+        url = f"{base}/cgi-bin/message/send"
+        payload = _wecom_http_json(
+            url,
+            params={"access_token": token},
+            body={
+                "touser": target,
+                "msgtype": "text",
+                "agentid": agent_id,
+                "text": {"content": text},
+                "safe": 0,
+            },
+            timeout=min(self.timeout, 15.0),
+        )
+        if _wecom_errcode(payload) != 0:
+            raise NotifyError(_wecom_error(payload))
+        log.info("企业微信 API 通知已发出（agentid=%s）", agent_id)
+        return {
+            "ok": True,
+            "stdout": json.dumps(
+                {"errcode": 0, "errmsg": payload.get("errmsg") or "ok"},
+                ensure_ascii=False,
+            )[:2000],
+        }
+
+    def _wecom_access_token(self, base: str, corp_id: str, secret: str) -> str:
+        now = time.time()
+        key = f"{base}|{corp_id}|{secret}"
+        if self._wecom_token and now < self._wecom_token_until and getattr(
+            self, "_wecom_token_key", ""
+        ) == key:
+            return self._wecom_token
+        payload = _wecom_http_json(
+            f"{base}/cgi-bin/gettoken",
+            params={"corpid": corp_id, "corpsecret": secret},
+            timeout=min(self.timeout, 15.0),
+        )
+        token = str(payload.get("access_token") or "").strip()
+        if _wecom_errcode(payload) != 0 or not token:
+            raise NotifyError(_wecom_error(payload))
+        try:
+            expires = float(payload.get("expires_in") or 7200)
+        except (TypeError, ValueError):
+            expires = 7200.0
+        self._wecom_token = token
+        self._wecom_token_key = key
+        # Refresh two minutes early; never cache a token for longer than the
+        # server said it is valid.
+        self._wecom_token_until = now + max(60.0, expires - 120.0)
+        return token
 
     def _record_failure(self, message: str) -> None:
         self.last_error = message

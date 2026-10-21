@@ -18,6 +18,8 @@ interface Props {
   cash: number;
   positionQty: number;
   realizedPnl: number;
+  /** Configured default order size in quote currency. */
+  defaultQuote?: number;
   feeRate: number;
   pickedPrice: number | null;
   protection?: PaperProtection | null;
@@ -64,6 +66,7 @@ export default function OrderTicket({
   cash,
   positionQty,
   realizedPnl,
+  defaultQuote = 0,
   feeRate,
   pickedPrice,
   protection,
@@ -76,7 +79,10 @@ export default function OrderTicket({
   const [orderType, setOrderType] = useState<OrderType>("limit");
   const [sizeMode, setSizeMode] = useState<SizeMode>("quote");
   const [price, setPrice] = useState("");
-  const [size, setSize] = useState("");
+  const [size, setSize] = useState(() => {
+    const remembered = readLastQuote();
+    return remembered || (defaultQuote > 0 ? String(defaultQuote) : "");
+  });
   const [stopLoss, setStopLoss] = useState("");
   const [takeProfit, setTakeProfit] = useState("");
   const [trigger, setTrigger] = useState("");
@@ -109,7 +115,11 @@ export default function OrderTicket({
   useEffect(() => {
     priceSeeded.current = false;
     setPrice("");
-    setSize(sizeMode === "quote" ? readLastQuote() : "");
+    setSize(
+      sizeMode === "quote"
+        ? readLastQuote() || (defaultQuote > 0 ? String(defaultQuote) : "")
+        : "",
+    );
     setStopLoss("");
     setTakeProfit("");
     setPreview(null);
@@ -119,6 +129,16 @@ export default function OrderTicket({
     // would wipe the form every time the user flips the unit.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [symbol, market]);
+
+  // Settings can arrive after the ticket mounted (App loads them async).
+  // Fill the size only while the user has not typed anything; never overwrite
+  // an amount already being edited.
+  useEffect(() => {
+    if (sizeMode !== "quote" || defaultQuote <= 0) return;
+    setSize((current) =>
+      current.trim() ? current : String(defaultQuote),
+    );
+  }, [defaultQuote, sizeMode]);
 
   // Flipping side must not leave a limit price from the other direction: a buy
   // parked at 60,000 becomes a market-crossing sell once the user switches, and
@@ -676,7 +696,7 @@ export default function OrderTicket({
             <span>条件单</span>
             <em>触发后按{orderType === "market" ? "市价" : "限价"}成交</em>
           </label>
-          <div className="protect-row">
+          <div className="conditional-row">
             <div className="segmented">
               <button
                 type="button"

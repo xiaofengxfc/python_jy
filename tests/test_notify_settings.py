@@ -36,15 +36,44 @@ def test_notify_settings_round_trip_through_the_config_file(tmp_path) -> None:
     path = tmp_path / "config.json"
     store = ConfigStore(path)
     store.settings.notify = NotifySettings(
-        enabled=True, target="wxid-9", channel="weixin", command=r"C:\npm\openclaw.cmd"
+        enabled=True,
+        mode="wecom_api",
+        target="wxid-9",
+        corp_id="ww123",
+        agent_id="1000002",
+        channel="weixin",
+        command=r"C:\npm\openclaw.cmd",
     )
     store.save()
 
     loaded = ConfigStore(path).settings.notify
     assert isinstance(loaded, NotifySettings)
     assert loaded.enabled is True
+    assert loaded.mode == "wecom_api"
     assert loaded.target == "wxid-9"
+    assert loaded.corp_id == "ww123"
+    assert loaded.agent_id == "1000002"
     assert loaded.channel == "weixin"
+
+
+def test_invalid_notification_mode_is_rejected() -> None:
+    with pytest.raises(HTTPException, match="openclaw"):
+        _apply_notify(NotifySettings(), {"mode": "webhook"})
+
+
+def test_api_mode_enabled_requires_corp_and_agent() -> None:
+    with pytest.raises(HTTPException, match="CorpID"):
+        _apply_notify(
+            NotifySettings(enabled=True, mode="wecom_api", target="Zhang"),
+            {},
+        )
+    with pytest.raises(HTTPException, match="AgentId"):
+        _apply_notify(
+            NotifySettings(
+                enabled=True, mode="wecom_api", target="Zhang", corp_id="ww123"
+            ),
+            {},
+        )
 
 
 def test_unknown_notify_keys_are_ignored() -> None:

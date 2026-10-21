@@ -64,10 +64,13 @@ Node 不在 PATH 时：`$env:Path = "D:\tool\node;" + $env:Path`。
 
 ## 5. 已验证的现实约束（别重新踩）
 
-- 推送通道是**企业微信智能机器人（API 模式 + 长连接）**：本机 OpenClaw 网关
+- 推送通道默认是**企业微信智能机器人（API 模式 + 长连接）**：本机 OpenClaw 网关
   主动连 `wss://openws.work.weixin.qq.com`，没有回调 URL、没有扫码、不会过期。
   凭证在 `~/.openclaw/openclaw.json` 的 `channels.wecom.{botId,secret}`；
   发送用 `--channel wecom --target <成员 userid>`。
+- 设置页也支持**企业微信自建应用 API 直连**（CorpID + AgentId + Secret），
+  直接调用 `qyapi.weixin.qq.com`，不依赖 OpenClaw；Secret 只存系统密钥环。
+  `notify.mode=openclaw|wecom_api` 决定使用哪条通道，默认 `openclaw` 保持兼容。
 - 单次 `openclaw message send` 约 **30 秒**（Node 启动 + 网关往返）。
 - 网关冷启动要 **50 秒以上**，`START_TIMEOUT` 已调到 180 秒。
 - 企微机器人只能在**已存在的会话**里推送：目标成员必须先给机器人发过一条消息，

@@ -291,7 +291,7 @@ class FreqtradeBridge:
             "margin_mode": "",
             "timeframe": self.settings.timeframe or "15m",
             "exchange": {
-                "name": self.settings.exchange or "gate",
+                "name": self.settings.exchange or "binance",
                 "key": "",
                 "secret": "",
                 "ccxt_config": {},
@@ -478,7 +478,7 @@ class FreqtradeBridge:
         if not pair or "/" not in pair:
             raise FreqtradeError(f"交易对格式应为 BTC/USDT：{pair}")
         safe_pair = pair.replace("/", "_").replace(":", "_")
-        folder = self.data_dir / (self.settings.exchange or "gate")
+        folder = self.data_dir / (self.settings.exchange or "binance")
         folder.mkdir(parents=True, exist_ok=True)
         path = (folder / f"{safe_pair}-{timeframe}.json").resolve()
         if path.parent != folder.resolve():

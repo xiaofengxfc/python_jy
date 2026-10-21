@@ -105,6 +105,8 @@ export interface Account {
   cash: number;
   starting_balance: number;
   realized_pnl: number;
+  /** Realized PnL for each pair, including pairs whose position is closed. */
+  realized_pnl_by_symbol?: Record<string, number>;
   positions: PaperPosition[];
   orders: PaperOrder[];
   trades: PaperTrade[];
@@ -174,10 +176,18 @@ export interface Portfolio {
 
 export interface NotifySettings {
   enabled: boolean;
+  /** `wecom_api` direct self-built-app API, or `openclaw` smart-bot gateway. */
+  mode: "wecom_api" | "openclaw" | string;
   /** OpenClaw channel id for the WeChat plugin. */
   channel: string;
   /** WeChat conversation the gateway should deliver to. */
   target: string;
+  /** Self-built-app Corpid (direct API mode). */
+  corp_id: string;
+  /** Self-built-app AgentId (direct API mode). */
+  agent_id: string;
+  /** Direct API base URL; empty means the public qyapi host. */
+  api_base: string;
   /** Account id; empty means the gateway's default (single-account setups). */
   account: string;
   /** OpenClaw executable; empty means "openclaw" from PATH. */
@@ -354,11 +364,17 @@ export interface AIFilterResult {
 /** Reachability of the local OpenClaw gateway, as reported by the backend. */
 export interface NotifyStatus {
   enabled: boolean;
+  mode: "wecom_api" | "openclaw" | string;
   channel: string;
   target: string;
   /** Account id used for the send; empty means the gateway's default. */
   account: string;
   command: string;
+  corp_id: string;
+  agent_id: string;
+  api_base: string;
+  /** True when the direct-API secret is in the OS keyring. */
+  secret_saved: boolean;
   available: boolean;
   /** Non-empty when the target does not look like a 企业微信 userid. */
   target_warning: string;
@@ -430,6 +446,8 @@ export interface ChannelStatus {
   lifecycle: string;
   /** Plugin account id currently active. */
   account: string;
+  /** Bot ID from OpenClaw's channels.wecom API-mode config (never the secret). */
+  bot_id?: string;
   /** missing | installed | ready | unknown */
   state: string;
   /** One-line summary for the card, or the raw CLI excerpt as a fallback. */

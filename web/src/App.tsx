@@ -85,6 +85,7 @@ export default function App() {
           <TradingPage
             health={health}
             healthError={healthError}
+            settings={settings}
             onMarketChange={setMarket}
             onAccountChange={handleAccountChange}
             onNavigate={setPage}

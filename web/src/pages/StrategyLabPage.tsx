@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 import { api, query } from "../api";
 import { TIMEFRAMES, fmt } from "../format";
 import type { Strategy, SymbolInfo } from "../types";
+import FreqtradeStrategyLab from "../components/FreqtradeStrategyLab";
 
 /* --------------------------------------------------------------- types */
 /* The lab endpoints live outside `types.ts` because they are still new: only
@@ -34,6 +35,8 @@ interface Candidate {
   backtest?: Record<string, unknown>;
   note?: string;
   reviewer?: string;
+  registered_key?: string;
+  strategy_path?: string;
 }
 
 interface OptimizeRound {
@@ -160,14 +163,43 @@ export default function StrategyLabPage() {
   const [rounds, setRounds] = useState(3);
   const [metric, setMetric] = useState("sharpe");
   const [optimizeBusy, setOptimizeBusy] = useState(false);
+  const [applyBusy, setApplyBusy] = useState(false);
   const [jobId, setJobId] = useState("");
   const [job, setJob] = useState<OptimizeJob | null>(null);
 
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const pollRef = useRef<number | undefined>(undefined);
+  const handoffApplied = useRef(false);
 
   useEffect(() => () => window.clearInterval(pollRef.current), []);
+
+  // "优化策略" from AI 自主交易 carries the signal strategy and chart context.
+  // It is one-shot: remove it after reading so a later sidebar visit is clean.
+  useEffect(() => {
+    if (handoffApplied.current) return;
+    handoffApplied.current = true;
+    const raw = window.sessionStorage.getItem("bitrader.lab.handoff");
+    if (!raw) return;
+    window.sessionStorage.removeItem("bitrader.lab.handoff");
+    try {
+      const data = JSON.parse(raw) as {
+        strategy?: string;
+        symbol?: string;
+        timeframe?: string;
+        market?: string;
+      };
+      if (data.strategy) setBaseKey(data.strategy);
+      if (data.symbol) setSymbol(data.symbol);
+      if (data.timeframe) setTimeframe(data.timeframe);
+      if (data.market) setMarket(data.market);
+      setNotice(
+        `已带入 ${data.strategy ?? "策略"} · ${data.symbol ?? ""} ${data.timeframe ?? ""}，可直接启动优化。`,
+      );
+    } catch {
+      /* malformed handoff is ignored */
+    }
+  }, []);
 
   /* ------------------------------------------------------------- loading */
   const loadCandidates = useCallback(async () => {
@@ -212,6 +244,13 @@ export default function StrategyLabPage() {
       })
       .catch(() => setSymbols([]));
   }, [market]);
+
+  useEffect(() => {
+    if (!strategies.length) return;
+    setBaseKey((current) =>
+      strategies.some((item) => item.key === current) ? current : strategies[0]!.key,
+    );
+  }, [strategies]);
 
   /* ------------------------------------------------------------ actions */
   const pickCandidate = useCallback(async (candidate: Candidate) => {
@@ -284,7 +323,13 @@ export default function StrategyLabPage() {
         setCandidates((current) =>
           current.map((item) => (item.id === updated.id ? updated : item)),
         );
-        setNotice(approve ? "已批准该候选。" : "已拒绝该候选。");
+        setNotice(
+          approve
+            ? updated.registered_key
+              ? `已批准并生成本地策略：${updated.registered_key}.py`
+              : "已批准该候选。"
+            : "已拒绝该候选。",
+        );
       } catch (caught) {
         setError(caught instanceof Error ? caught.message : String(caught));
       }
@@ -368,6 +413,44 @@ export default function StrategyLabPage() {
       setNotice("已复制 best 参数 JSON，可在「自动交易」的参数字段里粘贴。");
     } catch (caught) {
       setError(`复制失败：${caught instanceof Error ? caught.message : String(caught)}`);
+    }
+  };
+
+  /** Explicit human hand-off: save the optimizer's best params for this
+   * strategy. AI 自主交易 reads them on its next start; nothing is applied to
+   * a running trader and no code is generated. */
+  const applyBest = async () => {
+    if (!baseKey || !result?.best) return;
+    const label = strategies.find((item) => item.key === baseKey)?.name ?? baseKey;
+    if (
+      !window.confirm(
+        `将最优参数应用到「${label}」？\n\n` +
+          "只会写入 AI 自主交易的参数配置，不会自动启动或修改正在运行的策略。",
+      )
+    ) {
+      return;
+    }
+    setApplyBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      const current = await api<{
+        settings: { ai_auto?: { strategy_params?: Record<string, Record<string, unknown>> } };
+      }>("/api/settings");
+      const saved = current.settings.ai_auto?.strategy_params ?? {};
+      await api("/api/settings", {
+        method: "PUT",
+        body: JSON.stringify({
+          ai_auto: {
+            strategy_params: { ...saved, [baseKey]: result.best },
+          },
+        }),
+      });
+      setNotice(`已保存「${label}」的最优参数。下次启动 AI 自主交易时生效。`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setApplyBusy(false);
     }
   };
 
@@ -500,15 +583,20 @@ export default function StrategyLabPage() {
                     <button
                       type="button"
                       className="btn-sm primary"
-                      disabled={!selected.checks?.ok || selected.status === "approved"}
+                      disabled={
+                        !selected.checks?.ok ||
+                        (selected.status === "approved" && !!selected.registered_key)
+                      }
                       title={
                         selected.checks?.ok
-                          ? "批准该候选（不会自动注册为可交易策略）"
+                          ? "批准并生成本地策略文件（会触发热加载）"
                           : "静态检查未通过，不能批准"
                       }
                       onClick={() => void review(true)}
                     >
-                      批准
+                      {selected.status === "approved" && !selected.registered_key
+                        ? "生成本地策略"
+                        : "批准"}
                     </button>
                     <button
                       type="button"
@@ -544,6 +632,13 @@ export default function StrategyLabPage() {
                         ? ` · 类 ${selected.checks.classes.join(", ")}`
                         : ""}
                     </div>
+                    {selected.registered_key && (
+                      <div className="lab-code-meta faint">
+                        已生成本地策略：
+                        <code>{selected.registered_key}.py</code>
+                        {selected.strategy_path ? ` · ${selected.strategy_path}` : ""}
+                      </div>
+                    )}
                     {selected.checks?.imports?.length ? (
                       <div className="lab-code-meta faint">
                         导入：{selected.checks.imports.join(", ")}
@@ -794,9 +889,17 @@ export default function StrategyLabPage() {
                       <span className="card-title">最优参数</span>
                       <span className="lab-chip approved">评分 {fmt(result.best_score, 4)}</span>
                       <span className="spacer" />
-                      <button type="button" className="link-btn" disabled={!bestJson} onClick={() => void copyBest()}>
-                        复制 JSON
-                      </button>
+                       <button type="button" className="link-btn" disabled={!bestJson} onClick={() => void copyBest()}>
+                         复制 JSON
+                       </button>
+                       <button
+                         type="button"
+                         className="btn-sm primary"
+                         disabled={applyBusy || !result?.best}
+                         onClick={() => void applyBest()}
+                       >
+                         {applyBusy ? "保存中…" : "应用到 AI 交易"}
+                       </button>
                     </div>
                     <pre className="lab-best-json">{bestJson || "{}"}</pre>
                     <div className="lab-best-metrics">
@@ -808,7 +911,8 @@ export default function StrategyLabPage() {
                       ))}
                     </div>
                     <div className="hint">
-                      暂不自动写入自动交易：把这段 JSON 的字段名与「自动交易 → 策略参数」对应后手动填入。
+                      参数不会自动写入正在运行的交易：点「应用到 AI 交易」后，下次启动 AI 自主交易时使用；
+                      也可复制 JSON 手动填写。
                     </div>
                   </div>
                 )}
@@ -816,6 +920,8 @@ export default function StrategyLabPage() {
             </div>
           </div>
         </div>
+
+        <FreqtradeStrategyLab market={market} symbol={symbol} timeframe={timeframe} />
       </div>
     </>
   );

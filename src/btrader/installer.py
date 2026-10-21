@@ -164,9 +164,14 @@ class OpenClawInstaller:
             "enabled": True,
             "lifecycle": "",
             "account": "",
+            "bot_id": "",
             "state": "unknown",
             "detail": "",
         }
+        saved = _read_wecom_credentials()
+        saved_ok = bool(saved.get("botId") and saved.get("hasSecret"))
+        if saved:
+            info["bot_id"] = saved.get("botId", "")
         if not exe:
             info["state"] = "missing"
             info["detail"] = "未安装 openclaw"
@@ -195,13 +200,60 @@ class OpenClawInstaller:
         if not info["plugin"]:
             info["state"] = "missing"
             info["detail"] = info["detail"] or "网关中未注册企业微信渠道"
-        elif info["configured"]:
+        elif info["configured"] or saved_ok:
+            info["configured"] = True
             info["state"] = "ready"
             info["detail"] = _channel_detail(info)
         else:
             info["state"] = "installed"
             info["detail"] = info["detail"] or "插件已装，但还没填 Bot ID / Secret"
         return info
+
+    def configure_channel(self, bot_id: str, secret: str = "") -> dict:
+        """Save the 企业微信 smart-bot API credentials used by the gateway.
+
+        API mode means Bot ID + Secret, not a webhook URL. The secret is kept in
+        OpenClaw's own config (the process that owns the long connection), never
+        in biTrader's config or this status payload. An empty secret preserves
+        the previously saved one so the UI can edit just the Bot ID.
+        """
+        bot_id = bot_id.strip()
+        secret = secret.strip()
+        if not bot_id:
+            raise ValueError("Bot ID 不能为空")
+        path = _openclaw_config_path()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            data = {}
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"读取 OpenClaw 配置失败：{exc}") from exc
+        if not isinstance(data, dict):
+            raise ValueError("OpenClaw 配置格式不正确")
+        channels = data.setdefault("channels", {})
+        if not isinstance(channels, dict):
+            raise ValueError("OpenClaw 配置中的 channels 格式不正确")
+        current = channels.setdefault(WECOM_CHANNEL, {})
+        if not isinstance(current, dict):
+            current = {}
+            channels[WECOM_CHANNEL] = current
+        if not secret and not current.get("secret"):
+            raise ValueError("Secret 不能为空")
+        current["botId"] = bot_id
+        if secret:
+            current["secret"] = secret
+        current["enabled"] = True
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(path)
+        return {
+            "ok": True,
+            "channel": WECOM_CHANNEL,
+            "bot_id": bot_id,
+            "configured": True,
+            "note": "已保存 API 模式凭证。重启网关后生效。",
+        }
 
     def start(self, options: InstallOptions) -> dict:
         """Begin an install. Raises ``ValueError`` when it cannot start."""
@@ -494,6 +546,27 @@ def _state_dir() -> Path:
         if value:
             return Path(value).expanduser()
     return Path.home() / ".openclaw"
+
+
+def _openclaw_config_path() -> Path:
+    return _state_dir() / "openclaw.json"
+
+
+def _read_wecom_credentials() -> dict:
+    """Read only the non-secret fields needed to display the API configuration."""
+    try:
+        data = json.loads(_openclaw_config_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    channels = data.get("channels") if isinstance(data, dict) else None
+    wecom = channels.get(WECOM_CHANNEL) if isinstance(channels, dict) else None
+    if not isinstance(wecom, dict):
+        return {}
+    return {
+        "botId": str(wecom.get("botId") or ""),
+        "enabled": bool(wecom.get("enabled", True)),
+        "hasSecret": bool(wecom.get("secret")),
+    }
 
 
 def _forget_account(account: str) -> list[str]:

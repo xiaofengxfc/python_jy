@@ -1,8 +1,8 @@
 """AI 候选策略的落盘与人工审核（Phase 4）。
 
-候选永远只写 ``%APPDATA%/biTrader/strategies/candidates/``，**绝不 import、
-绝不自动复制进正式策略目录**。审核通过只是把状态改为 ``approved``；启用仍由
-人工在策略实验室里执行（Phase 4-B 接线）。
+候选先写 ``%APPDATA%/biTrader/strategies/candidates/``；审核通过时由
+``routes_lab`` 复制为正式用户策略并触发热加载。候选目录本身仍不 import，
+也不直接参与交易。
 """
 
 from __future__ import annotations
@@ -40,6 +40,8 @@ class Candidate:
     backtest: dict[str, Any] = field(default_factory=dict)
     note: str = ""
     reviewer: str = ""
+    registered_key: str = ""
+    strategy_path: str = ""
 
     @property
     def code_path(self) -> Path:
@@ -162,5 +164,15 @@ class CandidateStore:
     def record_backtest(self, candidate_id: str, metrics: dict[str, Any]) -> Candidate:
         candidate = self.get(candidate_id)
         candidate.backtest = dict(metrics)
+        self._write(candidate)
+        return candidate
+
+    def mark_registered(
+        self, candidate_id: str, *, key: str, strategy_path: str
+    ) -> Candidate:
+        """Remember the user strategy file created when a candidate is approved."""
+        candidate = self.get(candidate_id)
+        candidate.registered_key = key
+        candidate.strategy_path = strategy_path
         self._write(candidate)
         return candidate

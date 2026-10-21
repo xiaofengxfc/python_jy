@@ -98,6 +98,7 @@ export default function BacktestPage() {
   const [aiDescribe, setAiDescribe] = useState("");
   const [aiBusy, setAiBusy] = useState<"filter" | "describe" | "suggest" | "">("");
   const [editorOpen, setEditorOpen] = useState(false);
+  const handoffApplied = useRef(false);
   /** Plain-language strategy picking: the model may only choose one of the
    * strategies that already exist and fill its params — never write code. */
   const [idea, setIdea] = useState("");
@@ -169,6 +170,35 @@ export default function BacktestPage() {
       })
       .catch(() => setSymbols([]));
   }, [config.market]);
+
+  useEffect(() => {
+    if (handoffApplied.current || strategies.length === 0) return;
+    handoffApplied.current = true;
+    const raw = window.sessionStorage.getItem("bitrader.backtest.handoff");
+    if (!raw) return;
+    window.sessionStorage.removeItem("bitrader.backtest.handoff");
+    try {
+      const data = JSON.parse(raw) as {
+        strategy?: string;
+        symbol?: string;
+        timeframe?: string;
+        market?: string;
+      };
+      const target = strategies.find((item) => item.key === data.strategy);
+      if (!target) return;
+      setTab("single");
+      setConfig((current) => ({
+        ...current,
+        strategy: target.key,
+        params: { ...target.defaults },
+        symbol: data.symbol || current.symbol,
+        timeframe: data.timeframe || current.timeframe,
+        market: data.market || current.market,
+      }));
+    } catch {
+      /* malformed handoff is ignored */
+    }
+  }, [strategies]);
 
   const patch = (values: Partial<Config>) => setConfig((current) => ({ ...current, ...values }));
 

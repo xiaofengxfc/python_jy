@@ -59,6 +59,9 @@ class AIAutoSettings:
     cooldown_sec: float = 30.0
     poll_sec: float = 60.0
     require_stop: bool = True
+    # Best parameter sets explicitly applied from the strategy lab, keyed by
+    # strategy. They never change without a human clicking “apply”.
+    strategy_params: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -72,7 +75,7 @@ class FreqtradeSettings:
 
     enabled: bool = True
     python: str = ""
-    exchange: str = "gate"
+    exchange: str = "binance"
     trade_port: int = 18081
     username: str = "btrader"
     dry_run: bool = True

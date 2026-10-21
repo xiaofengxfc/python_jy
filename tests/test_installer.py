@@ -262,6 +262,7 @@ def test_channel_plan_needs_the_cli(fake_env) -> None:
 
 def test_channel_status_reads_the_gateway_catalog(fake_env, monkeypatch) -> None:
     fake_env["which"]["openclaw"] = "/usr/local/bin/openclaw"
+    monkeypatch.setattr("btrader.installer._read_wecom_credentials", lambda: {})
     output = (
         "Chat channels:\n"
         "- wecom: installed, not configured, disabled\n"
@@ -272,6 +273,40 @@ def test_channel_status_reads_the_gateway_catalog(fake_env, monkeypatch) -> None
     # Installed but never scanned: the page must offer the QR code, not "done".
     assert status["configured"] is False
     assert status["state"] == "installed"
+
+
+def test_configure_channel_saves_api_mode_credentials(tmp_path, monkeypatch) -> None:
+    """API mode stores Bot ID + Secret in OpenClaw's config, never in status."""
+    monkeypatch.setenv("OPENCLAW_STATE_DIR", str(tmp_path))
+    installer = OpenClawInstaller()
+    result = installer.configure_channel("bot-123", "secret-456")
+    assert result["configured"] is True
+    path = tmp_path / "openclaw.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["channels"]["wecom"]["botId"] == "bot-123"
+    assert data["channels"]["wecom"]["secret"] == "secret-456"
+    assert data["channels"]["wecom"]["enabled"] is True
+    # Editing only the Bot ID keeps the stored secret.
+    installer.configure_channel("bot-789", "")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["channels"]["wecom"]["botId"] == "bot-789"
+    assert data["channels"]["wecom"]["secret"] == "secret-456"
+
+
+def test_channel_status_reports_saved_api_credentials(fake_env, monkeypatch) -> None:
+    fake_env["which"]["openclaw"] = "/usr/local/bin/openclaw"
+    monkeypatch.setattr(
+        "btrader.installer._read_wecom_credentials",
+        lambda: {"botId": "bot-123", "hasSecret": True, "enabled": True},
+    )
+    monkeypatch.setattr(
+        "btrader.installer._run_capture",
+        lambda args, timeout=30.0: "- wecom: installed, not configured, disabled\n",
+    )
+    status = OpenClawInstaller().channel_status()
+    assert status["configured"] is True
+    assert status["bot_id"] == "bot-123"
+    assert status["state"] == "ready"
 
 
 def test_channel_status_reports_a_missing_channel(fake_env, monkeypatch) -> None:

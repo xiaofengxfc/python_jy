@@ -3,7 +3,7 @@ import { api, query } from "../api";
 import { MARKET_LABELS, TIMEFRAMES, TIMEFRAME_MS, fmtCompact, fmtPrice } from "../format";
 import { foldTick } from "../liveCandle";
 import { useMarketStream } from "../hooks/useMarketStream";
-import type { Account, AILevel, Candle, Health, SymbolInfo } from "../types";
+import type { Account, AILevel, AppSettings, Candle, Health, SymbolInfo } from "../types";
 import AIPanel from "../components/AIPanel";
 import AITradingPanel from "../components/AITradingPanel";
 import BottomTabs, { type BottomTab } from "../components/BottomTabs";
@@ -26,6 +26,7 @@ import SymbolPicker from "../components/SymbolPicker";
 interface Props {
   health: Health | null;
   healthError: string;
+  settings: AppSettings | null;
   onMarketChange: (market: string) => void;
   onAccountChange: (equity: number) => void;
   onNavigate?: (page: "lab" | "backtest") => void;
@@ -104,6 +105,7 @@ function loadIndicators(): IndicatorConfig[] {
 export default function TradingPage({
   health,
   healthError,
+  settings,
   onMarketChange,
   onAccountChange,
   onNavigate,
@@ -111,7 +113,7 @@ export default function TradingPage({
   const [market, setMarket] = useState("spot");
   const [symbol, setSymbol] = useState("");
   const [symbols, setSymbols] = useState<SymbolInfo[]>([]);
-  const [timeframe, setTimeframe] = useState("15m");
+  const [timeframe, setTimeframe] = useState(settings?.timeframe || "15m");
   /** Every indicator switched on, with its parameters. Several may be stacked
    * at once; MA is the default because trend context is what most traders look
    * at first. Loaded from localStorage so a reload keeps the setup. */
@@ -210,6 +212,13 @@ export default function TradingPage({
   }, [drawings, market, symbol, timeframe]);
 
   /* ---------------------------------------------------------- symbols */
+  const defaultsApplied = useRef(false);
+  useEffect(() => {
+    if (!settings || defaultsApplied.current) return;
+    defaultsApplied.current = true;
+    if (settings.timeframe) setTimeframe(settings.timeframe);
+  }, [settings]);
+
   useEffect(() => {
     let cancelled = false;
     setSymbolError("");
@@ -220,14 +229,18 @@ export default function TradingPage({
         if (cancelled) return;
         setSymbols(data.items);
         if (data.degraded) setSymbolError(data.error ?? "交易对列表来自离线备用数据");
-        // Prefer USDT pairs, which is what most people start with.
-        const known = data.items.some((item) => item.symbol === symbol);
+        // Prefer the configured default when it is actually listed, then
+        // fall back to USDT pairs (what most people start with).
+        const preferred = settings?.last_symbol || symbol;
+        const known = data.items.some((item) => item.symbol === preferred);
         if (!known) {
-          const preferred =
+          const fallback =
             data.items.find((item) => item.symbol === "BTC/USDT") ??
             data.items.find((item) => item.quote === "USDT") ??
             data.items[0];
-          setSymbol(preferred?.symbol ?? "");
+          setSymbol(fallback?.symbol ?? "");
+        } else if (preferred !== symbol) {
+          setSymbol(preferred);
         }
       })
       .catch((error: unknown) => {
@@ -237,9 +250,11 @@ export default function TradingPage({
     return () => {
       cancelled = true;
     };
-    // `symbol` decides only whether the current choice still exists.
+    // `symbol` decides only whether the current choice still exists. Settings
+    // are read when they arrive so a saved default can win over the hardcoded
+    // BTC fallback.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [market]);
+  }, [market, settings?.last_symbol]);
 
   /* ------------------------------------------------------------ klines */
   const loadKlines = useCallback(async () => {
@@ -248,7 +263,7 @@ export default function TradingPage({
     setChartLoading(true);
     try {
       const data = await api<{ candles: Candle[]; source?: string; degraded?: boolean }>(
-        `/api/klines?${query({ market, symbol, timeframe, limit: 400 })}`,
+        `/api/klines?${query({ market, symbol, timeframe, limit: settings?.kline_limit ?? 400 })}`,
       );
       if (id !== requestId.current) return;
       setCandles(data.candles ?? []);
@@ -266,7 +281,7 @@ export default function TradingPage({
     } finally {
       if (id === requestId.current) setChartLoading(false);
     }
-  }, [market, symbol, timeframe]);
+  }, [market, symbol, timeframe, settings?.kline_limit]);
 
   useEffect(() => {
     void loadKlines();
@@ -284,7 +299,7 @@ export default function TradingPage({
     setOlderLoading(true);
     try {
       const data = await api<{ candles: Candle[] }>(
-        `/api/klines?${query({ market, symbol, timeframe, limit: 400, before: first })}`,
+        `/api/klines?${query({ market, symbol, timeframe, limit: settings?.kline_limit ?? 400, before: first })}`,
       );
       const older = data.candles ?? [];
       if (!older.length) return;
@@ -298,7 +313,7 @@ export default function TradingPage({
     } finally {
       setOlderLoading(false);
     }
-  }, [market, symbol, timeframe, candles, olderLoading]);
+  }, [market, symbol, timeframe, candles, olderLoading, settings?.kline_limit]);
 
   /* ------------------------------------------------- live last candle */
   // The socket is the only thing that moves between REST snapshots, so fold
@@ -538,7 +553,7 @@ export default function TradingPage({
 
       {banner && <div className="banner error">{banner}</div>}
 
-      <div className={`trading${bottomTab === "ai" ? " ai-open" : ""}`}>
+      <div className="trading">
         <div className="trading-main">
           <div className="symbol-strip">
             <SymbolPicker
@@ -594,7 +609,8 @@ export default function TradingPage({
               <span className="spacer" />
               <button
                 type="button"
-                className="link-btn"
+                className={`chart-ai-link${bottomTab === "ai" ? " active" : ""}`}
+                aria-pressed={bottomTab === "ai"}
                 onClick={() => setBottomTab("ai")}
                 title="在下方打开 AI 分析（内嵌，不遮挡图表）"
               >
@@ -797,7 +813,8 @@ export default function TradingPage({
             lastPrice={lastPrice}
             cash={cash}
             positionQty={positionQty}
-            realizedPnl={account?.realized_pnl ?? 0}
+            realizedPnl={account?.realized_pnl_by_symbol?.[symbol] ?? 0}
+            defaultQuote={settings?.default_order_quote}
             feeRate={FEE_RATE}
             pickedPrice={pickedPrice}
             protection={account?.protections?.find((item) => item.symbol === symbol) ?? null}

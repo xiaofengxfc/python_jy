@@ -142,6 +142,100 @@ def test_send_now_builds_the_openclaw_message_command(captured) -> None:
     assert captured["kwargs"]["shell"] is False
 
 
+def test_wecom_api_mode_uses_corp_agent_and_keyring_secret(monkeypatch) -> None:
+    """Direct API mode must not invoke OpenClaw at all."""
+    calls: list[dict] = []
+
+    def fake_http(url, *, params=None, body=None, timeout=15.0):
+        calls.append({"url": url, "params": params, "body": body, "timeout": timeout})
+        if url.endswith("/cgi-bin/gettoken"):
+            return {"errcode": 0, "access_token": "token-123", "expires_in": 7200}
+        return {"errcode": 0, "errmsg": "ok"}
+
+    monkeypatch.setattr("btrader.notify._wecom_http_json", fake_http)
+    monkeypatch.setattr("btrader.notify.load_wecom_secret", lambda: "corp-secret")
+    notifier = WeChatNotifier(
+        NotifySettings(
+            enabled=True,
+            mode="wecom_api",
+            target="XiaoJiaJian",
+            corp_id="ww123",
+            agent_id="1000002",
+        ),
+        timeout=1.0,
+    )
+    result = notifier.send_now("成交了")
+    assert result["ok"] is True
+    assert calls[0]["url"].endswith("/cgi-bin/gettoken")
+    assert calls[0]["params"] == {"corpid": "ww123", "corpsecret": "corp-secret"}
+    assert calls[1]["body"]["touser"] == "XiaoJiaJian"
+    assert calls[1]["body"]["agentid"] == 1000002
+    assert calls[1]["body"]["text"]["content"] == "成交了"
+    assert notifier.status()["mode"] == "wecom_api"
+    assert notifier.status()["secret_saved"] is True
+    assert notifier.status()["available"] is True
+
+
+def test_wecom_api_reports_invalid_secret(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "btrader.notify._wecom_http_json",
+        lambda *args, **kwargs: {"errcode": 40001, "errmsg": "invalid credential"},
+    )
+    monkeypatch.setattr("btrader.notify.load_wecom_secret", lambda: "bad")
+    notifier = WeChatNotifier(
+        NotifySettings(
+            enabled=True,
+            mode="wecom_api",
+            target="XiaoJiaJian",
+            corp_id="ww123",
+            agent_id="1000002",
+        )
+    )
+    with pytest.raises(NotifyError, match="Secret"):
+        notifier.send_now("hello")
+
+
+def test_wecom_api_requires_a_saved_secret(monkeypatch) -> None:
+    monkeypatch.setattr("btrader.notify.load_wecom_secret", lambda: "")
+    notifier = WeChatNotifier(
+        NotifySettings(
+            enabled=True,
+            mode="wecom_api",
+            target="XiaoJiaJian",
+            corp_id="ww123",
+            agent_id="1000002",
+        )
+    )
+    with pytest.raises(NotifyError, match="Secret"):
+        notifier.send_now("hello")
+
+
+def test_wecom_secret_helpers_use_the_os_keyring(monkeypatch) -> None:
+    import keyring
+
+    values: dict[tuple[str, str], str] = {}
+
+    def set_password(service: str, username: str, value: str) -> None:
+        values[(service, username)] = value
+
+    def get_password(service: str, username: str) -> str | None:
+        return values.get((service, username))
+
+    def delete_password(service: str, username: str) -> None:
+        values.pop((service, username), None)
+
+    monkeypatch.setattr(keyring, "set_password", set_password)
+    monkeypatch.setattr(keyring, "get_password", get_password)
+    monkeypatch.setattr(keyring, "delete_password", delete_password)
+
+    from btrader.notify import load_wecom_secret, save_wecom_secret
+
+    assert save_wecom_secret("secret-1") is True
+    assert load_wecom_secret() == "secret-1"
+    assert save_wecom_secret("") is True
+    assert load_wecom_secret() == ""
+
+
 def test_account_is_only_passed_when_set(captured) -> None:
     """One bound account needs no ``--account``; two do, or the plugin refuses."""
     notifier = WeChatNotifier(
