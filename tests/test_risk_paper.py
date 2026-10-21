@@ -508,3 +508,58 @@ def test_risk_state_from_an_older_day_is_discarded(tmp_path):
     restarted = RiskManager(settings, db)
     assert restarted.check_order(10, 0, 10).allowed
     db.close()
+
+
+def test_paper_realized_pnl_outlives_the_position():
+    """A booked result belongs to the pair, not to the position object.
+
+    The position is dropped from every payload the moment it goes flat, so
+    summing position.realized_pnl made a closed round read as 0: the panel
+    said "已实现盈亏 0" right after a losing exit.
+    """
+    broker = PaperBroker(starting_balance=1_000, fee_rate=0.0, slippage_bps=0)
+    broker.place_order("BTC/USDT", "buy", "market", 1.0, price=100.0)
+    broker.place_order("BTC/USDT", "sell", "market", 1.0, price=90.0)
+
+    assert broker.account.positions["BTC/USDT"].contracts == 0.0
+    assert broker.account.realized_by_symbol["BTC/USDT"] == pytest.approx(-10.0)
+    assert broker.realized_pnl() == pytest.approx(-10.0)
+
+
+def test_paper_realized_pnl_accumulates_across_rounds():
+    broker = PaperBroker(starting_balance=1_000, fee_rate=0.0, slippage_bps=0)
+    for entry, exit_price in ((100.0, 110.0), (110.0, 105.0)):
+        broker.place_order("BTC/USDT", "buy", "market", 1.0, price=entry)
+        broker.place_order("BTC/USDT", "sell", "market", 1.0, price=exit_price)
+    assert broker.account.realized_by_symbol["BTC/USDT"] == pytest.approx(5.0)
+    assert broker.realized_pnl() == pytest.approx(5.0)
+
+
+def test_paper_realized_pnl_survives_restart(tmp_path):
+    """Without the persisted ledger every closed round vanished on restart."""
+    _, trading, db = _trading(tmp_path)
+    trading.paper.place_order("ETH/USDT", "buy", "market", 2.0, price=50.0)
+    trading.paper.place_order("ETH/USDT", "sell", "market", 2.0, price=45.0)
+    trading.save_paper_state()
+
+    snapshot = db.get_json("paper.account.v1")
+    assert snapshot["realized_by_symbol"]["ETH/USDT"] == pytest.approx(-10.0)
+    assert snapshot["positions"] == []
+
+    fresh = PaperBroker(starting_balance=10_000)
+    assert fresh.restore(snapshot)
+    assert fresh.realized_pnl() == pytest.approx(-10.0)
+    db.close()
+
+
+def test_paper_restore_rebuilds_ledger_from_an_old_snapshot():
+    """A snapshot written before the ledger existed still carries its trades."""
+    broker = PaperBroker(starting_balance=1_000, fee_rate=0.0, slippage_bps=0)
+    broker.place_order("BTC/USDT", "buy", "market", 1.0, price=100.0)
+    broker.place_order("BTC/USDT", "sell", "market", 1.0, price=104.0)
+
+    snapshot = broker.snapshot()
+    snapshot.pop("realized_by_symbol")
+    restored = PaperBroker(starting_balance=10_000)
+    assert restored.restore(snapshot)
+    assert restored.account.realized_by_symbol["BTC/USDT"] == pytest.approx(4.0)

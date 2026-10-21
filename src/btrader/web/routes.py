@@ -828,6 +828,9 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
         market = ctx.market_type
         with state.account_lock:
             account = ctx.paper.account
+            # Booked result per pair; it survives the position going flat, so
+            # the page total no longer resets to zero after a round trip.
+            ledger = account.realized_by_symbol
             positions = []
             for position in account.positions.values():
                 if abs(position.contracts) <= 1e-12:
@@ -842,7 +845,7 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
                         "last": last,
                         "unrealized": (last - position.entry_price) * position.contracts,
                         "quote_value": last * position.contracts,
-                        "realized_pnl": position.realized_pnl,
+                        "realized_pnl": ledger.get(position.symbol, position.realized_pnl),
                         "fees": position.fees,
                     }
                 )
@@ -872,10 +875,13 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
                 "cash": account.cash,
                 "starting_balance": account.starting_balance,
                 "equity": equity,
-                "realized_pnl": sum(p.realized_pnl for p in account.positions.values()),
+                "realized_pnl": account.realized_pnl,
                 "realized_pnl_by_symbol": {
-                    position.symbol: position.realized_pnl
-                    for position in account.positions.values()
+                    **{
+                        symbol: 0.0
+                        for symbol in (item["symbol"] for item in positions)
+                    },
+                    **ledger,
                 },
                 "positions": positions,
                 "orders": orders,

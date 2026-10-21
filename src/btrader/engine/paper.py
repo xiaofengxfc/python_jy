@@ -50,10 +50,21 @@ class PaperAccount:
     # market/limit order; unlike ``protections`` they are not tied to a
     # position's size and can be placed while a limit entry is still resting.
     conditional: list[dict] = field(default_factory=list)
+    # Cumulative realized PnL per pair.  It lives on the account, not on the
+    # position, because a position is dropped from the snapshot (and from every
+    # API payload) the moment it goes flat: a booked result has to outlive that,
+    # or every closed round silently disappears from the panel and from the
+    # total as soon as the app restarts.
+    realized_by_symbol: dict[str, float] = field(default_factory=dict)
 
     @property
     def equity(self) -> float:
         return self.cash
+
+    @property
+    def realized_pnl(self) -> float:
+        """Booked result of the whole account, closed rounds included."""
+        return sum(self.realized_by_symbol.values())
 
     def position_for(self, symbol: str) -> PaperPosition:
         return self.positions.setdefault(symbol, PaperPosition(symbol))
@@ -546,6 +557,9 @@ class PaperBroker:
             direction = 1.0 if old > 0 else -1.0
             realized = (fill - position.entry_price) * closed * direction - fee
             position.realized_pnl += realized
+            self.account.realized_by_symbol[order["symbol"]] = (
+                self.account.realized_by_symbol.get(order["symbol"], 0.0) + realized
+            )
         if abs(new) < 1e-12:
             position.contracts = 0.0
             position.entry_price = 0.0
@@ -590,7 +604,9 @@ class PaperBroker:
         return abs(position.contracts) * price
 
     def realized_pnl(self) -> float:
-        return sum(p.realized_pnl for p in self.account.positions.values())
+        """Cumulative realized PnL of the account, closed rounds included."""
+        with self._lock:
+            return self.account.realized_pnl
 
     def unrealized_pnl(self, prices: dict[str, float]) -> float:
         total = 0.0
@@ -624,6 +640,7 @@ class PaperBroker:
                 "quote_asset": account.quote_asset,
                 "starting_balance": account.starting_balance,
                 "cash": account.cash,
+                "realized_by_symbol": dict(account.realized_by_symbol),
                 "positions": [
                     {
                         "symbol": position.symbol,
@@ -671,6 +688,25 @@ class PaperBroker:
                 )
                 if abs(position.contracts) > 1e-12:
                     account.positions[position.symbol] = position
+            ledger = data.get("realized_by_symbol")
+            if isinstance(ledger, dict):
+                account.realized_by_symbol = {
+                    str(symbol): float(value or 0.0) for symbol, value in ledger.items()
+                }
+            else:
+                # A snapshot written before the ledger existed only carries the
+                # figure on the still-open position, so every closed round is
+                # gone from it.  The booked trades still remember their own
+                # realized result: rebuild the ledger from them instead of
+                # starting the panel at zero.
+                for trade in data.get("trades") or []:
+                    if not isinstance(trade, dict) or not trade.get("symbol"):
+                        continue
+                    symbol = str(trade["symbol"])
+                    account.realized_by_symbol[symbol] = (
+                        account.realized_by_symbol.get(symbol, 0.0)
+                        + float(trade.get("realized") or 0.0)
+                    )
             for symbol, guard in (data.get("protections") or {}).items():
                 if isinstance(guard, dict):
                     account.protections[str(symbol)] = dict(guard)

@@ -674,28 +674,31 @@ def create_app() -> FastAPI:
         state = get_state()
         with state.account_lock:
             account = state.ctx.paper.account
+            # The booked result belongs to the pair, not to the position object:
+            # a closed round keeps counting after the position went flat.
+            ledger = account.realized_by_symbol
             positions = [
                 {
                     "symbol": position.symbol,
                     "contracts": position.contracts,
                     "side": position.side,
                     "entry_price": position.entry_price,
-                    "realized_pnl": position.realized_pnl,
+                    "realized_pnl": ledger.get(position.symbol, position.realized_pnl),
                 }
                 for position in account.positions.values()
                 if abs(position.contracts) > 1e-12
             ]
+            realized_by_symbol = dict(ledger)
+            for item in positions:
+                realized_by_symbol.setdefault(item["symbol"], item["realized_pnl"])
             orders = [dict(order) for order in account.orders[-50:]][::-1]
             trades = [dict(trade) for trade in account.trades[-50:]][::-1]
             return {
                 "quote_asset": account.quote_asset,
                 "cash": account.cash,
                 "starting_balance": account.starting_balance,
-                "realized_pnl": sum(p.realized_pnl for p in account.positions.values()),
-                "realized_pnl_by_symbol": {
-                    position.symbol: position.realized_pnl
-                    for position in account.positions.values()
-                },
+                "realized_pnl": account.realized_pnl,
+                "realized_pnl_by_symbol": realized_by_symbol,
                 "positions": positions,
                 "orders": orders,
                 "trades": trades,
