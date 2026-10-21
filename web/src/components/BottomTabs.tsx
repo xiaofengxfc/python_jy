@@ -284,7 +284,17 @@ export default function BottomTabs({
 
         {tab === "positions" && (
           <Table
-            headers={["交易对", "方向", "数量", "开仓价", "已实现盈亏", "平仓数量", "操作"]}
+            headers={[
+              "交易对",
+              "方向",
+              "数量",
+              "开仓价",
+              "最新价",
+              "浮动盈亏",
+              "已实现盈亏",
+              "平仓数量",
+              "操作",
+            ]}
             rightFrom={2}
             rows={positions.map((position) => [
               position.symbol,
@@ -297,6 +307,12 @@ export default function BottomTabs({
               </span>,
               fmt(position.contracts, 6),
               fmtPrice(position.entry_price),
+              position.last ? fmtPrice(position.last) : "—",
+              // Marked by the same server call the 资产 page uses, so the two
+              // pages cannot show a different PnL for one position.
+              <span className={(position.unrealized ?? 0) >= 0 ? "up" : "down"}>
+                {position.unrealized === undefined ? "—" : fmt(position.unrealized, 2)}
+              </span>,
               <span className={position.realized_pnl >= 0 ? "up" : "down"}>
                 {fmt(position.realized_pnl, 2)}
               </span>,

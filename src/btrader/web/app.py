@@ -25,7 +25,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from ..context import AppContext
-from ..core.types import TIMEFRAME_SECONDS, MarketType, RunMode
+from ..core.types import TIMEFRAME_SECONDS, MarketType, RunMode, market_for_symbol
 from ..engine.trading import OrderRejected, OrderRequest
 from ..exchange.symbols import format_amount, load_symbols
 from ..exchange import mirror
@@ -287,15 +287,8 @@ class ConditionalPayload(BaseModel):
 
 
 def _market_for_symbol(symbol: str) -> MarketType:
-    """Infer the market from a ccxt symbol when the caller did not say.
-
-    ``BTC/USDT`` -> spot, ``BTC/USDT:USDT`` -> USDT-margined,
-    ``BTC/USD:BTC`` -> coin-margined.
-    """
-    if ":" not in symbol:
-        return MarketType.SPOT
-    settle = symbol.rsplit(":", 1)[1]
-    return MarketType.USDM if settle.upper() in ("USDT", "USDC") else MarketType.COINM
+    """Infer the market from a ccxt symbol (shared with the pricing path)."""
+    return market_for_symbol(symbol)
 
 
 def _paper_held(state: _State, symbol: str) -> float:
@@ -303,6 +296,23 @@ def _paper_held(state: _State, symbol: str) -> float:
     position = state.ctx.paper.account.positions.get(symbol)
     return abs(position.contracts) if position else 0.0
 
+
+def _paper_last_price(state: _State, symbol: str) -> float:
+    """Last traded price of a paper symbol, 0.0 when the market is unreachable.
+
+    The trading panel needs the same equity the portfolio page shows, and that
+    page prices every position off the live ticker. Returning 0.0 (instead of
+    raising) lets the caller fall back to the entry price, so an offline
+    exchange shows an honest "no PnL yet" rather than a made-up number.
+    """
+    market = _market_for_symbol(symbol)
+    try:
+        with state.locks[market]:
+            raw = state.ctx.market_rest_for(market).fetch_ticker(market, symbol)
+        return float(raw.get("last") or 0.0)
+    except Exception:
+        log.debug("纸面持仓取价失败 %s", symbol, exc_info=True)
+        return 0.0
 
 def _balance_free(balance: Any, asset: str) -> float:
     """Free balance of one asset from a ccxt balance payload."""
@@ -672,31 +682,55 @@ def create_app() -> FastAPI:
     @app.get("/api/account")
     def api_account() -> dict[str, Any]:
         state = get_state()
+        # Prices are fetched before the account lock is taken: a slow ticker
+        # must never hold up an order submission.
+        with state.account_lock:
+            symbols = [
+                position.symbol
+                for position in state.ctx.paper.account.positions.values()
+                if abs(position.contracts) > 1e-12
+            ]
+        marks = {symbol: _paper_last_price(state, symbol) for symbol in symbols}
         with state.account_lock:
             account = state.ctx.paper.account
             # The booked result belongs to the pair, not to the position object:
             # a closed round keeps counting after the position went flat.
             ledger = account.realized_by_symbol
-            positions = [
-                {
-                    "symbol": position.symbol,
-                    "contracts": position.contracts,
-                    "side": position.side,
-                    "entry_price": position.entry_price,
-                    "realized_pnl": ledger.get(position.symbol, position.realized_pnl),
-                }
-                for position in account.positions.values()
-                if abs(position.contracts) > 1e-12
-            ]
+            positions = []
+            for position in account.positions.values():
+                if abs(position.contracts) <= 1e-12:
+                    continue
+                last = marks.get(position.symbol) or position.entry_price
+                positions.append(
+                    {
+                        "symbol": position.symbol,
+                        "contracts": position.contracts,
+                        "side": position.side,
+                        "entry_price": position.entry_price,
+                        # The same fields the portfolio page renders, so the two
+                        # pages cannot quote a different equity for one account.
+                        "last": last,
+                        "unrealized": (last - position.entry_price) * position.contracts,
+                        "quote_value": last * position.contracts,
+                        # This position's own booked result: a fresh entry
+                        # reads 0, it never inherits the pair's last round.
+                        # The pair total stays in realized_pnl_by_symbol.
+                        "realized_pnl": position.realized_pnl,
+                    }
+                )
             realized_by_symbol = dict(ledger)
             for item in positions:
                 realized_by_symbol.setdefault(item["symbol"], item["realized_pnl"])
+            # Cash plus marked positions: the same figure /api/portfolio
+            # computes, so the sidebar and the 资产 page agree.
+            equity = account.cash + sum(item["quote_value"] for item in positions)
             orders = [dict(order) for order in account.orders[-50:]][::-1]
             trades = [dict(trade) for trade in account.trades[-50:]][::-1]
             return {
                 "quote_asset": account.quote_asset,
                 "cash": account.cash,
                 "starting_balance": account.starting_balance,
+                "equity": equity,
                 "realized_pnl": account.realized_pnl,
                 "realized_pnl_by_symbol": realized_by_symbol,
                 "positions": positions,

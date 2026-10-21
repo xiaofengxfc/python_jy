@@ -809,8 +809,8 @@ export default function OrderTicket({
             {mode === "live" ? "可用余额" : "纸面余额"}{" "}
             <b className="num">{fmt(cash, 2)}</b> {quote}
           </span>
-          <span>
-            已实现{" "}
+          <span title="当前持仓已平掉那部分的盈亏（含手续费）；新开仓从 0 开始">
+            本仓已实现{" "}
             <b className={`num ${realizedPnl >= 0 ? "up" : "down"}`}>
               {fmt(realizedPnl, 2)}
             </b>

@@ -115,6 +115,19 @@ class RunMode(str, Enum):
         return {"backtest": "回测", "paper": "纸面交易", "live": "实盘"}[self.value]
 
 
+def market_for_symbol(symbol: str) -> MarketType:
+    """Infer the market from a ccxt symbol when the caller did not say.
+
+    ``BTC/USDT`` -> spot, ``BTC/USDT:USDT`` -> USDT-margined,
+    ``BTC/USD:BTC`` -> coin-margined.  Shared so that pricing a paper
+    position and routing an order can never disagree about its venue.
+    """
+    if ":" not in symbol:
+        return MarketType.SPOT
+    settle = symbol.rsplit(":", 1)[1]
+    return MarketType.USDM if settle.upper() in ("USDT", "USDC") else MarketType.COINM
+
+
 def timeframe_seconds(timeframe: str) -> int:
     try:
         return TIMEFRAME_SECONDS[timeframe]

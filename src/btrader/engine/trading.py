@@ -620,7 +620,11 @@ class TradingService:
             return
         if amount <= 0 or price <= 0:
             return
-        realized = order.get("realized")
+        # An entry books its fee as realized PnL (see PaperBroker._fill), but
+        # announcing "已实现 -3.99" on a plain buy would read as a loss on a
+        # trade that has not closed anything yet: only report a closed round.
+        closed = float(order.get("closedQty") or 0.0)
+        realized = order.get("realized") if closed > 1e-12 else None
         text = WeChatNotifier.format_fill(
             symbol=str(order.get("symbol") or ""),
             side=str(order.get("side") or ""),

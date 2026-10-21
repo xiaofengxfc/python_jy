@@ -47,8 +47,13 @@ export interface PaperPosition {
   contracts: number;
   side: "long" | "short" | "flat";
   entry_price: number;
+  /** Booked result of the pair: net of every fee paid, closed rounds included. */
   realized_pnl: number;
   fees?: number;
+  /** Marked fields, present on /api/account and /api/portfolio alike. */
+  last?: number;
+  unrealized?: number;
+  quote_value?: number;
 }
 
 export interface PaperOrder {
@@ -104,6 +109,8 @@ export interface Account {
   quote_asset: string;
   cash: number;
   starting_balance: number;
+  /** Cash plus marked positions: the same figure the 资产 page shows. */
+  equity?: number;
   realized_pnl: number;
   /** Realized PnL for each pair, including pairs whose position is closed. */
   realized_pnl_by_symbol?: Record<string, number>;

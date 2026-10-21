@@ -563,3 +563,168 @@ def test_paper_restore_rebuilds_ledger_from_an_old_snapshot():
     restored = PaperBroker(starting_balance=10_000)
     assert restored.restore(snapshot)
     assert restored.account.realized_by_symbol["BTC/USDT"] == pytest.approx(4.0)
+
+
+def test_paper_entry_fee_is_booked_as_realized():
+    """A commission is a realized cost the moment it is paid.
+
+    Leaving it off the opening side is what made 已实现盈亏 and the 资产 page
+    disagree: the gap was exactly the fees of the still-open positions.
+    """
+    broker = PaperBroker(starting_balance=1_000, fee_rate=0.001, slippage_bps=0)
+    broker.place_order("BTC/USDT", "buy", "market", 1.0, price=100.0)
+    assert broker.realized_pnl() == pytest.approx(-0.1)
+    assert broker.account.realized_by_symbol["BTC/USDT"] == pytest.approx(-0.1)
+
+
+def test_paper_pnl_columns_reconcile_with_equity():
+    """已实现 + 浮动 must equal 权益变化, fees included.
+
+    This is the invariant both pages rely on: if it holds, the trading panel
+    and the 资产 page cannot quote two different results for one account.
+    """
+    broker = PaperBroker(starting_balance=1_000, fee_rate=0.001, slippage_bps=0)
+    broker.place_order("BTC/USDT", "buy", "market", 1.0, price=100.0)
+    broker.place_order("BTC/USDT", "sell", "market", 0.4, price=120.0)
+
+    position = broker.account.positions["BTC/USDT"]
+    last = 90.0
+    realized = broker.realized_pnl()
+    unrealized = (last - position.entry_price) * position.contracts
+    equity = broker.account.cash + last * position.contracts
+    assert equity - broker.account.starting_balance == pytest.approx(
+        realized + unrealized
+    )
+
+
+def test_paper_fee_aware_ledger_survives_restart():
+    broker = PaperBroker(starting_balance=1_000, fee_rate=0.001, slippage_bps=0)
+    broker.place_order("BTC/USDT", "buy", "market", 1.0, price=100.0)
+
+    restored = PaperBroker(starting_balance=10_000)
+    assert restored.restore(broker.snapshot())
+    assert restored.realized_pnl() == pytest.approx(-0.1)
+
+
+def test_paper_partial_close_keeps_the_entry_price():
+    """Closing part of a position must not move the average cost.
+
+    The weighted-average formula used to run on reducing fills too, so every
+    partial close dragged the entry towards the exit price and the position
+    then reported a 浮动盈亏 (and a later realized figure) that matched
+    neither the fills nor the 资产 page.
+    """
+    broker = PaperBroker(starting_balance=1_000, fee_rate=0.0, slippage_bps=0)
+    broker.place_order("BTC/USDT", "buy", "market", 1.0, price=100.0)
+    broker.place_order("BTC/USDT", "sell", "market", 0.4, price=120.0)
+
+    position = broker.account.positions["BTC/USDT"]
+    assert position.contracts == pytest.approx(0.6)
+    assert position.entry_price == pytest.approx(100.0)
+    # 0.6 still held at a 100 cost: a move to 90 is a 6 loss, not a 2 gain.
+    assert position.unrealized(90.0) == pytest.approx(-6.0)
+
+    # Adding in the same direction still averages the two lots.
+    broker.place_order("BTC/USDT", "buy", "market", 0.6, price=110.0)
+    position = broker.account.positions["BTC/USDT"]
+    assert position.contracts == pytest.approx(1.2)
+    assert position.entry_price == pytest.approx(105.0)
+
+
+def test_paper_old_snapshot_books_entry_fees_too():
+    """Rebuilding a pre-ledger snapshot must not lose the entry-side fees.
+
+    Summing the trades alone left every opening commission unbooked, so the
+    restored account still disagreed with its own equity by that amount.
+    """
+    broker = PaperBroker(starting_balance=1_000, fee_rate=0.001, slippage_bps=0)
+    broker.place_order("BTC/USDT", "buy", "market", 1.0, price=100.0)
+    broker.place_order("BTC/USDT", "sell", "market", 1.0, price=110.0)
+
+    snapshot = broker.snapshot()
+    snapshot.pop("realized_by_symbol")
+    restored = PaperBroker(starting_balance=10_000)
+    assert restored.restore(snapshot)
+    # 0.1 in + 0.11 out of fees, and +10 on the round trip.
+    assert restored.realized_pnl() == pytest.approx(10.0 - 0.1 - 0.11)
+
+
+def test_paper_legacy_ledger_is_topped_up_on_restore():
+    """A ledger saved before fees were booked gets repaired on the next load.
+
+    The trade log replays to the stored cash, which proves it holds every fill,
+    so the pair totals are simply recomputed — the opening commissions the old
+    code never booked come back and the account reconciles with its 权益.
+    """
+    broker = PaperBroker(starting_balance=1_000, fee_rate=0.001, slippage_bps=0)
+    broker.place_order("BTC/USDT", "buy", "market", 1.0, price=100.0)
+    broker.place_order("BTC/USDT", "sell", "market", 1.0, price=110.0)
+
+    snapshot = broker.snapshot()
+    snapshot["realized_by_symbol"] = {"BTC/USDT": 10.0 - 0.11}  # closing fill only
+    restored = PaperBroker(starting_balance=10_000)
+    assert restored.restore(snapshot)
+    assert restored.realized_pnl() == pytest.approx(10.0 - 0.1 - 0.11)
+
+    # A ledger that already knows its fees is left alone.
+    again = PaperBroker(starting_balance=10_000)
+    assert again.restore(restored.snapshot())
+    assert again.realized_pnl() == pytest.approx(10.0 - 0.1 - 0.11)
+
+
+def test_paper_new_position_starts_its_own_realized_tally():
+    """The row shows this position's result, not the pair's history.
+
+    Closing a round and opening a new one used to keep reporting the closed
+    round as the new position's 已实现盈亏, because the row read the pair's
+    cumulative ledger instead of the position itself.
+    """
+    broker = PaperBroker(starting_balance=1_000, fee_rate=0.0, slippage_bps=0)
+    broker.place_order("BTC/USDT", "buy", "market", 1.0, price=100.0)
+    broker.place_order("BTC/USDT", "sell", "market", 1.0, price=130.0)
+    assert broker.account.realized_by_symbol["BTC/USDT"] == pytest.approx(30.0)
+
+    broker.place_order("BTC/USDT", "buy", "market", 1.0, price=200.0)
+    position = broker.account.positions["BTC/USDT"]
+    assert position.realized_pnl == pytest.approx(0.0)
+    # ... while the account still remembers the pair it already booked.
+    assert broker.account.realized_by_symbol["BTC/USDT"] == pytest.approx(30.0)
+
+    broker.place_order("BTC/USDT", "sell", "market", 0.5, price=220.0)
+    assert position.realized_pnl == pytest.approx(10.0)
+    assert broker.account.realized_by_symbol["BTC/USDT"] == pytest.approx(40.0)
+
+
+def test_paper_entry_fee_stays_out_of_the_position_tally():
+    """Nothing is closed yet, so the position reports 0 while the account
+    still books the commission it paid."""
+    broker = PaperBroker(starting_balance=1_000, fee_rate=0.001, slippage_bps=0)
+    broker.place_order("BTC/USDT", "buy", "market", 1.0, price=100.0)
+
+    position = broker.account.positions["BTC/USDT"]
+    assert position.realized_pnl == pytest.approx(0.0)
+    assert broker.realized_pnl() == pytest.approx(-0.1)
+
+
+def test_paper_position_tally_is_repaired_on_restore():
+    """A snapshot whose row held the pair total is repaired from the fills.
+
+    This is what a saved account looked like after the previous semantics:
+    the still-open position carried the pair's whole history as its own
+    已实现盈亏, so the panel showed a closed round on a position that had not
+    closed anything.
+    """
+    broker = PaperBroker(starting_balance=1_000, fee_rate=0.0, slippage_bps=0)
+    broker.place_order("BTC/USDT", "buy", "market", 1.0, price=100.0)
+    broker.place_order("BTC/USDT", "sell", "market", 1.0, price=130.0)
+    # New leg, nothing closed on it yet.
+    broker.place_order("BTC/USDT", "buy", "market", 1.0, price=200.0)
+
+    snapshot = broker.snapshot()
+    snapshot["positions"][0]["realized_pnl"] = 30.0  # the old, wrong figure
+
+    restored = PaperBroker(starting_balance=10_000)
+    assert restored.restore(snapshot)
+    position = restored.account.positions["BTC/USDT"]
+    assert position.realized_pnl == pytest.approx(0.0)
+    assert restored.account.realized_by_symbol["BTC/USDT"] == pytest.approx(30.0)

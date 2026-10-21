@@ -70,6 +70,104 @@ class PaperAccount:
         return self.positions.setdefault(symbol, PaperPosition(symbol))
 
 
+def _replay_realized(
+    trades: list[dict],
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Per-pair booked result and opening-side fees, rebuilt from the log.
+
+    Every fill is classified exactly like :meth:`PaperBroker._fill` does it —
+    by replaying the signed size — so a fill that only opens a position is
+    recognised as such even though it books no price move.  Returns
+    ``(closing PnL, opening fees)``: closing PnL is what the trade recorded
+    for the closed part (already net of that fill's fee), opening fees is the
+    commission paid by the fills that added exposure.
+    """
+    booked: dict[str, float] = {}
+    open_fees: dict[str, float] = {}
+    sizes: dict[str, float] = {}
+    for trade in sorted(trades, key=lambda item: item.get("timestamp") or 0):
+        symbol = str(trade.get("symbol") or "")
+        if not symbol:
+            continue
+        amount = float(trade.get("amount") or 0.0)
+        signed = amount if trade.get("side") == "buy" else -amount
+        held = sizes.get(symbol, 0.0)
+        if held != 0 and (held > 0) != (signed > 0):
+            booked[symbol] = booked.get(symbol, 0.0) + float(
+                trade.get("realized") or 0.0
+            )
+        else:
+            open_fees[symbol] = open_fees.get(symbol, 0.0) + float(
+                trade.get("fee") or 0.0
+            )
+        sizes[symbol] = held + signed
+    return booked, open_fees
+
+
+def _replay_positions(trades: list[dict]) -> dict[str, dict[str, float]]:
+    """Rebuild every pair's *open* leg from the trade log.
+
+    Returns ``{symbol: {size, tally, fees}}`` for the leg that is still open:
+    the numbers :meth:`PaperBroker._fill` keeps on the position object (the
+    closed part of this leg net of its fee share, plus the fees the leg paid).
+    Used to repair a snapshot whose position figure was saved under older
+    semantics, where it held the pair's whole history instead of this leg's.
+    """
+    book: dict[str, dict[str, float]] = {}
+    for trade in sorted(trades, key=lambda item: item.get("timestamp") or 0):
+        symbol = str(trade.get("symbol") or "")
+        if not symbol:
+            continue
+        state = book.setdefault(
+            symbol, {"size": 0.0, "entry": 0.0, "tally": 0.0, "fees": 0.0}
+        )
+        amount = float(trade.get("amount") or 0.0)
+        signed = amount if trade.get("side") == "buy" else -amount
+        fee = float(trade.get("fee") or 0.0)
+        fill = float(trade.get("price") or 0.0)
+        old = state["size"]
+        new = old + signed
+        if abs(old) < 1e-12:
+            # A new leg starts its own tally here.
+            state["tally"] = 0.0
+            state["fees"] = 0.0
+        closed = 0.0
+        price_pnl = 0.0
+        if old != 0 and (old > 0) != (signed > 0):
+            closed = min(abs(signed), abs(old))
+            direction = 1.0 if old > 0 else -1.0
+            price_pnl = (fill - state["entry"]) * closed * direction
+        if abs(new) > 1e-12:
+            state["fees"] += fee
+        if closed > 0:
+            share = fee * (closed / abs(signed)) if signed else fee
+            state["tally"] += price_pnl - share
+        if abs(new) < 1e-12:
+            state["entry"] = 0.0
+        elif old == 0 or (old > 0) != (new > 0):
+            state["entry"] = fill
+        elif (old > 0) == (signed > 0):
+            state["entry"] = (state["entry"] * old + fill * signed) / new
+        state["size"] = new
+    return book
+
+def _log_covers_the_account(account: PaperAccount, trades: list[dict]) -> bool:
+    """Whether the trade log can account for the whole cash balance.
+
+    Only a fill moves paper cash, so a log that replays to the stored cash
+    must contain every fill the account ever made.  That is what makes it safe
+    to recompute the ledger from it: if a fill were missing, the replayed cash
+    would not match.  Rounds older than a truncated (500-row) log fail this
+    check, and then the saved ledger is kept because it knows more than the log.
+    """
+    flows = 0.0
+    for trade in trades:
+        amount = float(trade.get("amount") or 0.0)
+        signed = amount if trade.get("side") == "buy" else -amount
+        flows -= signed * float(trade.get("price") or 0.0)
+        flows -= float(trade.get("fee") or 0.0)
+    return abs(account.starting_balance + flows - account.cash) <= 1e-6
+
 class PaperBroker:
     """Minimal market/limit simulator.
 
@@ -531,10 +629,19 @@ class PaperBroker:
         return None
 
     def _fill(self, order: dict, price: float) -> float:
-        """Fill an order and return the realized PnL of the closing part.
+        """Fill an order and return the realized PnL booked by this fill.
 
-        Realized PnL is already net of this fill's fee; it is 0 for an order
-        that only opens (or adds to) a position.
+        Two tallies are maintained on purpose:
+
+        * the account ledger (``account.realized_by_symbol``) books the whole
+          fee of this fill, including the commission of an order that only
+          opens a position.  A commission is a realized cost the moment it
+          leaves the account, and booking it is what keeps the totals honest:
+          ``权益 - 初始 == 已实现 + 浮动`` for every account state.
+        * the position tally (``position.realized_pnl``) only records what
+          *this* position closed, net of the closed size's fee share.  It is
+          reset whenever a new position is opened, so a fresh entry reads 0
+          instead of inheriting the pair's previous round.
         """
         qty = order["amount"]
         side = order["side"]
@@ -550,26 +657,52 @@ class PaperBroker:
         fee = abs(signed) * fill * self.fee_rate
         self.account.cash -= signed * fill + fee
 
-        realized = 0.0
         closed = 0.0
+        price_pnl = 0.0
         if old != 0 and (old > 0) != (signed > 0):
             closed = min(abs(signed), abs(old))
             direction = 1.0 if old > 0 else -1.0
-            realized = (fill - position.entry_price) * closed * direction - fee
-            position.realized_pnl += realized
-            self.account.realized_by_symbol[order["symbol"]] = (
-                self.account.realized_by_symbol.get(order["symbol"], 0.0) + realized
-            )
+            price_pnl = (fill - position.entry_price) * closed * direction
+        symbol = order["symbol"]
+        # A brand-new position starts its own tally. The pair's history stays
+        # in the account ledger, but the row must never show a previous round's
+        # result as if it were this position's own 已实现盈亏.
+        if abs(old) < 1e-12:
+            position.realized_pnl = 0.0
+            position.fees = 0.0
+        # Account ledger: every fee is booked the moment it is paid, so the
+        # totals reconcile with the equity (已实现 + 浮动 == 权益变化).
+        realized = price_pnl - fee
+        self.account.realized_by_symbol[symbol] = (
+            self.account.realized_by_symbol.get(symbol, 0.0) + realized
+        )
         if abs(new) < 1e-12:
             position.contracts = 0.0
             position.entry_price = 0.0
+            # The tally is kept for the record; a flat position is not shown
+            # anywhere, and the next entry resets it before anything renders.
         elif old == 0 or (old > 0) != (new > 0):
+            # A fresh side (first entry, or a flip through zero) starts here.
             position.entry_price = fill
             position.contracts = new
-        else:
+        elif (old > 0) == (signed > 0):
+            # Adding in the same direction: weighted average of the two lots.
             position.entry_price = (position.entry_price * old + fill * signed) / new
             position.contracts = new
-        position.fees += fee
+        else:
+            # Reducing without crossing zero: the average cost stays put, only
+            # the size changes. Averaging the exit price in here used to drag
+            # the entry towards the exit on every partial close, which made the
+            # panel's 浮动盈亏 wrong and disagreed with the booked result.
+            position.contracts = new
+        if abs(new) > 1e-12:
+            position.fees += fee
+        if closed > 0:
+            # Position tally: what this position actually closed, net of the
+            # fee share of the closed size. An entry books nothing here, so a
+            # fresh position reads 0 until it really closes.
+            share = fee * (closed / abs(signed)) if signed else fee
+            position.realized_pnl += price_pnl - share
 
         order["filled"] = qty
         order["remaining"] = 0.0
@@ -688,25 +821,42 @@ class PaperBroker:
                 )
                 if abs(position.contracts) > 1e-12:
                     account.positions[position.symbol] = position
+            trades = [
+                item
+                for item in (data.get("trades") or [])
+                if isinstance(item, dict) and item.get("symbol")
+            ]
+            booked, open_fees = _replay_realized(trades)
+            rebuilt = {
+                symbol: booked.get(symbol, 0.0) - open_fees.get(symbol, 0.0)
+                for symbol in set(booked) | set(open_fees)
+            }
             ledger = data.get("realized_by_symbol")
             if isinstance(ledger, dict):
                 account.realized_by_symbol = {
                     str(symbol): float(value or 0.0) for symbol, value in ledger.items()
                 }
-            else:
-                # A snapshot written before the ledger existed only carries the
-                # figure on the still-open position, so every closed round is
-                # gone from it.  The booked trades still remember their own
-                # realized result: rebuild the ledger from them instead of
-                # starting the panel at zero.
-                for trade in data.get("trades") or []:
-                    if not isinstance(trade, dict) or not trade.get("symbol"):
+            # Recompute whenever the log can be trusted to hold the whole
+            # history.  Two saved shapes need it: a snapshot with no ledger at
+            # all (every closed round missing) and one saved before commissions
+            # were booked on the opening side (short by exactly those fees).
+            complete = _log_covers_the_account(account, trades)
+            if complete or not account.realized_by_symbol:
+                account.realized_by_symbol = dict(rebuilt)
+            if complete:
+                # The position tally used to hold the pair's cumulative
+                # figure, so a previously saved row showed an earlier round as
+                # if it belonged to the position that is open now. Rebuild the
+                # tally of the still-open leg from the fills themselves.
+                legs = _replay_positions(trades)
+                for symbol, position in account.positions.items():
+                    leg = legs.get(symbol)
+                    if not leg:
                         continue
-                    symbol = str(trade["symbol"])
-                    account.realized_by_symbol[symbol] = (
-                        account.realized_by_symbol.get(symbol, 0.0)
-                        + float(trade.get("realized") or 0.0)
-                    )
+                    if abs(leg["size"] - position.contracts) > 1e-9:
+                        continue
+                    position.realized_pnl = leg["tally"]
+                    position.fees = leg["fees"]
             for symbol, guard in (data.get("protections") or {}).items():
                 if isinstance(guard, dict):
                     account.protections[str(symbol)] = dict(guard)

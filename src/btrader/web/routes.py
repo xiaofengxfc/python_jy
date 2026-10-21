@@ -26,7 +26,14 @@ import pandas as pd
 from ..backtest import BacktestConfig, grid_search, run_backtest
 from ..core.config import AIAutoSettings, RiskSettings
 from ..core.credentials import Credentials
-from ..core.types import TIMEFRAME_SECONDS, MarketType, Network, RunMode, timeframe_seconds
+from ..core.types import (
+    TIMEFRAME_SECONDS,
+    MarketType,
+    Network,
+    RunMode,
+    market_for_symbol,
+    timeframe_seconds,
+)
 from ..engine.ai_trader import AITrader, AITraderConfig, TradeLease
 from ..engine.auto import AutoTrader, AutoTraderConfig
 from ..exchange import mirror
@@ -826,6 +833,15 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
         state = get_state()
         ctx = state.ctx
         market = ctx.market_type
+        # Prices are fetched before the account lock: a slow ticker must never
+        # hold up an order submission.
+        with state.account_lock:
+            symbols = [
+                position.symbol
+                for position in ctx.paper.account.positions.values()
+                if abs(position.contracts) > 1e-12
+            ]
+        marks = {symbol: _position_price(state, symbol) for symbol in symbols}
         with state.account_lock:
             account = ctx.paper.account
             # Booked result per pair; it survives the position going flat, so
@@ -835,7 +851,7 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
             for position in account.positions.values():
                 if abs(position.contracts) <= 1e-12:
                     continue
-                last = _last_price(state, market, position.symbol) or position.entry_price
+                last = marks.get(position.symbol) or position.entry_price
                 positions.append(
                     {
                         "symbol": position.symbol,
@@ -845,7 +861,9 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
                         "last": last,
                         "unrealized": (last - position.entry_price) * position.contracts,
                         "quote_value": last * position.contracts,
-                        "realized_pnl": ledger.get(position.symbol, position.realized_pnl),
+                        # The position's own result (0 for a fresh entry);
+                        # the pair total is not shown here on purpose.
+                        "realized_pnl": position.realized_pnl,
                         "fees": position.fees,
                     }
                 )
@@ -1694,6 +1712,23 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
 
 
 # ------------------------------------------------------------------- helpers
+def _position_price(state, symbol: str) -> float:
+    """Last price of one paper position, 0.0 when the market is unreachable.
+
+    Priced off the symbol's own venue, not the market currently selected in
+    the UI: a spot position must keep its value after the user switches to
+    futures, and /api/account uses the same rule so both pages agree.
+    """
+    try:
+        with state.locks[market_for_symbol(symbol)]:
+            raw = state.ctx.market_rest_for(market_for_symbol(symbol)).fetch_ticker(
+                market_for_symbol(symbol), symbol
+            )
+        return float(raw.get("last") or 0.0)
+    except Exception:
+        log.debug("持仓取价失败 %s", symbol, exc_info=True)
+        return 0.0
+
 def _last_price(state, market: MarketType, symbol: str) -> float | None:
     try:
         with state.locks[market]:

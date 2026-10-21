@@ -401,12 +401,17 @@ export default function TradingPage({
       const data = await api<Account>(path);
       setAccount(data);
       setLiveError("");
+      // Server-side equity (cash + marked positions) so the sidebar quotes the
+      // same number as the 资产 page. The local sum used to mark positions at
+      // the last *trade* price, which drifted away from the portfolio total.
       const equity =
+        data.equity ??
         data.cash +
-        data.positions.reduce((sum, position) => {
-          const held = data.trades.find((trade) => trade.symbol === position.symbol);
-          return sum + Math.abs(position.contracts) * (held?.price ?? position.entry_price);
-        }, 0);
+          data.positions.reduce(
+            (sum, position) =>
+              sum + Math.abs(position.contracts) * (position.last ?? position.entry_price),
+            0,
+          );
       onAccountChange(equity);
     } catch (error) {
       // A live read failure must be visible: an empty account would look like
@@ -813,7 +818,10 @@ export default function TradingPage({
             lastPrice={lastPrice}
             cash={cash}
             positionQty={positionQty}
-            realizedPnl={account?.realized_pnl_by_symbol?.[symbol] ?? 0}
+            realizedPnl={
+              account?.positions.find((position) => position.symbol === symbol)
+                ?.realized_pnl ?? 0
+            }
             defaultQuote={settings?.default_order_quote}
             feeRate={FEE_RATE}
             pickedPrice={pickedPrice}
