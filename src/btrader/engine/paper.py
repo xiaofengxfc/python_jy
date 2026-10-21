@@ -18,14 +18,11 @@ class PaperPosition:
     symbol: str
     contracts: float = 0.0
     entry_price: float = 0.0
-    # Booked result of *this* position only, net of the fees it has paid so
-    # far. A brand-new position starts at 0 and never inherits the pair.
+    # Booked result of *this* position only, net of every fee it has paid so
+    # far. A brand-new position starts at 0 and never inherits the pair, but
+    # the commission of getting in is deducted the moment it is paid.
     realized_pnl: float = 0.0
-    # Every fee this position has paid, and the part of it that was paid to
-    # get in. The entry part is realized in proportion to how much of the
-    # position is closed, so 已实现盈亏 is net of commissions on both sides.
     fees: float = 0.0
-    entry_fees: float = 0.0
 
     @property
     def side(self) -> str:
@@ -115,7 +112,7 @@ def _replay_positions(trades: list[dict]) -> dict[str, dict[str, float]]:
 
     Returns ``{symbol: {size, tally, fees}}`` for the leg that is still open:
     the numbers :meth:`PaperBroker._fill` keeps on the position object (the
-    closed part of this leg net of its fee share, plus the fees the leg paid).
+    price move of what this leg closed minus every commission it paid).
     Used to repair a snapshot whose position figure was saved under older
     semantics, where it held the pair's whole history instead of this leg's.
     """
@@ -126,7 +123,7 @@ def _replay_positions(trades: list[dict]) -> dict[str, dict[str, float]]:
             continue
         state = book.setdefault(
             symbol,
-            {"size": 0.0, "entry": 0.0, "tally": 0.0, "fees": 0.0, "entry_fees": 0.0},
+            {"size": 0.0, "entry": 0.0, "tally": 0.0, "fees": 0.0},
         )
         amount = float(trade.get("amount") or 0.0)
         signed = amount if trade.get("side") == "buy" else -amount
@@ -138,7 +135,6 @@ def _replay_positions(trades: list[dict]) -> dict[str, dict[str, float]]:
             # A new leg starts its own tally here.
             state["tally"] = 0.0
             state["fees"] = 0.0
-            state["entry_fees"] = 0.0
         closed = 0.0
         price_pnl = 0.0
         if old != 0 and (old > 0) != (signed > 0):
@@ -147,15 +143,9 @@ def _replay_positions(trades: list[dict]) -> dict[str, dict[str, float]]:
             price_pnl = (fill - state["entry"]) * closed * direction
         opened = max(abs(signed) - closed, 0.0)
         state["fees"] += fee
-        if closed > 0 and abs(signed) > 1e-12:
-            entry_share = state["entry_fees"] * (closed / abs(old)) if old else 0.0
-            exit_share = fee * (closed / abs(signed))
-            state["tally"] += price_pnl - entry_share - exit_share
-            state["entry_fees"] = max(state["entry_fees"] - entry_share, 0.0)
-        if opened > 0 and abs(signed) > 1e-12:
-            state["entry_fees"] += fee * (opened / abs(signed))
+        state["tally"] += price_pnl - fee
         if old != 0 and new != 0 and (old > 0) != (new > 0):
-            state["tally"] = 0.0
+            state["tally"] = -fee * (opened / abs(signed))
         if abs(new) < 1e-12:
             state["entry"] = 0.0
         elif old == 0 or (old > 0) != (new > 0):
@@ -164,6 +154,7 @@ def _replay_positions(trades: list[dict]) -> dict[str, dict[str, float]]:
             state["entry"] = (state["entry"] * old + fill * signed) / new
         state["size"] = new
     return book
+
 
 def _log_covers_the_account(account: PaperAccount, trades: list[dict]) -> bool:
     """Whether the trade log can account for the whole cash balance.
@@ -685,29 +676,22 @@ class PaperBroker:
         if abs(old) < 1e-12:
             position.realized_pnl = 0.0
             position.fees = 0.0
-            position.entry_fees = 0.0
         # Account ledger: every fee is booked the moment it is paid, so the
         # totals reconcile with the equity (已实现 + 浮动 == 权益变化).
         realized = price_pnl - fee
         self.account.realized_by_symbol[symbol] = (
             self.account.realized_by_symbol.get(symbol, 0.0) + realized
         )
-        # Position tally: net of *both* sides of the commission. The entry fee
-        # of the units being closed becomes realized now, in proportion to how
-        # much of the position they covered; the exit fee is charged on the
-        # closed size. Leaving the entry side out would report a round trip as
-        # better than it was — the panel must show the money actually made.
-        if closed > 0 and abs(signed) > 1e-12:
-            entry_share = position.entry_fees * (closed / abs(old)) if old else 0.0
-            exit_share = fee * (closed / abs(signed))
-            position.realized_pnl += price_pnl - entry_share - exit_share
-            position.entry_fees = max(position.entry_fees - entry_share, 0.0)
-        if opened > 0 and abs(signed) > 1e-12:
-            position.entry_fees += fee * (opened / abs(signed))
+        # Position tally, same rule: the price move of anything closed minus
+        # the whole commission of this fill. Booking the entry commission here
+        # too is what makes 已实现盈亏 a net figure — a round trip that ends
+        # where it started must report the two commissions it cost, not 0.
+        position.realized_pnl += price_pnl - fee
         if old != 0 and new != 0 and (old > 0) != (new > 0):
             # Flipped through zero: the other side is a brand-new position and
-            # must not open with the closed side's result on it.
-            position.realized_pnl = 0.0
+            # must not open with the closed side's result on it. It still pays
+            # the commission of the size it just opened.
+            position.realized_pnl = -fee * (opened / abs(signed))
         if abs(new) < 1e-12:
             position.contracts = 0.0
             position.entry_price = 0.0
@@ -806,7 +790,6 @@ class PaperBroker:
                         "entry_price": position.entry_price,
                         "realized_pnl": position.realized_pnl,
                         "fees": position.fees,
-                        "entry_fees": position.entry_fees,
                     }
                     for position in account.positions.values()
                     if abs(position.contracts) > 1e-12
@@ -844,7 +827,6 @@ class PaperBroker:
                     entry_price=float(item.get("entry_price") or 0.0),
                     realized_pnl=float(item.get("realized_pnl") or 0.0),
                     fees=float(item.get("fees") or 0.0),
-                    entry_fees=float(item.get("entry_fees") or 0.0),
                 )
                 if abs(position.contracts) > 1e-12:
                     account.positions[position.symbol] = position
@@ -884,7 +866,6 @@ class PaperBroker:
                         continue
                     position.realized_pnl = leg["tally"]
                     position.fees = leg["fees"]
-                    position.entry_fees = leg["entry_fees"]
             for symbol, guard in (data.get("protections") or {}).items():
                 if isinstance(guard, dict):
                     account.protections[str(symbol)] = dict(guard)

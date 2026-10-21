@@ -698,14 +698,17 @@ def test_paper_new_position_starts_its_own_realized_tally():
     assert broker.account.realized_by_symbol["BTC/USDT"] == pytest.approx(40.0)
 
 
-def test_paper_entry_fee_stays_out_of_the_position_tally():
-    """Nothing is closed yet, so the position reports 0 while the account
-    still books the commission it paid."""
+def test_paper_entry_fee_is_booked_on_the_position_too():
+    """已实现盈亏 is a net figure: the entry commission is deducted at once.
+
+    Reporting 0 while 0.1 of commission had already left the account is what
+    made the panel look like it never counted fees.
+    """
     broker = PaperBroker(starting_balance=1_000, fee_rate=0.001, slippage_bps=0)
     broker.place_order("BTC/USDT", "buy", "market", 1.0, price=100.0)
 
     position = broker.account.positions["BTC/USDT"]
-    assert position.realized_pnl == pytest.approx(0.0)
+    assert position.realized_pnl == pytest.approx(-0.1)
     assert broker.realized_pnl() == pytest.approx(-0.1)
 
 
@@ -742,10 +745,12 @@ def test_paper_position_tally_is_net_of_both_fees():
     broker = PaperBroker(starting_balance=1_000, fee_rate=0.001, slippage_bps=0)
     broker.place_order("BTC/USDT", "buy", "market", 1.0, price=100.0)
     position = broker.account.positions["BTC/USDT"]
-    assert position.realized_pnl == pytest.approx(0.0)  # nothing closed yet
+    assert position.realized_pnl == pytest.approx(-0.1)  # entry commission
 
     broker.place_order("BTC/USDT", "sell", "market", 1.0, price=100.0)
     assert position.realized_pnl == pytest.approx(-0.2)  # 0.1 in + 0.1 out
+    assert broker.realized_pnl() == pytest.approx(-0.2)
+    assert broker.realized_pnl() == pytest.approx(position.realized_pnl)
 
 
 def test_paper_partial_closes_deduct_their_share_of_the_entry_fee():
@@ -759,10 +764,9 @@ def test_paper_partial_closes_deduct_their_share_of_the_entry_fee():
     broker.place_order("BTC/USDT", "buy", "market", 1.0, price=100.0)
     broker.place_order("BTC/USDT", "sell", "market", 0.5, price=110.0)
     position = broker.account.positions["BTC/USDT"]
-    assert position.realized_pnl == pytest.approx(4.895)
-    assert position.entry_fees == pytest.approx(0.05)
+    assert position.realized_pnl == pytest.approx(-0.1 + 5.0 - 0.055)
 
     broker.place_order("BTC/USDT", "sell", "market", 0.5, price=100.0)
-    assert position.realized_pnl == pytest.approx(4.895 - 0.1)
-    # Account ledger: the price move minus every fee paid (5 - 0.205).
+    assert position.realized_pnl == pytest.approx(4.795)
+    # Fully closed: the position's own figure and the account agree exactly.
     assert broker.realized_pnl() == pytest.approx(4.795)
