@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
 import { TIMEFRAMES, fmt, fmtPrice } from "../format";
-import type { BacktestResult } from "../types";
+import type { BacktestResult, Strategy } from "../types";
 import LineChart from "../components/LineChart";
 import Table from "../components/Table";
 import FreqtradeStrategyEditor from "./FreqtradeStrategyEditor";
+import FreqtradeLocalPicker from "./FreqtradeLocalPicker";
 
 interface FreqtradeStatus {
   installed: boolean;
@@ -20,7 +21,16 @@ interface StrategyFile {
   name: string;
   file: string;
   classes: string[];
+  /** `Btrader_*` shims are generated from a local strategy, not hand-written. */
+  generated?: boolean;
 }
+
+type Source = "ft" | "local";
+
+const MARKETS: [string, string][] = [
+  ["spot", "现货（只做多）"],
+  ["usdm", "U 本位合约（可做空）"],
+];
 
 const METRICS: [string, string, "pct" | "num"][] = [
   ["total_return", "总收益", "pct"],
@@ -46,20 +56,36 @@ export default function FreqtradeBacktestPanel() {
   const [notice, setNotice] = useState("");
   const [result, setResult] = useState<BacktestResult | null>(null);
   const [editorOpen, setEditorOpen] = useState(false);
+  const [source, setSource] = useState<Source>("local");
+  const [localStrategies, setLocalStrategies] = useState<Strategy[]>([]);
+  const [localKey, setLocalKey] = useState("");
+  const [localParams, setLocalParams] = useState<Record<string, unknown>>({});
+  const [market, setMarket] = useState("spot");
 
-  useEffect(() => {
+  const load = () => {
     Promise.all([
       api<FreqtradeStatus>("/api/ft/status"),
       api<{ items: StrategyFile[] }>("/api/ft/strategies"),
+      api<{ items: Strategy[] }>("/api/strategies"),
     ])
-      .then(([next, files]) => {
+      .then(([next, files, local]) => {
         setStatus(next);
         setStrategies(files.items);
+        setLocalStrategies(local.items ?? []);
         setStrategy((current) => current || files.items[0]?.name || "");
+        setLocalKey((current) => current || local.items?.[0]?.key || "");
+        setLocalParams((current) =>
+          Object.keys(current).length ? current : { ...(local.items?.[0]?.defaults ?? {}) },
+        );
       })
       .catch((caught) =>
         setError(caught instanceof Error ? caught.message : String(caught)),
       );
+  };
+
+  useEffect(() => {
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const selected = useMemo(
@@ -68,8 +94,12 @@ export default function FreqtradeBacktestPanel() {
   );
 
   const run = async () => {
-    if (!strategy) {
+    if (source === "ft" && !strategy) {
       setError("请先选择 Freqtrade 策略");
+      return;
+    }
+    if (source === "local" && !localKey) {
+      setError("请先选择本地策略");
       return;
     }
     setBusy("同步行情…");
@@ -79,20 +109,23 @@ export default function FreqtradeBacktestPanel() {
     try {
       const data = await api<{ rows: number; path: string }>("/api/ft/data", {
         method: "POST",
-        body: JSON.stringify({ pair, timeframe, market: "spot", limit: bars }),
+        body: JSON.stringify({ pair, timeframe, market, limit: bars }),
       });
       setBusy(`已同步 ${data.rows} 根 K 线，回测中…`);
       const next = await api<BacktestResult>("/api/ft/backtest", {
         method: "POST",
-        body: JSON.stringify({
-          strategy,
-          timerange,
-          timeframe,
-          pairs: [pair],
-        }),
+        body: JSON.stringify(
+          source === "local"
+            ? { local_key: localKey, params: localParams, market, timerange, timeframe, pairs: [pair] }
+            : { strategy, market, timerange, timeframe, pairs: [pair] },
+        ),
       });
       setResult(next);
-      setNotice(`回测完成：${String(next.metrics.trades ?? 0)} 笔成交`);
+      setNotice(
+        `回测完成：${String(next.metrics.trades ?? 0)} 笔成交` +
+          (source === "local" ? `（适配器 ${String(next.params.strategy ?? "")}）` : ""),
+      );
+      if (source === "local") load();
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -114,7 +147,9 @@ export default function FreqtradeBacktestPanel() {
           <button
             type="button"
             className="btn-sm primary"
-            disabled={Boolean(busy) || !strategy}
+            disabled={
+              Boolean(busy) || (source === "local" ? !localKey : !strategy)
+            }
             onClick={() => void run()}
           >
             {busy || "同步 K 线并回测"}
@@ -131,33 +166,79 @@ export default function FreqtradeBacktestPanel() {
           )}
           <div className="form-grid">
             <div className="field">
-              <label>策略</label>
+              <label>策略来源</label>
               <select
                 className="select"
-                value={strategy}
-                onChange={(event) => setStrategy(event.target.value)}
+                value={source}
+                onChange={(event) => setSource(event.target.value as Source)}
                 disabled={Boolean(busy)}
               >
-                {strategies.length === 0 && <option value="">（策略目录为空）</option>}
-                {strategies.map((item) => (
-                  <option key={item.name} value={item.name}>
-                    {item.name}
+                <option value="local">本地 biTrader 策略</option>
+                <option value="ft">Freqtrade 策略（IStrategy）</option>
+              </select>
+              <div className="hint">
+                {source === "local"
+                  ? "自动生成 IStrategy 适配器，只跑 target 信号，关掉 Freqtrade 自带的止盈止损"
+                  : "user_data/strategies 里手写的策略文件"}
+              </div>
+            </div>
+            {source === "local" ? (
+              <FreqtradeLocalPicker
+                strategies={localStrategies}
+                value={localKey}
+                params={localParams}
+                disabled={Boolean(busy)}
+                onChange={setLocalKey}
+                onParams={setLocalParams}
+              />
+            ) : (
+              <div className="field">
+                <label>Freqtrade 策略</label>
+                <select
+                  className="select"
+                  value={strategy}
+                  onChange={(event) => setStrategy(event.target.value)}
+                  disabled={Boolean(busy)}
+                >
+                  {strategies.length === 0 && <option value="">（策略目录为空）</option>}
+                  {strategies.map((item) => (
+                    <option key={item.name} value={item.name}>
+                      {item.name}{item.generated ? "（自动生成）" : ""}
+                    </option>
+                  ))}
+                </select>
+                <div className="hint">
+                  {selected
+                    ? "user_data/strategies/" + selected.file
+                    : "把 Freqtrade 策略放到 sidecar 的 user_data/strategies"}
+                </div>
+                <button
+                  type="button"
+                  className="link-btn"
+                  disabled={!strategy || Boolean(busy) || Boolean(selected?.generated)}
+                  onClick={() => setEditorOpen(true)}
+                >
+                  {selected?.generated ? "自动生成的适配器不可编辑" : "编辑源码"}
+                </button>
+              </div>
+            )}
+            <div className="field">
+              <label>市场</label>
+              <select
+                className="select"
+                value={market}
+                onChange={(event) => setMarket(event.target.value)}
+                disabled={Boolean(busy)}
+              >
+                {MARKETS.map(([value, label]) => (
+                  <option key={value} value={value}>
+                    {label}
                   </option>
                 ))}
               </select>
               <div className="hint">
-                {selected
-                  ? `user_data/strategies/${selected.file}`
-                  : "把 Freqtrade 策略放到 sidecar 的 user_data/strategies"}
+                决定 K 线来源。Freqtrade 回测按现货模式运行，本地策略的做空段会被忽略。
               </div>
-              <button
-                type="button"
-                className="link-btn"
-                disabled={!strategy || Boolean(busy)}
-                onClick={() => setEditorOpen(true)}
-              >
-                编辑源码
-              </button>
             </div>
             <div className="field">
               <label>交易对</label>
@@ -212,6 +293,11 @@ export default function FreqtradeBacktestPanel() {
 
       {result && (
         <>
+          {(result as { warnings?: string[] }).warnings?.length ? (
+            <div className="banner warn">
+              {(result as { warnings?: string[] }).warnings?.join("；")}
+            </div>
+          ) : null}
           <div className="metrics">
             {METRICS.map(([key, label, kind]) => {
               const value = Number(result.metrics[key] ?? 0);

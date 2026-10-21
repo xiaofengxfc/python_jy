@@ -77,6 +77,10 @@ export default function StrategyEditor({
   const [isNew, setIsNew] = useState(false);
   const [newKey, setNewKey] = useState("my_strategy");
   const [busy, setBusy] = useState<"" | "load" | "save" | "validate">("");
+  const [renaming, setRenaming] = useState(false);
+  const [renameKey, setRenameKey] = useState("");
+  const [renameName, setRenameName] = useState("");
+  const [renameBusy, setRenameBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [report, setReport] = useState<ValidationReport | null>(null);
@@ -94,6 +98,7 @@ export default function StrategyEditor({
       setNotice("");
       setReport(null);
       setIsNew(false);
+      setRenaming(false);
       try {
         const data = await api<SourceDetail>(
           `/api/strategies/${encodeURIComponent(key)}/source`,
@@ -145,6 +150,49 @@ export default function StrategyEditor({
     setReport(null);
     setError("");
     setNotice(`已复制为「${key}」，保存后会生成新文件，原策略不变。`);
+  };
+
+  /** Rename the plugin: new key (and file name) plus an optional display name.
+   * The file moves, the class key is rewritten and the registry reloads, so the
+   * backtest page and the auto trader see the new name immediately. */
+  const startRename = () => {
+    if (!detail) return;
+    setRenaming(true);
+    setRenameKey(detail.key.endsWith("_copy") ? detail.key : detail.key + "_v2");
+    setRenameName(detail.name ?? "");
+    setError("");
+    setNotice("");
+  };
+
+  const submitRename = async () => {
+    if (!detail) return;
+    const nextKey = renameKey.trim();
+    if (!nextKey) {
+      setError("请填写新的策略 key");
+      return;
+    }
+    setRenameBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      const result = await api<{ key: string; filename: string }>(
+        "/api/strategies/" + encodeURIComponent(detail.key) + "/rename",
+        {
+          method: "POST",
+          body: JSON.stringify({ new_key: nextKey, new_name: renameName.trim() }),
+        },
+      );
+      setRenaming(false);
+      setSelected(result.key);
+      setNotice("已重命名并热加载：" + result.filename);
+      onSelect(result.key);
+      onSaved?.(result.key);
+      void load(result.key);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setRenameBusy(false);
+    }
   };
 
   const validate = async () => {
@@ -243,6 +291,19 @@ export default function StrategyEditor({
           <button
             type="button"
             className="btn-sm"
+            onClick={startRename}
+            disabled={busy !== "" || isNew || !detail?.editable || detail?.builtin}
+            title={
+              detail?.builtin
+                ? "内置策略只读；先「复制为新策略」再改名"
+                : "改文件名和 key，引用会自动跟上"
+            }
+          >
+            重命名
+          </button>
+          <button
+            type="button"
+            className="btn-sm"
             onClick={() => void validate()}
             disabled={busy !== "" || !code.trim()}
           >
@@ -277,6 +338,53 @@ export default function StrategyEditor({
             onChange={(event) => setNewKey(event.target.value)}
             spellCheck={false}
           />
+        </div>
+      )}
+
+      {renaming && detail && (
+        <div className="strategy-editor-newkey">
+          <label className="field-label" htmlFor="strategy-rename-key">
+            <span>新 key</span>
+            <em>小写字母开头；文件名会一起改，引用自动迁移</em>
+          </label>
+          <input
+            id="strategy-rename-key"
+            className="input"
+            value={renameKey}
+            spellCheck={false}
+            onChange={(event) => setRenameKey(event.target.value)}
+          />
+          <label className="field-label" htmlFor="strategy-rename-name">
+            <span>显示名</span>
+            <em>可选</em>
+          </label>
+          <input
+            id="strategy-rename-name"
+            className="input"
+            value={renameName}
+            onChange={(event) => setRenameName(event.target.value)}
+          />
+          <div className="row" style={{ gap: 8 }}>
+            <button
+              type="button"
+              className="btn-sm primary"
+              disabled={renameBusy || !renameKey.trim()}
+              onClick={() => void submitRename()}
+            >
+              {renameBusy ? "重命名中…" : "确认重命名"}
+            </button>
+            <button
+              type="button"
+              className="btn-sm"
+              disabled={renameBusy}
+              onClick={() => setRenaming(false)}
+            >
+              取消
+            </button>
+            <span className="faint" style={{ fontSize: 11 }}>
+              自动交易或 AI 交易正在使用这个策略时会被拒绝。
+            </span>
+          </div>
         </div>
       )}
 

@@ -59,9 +59,21 @@ interface Compared {
   result: BacktestResult;
 }
 
+/** An AI candidate from the strategy lab. Candidates live in their own folder
+ * and are addressed as `cand:<id>`: the backend loads them into a throwaway
+ * registry, so testing one here never adds it to the live strategy list. */
+interface Candidate {
+  id: string;
+  strategy_key?: string;
+  name?: string;
+  status?: string;
+  checks?: { ok?: boolean };
+}
+
 export default function BacktestPage() {
   const [tab, setTab] = useState<Tab>("single");
   const [strategies, setStrategies] = useState<Strategy[]>([]);
+  const [candidates, setCandidates] = useState<Candidate[]>([]);
   const [symbols, setSymbols] = useState<SymbolInfo[]>([]);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -104,10 +116,34 @@ export default function BacktestPage() {
   const [idea, setIdea] = useState("");
   const [suggestNote, setSuggestNote] = useState("");
 
+  /** Candidates that passed the static check, in the same shape as a strategy
+   * so the picker and the run button do not need a second code path.
+   * Parameters are the defaults in the candidate source; the lab is where a
+   * candidate gets tuned, this page only measures it. */
+  const candidateOptions = useMemo<Strategy[]>(() =>
+    candidates
+      .filter((item) => item.checks?.ok !== false)
+      .map((item) => ({
+        key: `cand:${item.id}`,
+        name: `候选 · ${item.name || item.strategy_key || item.id}`,
+        description: item.status === "approved" ? "已批准候选" : "未注册候选",
+        allow_short: true,
+        params: [],
+        defaults: {},
+        source_name: "",
+        editable: false,
+      })),
+  [candidates]);
+
   const strategy = useMemo(
-    () => strategies.find((item) => item.key === config.strategy) ?? null,
-    [strategies, config.strategy],
+    () =>
+      strategies.find((item) => item.key === config.strategy) ??
+      candidateOptions.find((item) => item.key === config.strategy) ??
+      null,
+    [strategies, candidateOptions, config.strategy],
   );
+
+  const isCandidate = config.strategy.startsWith("cand:");
 
   /** Re-read the registry after the source editor saves. Selecting the new key
    * also refreshes the parameter form; built-ins keep their current params. */
@@ -155,6 +191,10 @@ export default function BacktestPage() {
     api<{ items: BacktestRun[] }>("/api/backtest/runs?limit=50")
       .then((data) => setRuns(data.items))
       .catch(() => setRuns([]));
+
+    api<{ items: Candidate[] }>("/api/ai/strategies/candidates")
+      .then((data) => setCandidates(data.items ?? []))
+      .catch(() => setCandidates([]));
   }, []);
 
   useEffect(() => {
@@ -541,33 +581,55 @@ export default function BacktestPage() {
                   className="select"
                   value={config.strategy}
                   onChange={(event) => {
-                    const found = strategies.find((item) => item.key === event.target.value);
+                    const key = event.target.value;
+                    const found =
+                      strategies.find((item) => item.key === key) ??
+                      candidateOptions.find((item) => item.key === key);
                     patch({
-                      strategy: event.target.value,
+                      strategy: key,
                       params: found ? { ...found.defaults } : {},
                     });
                     setGridText({});
                   }}
                 >
-                  {strategies.map((item) => (
-                    <option key={item.key} value={item.key}>
-                      {item.name}
-                    </option>
-                  ))}
+                  <optgroup label="正式策略">
+                    {strategies.map((item) => (
+                      <option key={item.key} value={item.key}>
+                        {item.name}
+                      </option>
+                    ))}
+                  </optgroup>
+                  {candidateOptions.length > 0 && (
+                    <optgroup label="候选策略（未注册）">
+                      {candidateOptions.map((item) => (
+                        <option key={item.key} value={item.key}>
+                          {item.name}
+                        </option>
+                      ))}
+                    </optgroup>
+                  )}
                 </select>
                 <div className="strategy-editor-trigger">
                   <span className="faint">
-                    {strategy?.editable
-                      ? `用户策略 · ${strategy.source_name || `${strategy.key}.py`}`
-                      : "内置策略 · 只读"}
+                    {isCandidate
+                      ? "候选策略 · 用源码里的默认参数回测，不会注册为正式策略"
+                      : strategy?.editable
+                        ? `用户策略 · ${strategy.source_name || `${strategy.key}.py`}`
+                        : "内置策略 · 只读"}
                   </span>
                   <button
                     type="button"
                     className="btn-sm"
+                    disabled={isCandidate}
                     onClick={() => setEditorOpen(true)}
                   >
                     编辑源码
                   </button>
+                  {isCandidate && (
+                    <span className="faint" style={{ fontSize: 11 }}>
+                      批准后在策略实验室生成正式策略
+                    </span>
+                  )}
                 </div>
               </div>
 
@@ -608,6 +670,11 @@ export default function BacktestPage() {
               ) : (
                 <div>
                   <div className="section-title">策略参数</div>
+                  {isCandidate && (
+                    <div className="hint" style={{ marginBottom: 8 }}>
+                      候选策略没有参数表单：回测用源码里的默认值。要调参数请先在策略实验室批准。
+                    </div>
+                  )}
                   <ParamFields
                     specs={strategy?.params ?? []}
                     values={config.params}

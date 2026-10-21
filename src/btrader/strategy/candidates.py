@@ -10,12 +10,17 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
+import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .. import paths
+from .base import Strategy
+from .registry import StrategyRegistry
 from .sandbox import CheckReport, check_code
 
 STATUS_PENDING = "pending"
@@ -142,6 +147,54 @@ class CandidateStore:
             raise CandidateError(f"候选代码不存在：{candidate_id}")
         return path.read_text(encoding="utf-8")
 
+    # ---------------------------------------------------------- instantiate
+    def load_strategy(self, candidate_id: str) -> Strategy:
+        """Instantiate a candidate strategy without touching the registry.
+
+        A candidate may be backtested before it is approved, but it must not
+        join the shared strategy list: the source is copied into a throwaway
+        folder under a unique module name and loaded by a private
+        ``StrategyRegistry``, so the live list stays exactly as the user left
+        it and a broken candidate cannot disable a working strategy.
+        """
+        code = self.read_code(candidate_id)
+        report = check_code(code)
+        if not report.ok:
+            issues = report.as_dict()["issues"][:3]
+            problems = "；".join(item["message"] for item in issues)
+            raise CandidateError(f"静态检查未通过，不能回测：{problems}")
+        folder = Path(tempfile.mkdtemp(prefix="btrader-cand-"))
+        try:
+            stem = "cand_" + hashlib.sha1(candidate_id.encode("utf-8")).hexdigest()[:12]
+            (folder / f"{stem}.py").write_text(code, encoding="utf-8", newline="\n")
+            registry = StrategyRegistry()
+            registry.discover([folder])
+            # ``discover`` also loads the built-ins; only the keys that came
+            # from the throwaway folder belong to this candidate.
+            keys = [key for key in registry.keys if registry.source_path(key) is not None]
+            if not keys:
+                detail = "\n".join(registry.errors[-2:]) or "没有找到 Strategy 子类"
+                raise CandidateError(f"候选代码无法加载：{detail}")
+            declared = str(self.get(candidate_id).strategy_key or "")
+            return registry.get(declared if declared in keys else keys[0])
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def rename_registered_key(self, old_key: str, new_key: str) -> int:
+        """Keep the candidate records pointing at a renamed strategy file."""
+        changed = 0
+        for candidate in self.list():
+            if candidate.registered_key != old_key:
+                continue
+            candidate.registered_key = new_key
+            if candidate.strategy_path:
+                candidate.strategy_path = str(
+                    Path(candidate.strategy_path).with_name(f"{new_key}.py")
+                )
+            self._write(candidate)
+            changed += 1
+        return changed
+
     def _from_dict(self, data: dict[str, Any]) -> Candidate:
         known = {f for f in Candidate.__dataclass_fields__}
         candidate = Candidate(**{k: v for k, v in data.items() if k in known})
@@ -176,3 +229,22 @@ class CandidateStore:
         candidate.strategy_path = strategy_path
         self._write(candidate)
         return candidate
+
+
+_STORE: CandidateStore | None = None
+_STORE_LOCK = threading.Lock()
+
+
+def default_store() -> CandidateStore:
+    """Process-wide candidate store.
+
+    The lab, the backtest route and the AI quant panel all read the same
+    directory; one instance keeps their writes from racing on the JSON
+    sidecar files.
+    """
+    global _STORE
+    if _STORE is None:
+        with _STORE_LOCK:
+            if _STORE is None:
+                _STORE = CandidateStore()
+    return _STORE

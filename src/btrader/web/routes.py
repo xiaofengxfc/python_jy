@@ -33,6 +33,9 @@ from ..exchange import mirror
 from ..exchange.rest import BinanceREST
 from ..installer import InstallOptions, restart_gateway_process
 from ..notify import WeChatNotifier, load_wecom_secret, save_wecom_secret
+from ..strategy.candidates import CandidateError, default_store
+from ..strategy.source import StrategySourceError, rename_source
+from ..freqtrade_compat import remove_adapter
 from .. import ai, llm
 from .. import paths
 
@@ -63,6 +66,60 @@ def _market(value: str) -> MarketType:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"未知市场：{value}") from exc
 
+
+# A candidate is addressed as ``cand:<id>`` everywhere a strategy key is
+# accepted. It is loaded into a throwaway registry, never into the shared one,
+# so testing an unapproved candidate cannot change the live strategy list.
+CANDIDATE_PREFIX = "cand:"
+
+
+def _candidate_id(key: str) -> str:
+    return key[len(CANDIDATE_PREFIX):] if key.startswith(CANDIDATE_PREFIX) else ""
+
+
+def _strategy_for(state, key: str):
+    """Resolve a strategy key, or a ``cand:<id>`` candidate, into an instance."""
+    candidate_id = _candidate_id(key)
+    if not candidate_id:
+        try:
+            return state.ctx.strategies.get(key)
+        except KeyError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        return default_store().load_strategy(candidate_id)
+    except CandidateError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _record_candidate_backtest(key: str, metrics: dict[str, Any], *, symbol: str, timeframe: str) -> None:
+    """Keep the candidate's own record in step with a lab/backtest run."""
+    candidate_id = _candidate_id(key)
+    if not candidate_id or not metrics:
+        return
+    payload = dict(metrics)
+    payload.update({"symbol": symbol, "timeframe": timeframe, "source": "btrader"})
+    try:
+        default_store().record_backtest(candidate_id, payload)
+    except Exception:  # a failed bookkeeping write must not lose the result
+        log.warning("写入候选回测记录失败", exc_info=True)
+
+
+def _strategy_in_use(auto, ai_ctl, key: str) -> str:
+    """Why renaming ``key`` is refused right now, or an empty string."""
+    try:
+        status = auto.status() or {}
+    except Exception:  # pragma: no cover - defensive
+        status = {}
+    if status.get("running") and str((status.get("config") or {}).get("strategy") or "") == key:
+        return "自动交易正在使用该策略，请先停止再重命名"
+    try:
+        ai_status = ai_ctl.status() or {}
+    except Exception:  # pragma: no cover - defensive
+        ai_status = {}
+    if str(ai_status.get("state") or "stopped") != "stopped":
+        if str((ai_status.get("config") or {}).get("strategy") or "") == key:
+            return "AI 自主交易正在使用该策略，请先停止再重命名"
+    return ""
 
 def _reject_if_freqtrade_running(ctx) -> None:
     """Keep the sidecar and the in-process engine from trading the same account."""
@@ -287,6 +344,11 @@ class OptimizePayload(BacktestPayload):
     grid: dict[str, list[Any]] = Field(default_factory=dict)
     metric: str = "sharpe"
     top_n: int = Field(default=30, ge=1, le=200)
+
+
+class StrategyRenamePayload(BaseModel):
+    new_key: str
+    new_name: str = ""
 
 
 class AIFilterPayload(BacktestPayload):
@@ -1461,6 +1523,57 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
             )
         return {"items": items}
 
+    @router.post("/api/strategies/{key}/rename")
+    def strategy_rename(key: str, payload: StrategyRenamePayload) -> dict[str, Any]:
+        """Rename a user strategy: new key (and file name), optional display name.
+
+        Renaming is refused while an engine is trading this strategy: the loop
+        holds its own instance bound to the old key, and the rename would make
+        the next restart silently run something else.
+        """
+        state = get_state()
+        ctx = state.ctx
+        blocked = _strategy_in_use(auto, ai_ctl, key)
+        if blocked:
+            raise HTTPException(status_code=409, detail=blocked)
+        try:
+            result = rename_source(
+                ctx.strategies,
+                key=key,
+                new_key=payload.new_key,
+                new_name=payload.new_name,
+            )
+        except StrategySourceError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        new_key = result["key"]
+        # Everything that remembers the old key by name has to follow it.
+        moved = 0
+        try:
+            moved = default_store().rename_registered_key(key, new_key)
+        except Exception:
+            log.warning("更新候选记录的注册键失败", exc_info=True)
+        try:
+            touched = False
+            saved = dict(getattr(ctx.settings.ai_auto, "strategy_params", {}) or {})
+            if key in saved:
+                saved[new_key] = saved.pop(key)
+                ctx.settings.ai_auto.strategy_params = saved
+                touched = True
+            # The sidecar remembers its strategy by name too; leaving the old
+            # name there would make the next start fail on a missing class.
+            if getattr(ctx.settings.freqtrade, "strategy", "") == key:
+                ctx.settings.freqtrade.strategy = new_key
+                touched = True
+            if touched:
+                ctx.save_settings()
+        except Exception:
+            log.warning("迁移策略引用失败", exc_info=True)
+        try:
+            remove_adapter(ctx.freqtrade, key)
+        except Exception:
+            log.debug("删除 Freqtrade 适配器失败", exc_info=True)
+        return {**result, "candidates_updated": moved}
+
     # ------------------------------------------------------- automated trade
     @router.get("/api/auto/status")
     def auto_status(since: int = 0) -> dict[str, Any]:
@@ -1872,10 +1985,7 @@ def _validate_backtest(state, payload: BacktestPayload):
     market = _market(payload.market)
     if payload.timeframe not in TIMEFRAME_SECONDS:
         raise HTTPException(status_code=400, detail=f"不支持的周期：{payload.timeframe}")
-    try:
-        strategy = state.ctx.strategies.get(payload.strategy)
-    except KeyError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    strategy = _strategy_for(state, payload.strategy)
     params = strategy.validate_params(payload.params)
     config = BacktestConfig(
         initial_capital=payload.initial_capital,
@@ -1932,6 +2042,12 @@ def _start_backtest(state, jobs: JobStore, payload: BacktestPayload) -> dict[str
                     log.warning("保存回测记录失败", exc_info=True)
             jobs.update(job_id, status="done", progress=1.0, result=serialized)
             metrics = serialized.get("metrics") or {}
+            _record_candidate_backtest(
+                payload.strategy,
+                metrics,
+                symbol=payload.symbol,
+                timeframe=payload.timeframe,
+            )
             _notify_task(
                 state.ctx,
                 "回测完成",

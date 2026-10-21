@@ -10,9 +10,11 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
+from ..core.types import MarketType
 from ..freqtrade import FreqtradeError
+from ..freqtrade_compat import ensure_adapter
 
 
 class StartPayload(BaseModel):
@@ -25,10 +27,19 @@ class StrategyPayload(BaseModel):
 
 
 class BacktestPayload(BaseModel):
-    strategy: str
+    # Either a Freqtrade strategy file name, or ``local_key``: a biTrader
+    # strategy that is first rendered into an IStrategy adapter.
+    strategy: str = ""
     timerange: str = ""
     timeframe: str = ""
     pairs: list[str] | None = None
+    local_key: str = ""
+    params: dict[str, Any] = Field(default_factory=dict)
+    market: str = "spot"
+
+
+class RenamePayload(BaseModel):
+    new_name: str
 
 
 class DataPayload(BaseModel):
@@ -36,6 +47,13 @@ class DataPayload(BaseModel):
     timeframe: str = "1h"
     market: str = "spot"
     limit: int = 1000
+
+
+def _market(value: str) -> MarketType:
+    try:
+        return MarketType(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"未知市场：{value}") from exc
 
 
 def build_freqtrade_router(get_state: Callable[[], Any]) -> APIRouter:
@@ -88,6 +106,13 @@ def build_freqtrade_router(get_state: Callable[[], Any]) -> APIRouter:
     def save_strategy(name: str, payload: StrategyPayload) -> dict[str, Any]:
         try:
             return bridge().save_strategy(name, payload.code)
+        except FreqtradeError as exc:
+            raise fail(exc) from exc
+
+    @router.post("/api/ft/strategies/{name}/rename")
+    def rename_strategy(name: str, payload: RenamePayload) -> dict[str, Any]:
+        try:
+            return bridge().rename_strategy(name, payload.new_name)
         except FreqtradeError as exc:
             raise fail(exc) from exc
 
@@ -158,15 +183,52 @@ def build_freqtrade_router(get_state: Callable[[], Any]) -> APIRouter:
 
     @router.post("/api/ft/backtest")
     def backtest(payload: BacktestPayload) -> dict[str, Any]:
+        item = bridge()
         try:
-            return bridge().backtest(
-                payload.strategy,
+            name = payload.strategy
+            adapter = None
+            warnings: list[str] = []
+            if payload.local_key:
+                # A local strategy is a ``Strategy.generate()`` plugin, not an
+                # IStrategy: render the shim, then run it through the same CLI
+                # path every Freqtrade backtest uses.
+                market = _market(payload.market)
+                adapter = ensure_adapter(
+                    item,
+                    get_state().ctx.strategies,
+                    payload.local_key,
+                    params=payload.params,
+                    timeframe=payload.timeframe or "1h",
+                    # The sidecar config is spot-only, and Freqtrade refuses a
+                    # can_short strategy outside futures mode. Saying so beats
+                    # pretending the short leg was measured.
+                    allow_short=False,
+                )
+                name = adapter["name"]
+                if market.is_futures:
+                    warnings.append(
+                        "Freqtrade 目前以现货模式回测：策略的做空段会被忽略，"
+                        "要做空请用 biTrader 引擎回测。"
+                    )
+            if not name:
+                raise FreqtradeError("请选择一个策略")
+            result = item.backtest(
+                name,
                 timerange=payload.timerange,
                 timeframe=payload.timeframe,
                 pairs=payload.pairs,
             )
         except FreqtradeError as exc:
             raise fail(exc) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if adapter is not None:
+            result["local_key"] = payload.local_key
+            result["adapter"] = adapter["name"]
+            result["params"] = {**(result.get("params") or {}), **adapter["params"]}
+        if warnings:
+            result["warnings"] = warnings
+        return result
 
     @router.get("/api/ft/backtest/status")
     def backtest_status() -> dict[str, Any]:

@@ -436,6 +436,9 @@ class FreqtradeBridge:
                     "name": path.stem,
                     "file": path.name,
                     "classes": classes,
+                    # biTrader-generated IStrategy shims are build artifacts:
+                    # the UI groups them apart so nobody edits them by hand.
+                    "generated": path.stem.startswith("Btrader_"),
                     "mtime": path.stat().st_mtime,
                 }
             )
@@ -467,6 +470,37 @@ class FreqtradeBridge:
         tmp.write_text(cleaned, encoding="utf-8")
         tmp.replace(path)
         return {"ok": True, "name": stem, "file": path.name}
+
+    def rename_strategy(self, name: str, new_name: str) -> dict[str, Any]:
+        """Rename a Freqtrade strategy file (and its class when they match).
+
+        Freqtrade resolves ``--strategy`` by class name, so a file whose class
+        name no longer matches would silently vanish from the list. The class
+        is renamed together with the file whenever the two were identical,
+        which is the normal case for files created through this UI.
+        """
+        old_path = (self.strategy_dir / f"{Path(name).stem}.py").resolve()
+        if old_path.parent != self.strategy_dir:
+            raise FreqtradeError("策略路径越界")
+        if not old_path.exists():
+            raise FreqtradeError(f"策略不存在：{name}")
+        stem = "".join(ch for ch in new_name if ch.isalnum() or ch in "_-")[:64]
+        if not stem:
+            raise FreqtradeError("策略文件名不能为空")
+        if stem == old_path.stem:
+            return {"ok": True, "name": stem, "file": old_path.name, "renamed": False}
+        target = (self.strategy_dir / f"{stem}.py").resolve()
+        if target.parent != self.strategy_dir:
+            raise FreqtradeError("策略路径越界")
+        if target.exists():
+            raise FreqtradeError(f"策略 {stem} 已经存在，请换一个名字")
+        code = old_path.read_text(encoding="utf-8")
+        # Only the class that carried the old file name is rewritten; anything
+        # else in the file is left exactly as the user wrote it.
+        code = code.replace(f"class {old_path.stem}(", f"class {stem}(")
+        target.write_text(code, encoding="utf-8", newline="\n")
+        old_path.unlink()
+        return {"ok": True, "name": stem, "file": target.name, "renamed": True}
 
     # --------------------------------------------------------------- backtest
     def write_ohlcv(self, pair: str, timeframe: str, rows: Any) -> dict[str, Any]:

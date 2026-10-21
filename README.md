@@ -158,6 +158,38 @@ class MyStrategy(Strategy):
 完整示例见 `strategies/example_strategy.py`。注意：策略是本地 Python 代码，
 拥有与本程序相同的系统权限，请只运行你自己信任的策略。
 
+### 重命名策略
+
+回测页「编辑源码」面板里的**重命名**按钮会把文件、`key` 和可选显示名一起改掉：
+
+- 旧文件删除、新文件写入、注册表热加载，引用关系不会断（回测记录是快照，不追随改名）；
+- 内置策略只读，先「复制为新策略」再改名；目标 key 已存在会被拒绝；
+- 自动交易或 AI 交易**正在使用**该策略时返回 409，先停引擎再改。
+
+### 候选策略可以直接回测
+
+策略实验室里 AI 生成的候选（`%APPDATA%/biTrader/strategies/candidates/`）在批准前就能测：
+
+- 回测页的策略下拉多了「候选策略（未注册）」分组，选中即按 `cand:<id>` 回测；
+- 后台用**临时目录 + 独立注册表**加载候选，正式策略列表不会多出一个未批准的文件；
+- 参数用源码里的默认值（没有参数表单），结果写回候选的 `backtest` 字段，实验室里能看到；
+- 批准后候选才变成正式策略，再按正常策略调参。
+
+### Freqtrade 兼容层（本地策略也能跑 Freqtrade 回测）
+
+Freqtrade 只认 `IStrategy`，本程序的策略是 `Strategy.generate()` 插件，两者格式不同。
+「Freqtrade」页现在可以先选**策略来源**：
+
+| 来源 | 说明 |
+| --- | --- |
+| 本地 biTrader 策略 | 回测前自动生成 `user_data/strategies/Btrader_<key>.py` 适配器，把 `target` 翻译成 `enter_long/exit_long/enter_short/exit_short` |
+| Freqtrade 策略 | `user_data/strategies` 里手写的 `IStrategy`，行为不变 |
+
+适配器每次回测重新生成（手改会被覆盖，`generated` 标记会在策略列表里标出），并且
+关掉 Freqtrade 自带的 ROI/止损，避免两个引擎对同一份信号给出不同结论。
+侧车配置固定为**现货模式**，因此本地策略的做空段会被忽略，界面会给出提示；要做空请用 biTrader 引擎回测。
+只支持 `generate()` 里产出 `target` 的常规策略；依赖自定义钩子或私有数据源的策略不适用。
+
 ## 风控
 
 所有下单（手动与自动）都会经过 `RiskManager`：

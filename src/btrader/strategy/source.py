@@ -182,6 +182,37 @@ def read_source(registry: StrategyRegistry, key: str, directory: Path | None = N
     }
 
 
+_KEY_ASSIGN = re.compile(r'(?m)^([ \t]*)key[ \t]*=[ \t]*(["\'])([^"\'\n]*)\2')
+_NAME_ASSIGN = re.compile(r'(?m)^([ \t]*)name[ \t]*=[ \t]*(["\'])([^"\'\n]*)\2')
+
+
+def _rename_literals(code: str, *, old_key: str, new_key: str, new_name: str = "") -> str:
+    """Rewrite the class's ``key`` (and optionally ``name``) literal.
+
+    Only the first ``key = "..."`` assignment is touched: that is the one the
+    registry reads, and a strategy with two of them is already broken.
+    """
+    match = _KEY_ASSIGN.search(code)
+    if match is None:
+        raise StrategySourceError('策略源码缺少 key = "..." 字面量，无法重命名')
+    if match.group(3) != old_key:
+        raise StrategySourceError(
+            f"源码里的 key='{match.group(3)}' 与要重命名的 '{old_key}' 不一致"
+        )
+    indent = match.group(1)
+    head = code[: match.start()]
+    key_line = f'{indent}key = "{new_key}"'
+    code = head + key_line + code[match.end():]
+    if not new_name:
+        return code
+    named = _NAME_ASSIGN.search(code)
+    if named is not None:
+        return code[: named.start()] + f'{named.group(1)}name = "{new_name}"' + code[named.end():]
+    # No display name yet: put one directly under the key so the UI stops
+    # showing the class name after a rename.
+    insert_at = len(head) + len(key_line)
+    return code[:insert_at] + f'\n{indent}name = "{new_name}"' + code[insert_at:]
+
 def validate_source(code: str) -> dict[str, Any]:
     report = _report(code)
     key = _class_key(code)
@@ -249,6 +280,65 @@ def save_source(
     return {
         "ok": True,
         "key": key,
+        "filename": target.name,
+        "source_name": target.name,
+        "editable": True,
+    }
+
+
+def rename_source(
+    registry: StrategyRegistry,
+    *,
+    key: str,
+    new_key: str,
+    new_name: str = "",
+    directory: Path | None = None,
+) -> dict[str, Any]:
+    """Rename a user strategy: new key (and file name), optional display name.
+
+    Built-ins are refused: they live in the package and the UI already offers
+    "复制为新策略" for that. The new file is written and hot-loaded *before*
+    the old one is deleted, and rolled back if the reload fails, so a bad
+    rename cannot leave the user without the strategy they had.
+    """
+    directory = _user_dir(directory)
+    old_path = registry.source_path(key)
+    if old_path is None:
+        if key in registry:
+            raise StrategySourceError("内置策略只读；请先「复制为新策略」再改名", status=403)
+        raise StrategySourceError(f"未知策略：{key}", status=404)
+    new_key = (new_key or "").strip()
+    if new_key == key:
+        raise StrategySourceError("新 key 与当前 key 相同")
+    target = _file_for(new_key, directory)
+    if target.exists():
+        raise StrategySourceError(f"文件 {target.name} 已存在，请换一个 key")
+    if new_key in registry:
+        raise StrategySourceError(f"策略 {new_key} 已经存在，请换一个 key")
+    code = old_path.read_text(encoding="utf-8")
+    updated = _rename_literals(
+        code, old_key=key, new_key=new_key, new_name=(new_name or "").strip()
+    )
+    report = validate_source(updated)
+    if not report.get("ok"):
+        raise StrategySourceError("重命名后的源码没有通过静态检查", status=422)
+    if str(report.get("key") or "") != new_key:
+        raise StrategySourceError("重命名后的 key 与文件名不一致", status=422)
+    tmp = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    tmp.write_text(updated, encoding="utf-8", newline="\n")
+    tmp.replace(target)
+    registry.discover([directory])
+    if new_key not in registry:
+        target.unlink(missing_ok=True)
+        registry.discover([directory])
+        detail = "\n".join(registry.errors[-3:]) or "策略没有被注册"
+        raise StrategySourceError(f"重命名后加载失败：{detail}", status=422)
+    old_path.unlink(missing_ok=True)
+    registry.discover([directory])
+    return {
+        "ok": True,
+        "key": new_key,
+        "previous": key,
         "filename": target.name,
         "source_name": target.name,
         "editable": True,

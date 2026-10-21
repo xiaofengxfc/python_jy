@@ -61,6 +61,13 @@ interface OptimizeResult {
   stopped?: string;
 }
 
+interface BacktestJob {
+  status?: string;
+  progress?: number;
+  error?: string;
+  result?: { metrics?: Record<string, number> };
+}
+
 interface OptimizeJob {
   id?: string;
   status?: string;
@@ -145,6 +152,7 @@ export default function StrategyLabPage() {
   const [codeError, setCodeError] = useState("");
   const [codeLoading, setCodeLoading] = useState(false);
   const [reviewNote, setReviewNote] = useState("");
+  const [backtestBusy, setBacktestBusy] = useState(false);
 
   /* generation */
   const [instruction, setInstruction] = useState("");
@@ -336,6 +344,63 @@ export default function StrategyLabPage() {
     },
     [selected, reviewNote],
   );
+
+  /** Backtest the candidate *before* it is approved.
+   * The backend loads it into a throwaway registry (`cand:<id>`), so the
+   * strategy list never gains a file the user did not approve. */
+  const backtestCandidate = useCallback(async () => {
+    if (!selected) return;
+    setBacktestBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      const started = await api<{ job_id: string }>("/api/backtest/run", {
+        method: "POST",
+        body: JSON.stringify({
+          market,
+          symbol,
+          timeframe,
+          strategy: "cand:" + selected.id,
+          params: {},
+          bars: 800,
+          allow_short: market !== "spot",
+          save: false,
+        }),
+      });
+      setNotice(
+        "候选回测已启动：" + (selected.name ?? selected.strategy_key) + " · " + symbol + " " + timeframe,
+      );
+      let outcome: BacktestJob | null = null;
+      for (let attempt = 0; attempt < 180; attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 1000));
+        const job = await api<BacktestJob>(
+          "/api/backtest/jobs/" + encodeURIComponent(started.job_id),
+        );
+        if (job.status === "running") continue;
+        outcome = job;
+        break;
+      }
+      if (!outcome) throw new Error("回测超时，请稍后用回测页重试");
+      if (outcome.status !== "done") throw new Error(outcome.error || "回测失败");
+      const metrics = outcome.result?.metrics ?? {};
+      const refreshed = await api<{ candidate: Candidate; code: string }>(
+        "/api/ai/strategies/candidates/" + encodeURIComponent(selected.id),
+      );
+      setSelected(refreshed.candidate);
+      setCandidates((current) =>
+        current.map((item) =>
+          item.id === refreshed.candidate.id ? refreshed.candidate : item,
+        ),
+      );
+      const trades = Number(metrics.trades ?? 0);
+      const total = fmt(Number(metrics.total_return ?? 0) * 100, 2);
+      setNotice("回测完成：" + trades + " 笔成交，总收益 " + total + "%。");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBacktestBusy(false);
+    }
+  }, [selected, market, symbol, timeframe]);
 
   /* -------------------------------------------------------- optimisation */
   const stopPolling = useCallback(() => {
@@ -606,6 +671,15 @@ export default function StrategyLabPage() {
                     >
                       拒绝
                     </button>
+                    <button
+                      type="button"
+                      className="btn-sm"
+                      disabled={backtestBusy || !selected.checks?.ok}
+                      title="用源码默认参数跑一次回测；不会注册为正式策略"
+                      onClick={() => void backtestCandidate()}
+                    >
+                      {backtestBusy ? "回测中…" : "回测候选"}
+                    </button>
                   </>
                 )}
                 <button
@@ -632,6 +706,17 @@ export default function StrategyLabPage() {
                         ? ` · 类 ${selected.checks.classes.join(", ")}`
                         : ""}
                     </div>
+                    {selected.backtest && Object.keys(selected.backtest).length > 0 && (
+                      <div className="lab-code-meta faint">
+                        上次回测：收益
+                        {fmt(Number(selected.backtest.total_return ?? 0) * 100, 2)}%
+                        {", 夏普 " + fmt(Number(selected.backtest.sharpe ?? 0), 2)}
+                        {", 回撤 " + fmt(Number(selected.backtest.max_drawdown ?? 0) * 100, 2)}%
+                        {", " + String(Number(selected.backtest.trades ?? 0)) + " 笔"}
+                        {selected.backtest.symbol ? " · " + String(selected.backtest.symbol) : ""}
+                        {selected.backtest.timeframe ? " " + String(selected.backtest.timeframe) : ""}
+                      </div>
+                    )}
                     {selected.registered_key && (
                       <div className="lab-code-meta faint">
                         已生成本地策略：
