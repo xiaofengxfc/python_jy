@@ -105,6 +105,19 @@ def build_freqtrade_router(get_state: Callable[[], Any]) -> APIRouter:
         except FreqtradeError as exc:
             raise fail(exc) from exc
 
+    @router.get("/api/ft/history")
+    def history(limit: int = 50) -> dict[str, Any]:
+        try:
+            count = max(1, min(int(limit), 200))
+            items = bridge().client().request(
+                "GET", f"/api/v1/trades?limit={count}"
+            )
+            if isinstance(items, dict):
+                items = items.get("trades") or []
+            return {"items": items or []}
+        except FreqtradeError as exc:
+            raise fail(exc) from exc
+
     @router.post("/api/ft/forceexit")
     def forceexit(payload: dict[str, Any] | None = None) -> dict[str, Any]:
         try:

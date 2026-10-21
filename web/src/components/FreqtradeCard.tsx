@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api";
-import { fmt } from "../format";
+import { fmt, fmtPrice } from "../format";
 import { useFreqtradeStream } from "../hooks/useFreqtradeStream";
 import Table from "./Table";
 
@@ -47,6 +47,20 @@ interface FtProfit {
   closed_trade_count?: number;
 }
 
+interface FtHistory {
+  trade_id: number;
+  pair: string;
+  is_short: boolean;
+  open_date?: string;
+  close_date?: string;
+  open_rate: number;
+  close_rate?: number;
+  amount: number;
+  profit_pct?: number;
+  profit_abs?: number;
+  exit_reason?: string;
+}
+
 /** Status and lifecycle for the optional Freqtrade sidecar. Kept separate from
  * the legacy `/api/auto/*` panel so both engines can coexist during migration. */
 export default function FreqtradeCard() {
@@ -58,6 +72,7 @@ export default function FreqtradeCard() {
   const [notice, setNotice] = useState("");
   const [showLog, setShowLog] = useState(false);
   const [trades, setTrades] = useState<FtTrade[]>([]);
+  const [history, setHistory] = useState<FtHistory[]>([]);
   const [profit, setProfit] = useState<FtProfit | null>(null);
   const [streamEvent, setStreamEvent] = useState("");
 
@@ -71,14 +86,17 @@ export default function FreqtradeCard() {
       setStrategies(files.items);
       setStrategy((current) => current || next.strategy || files.items[0]?.name || "");
       if (next.running && next.api_ok) {
-        const [tradeData, profitData] = await Promise.all([
+        const [tradeData, historyData, profitData] = await Promise.all([
           api<{ items: FtTrade[] }>("/api/ft/trades"),
+          api<{ items: FtHistory[] }>("/api/ft/history?limit=20"),
           api<FtProfit>("/api/ft/profit"),
         ]);
         setTrades(tradeData.items ?? []);
+        setHistory(historyData.items ?? []);
         setProfit(profitData);
       } else {
         setTrades([]);
+        setHistory([]);
         setProfit(null);
       }
     } catch (caught) {
@@ -318,6 +336,42 @@ export default function FreqtradeCard() {
                     ];
                   })}
                   empty="当前没有持仓"
+                />
+              </div>
+            )}
+            {status.running && status.api_ok && (
+              <div className="ft-positions">
+                <div className="ft-pos-head">
+                  <span>最近成交 {history.length}</span>
+                  <span className="faint">已平仓 · 最多 20 条</span>
+                  <span className="spacer" />
+                </div>
+                <Table
+                  headers={["平仓时间", "交易对", "方向", "开仓价", "平仓价", "盈亏"]}
+                  rightFrom={3}
+                  rows={history.map((trade) => {
+                    const pnl = Number(trade.profit_pct ?? 0) * 100;
+                    const closed = trade.close_date
+                      ? new Date(trade.close_date).toLocaleString("zh-CN", {
+                          hour12: false,
+                          month: "2-digit",
+                          day: "2-digit",
+                          hour: "2-digit",
+                          minute: "2-digit",
+                        })
+                      : "—";
+                    return [
+                      closed,
+                      trade.pair,
+                      <span className={trade.is_short ? "down" : "up"}>
+                        {trade.is_short ? "空" : "多"}
+                      </span>,
+                      fmtPrice(Number(trade.open_rate ?? 0)),
+                      fmtPrice(Number(trade.close_rate ?? 0)),
+                      <span className={pnl >= 0 ? "up" : "down"}>{fmt(pnl, 2)}%</span>,
+                    ];
+                  })}
+                  empty="暂无已平仓成交"
                 />
               </div>
             )}
