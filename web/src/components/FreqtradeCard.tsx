@@ -61,6 +61,13 @@ interface FtHistory {
   exit_reason?: string;
 }
 
+interface FtDaily {
+  date: string;
+  abs_profit?: number;
+  rel_profit?: number;
+  trade_count?: number;
+}
+
 /** Status and lifecycle for the optional Freqtrade sidecar. Kept separate from
  * the legacy `/api/auto/*` panel so both engines can coexist during migration. */
 export default function FreqtradeCard() {
@@ -73,6 +80,7 @@ export default function FreqtradeCard() {
   const [showLog, setShowLog] = useState(false);
   const [trades, setTrades] = useState<FtTrade[]>([]);
   const [history, setHistory] = useState<FtHistory[]>([]);
+  const [daily, setDaily] = useState<FtDaily[]>([]);
   const [profit, setProfit] = useState<FtProfit | null>(null);
   const [streamEvent, setStreamEvent] = useState("");
 
@@ -86,17 +94,20 @@ export default function FreqtradeCard() {
       setStrategies(files.items);
       setStrategy((current) => current || next.strategy || files.items[0]?.name || "");
       if (next.running && next.api_ok) {
-        const [tradeData, historyData, profitData] = await Promise.all([
+        const [tradeData, historyData, dailyData, profitData] = await Promise.all([
           api<{ items: FtTrade[] }>("/api/ft/trades"),
           api<{ items: FtHistory[] }>("/api/ft/history?limit=20"),
+          api<{ items: FtDaily[] }>("/api/ft/daily?days=30"),
           api<FtProfit>("/api/ft/profit"),
         ]);
         setTrades(tradeData.items ?? []);
         setHistory(historyData.items ?? []);
+        setDaily(dailyData.items ?? []);
         setProfit(profitData);
       } else {
         setTrades([]);
         setHistory([]);
+        setDaily([]);
         setProfit(null);
       }
     } catch (caught) {
@@ -372,6 +383,38 @@ export default function FreqtradeCard() {
                     ];
                   })}
                   empty="暂无已平仓成交"
+                />
+              </div>
+            )}
+            {status.running && status.api_ok && (
+              <div className="ft-positions">
+                <div className="ft-pos-head">
+                  <span>近 {daily.length} 个交易日</span>
+                  <span className="faint">按日汇总 · 最近 10 天</span>
+                  <span className="spacer" />
+                </div>
+                <Table
+                  headers={["日期", "成交", "收益", "收益率"]}
+                  rightFrom={1}
+                  rows={[...daily]
+                    .sort((a, b) => b.date.localeCompare(a.date))
+                    .slice(0, 10)
+                    .map((item) => {
+                      const pnl = Number(item.rel_profit ?? 0) * 100;
+                      return [
+                        item.date,
+                        fmt(Number(item.trade_count ?? 0), 0),
+                        <span
+                          className={Number(item.abs_profit ?? 0) >= 0 ? "up" : "down"}
+                        >
+                          {fmt(Number(item.abs_profit ?? 0), 2)} USDT
+                        </span>,
+                        <span className={pnl >= 0 ? "up" : "down"}>
+                          {fmt(pnl, 2)}%
+                        </span>,
+                      ];
+                    })}
+                  empty="暂无日报"
                 />
               </div>
             )}

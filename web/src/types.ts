@@ -267,6 +267,20 @@ export interface AIAnalysis {
   model: string;
 }
 
+export interface FreqtradeSettings {
+  enabled: boolean;
+  python: string;
+  exchange: string;
+  trade_port: number;
+  username: string;
+  dry_run: boolean;
+  stake_amount: number;
+  max_open_trades: number;
+  strategy: string;
+  timeframe: string;
+  pairs: string[];
+}
+
 export interface AppSettings {
   network: string;
   market_type: string;
@@ -291,6 +305,7 @@ export interface AppSettings {
   theme: string;
   notify: NotifySettings;
   ai: AISettings;
+  freqtrade: FreqtradeSettings;
 }
 
 /** One entry the model ruled on during an AI-filtered backtest. */

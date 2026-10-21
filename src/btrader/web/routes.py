@@ -127,6 +127,7 @@ class SettingsPayload(BaseModel):
     notify: dict[str, Any] | None = None
     ai: dict[str, Any] | None = None
     ai_auto: dict[str, Any] | None = None
+    freqtrade: dict[str, Any] | None = None
 
 
 class AITraderStartPayload(BaseModel):
@@ -860,6 +861,13 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
             candidate_auto = replace(settings.ai_auto)
             _apply_ai_auto(candidate_auto, payload.ai_auto)
             settings.ai_auto = candidate_auto
+        if payload.freqtrade is not None:
+            candidate_ft = replace(settings.freqtrade)
+            _apply_freqtrade(candidate_ft, payload.freqtrade)
+            # FreqtradeBridge keeps a reference to this dataclass. Mutate it in
+            # place after validation so the running backend sees new values.
+            for name in candidate_ft.__dataclass_fields__:
+                setattr(settings.freqtrade, name, getattr(candidate_ft, name))
 
         ctx.save_settings()
         return {"ok": True, "settings": settings.to_dict()}
@@ -1588,6 +1596,47 @@ def _apply_ai_auto(target: AIAutoSettings, values: dict[str, Any]) -> None:
             raise HTTPException(status_code=400, detail=f"ai_auto.{name} 不能为负")
     if not (0.0 <= target.min_confidence <= 1.0):
         raise HTTPException(status_code=400, detail="ai_auto.min_confidence 必须在 0 到 1 之间")
+
+
+def _apply_freqtrade(target: Any, values: dict[str, Any]) -> None:
+    """Validate Freqtrade sidecar settings without touching the live bridge."""
+    for key in ("enabled", "dry_run"):
+        if key in values:
+            setattr(target, key, bool(values[key]))
+    for key in ("trade_port", "max_open_trades"):
+        if key in values:
+            try:
+                setattr(target, key, int(values[key]))
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail=f"freqtrade.{key} 必须是整数") from None
+    for key in ("stake_amount",):
+        if key in values:
+            try:
+                setattr(target, key, float(values[key]))
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail=f"freqtrade.{key} 必须是数字") from None
+    for key in ("python", "exchange", "username", "strategy"):
+        if key in values:
+            setattr(target, key, str(values[key] or ""))
+    if "timeframe" in values:
+        timeframe = str(values["timeframe"] or "")
+        if timeframe not in TIMEFRAME_SECONDS:
+            raise HTTPException(status_code=400, detail=f"不支持的周期：{timeframe}")
+        target.timeframe = timeframe
+    if "pairs" in values:
+        pairs = values["pairs"]
+        if not isinstance(pairs, list):
+            raise HTTPException(status_code=400, detail="freqtrade.pairs 必须是交易对数组")
+        cleaned = [str(item).strip() for item in pairs if str(item).strip()]
+        if not cleaned:
+            raise HTTPException(status_code=400, detail="freqtrade.pairs 至少需要一个交易对")
+        target.pairs = cleaned[:20]
+    if target.trade_port < 1024 or target.trade_port > 65535:
+        raise HTTPException(status_code=400, detail="freqtrade.trade_port 必须在 1024 到 65535 之间")
+    if target.stake_amount <= 0:
+        raise HTTPException(status_code=400, detail="freqtrade.stake_amount 必须大于 0")
+    if target.max_open_trades < 1:
+        raise HTTPException(status_code=400, detail="freqtrade.max_open_trades 至少为 1")
 
 
 def _ai_portfolio(state, symbol: str) -> dict[str, Any]:

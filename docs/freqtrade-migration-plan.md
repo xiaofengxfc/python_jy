@@ -214,8 +214,10 @@ Freqtrade 进程。
   status/entry/exit/protection 原样转给浏览器；token 不进入页面。
 - 自动交易页默认引擎切到 `Freqtrade`，旧引擎保留为显式“旧引擎”回退；两套
   引擎启动时互斥，避免同时操作同一账户。
-- Freqtrade 自动交易卡新增最近已平仓成交（`/api/ft/history`），与持仓/累计
-  盈亏一起展示；数据来自 Freqtrade 的 `/api/v1/trades`。
+- 设置页新增 Freqtrade 配置卡片：开关、venv 路径、交易所、REST 端口、纸面
+  模式、单笔金额、最大持仓、周期、默认策略和交易对；后端校验后写回配置。
+- 自动交易卡新增近 30 日按日汇总（`/api/ft/daily`，展示最近 10 天）和最近
+  已平仓成交（`/api/ft/history`），数据均来自 Freqtrade REST。
 - AI 量化部署加入回测硬门槛：保存候选策略 → 运行 btrader 回测 → 必须至少
   成交且总收益为正 → 记录指标 → 才启动纸面自动交易；否则阻止并显示原因。
 - Freqtrade 策略编辑：回测页可直接读取/保存 `user_data/strategies/*.py`，

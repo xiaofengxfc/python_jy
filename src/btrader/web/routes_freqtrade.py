@@ -118,6 +118,19 @@ def build_freqtrade_router(get_state: Callable[[], Any]) -> APIRouter:
         except FreqtradeError as exc:
             raise fail(exc) from exc
 
+    @router.get("/api/ft/daily")
+    def daily(days: int = 30) -> dict[str, Any]:
+        try:
+            count = max(1, min(int(days), 30))
+            data = bridge().client().request(
+                "GET", f"/api/v1/daily?timescale={count}"
+            )
+            if isinstance(data, dict):
+                data = data.get("data") or data.get("daily") or []
+            return {"items": data or []}
+        except FreqtradeError as exc:
+            raise fail(exc) from exc
+
     @router.post("/api/ft/forceexit")
     def forceexit(payload: dict[str, Any] | None = None) -> dict[str, Any]:
         try:
