@@ -329,8 +329,19 @@ class AITrader:
         self._audit(
             {"kind": "lifecycle", "event": "start", "network": c.network}
         )
-        self._thread = threading.Thread(target=self._loop, name="ai-trader", daemon=True)
-        self._thread.start()
+        try:
+            thread = threading.Thread(target=self._loop, name="ai-trader", daemon=True)
+            thread.start()
+        except BaseException:
+            # 线程没起来就是没跑：state 和租约都要回滚，否则界面显示在跑、
+            # 实际没有 poller，交易权还被一个死引擎占着。
+            self._thread = None
+            with self._lock:
+                self._state = STATE_STOPPED
+            self.lease.release(self._owner_name)
+            self._audit({"kind": "lifecycle", "event": "start_failed"})
+            raise
+        self._thread = thread
         return True, "AI 交易已启动"
 
     def stop(self) -> None:
@@ -368,6 +379,12 @@ class AITrader:
             self._halted_reason = reason or "人工干预"
             self._state = STATE_HALTED
             self._paused = False
+        # 熔断的引擎不会再交易（step() 看 state、_submit() 看 _stop_event），
+        # 所以交易权当场还回去。留着它，auto / quant 甚至下一次启动都会报
+        # 「交易权已被占用」，一次熔断就把整个账户锁死。
+        # 拦住「熔断期间新开仓」的是 STATE_HALTED 与 AIGuard 的 halted_reason，
+        # 不是租约，别把这两件事混成一件。
+        self.lease.release(self._owner_name)
         self._audit({"kind": "lifecycle", "event": "halt", "reason": self._halted_reason})
 
     def kill(self, reason: str = "急停") -> None:

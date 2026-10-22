@@ -233,6 +233,74 @@ def test_kill_switch_blocks_and_releases_lease(tmp_path):
     assert trader.lease.owner == ""
     assert trader.step() is None
 
+def test_halt_releases_the_trade_lease_for_other_controllers(tmp_path):
+    """熔断不是把整个账户锁死：停下来的引擎不该继续占着交易权。
+
+    之前只有 stop()/kill() 释放租约，halt() 不释放。后果是一次熔断之后，
+    自动交易和 AI 量化再 acquire 只会拿到「交易权已被占用」，只能等有人手动
+    stop 那个已经停下来的引擎。
+    """
+    trader, _llm, _trading, _risk = make_trader(tmp_path)
+    lease = trader.lease
+    ok, _message = trader.start()
+    assert ok
+    assert lease.owner
+
+    trader.halt("人工熔断")
+
+    assert trader.state == "halted"
+    assert lease.owner == "", "熔断后必须当场把交易权还回去"
+    # 熔断的引擎仍然拒绝自己启动：拦新开仓的是 state 和 AIGuard，不是租约。
+    # （此刻 poller 还在空转，先撞上「上一轮线程仍在退出」那道检查，同样是拒绝。）
+    ok, _message = trader.start()
+    assert not ok
+    assert lease.owner == "", "被拒的启动不能顺手把交易权抓回来"
+    # 另一路（这里用同一把租约的第二个实例代表 auto/quant）马上能拿到。
+    other = AITrader(
+        trader.config, trading=FakeTrading(), llm=FakeLLM(),
+        frame_provider=make_frame, audit_path=tmp_path / "other.jsonl",
+        clock=lambda: 1_800_000_000.0, lease=lease,
+    )
+    ok, message = other.start()
+    assert ok, message
+    other.stop()
+    trader.stop()  # 熔断实例的 poller 仍在空转（step 直接返回），收尾停掉
+
+
+def test_failed_thread_start_rolls_back_state_and_lease(tmp_path, monkeypatch):
+    """线程起不来就是没跑：state 要回 stopped，交易权也要还回去。
+
+    之前 start() 先把 state 写成 running 再去起线程，线程抛异常时既不回滚
+    state 也不释放租约：界面显示在跑、实际没有 poller，而交易权被一个死引擎
+    占着，别的控制器再也拿不到。
+    """
+    from btrader.engine import ai_trader as ai_trader_module
+
+    class BoomThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+        def is_alive(self):
+            return False
+
+    class FakeThreading:
+        Thread = BoomThread
+
+    trader, _llm, _trading, _risk = make_trader(tmp_path)
+    monkeypatch.setattr(ai_trader_module, "threading", FakeThreading)
+
+    with pytest.raises(RuntimeError):
+        trader.start()
+
+    assert trader.state == "stopped", "线程没起来就不能显示在跑"
+    assert trader._thread is None
+    assert trader.lease.owner == "", "启动失败必须把交易权还回去"
+    assert trader.lease.acquire("auto")
+    trader.lease.release("auto")
+
 
 def test_start_has_no_live_enabled_gate(tmp_path):
     """「允许实盘」这道总闸删了：没有它照样能启动，凭据和 confirm_live 才是闸。
