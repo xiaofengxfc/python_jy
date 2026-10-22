@@ -626,6 +626,16 @@ class AITrader:
                     trace=pipeline.trace,
                 )
 
+        # 模型调用那几十秒里世界可能已经变了：提交前重读行情、持仓、策略信号复核。
+        recheck, portfolio, market_price = self._recheck_before_submit(
+            decision, portfolio, signal_target
+        )
+        if not recheck.ok:
+            return self._record(
+                "reject", reason=recheck.reason, decision=decision, now=now,
+                trace=pipeline.trace,
+            )
+
         guard = self.guard.check(
             decision,
             # 闸门看的「现在」也用此刻：有效期判的是「决策出生 → 提交」之间的间隔。
@@ -660,6 +670,115 @@ class AITrader:
         return self._record(
             "order", reason="", decision=decision, now=now, order=order, trace=pipeline.trace
         )
+
+    # -------------------------------------------------------------- recheck
+    @staticmethod
+    def _position_base(view: dict[str, Any]) -> float | None:
+        """把持仓折成基础币数量。
+
+        持仓金额是「数量 × 价格」，价格一动它就动；直接比金额会把「价格走了 0.2%」
+        认成「有人成交了」，那样每一轮都会把自己拒掉。
+        """
+        try:
+            price = float(view.get("price"))
+            quote = float(view.get("position_quote") or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if price <= 0:
+            return None
+        return quote / price
+
+    def _recheck_before_submit(
+        self,
+        decision: AIDecision,
+        portfolio: dict[str, Any],
+        signal_target: float | None,
+    ) -> tuple[GuardVerdict, dict[str, Any], float | None]:
+        """提交前把行情、持仓、策略信号重读一遍（B4）。
+
+        模型调用可能几十秒（deep 六段），这一轮开始时取的方向、持仓、价格到这一刻
+        都可能过期。原则只有一条：不确定就不下单，宁可少下一单。
+
+        只拦新开仓。平仓是去风险，拦平仓等于把人锁在仓位里——和 RiskManager 里
+        「entry 才判熔断、减仓不拦」是同一条理由。
+
+        返回 (裁决, 最新组合视图, 最新价)；裁决不过时调用方不下单，也不再拿旧值。
+        """
+        fresh: dict[str, Any] = dict(portfolio)
+        fresh_error = ""
+        if self.portfolio_provider is not None:
+            try:
+                data = self.portfolio_provider()
+            except Exception as exc:
+                fresh_error = f"读不到持仓（{exc}）"
+            else:
+                if isinstance(data, dict) and data:
+                    fresh = data
+                else:
+                    fresh_error = "读取持仓返回空快照"
+        price = fresh.get("price")
+        if price is None:
+            price = portfolio.get("price")
+
+        if not decision.is_entry:
+            # 平仓/观望：数字用最新的，但读不到也放行。拦减仓比漏减仓更糟——和
+            # RiskManager 只在 entry 上判熔断是同一条理由。
+            return GuardVerdict(True), fresh, price
+
+        if fresh_error:
+            return GuardVerdict(False, f"提交前复核：{fresh_error}"), fresh, price
+
+        # 方向：拿最新的策略信号再对一次。读不到、变空仓、反向，一律不下单。
+        if self.signal_provider is not None:
+            try:
+                latest_signal = float(self.signal_provider())
+            except Exception as exc:
+                return (
+                    GuardVerdict(False, f"提交前复核：策略信号读不到（{exc}）"),
+                    fresh,
+                    price,
+                )
+            if abs(latest_signal) < 1e-9:
+                return (
+                    GuardVerdict(False, "提交前复核：策略信号已转为空仓，不再开仓"),
+                    fresh,
+                    price,
+                )
+            wanted = 1.0 if decision.action == "open_long" else -1.0
+            if latest_signal * wanted < 0:
+                before = 0.0 if signal_target is None else signal_target
+                return (
+                    GuardVerdict(
+                        False,
+                        f"提交前复核：策略信号已从 {before:+.0%} 变成 {latest_signal:+.0%}，"
+                        f"与 {decision.action} 相反",
+                    ),
+                    fresh,
+                    price,
+                )
+
+        # 持仓：数量变了（模型调用期间成交了）就不按旧快照下单，也不自己改数。
+        was = self._position_base(portfolio)
+        now_qty = self._position_base(fresh)
+        if was is None or now_qty is None:
+            return (
+                GuardVerdict(False, "提交前复核：持仓或价格缺失，算不出当前仓位"),
+                fresh,
+                price,
+            )
+        if abs(now_qty - was) > max(1e-9, abs(was) * 1e-6):
+            before_quote = float(portfolio.get("position_quote") or 0.0)
+            now_quote = float(fresh.get("position_quote") or 0.0)
+            return (
+                GuardVerdict(
+                    False,
+                    "提交前复核：持仓在模型调用期间变了"
+                    f"（{before_quote:.2f} → {now_quote:.2f} USDT）",
+                ),
+                fresh,
+                price,
+            )
+        return GuardVerdict(True), fresh, price
 
     def _submit(self, decision: AIDecision, market_price: float | None) -> OrderResult:
         c = self.config

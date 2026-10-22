@@ -111,6 +111,8 @@ def make_trader(
     llm_ok: bool = True,
     portfolio: dict | None = None,
     signal_target: float | None = None,
+    frame_provider=None,
+    signal_provider=None,
     clock=None,
     budget: TradeBudget | None = None,
     lease: TradeLease | None = None,
@@ -133,9 +135,13 @@ def make_trader(
         config,
         trading=trading,
         llm=llm,
-        frame_provider=make_frame,
+        frame_provider=frame_provider or make_frame,
         portfolio_provider=lambda: dict(view),
-        signal_provider=(lambda: signal_target) if signal_target is not None else None,
+        signal_provider=(
+            signal_provider
+            if signal_provider is not None
+            else ((lambda: signal_target) if signal_target is not None else None)
+        ),
         audit_path=tmp_path / "audit.jsonl",
         clock=clock or (lambda: 1_800_000_000.0),
         risk=risk,
@@ -822,3 +828,203 @@ def test_the_controller_builds_every_trader_on_one_lease(tmp_path, monkeypatch):
     assert built[0]["lease"] is controller.lease
     assert built[1]["lease"] is controller.lease, "两个入口必须拿到同一把租约"
     assert isinstance(controller.lease.budget, TradeBudget)
+
+
+# ------------------------------- 提交前复核：模型调用那几十秒里世界可能变了
+def test_a_signal_flip_during_the_model_call_blocks_the_entry(tmp_path):
+    """模型思考的这几十秒里收出一根新 K 线，策略在新 K 线上翻空。
+
+    决策是照旧信号（+60%）做的 open_long，但提交时世界已经反过来：不能再下这一单，
+    也不能把它当成「策略仍然是多」的证据。
+    """
+    bars = [make_frame(30)]
+    signals = [0.6]
+    trader, llm, trading, _risk = make_trader(
+        tmp_path,
+        frame_provider=lambda: bars[-1],
+        signal_provider=lambda: signals[-1],
+    )
+    answer = llm.ask
+
+    def during_the_call(prompt, **kwargs):
+        bars.append(make_frame(31))  # 新 K 线收出来
+        signals.append(-0.4)  # 策略在这根 K 线上翻空
+        return answer(prompt, **kwargs)
+
+    llm.ask = during_the_call
+
+    record = trader.decide_once()
+
+    assert record is not None and record["outcome"] == "reject", record
+    assert "复核" in record["reason"] and "信号" in record["reason"], record["reason"]
+    assert trading.requests == []
+    assert audit_rows(tmp_path / "audit.jsonl")[-1]["reason"] == record["reason"]
+
+
+def test_a_signal_that_goes_flat_during_the_model_call_blocks_the_entry(tmp_path):
+    """信号从 +60% 掉到空仓：不确定就不下单。"""
+    signals = [0.6]
+    trader, llm, trading, _risk = make_trader(
+        tmp_path, signal_provider=lambda: signals[-1]
+    )
+    answer = llm.ask
+
+    def during_the_call(prompt, **kwargs):
+        signals.append(0.0)
+        return answer(prompt, **kwargs)
+
+    llm.ask = during_the_call
+
+    record = trader.decide_once()
+
+    assert record is not None and record["outcome"] == "reject", record
+    assert "空仓" in record["reason"], record["reason"]
+    assert trading.requests == []
+
+
+def test_the_signal_recheck_failing_blocks_the_entry(tmp_path):
+    """提交前读不到策略信号也是「不确定」，同样不下单。"""
+    calls = {"n": 0}
+
+    def flaky_signal() -> float:
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise RuntimeError("K 线接口超时")
+        return 0.6
+
+    trader, _llm, trading, _risk = make_trader(tmp_path, signal_provider=flaky_signal)
+
+    record = trader.decide_once()
+
+    assert record is not None and record["outcome"] == "reject", record
+    assert "复核" in record["reason"] and "信号" in record["reason"], record["reason"]
+    assert trading.requests == []
+
+
+def test_a_fill_during_the_model_call_blocks_the_entry(tmp_path):
+    """模型调用期间成交了：不能拿模型看到的那份旧持仓去算这一单。"""
+    view = {"equity": 1000.0, "position_quote": 0.0, "price": 100.0}
+    trader, llm, trading, _risk = make_trader(tmp_path, portfolio=view)
+    answer = llm.ask
+
+    def during_the_call(prompt, **kwargs):
+        view["position_quote"] = 40.0  # 这几秒里成交了 40 USDT
+        return answer(prompt, **kwargs)
+
+    llm.ask = during_the_call
+
+    record = trader.decide_once()
+
+    assert record is not None and record["outcome"] == "reject", record
+    assert "复核" in record["reason"] and "持仓" in record["reason"], record["reason"]
+    assert trading.requests == []
+
+
+def test_a_position_read_failure_before_submit_blocks_the_entry(tmp_path):
+    """提交前读不到持仓 = 不知道仓位，按「不下单」处理。"""
+    view = {"equity": 1000.0, "position_quote": 0.0, "price": 100.0}
+    reads = {"n": 0}
+
+    def flaky_portfolio() -> dict:
+        reads["n"] += 1
+        if reads["n"] > 1:
+            raise RuntimeError("账户接口超时")
+        return dict(view)
+
+    trader, _llm, trading, _risk = make_trader(tmp_path, portfolio=view)
+    trader.portfolio_provider = flaky_portfolio
+
+    record = trader.decide_once()
+
+    assert record is not None and record["outcome"] == "reject", record
+    assert "复核" in record["reason"] and "持仓" in record["reason"], record["reason"]
+    assert trading.requests == []
+
+
+def test_a_price_move_alone_is_not_a_position_change(tmp_path):
+    """持仓金额是 数量×价格：只看它变就说「持仓变了」，价格一走就误拒。"""
+    view = {"equity": 1000.0, "position_quote": 40.0, "price": 100.0}
+    trader, llm, trading, _risk = make_trader(tmp_path, portfolio=view)
+    answer = llm.ask
+
+    def during_the_call(prompt, **kwargs):
+        view["price"] = 100.2  # 价格 +0.2%，数量没动
+        view["position_quote"] = 40.08
+        return answer(prompt, **kwargs)
+
+    llm.ask = during_the_call
+
+    record = trader.decide_once()
+
+    assert record is not None and record["outcome"] == "order", record
+    assert len(trading.requests) == 1
+
+
+def test_the_recheck_does_not_block_a_close(tmp_path):
+    """复核只拦新开仓：拦平仓等于把用户锁在仓位里（AGENTS §7 同一条理由）。"""
+    view = {"equity": 1000.0, "position_quote": 400.0, "price": 100.0}
+    signals = [0.6]
+    trader, llm, trading, _risk = make_trader(
+        tmp_path,
+        answer=decision_json(action="close_long", quote=400.0, stop_loss=None),
+        portfolio=view,
+        signal_provider=lambda: signals[-1],
+        market_type="usdm",
+    )
+    answer = llm.ask
+
+    def during_the_call(prompt, **kwargs):
+        signals.append(-0.4)  # 信号翻空
+        view["position_quote"] = 380.0  # 期间还成交了一点
+        return answer(prompt, **kwargs)
+
+    llm.ask = during_the_call
+
+    record = trader.decide_once()
+
+    assert record is not None and record["outcome"] == "order", record
+    assert trading.requests[-1].reduce_only is True
+
+
+def test_the_price_drift_gate_sees_the_price_after_the_model_call(tmp_path):
+    """漂移闸以前比的是「模型调用开始前」的价：调用期间跳了 0.6% 也看不出来。"""
+    view = {"equity": 1000.0, "position_quote": 0.0, "price": 100.0}
+    trader, llm, trading, _risk = make_trader(tmp_path, portfolio=view)
+    answer = llm.ask
+
+    def during_the_call(prompt, **kwargs):
+        view["price"] = 100.6  # 决策价 100，这几秒里跳到 100.6（+0.6% > 0.5%）
+        return answer(prompt, **kwargs)
+
+    llm.ask = during_the_call
+
+    record = trader.decide_once()
+
+    assert record is not None and record["outcome"] == "reject", record
+    assert "漂移" in record["reason"], record["reason"]
+    assert trading.requests == []
+
+
+def test_a_close_still_goes_through_when_the_recheck_cannot_read(tmp_path):
+    """复核读取失败拦的是新开仓；平仓是去风险，不能因为读不到持仓就拦下来。"""
+    view = {"equity": 1000.0, "position_quote": 400.0, "price": 100.0}
+    reads = {"n": 0}
+
+    def flaky_portfolio() -> dict:
+        reads["n"] += 1
+        if reads["n"] > 1:
+            raise RuntimeError("账户接口超时")
+        return dict(view)
+
+    trader, _llm, trading, _risk = make_trader(
+        tmp_path,
+        answer=decision_json(action="close_long", quote=400.0, stop_loss=None),
+        portfolio=view,
+        market_type="usdm",
+    )
+    trader.portfolio_provider = flaky_portfolio
+
+    record = trader.decide_once()
+
+    assert record is not None and record["outcome"] == "order", record
+    assert trading.requests[-1].reduce_only is True
