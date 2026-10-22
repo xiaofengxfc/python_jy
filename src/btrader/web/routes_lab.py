@@ -382,7 +382,16 @@ class LabController:
                     strategy,
                     frame,
                     base_params,
-                    BacktestConfig(timeframe=timeframe),
+                    BacktestConfig(
+                        timeframe=timeframe,
+                        # 打分用的曲线必须是真实能成交的那条：现货不能借杠杆也不能
+                        # 做空，和 _validate_backtest 一个口径（那边也是非合约恒 1、
+                        # allow_short 恒 False）。默认 allow_short=True 时，同一段
+                        # 下跌行情里「靠做空吃到的收益」会被当成好成绩，排名顶到最前，
+                        # 而现货账户根本卖不出去。
+                        leverage=1.0,
+                        allow_short=market.is_futures,
+                    ),
                     bounds=payload.bounds or {},
                     rounds=rounds,
                     metric=payload.metric,
