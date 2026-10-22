@@ -761,6 +761,9 @@ class AITraderController:
             frame_provider=lambda: _closed_only(
                 _market_frame(state, ctx, market, symbol, timeframe, 300), timeframe
             ),
+            # 现读，不吃账户快照缓存：这一路每轮决策会多一次签名请求，但模型调用
+            # 本身就要几十秒，这点开销无所谓；关键是复核看见的必须是此刻的仓位，
+            # 否则模型调用期间成交的那笔会让这一单按旧仓位去下。
             portfolio_provider=lambda: _ai_portfolio(state, symbol),
             signal_provider=lambda: _strategy_signal(
                 state,
@@ -1828,11 +1831,22 @@ def _news_block(ctx: Any, symbol: str, limit: int = 8) -> str:
 
 
 def _ai_portfolio(state, symbol: str) -> dict[str, Any]:
-    """AI 交易用的组合视图：权益、该交易对持仓、最新价、风控状态。"""
+    """AI 交易用的组合视图：权益、该交易对持仓、最新价、风控状态。
+
+    走 ``AccountService.live_snapshot``：这条路的两次读取（决策开头的账户描述、
+    提交前的复核）都要「此刻」。快照缓存是给面板的（每 2 秒轮询一次），AI 交易
+    每轮只读两次、模型调用本身就几十秒，这点开销无所谓；而模型调用那几十秒里成交
+    的仓位如果只在缓存里缺席，复核就会放行并拿错的仓位去下单。
+
+    读不到就把错误抛出去：``AITrader._portfolio`` 会吞成空视图（这一轮不下单），
+    复核那边则按「读不到持仓 = 不确定 = 不下单」拒绝，不拿上一次的持仓顶替。
+    """
     ctx = state.ctx
     market = ctx.market_type
     price = _last_price(state, market, symbol)
-    snapshot = ctx.account.snapshot(market, symbol)
+    snapshot = ctx.account.live_snapshot(market, symbol)
+    if snapshot.error:
+        raise RuntimeError(snapshot.error)
     position_quote = 0.0
     for item in snapshot.positions:
         if item.get("symbol") != symbol:

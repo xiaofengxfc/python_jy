@@ -212,6 +212,19 @@ class AccountService:
             self._cache[key] = snap
         return snap
 
+    def live_snapshot(self, market: MarketType, symbol: str | None = None) -> Snapshot:
+        """此刻的账户：绕开 ``snapshot()`` 的缓存，直接问交易所。
+
+        缓存是给面板用的（交易对 3 秒、全钱包权益 10 秒）：每 2 秒轮询一次的界面不能
+        每个都去签名读一遍余额和持仓。但「提交前复核」要的是此刻——模型调用那几十秒里
+        成交的仓位，缓存里根本还没有，复核照着旧快照就会放行。
+
+        只给 AI 交易的提交前复核用（``routes._ai_portfolio(fresh=True)``），面板别调。
+        代价是这条路每次都多一次签名请求；只在 AI 交易决策时发生，不在面板轮询上。
+        读取失败时 ``snapshot.error`` 有值，调用方要按「读不到」处理，别拿旧数顶替。
+        """
+        return self.snapshot(market, symbol, refresh=True)
+
     def refresh_all(self, markets: list[MarketType] | None = None) -> None:
         """Refresh every market the panels might show (background thread)."""
         for market in markets or list(MarketType):
