@@ -98,6 +98,16 @@ CACHE_SECONDS = 300.0
 CACHE_LIMIT = 500
 AUDIT_LIMIT_BYTES = 2 * 1024 * 1024
 
+# 「被截断」在两家协议里叫法不同：OpenAI 风格回 finish_reason="length"，
+# Anthropic 回 stop_reason="max_tokens"。两条都要认，否则 Anthropic 那边被截断
+# 的回答会被当成「模型答完了但答得不好」，用户又不知道是额度问题。
+TRUNCATED_FINISH = ("length", "max_tokens")
+
+
+def is_truncated(finish: str) -> bool:
+    """这一步回答是不是被输出上限截断了。"""
+    return str(finish or "") in TRUNCATED_FINISH
+
 
 @dataclass
 class AISettings:
@@ -241,9 +251,15 @@ class _Cache:
                 return None
             return entry
 
-    def put(self, key: str, text: str, tokens: int) -> None:
+    def put(self, key: str, text: str, tokens: int, finish: str = "") -> None:
         with self._lock:
-            self._entries[key] = {"at": time.time(), "text": text, "tokens": int(tokens)}
+            self._entries[key] = {
+                "at": time.time(),
+                "text": text,
+                "tokens": int(tokens),
+                # finish 存下来，缓存命中时才能照样报出 truncated。
+                "finish": str(finish or ""),
+            }
             self._flush()
 
     def calls_today(self) -> int:
@@ -413,11 +429,16 @@ class LLMService:
         if cache_key:
             hit = cache().get(cache_key, CACHE_SECONDS)
             if hit:
+                cached_finish = str(hit.get("finish") or "")
                 result.update(
                     ok=True,
                     text=str(hit.get("text") or ""),
                     cached=True,
                     tokens=int(hit.get("tokens") or 0),
+                    # 命中缓存也要如实报 finish / truncated：调用方按它决定
+                    # 「截断」还是「回答不合格」，缓存不该改变这个判断。
+                    finish=cached_finish,
+                    truncated=is_truncated(cached_finish),
                     elapsed=round(time.time() - started, 3),
                 )
                 return result
@@ -435,7 +456,7 @@ class LLMService:
         except AIError as exc:
             finish = str(getattr(exc, "finish", "") or "")
             result["finish"] = finish
-            result["truncated"] = finish == "length"
+            result["truncated"] = is_truncated(finish)
             result["error"] = str(exc)
             result["elapsed"] = round(time.time() - started, 3)
             _append_audit(
@@ -457,8 +478,11 @@ class LLMService:
             return result
 
         cache().count_call()
-        if cache_key:
-            cache().put(cache_key, text, tokens)
+        truncated = is_truncated(finish)
+        if cache_key and not truncated:
+            # 被截断的回答不进缓存：它是一次「没写完」的结果，缓存下来只会
+            # 让同样的半截答案在 5 分钟里反复命中。
+            cache().put(cache_key, text, tokens, finish)
         result.update(
             ok=True,
             text=text,
@@ -466,7 +490,7 @@ class LLMService:
             finish=finish,
             # 被截断的回答也可能有正文——JSON 停在字符串中间。routes_lab 靠这个
             # 把「截断」和「模型答非所问」分开报，不能在这里丢掉。
-            truncated=finish == "length",
+            truncated=truncated,
             elapsed=round(time.time() - started, 3),
         )
         _append_audit(

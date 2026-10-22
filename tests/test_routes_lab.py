@@ -113,6 +113,10 @@ class FakeStrategies:
     def __contains__(self, key: str) -> bool:
         return key in self.registry
 
+    @property
+    def keys(self) -> list[str]:
+        return self.registry.keys
+
 
 class FakeKlines:
     def fetch(self, market, symbol, timeframe, limit=1000):
@@ -153,7 +157,8 @@ def test_generate_stores_candidate(tmp_path: Path):
     assert candidate["checks"]["ok"] is True
     assert controller.list_candidates()["items"][0]["id"] == candidate["id"]
     detail = controller.get_candidate(candidate["id"])
-    assert detail["code"] == SAFE_CODE
+    # 解析会把首尾空行规整掉，比的是源码本身
+    assert detail["code"].strip() == SAFE_CODE.strip()
 
 
 def test_review_approves_candidate(tmp_path: Path):
@@ -167,16 +172,16 @@ def test_review_approves_candidate(tmp_path: Path):
     assert "gen_strategy" in controller.get_state().ctx.strategies
 
 
-def test_generate_reports_broken_json_apart_from_truncation(tmp_path: Path):
-    """没被截断却解析不出来，是模型答非所问，不该说成额度不够。"""
-    controller = make_controller(None, tmp_path, text="没有 JSON")
+def test_generate_names_prose_without_code(tmp_path: Path):
+    """模型只给了说明文字、没给代码：502 要点名这件事，别让用户猜。"""
+    controller = make_controller(None, tmp_path, text="## 改进思路\n\n这里只讲道理，没有代码。")
 
     with pytest.raises(HTTPException) as info:
         controller.generate(CandidateGeneratePayload())
 
     assert info.value.status_code == 502
-    assert info.value.detail == "模型返回的 JSON 不完整，重试一次"
-
+    assert "没有策略源码" in info.value.detail
+    assert "代码块" in info.value.detail
 
 def test_generate_reports_truncation_with_its_own_message(tmp_path: Path):
     """截断和 JSON 坏了是两种不同的失败，文案必须自己说清是哪一种。"""
@@ -218,7 +223,7 @@ def test_generate_succeeds_and_writes_the_candidate_to_disk(tmp_path: Path):
     assert result["ok"] is True
     candidate_id = result["candidate"]["id"]
     assert result["candidate"]["checks"]["ok"] is True
-    assert (tmp_path / f"{candidate_id}.py").read_text(encoding="utf-8") == SAFE_CODE
+    assert (tmp_path / f"{candidate_id}.py").read_text(encoding="utf-8").strip() == SAFE_CODE.strip()
     assert (tmp_path / f"{candidate_id}.json").exists()
 
 
@@ -290,3 +295,65 @@ def test_record_candidate_backtest(tmp_path: Path):
     assert stored["total_return"] == 0.12
     assert stored["symbol"] == "BTC/USDT"
     assert stored["source"] == "btrader"
+
+
+# ------------------------------------------------- replies that are prose + fences
+# 模型最常见的样子：说明文字 + 一个 python 代码块 + 尾部参数表格，全文没有 JSON。
+# 这条按审计里那条真实回答的形状（截了一段）拼出来，旧代码在这里直接 502。
+PROSE_HEAD = """## 改进思路
+
+带宽明显发散时才允许开新仓，平盘不交易。下面是改进后的策略代码。
+
+```python
+"""
+
+PROSE_TAIL = """
+```
+
+| 参数 | 说明 |
+| --- | --- |
+| period | 均线周期 |
+"""
+
+
+def prose_with_code() -> str:
+    return PROSE_HEAD + SAFE_CODE + PROSE_TAIL
+
+
+def test_generate_accepts_a_complete_code_block_even_when_truncated(tmp_path: Path):
+    """被截断的是后面的散文，代码整段在——这种就该收下，不必让用户重试。"""
+    controller = make_controller(None, tmp_path, text=prose_with_code(), truncated=True)
+
+    result = controller.generate(CandidateGeneratePayload())
+
+    candidate = result["candidate"]
+    assert result["ok"] is True
+    assert candidate["strategy_key"] == "gen_strategy"
+    assert candidate["checks"]["ok"] is True
+    assert "python 代码块" in candidate["note"]
+    stored = controller.get_candidate(candidate["id"])
+    assert stored["code"].strip() == SAFE_CODE.strip()
+
+
+def test_generate_renames_a_key_that_would_shadow_a_builtin(tmp_path: Path):
+    """模型会照抄 key = "bollinger"。核准后它会把内置策略顶掉，所以先改名。"""
+    code = SAFE_CODE.replace('key = "gen_strategy"', 'key = "bollinger"')
+    controller = make_controller({"strategy_key": "bollinger", "code": code}, tmp_path)
+
+    result = controller.generate(CandidateGeneratePayload())
+
+    candidate = result["candidate"]
+    assert candidate["strategy_key"] == "bollinger_ai"
+    assert "已被占用" in candidate["note"]
+    assert candidate["checks"]["ok"] is True
+
+
+def test_generate_tells_the_model_which_keys_are_taken(tmp_path: Path):
+    """提示词里念一遍现有 key，比让模型猜要省一次重试。"""
+    controller = make_controller({"strategy_key": "gen_strategy", "code": SAFE_CODE}, tmp_path)
+
+    controller.generate(CandidateGeneratePayload())
+
+    system = controller.get_state().ctx.ai.kwargs["system"]
+    assert "bollinger" in system
+    assert "不许和已有策略重复" in system

@@ -7,6 +7,7 @@ The controller is a plain class so the logic can be tested without HTTP.
 
 from __future__ import annotations
 
+import json
 import re
 import threading
 from pathlib import Path
@@ -15,7 +16,7 @@ from typing import Any, Callable
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from .. import ai, llm, paths
+from .. import ai, ai_candidate, llm, paths
 from ..ai_optimize import optimize_params
 from ..backtest import BacktestConfig
 from ..core.types import MarketType
@@ -23,14 +24,51 @@ from ..strategy.candidates import Candidate, CandidateError, CandidateStore
 from ..strategy.source import StrategySourceError, save_source
 from .routes import JobStore, _closed_only, _market_frame, _strategy_source
 
+# 一个能过静态检查的最小样例，直接念给模型看。要求它「照着格式写」比列字段名管用：
+# 只写字段名时它会给散文 + 代码块（实测四次全这样）。
+_SAMPLE_CODE = '''from btrader.strategy.base import IntParam, Strategy
+
+
+class EmaCross(Strategy):
+    key = "ema_cross_ai"
+    name = "快慢均线交叉"
+    params_spec = [IntParam("fast", "快线周期", 10, 2, 60)]
+
+    def generate(self, df, params):
+        ma = df["close"].rolling(int(params["fast"])).mean()
+        return df.assign(target=(df["close"] > ma).astype(float))[["target"]]
+'''
+
 GENERATE_SYSTEM = (
-    "你是量化策略工程师。只输出一个 JSON 对象，不要解释，不要输出 Markdown 代码块："
-    '{"strategy_key": "小写下划线", "name": "中文名", "code": "Python 源码"}。'
-    "code 必须是完整模块：从 btrader.strategy.base 导入 Strategy 与参数构造器"
-    "（IntParam/FloatParam/BoolParam/ChoiceParam，必须使用绝对导入），"
-    "定义一个直接继承 Strategy 的类，实现 generate(self, df, params) 并返回带 target 列的 DataFrame。"
+    "你是量化策略工程师。回答必须是**一个 JSON 对象**，不要解释，不要 Markdown 代码块，"
+    "第一个字符必须是左花括号 {，最后一个字符必须是右花括号 }。"
+    "字段只有三个：strategy_key（小写下划线）、name（中文名）、code（完整 Python 源码的字符串，"
+    "换行写成 \\n）。照着下面这个样例的格式回答（样例只是格式示范）：\n"
+    + json.dumps(
+        {"strategy_key": "ema_cross_ai", "name": "快慢均线交叉", "code": _SAMPLE_CODE},
+        ensure_ascii=False,
+    )
+    + "\ncode 必须是完整可运行的模块：从 btrader.strategy.base 导入 Strategy 和参数构造器"
+    "（IntParam/FloatParam/BoolParam/ChoiceParam）；定义一个直接继承 Strategy 的类，"
+    "实现 generate(self, df, params) 并返回带 target 列的 DataFrame。"
+    "必须用绝对导入：参考源码里的 from ..base、from ...core 是包内写法，"
+    "抄过来会导入失败，一律写成 from btrader.strategy.base import ...、"
+    "from btrader.core import ...。"
     "禁止导入 os/sys/subprocess/socket/requests/urllib 等模块，禁止 eval/exec/open。"
+    "实在要给代码块也可以，但只能给一个 python 代码块，不要散文、不要参数表格。"
 )
+
+
+def _generate_system(taken: list[str]) -> str:
+    """提示词 + 现有 key。撞库不是提示词能保证的，所以还有 sanitize_key 兜底。"""
+    if not taken:
+        return GENERATE_SYSTEM
+    return (
+        GENERATE_SYSTEM
+        + "strategy_key 不许和已有策略重复，已有的 key 有："
+        + "、".join(taken)
+        + "。换一个没出现过的。"
+    )
 
 
 class CandidateGeneratePayload(BaseModel):
@@ -110,6 +148,7 @@ class LabController:
                 base_source = _strategy_source(ctx.strategies.get(payload.base_key))
             except Exception:
                 base_source = ""
+        taken = self._taken_keys(ctx)
         prompt = (
             f"【参考策略】{payload.base_key or '无'}\n"
             f"【参考源码】\n{base_source[:4000]}\n"
@@ -117,41 +156,56 @@ class LabController:
         )
         answer = ctx.ai.ask(
             prompt,
-            system=GENERATE_SYSTEM,
+            system=_generate_system(sorted(taken)),
             kind="ai_lab",
             # 写代码比问答长：一个完整的策略模块 3-6k 字符，走专门的额度常量，
             # 让 JSON 一次写完整。改额度只动 llm 里那两个常量，别在这里写数字。
             max_tokens=llm.OUTPUT_TOKENS_CODE,
         )
-        # 截断和「答非所问」要分开报：前者是改进要求写太长，后者重试一次就好。
-        if answer.get("truncated"):
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    f"模型输出被截断（上限 {llm.OUTPUT_TOKENS_CODE} tokens），"
-                    "把改进要求写短一点再试"
-                ),
-            )
-        if not answer.get("ok"):
+        text = str(answer.get("text") or "")
+        if not answer.get("ok") and not text.strip():
             raise HTTPException(
                 status_code=502, detail=f"模型调用失败：{answer.get('error') or '未知错误'}"
             )
-        found = ai._find_json_object(str(answer.get("text") or ""))
-        if found is None:
-            raise HTTPException(status_code=502, detail="模型返回的 JSON 不完整，重试一次")
-        data, _start, _end = found
-        code = data.get("code")
-        if not isinstance(code, str) or not code.strip():
-            raise HTTPException(status_code=502, detail="模型返回的 JSON 缺少 code 字段")
-        key = str(data.get("strategy_key") or "ai_strategy")
+        # 先解析再判截断：代码抠出来了就是完整的一段，被截断的往往只是后面的散文。
+        # 真的抠不出来才按原因分：额度用完 vs 回答里根本没代码。
+        try:
+            parsed = ai_candidate.from_answer(text)
+        except ai_candidate.CandidateParseError as exc:
+            if answer.get("truncated"):
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        f"模型输出被截断（上限 {llm.OUTPUT_TOKENS_CODE} tokens），"
+                        "把改进要求写短一点再试"
+                    ),
+                ) from exc
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        key, key_note = ai_candidate.sanitize_key(parsed["strategy_key"], taken)
+        notes = "；".join(note for note in (parsed.get("note"), key_note) if note)
         candidate = self.candidates.create(
-            code,
+            parsed["code"],
             strategy_key=key,
-            name=str(data.get("name") or key),
+            name=parsed.get("name") or key,
             base_key=payload.base_key,
             model=getattr(ctx.ai.settings, "model", ""),
+            note=notes,
         )
         return {"ok": True, "candidate": candidate.to_dict()}
+
+    def _taken_keys(self, ctx: Any) -> set[str]:
+        """已被占用的 strategy_key：registry 里现有的 + 已有候选声明的。
+
+        候选批准后会写成用户策略，同 key 会顶掉内置策略（实测模型照抄了
+        ``key = "bollinger"``）。提示词里念一遍，撞上了再改名兜底。
+        """
+        taken: set[str] = set()
+        for key in getattr(ctx.strategies, "keys", ()) or ():
+            taken.add(str(key))
+        for item in self.candidates.list():
+            if item.strategy_key:
+                taken.add(str(item.strategy_key))
+        return taken
 
     def review(self, candidate_id: str, payload: CandidateReviewPayload) -> dict[str, Any]:
         try:

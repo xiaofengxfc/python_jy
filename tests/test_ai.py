@@ -1002,3 +1002,61 @@ def test_truncation_is_read_from_each_provider_field(
     assert "截断" in result["error"]
     assert "8000 tokens" in result["error"]
     assert "设置" not in result["error"]
+
+
+# ------------------------------- truncation across providers and through the cache
+def test_anthropic_max_tokens_counts_as_truncation(tmp_path, monkeypatch) -> None:
+    """Anthropic 说 max_tokens，OpenAI 说 length：两条都是「额度用完」。"""
+    service = _service(tmp_path, monkeypatch, "anthropic")
+    _capture_request(
+        monkeypatch,
+        {"content": [{"type": "text", "text": "半截"}], "stop_reason": "max_tokens"},
+    )
+
+    result = service.ask("写一个策略", max_tokens=llm.OUTPUT_TOKENS_CODE)
+
+    assert result["ok"] is True
+    assert result["finish"] == "max_tokens"
+    assert result["truncated"] is True
+
+
+def test_a_cached_answer_keeps_its_finish_reason(tmp_path, monkeypatch) -> None:
+    """命中缓存也要报 finish / truncated，否则第二次调用看起来像没被截断。"""
+    service = _service(tmp_path, monkeypatch, "openai")
+    llm.cache().put("lab|BTC|1h|1", "半截回答", 12, "max_tokens")
+
+    result = service.ask("问题", cache_key="lab|BTC|1h|1")
+
+    assert result["cached"] is True
+    assert result["finish"] == "max_tokens"
+    assert result["truncated"] is True
+
+
+def test_a_cached_complete_answer_is_not_reported_as_truncated(tmp_path, monkeypatch) -> None:
+    service = _service(tmp_path, monkeypatch, "openai")
+    llm.cache().put("key", "完整回答", 12, "stop")
+
+    result = service.ask("问题", cache_key="key")
+
+    assert result["cached"] is True
+    assert result["finish"] == "stop"
+    assert result["truncated"] is False
+
+
+def test_a_truncated_answer_is_not_cached(tmp_path, monkeypatch) -> None:
+    """半截答案缓存下来，5 分钟内每次重试都拿到同一份半截。"""
+    service = _service(tmp_path, monkeypatch, "openai")
+    calls: list[str] = []
+
+    def fake_request(spec, settings, key, system, prompt, **kwargs):
+        calls.append(prompt)
+        return "半截", 9, "length"
+
+    monkeypatch.setattr(service, "_request", fake_request)
+    first = service.ask("写一个策略", cache_key="lab|1")
+    second = service.ask("写一个策略", cache_key="lab|1")
+
+    assert first["truncated"] is True and second["truncated"] is True
+    assert second["cached"] is False
+    assert len(calls) == 2
+    assert llm.cache().get("lab|1", 600) is None
