@@ -289,3 +289,29 @@ def test_trading_page_explains_a_cross_market_symbol_fallback() -> None:
     assert "settings?.last_symbol && chosen && chosen !== settings.last_symbol" in page
     # 用户自己选、换市场、以及默认交易对可用时都要清掉
     assert page.count("setSymbolFallback(null)") >= 3, "说明不会消失"
+
+def test_conditional_orders_say_they_are_waiting_for_a_trigger() -> None:
+    """委托面板里的算法单（止损/止盈/条件单）不该读成「未成交」。
+
+    这些单子在币安是算法单，挂上就是等触发；它们的 price 恒为 0，只有 trigger 有值，
+    所以价格列已经回落到 trigger。时间也有缺的时候，缺了要显示「—」而不是 1970 年。
+    """
+    panel = (UI_DIR / "components" / "BottomTabs.tsx").read_text(encoding="utf-8")
+
+    assert 'order.trigger ? "等待触发" : "未成交"' in panel
+    assert "order.price ? fmtPrice(order.price) : order.trigger ? fmtPrice(order.trigger) : \"市价\"" in panel
+    assert "order.timestamp" in panel and ': "—",' in panel, "算法单没有时间时会显示 1970"
+
+def test_spot_backtest_cannot_ask_for_shorts() -> None:
+    """现货回测不许做空：勾选框置灰，请求里也不发 true。
+
+    后端 _validate_backtest 会把现货的 allow_short 收死成 False、杠杆收死成 1。
+    界面还留一个能勾的「允许做空」，用户会以为自己刚跑的是多空策略。
+    """
+    page = (UI_DIR / "pages" / "BacktestPage.tsx").read_text(encoding="utf-8")
+
+    assert 'allow_short: config.market === "spot" ? false : config.allow_short' in page
+    assert "disabled={config.market === \"spot\"}" in page
+    assert "现货不能做空" in page
+    # 合约还是能勾
+    assert "允许做空（仅合约市场生效）" in page

@@ -275,7 +275,8 @@ export default function BacktestPage({ onEditStrategy }: Props) {
     slippage_bps: config.slippage_bps,
     position_pct: config.position_pct,
     leverage: config.market === "spot" ? 1 : config.leverage,
-    allow_short: config.allow_short,
+    // 现货不能做空，后端也会收死；这里先别把做不到的事发出去。
+    allow_short: config.market === "spot" ? false : config.allow_short,
     stop_loss_pct: config.stop_loss_pct,
     take_profit_pct: config.take_profit_pct,
     save: true,
@@ -786,13 +787,16 @@ export default function BacktestPage({ onEditStrategy }: Props) {
                 </div>
               </div>
 
-              <label className="check">
+              <label className={config.market === "spot" ? "check faint" : "check"}>
                 <input
                   type="checkbox"
-                  checked={config.allow_short}
+                  checked={config.market === "spot" ? false : config.allow_short}
+                  disabled={config.market === "spot"}
                   onChange={(event) => patch({ allow_short: event.target.checked })}
                 />
-                允许做空（仅合约市场生效）
+                {config.market === "spot"
+                  ? "允许做空（现货不能做空，勾了也不会做）"
+                  : "允许做空（仅合约市场生效）"}
               </label>
             </div>
           </div>

@@ -336,8 +336,12 @@ export default function BottomTabs({
                     : "市价",
                 fmt(order.amount, 6),
                 order.price ? fmtPrice(order.price) : order.trigger ? fmtPrice(order.trigger) : "市价",
-                "未成交",
-                new Date(order.timestamp).toLocaleTimeString("zh-CN", { hour12: false }),
+                // 算法单（止损/止盈/条件单）挂上就是等着触发，和限价单的「未成交」不是一回事。
+                order.trigger ? "等待触发" : "未成交",
+                // 算法单偶尔没有 createTime，压成 0 会显示成 1970 年 08:00。
+                order.timestamp
+                  ? new Date(order.timestamp).toLocaleTimeString("zh-CN", { hour12: false })
+                  : "—",
                 <button
                   type="button"
                   className="btn-sm"
