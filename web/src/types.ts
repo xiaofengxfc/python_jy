@@ -193,30 +193,20 @@ export interface Portfolio {
 
 export interface NotifySettings {
   enabled: boolean;
-  /** `wecom_api` direct self-built-app API, or `openclaw` smart-bot gateway. */
-  mode: "wecom_api" | "openclaw" | string;
-  /** OpenClaw channel id for the WeChat plugin. */
-  channel: string;
-  /** WeChat conversation the gateway should deliver to. */
-  target: string;
-  /** Self-built-app Corpid (direct API mode). */
-  corp_id: string;
-  /** Self-built-app AgentId (direct API mode). */
-  agent_id: string;
-  /** Direct API base URL; empty means the public qyapi host. */
-  api_base: string;
-  /** Account id; empty means the gateway's default (single-account setups). */
-  account: string;
-  /** OpenClaw executable; empty means "openclaw" from PATH. */
-  command: string;
+  /** 企业微信群机器人地址，或任何收 JSON 的自建地址。自带 key，等同密码。 */
+  webhook_url: string;
+  /** auto 按地址判断，qyapi_markdown / qyapi_text 走群机器人，custom 用模板。 */
+  msg_format: "auto" | "qyapi_markdown" | "qyapi_text" | "custom" | string;
+  /** custom 格式的 JSON 模板，用 {title} 和 {content} 占位。 */
+  webhook_template: string;
+  /** 自定义请求头，每行一个「名称: 值」。 */
+  webhook_headers: string;
   on_fill: boolean;
   on_protection: boolean;
   on_risk_halt: boolean;
   on_live_warning: boolean;
   /** 自动交易启停、回测/优化完成或失败。 */
   on_task: boolean;
-  /** Probe the gateway port before spawning the CLI. */
-  preflight: boolean;
 }
 
 /** Optional LLM assistant. The API key is not here: it lives in the keyring. */
@@ -295,6 +285,8 @@ export interface AIAnalysis {
 }
 
 export interface AppSettings {
+  /** 交易所。现在只有币安接了完整链路。 */
+  platform: string;
   network: string;
   market_type: string;
   last_symbol: string;
@@ -318,6 +310,13 @@ export interface AppSettings {
   theme: string;
   notify: NotifySettings;
   ai: AISettings;
+}
+
+/** 凭证区顶部的交易所下拉项。enabled=false 的只占位，选了也下不了单。 */
+export interface PlatformOption {
+  key: string;
+  label: string;
+  enabled: boolean;
 }
 
 /** One entry the model ruled on during an AI-filtered backtest. */
@@ -366,55 +365,24 @@ export interface AIFilterResult {
 /** Reachability of the local OpenClaw gateway, as reported by the backend. */
 export interface NotifyStatus {
   enabled: boolean;
-  mode: "wecom_api" | "openclaw" | string;
-  channel: string;
-  target: string;
-  /** Account id used for the send; empty means the gateway's default. */
-  account: string;
-  command: string;
-  corp_id: string;
-  agent_id: string;
-  api_base: string;
-  /** True when the direct-API secret is in the OS keyring. */
-  secret_saved: boolean;
+  format: string;
+  /** 打码后的地址，只显示 key 的后四位。 */
+  url: string;
+  /** 地址填了没有。没填就发不出去。 */
   available: boolean;
-  /** Non-empty when the target does not look like a 企业微信 userid. */
-  target_warning: string;
   last_error: string;
   /** Unix seconds of the last failure, 0 when there has not been one. */
   last_error_at: number;
   last_success_at: number;
   dropped: number;
+  /** 队列里还没发出去的条数。 */
   pending: number;
-  /** Messages kept on disk after a failed send, waiting to be replayed. */
+  /** 失败后暂存、等通道恢复再补发的条数。 */
   spooled: number;
-  /** Seconds the channel is paused for after repeated failures; 0 = not paused. */
+  /** 熔断剩余秒数，0 表示没熔断。 */
   breaker_seconds: number;
 }
 
-/** State of the "install OpenClaw" helper. */
-export interface InstallStatus {
-  /** The `openclaw` CLI is on PATH. */
-  available: boolean;
-  /** `node --version` output, empty when Node.js is missing. */
-  node: string;
-  node_path: string;
-  npm: string;
-  npm_path: string;
-  /** A usable npm was found, so an install can be started. */
-  ready: boolean;
-  /** Why it cannot start (missing Node.js, bad path), Chinese, may be empty. */
-  reason: string;
-  registries: string[];
-  running: boolean;
-  /** idle | running | done | failed | canceled */
-  state: string;
-  command: string[];
-  started_at: number;
-  finished_at: number;
-  error: string;
-  log: string[];
-}
 
 /** Whether the local gateway process is up; WeChat push needs it. */
 export interface GatewayStatus {
@@ -431,31 +399,6 @@ export interface GatewayStatus {
   started_at: number;
 }
 
-/** What the gateway says about the 企业微信 channel itself. */
-export interface ChannelStatus {
-  channel: string;
-  /** The `openclaw` CLI exists. */
-  cli: boolean;
-  /** The gateway has the plugin in its catalog (even if not configured). */
-  plugin: boolean;
-  /** Bot ID and Secret are filled in, so the long connection can authenticate. */
-  configured: boolean;
-  /** The long connection is live inside the gateway process. */
-  running: boolean;
-  /** The plugin is enabled. */
-  enabled: boolean;
-  /** Gateway-reported lifecycle, e.g. "starting" or "running". */
-  lifecycle: string;
-  /** Plugin account id currently active. */
-  account: string;
-  /** Bot ID from OpenClaw's channels.wecom API-mode config (never the secret). */
-  bot_id?: string;
-  /** missing | installed | ready | unknown */
-  state: string;
-  /** One-line summary for the card, or the raw CLI excerpt as a fallback. */
-  detail: string;
-  gateway?: GatewayStatus;
-}
 
 export interface CredentialItem {
   market: string;

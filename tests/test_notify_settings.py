@@ -1,8 +1,7 @@
-"""Settings plumbing for the WeChat push.
+"""通知设置的读写。
 
-Two failure modes are pinned here because both are silent: an update that is
-rejected must not leave the live object half-changed, and a reloaded config must
-not leave the running services pointing at a stale nested settings object.
+两个失败都是静默的，所以钉在这里：被拒的修改不能把保存好的对象改一半，
+重新加载配置不能让运行中的服务指向旧的设置对象。
 """
 
 from __future__ import annotations
@@ -12,24 +11,59 @@ from dataclasses import replace
 import pytest
 from fastapi import HTTPException
 
-from btrader.core.config import AppSettings, ConfigStore, RiskSettings
+from btrader.core.config import ConfigStore
 from btrader.notify import NotifySettings
 from btrader.web.routes import _apply_notify
 
+URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=abcd1234efgh5678"
 
-def test_enabling_without_a_target_is_rejected() -> None:
-    candidate = replace(NotifySettings(enabled=False, target=""), enabled=True)
-    with pytest.raises(HTTPException, match="userid"):
+
+def test_enabling_without_an_address_is_rejected() -> None:
+    candidate = replace(NotifySettings(enabled=False, webhook_url=""), enabled=True)
+    with pytest.raises(HTTPException, match="Webhook 地址"):
         _apply_notify(candidate, {})
 
 
 def test_a_rejected_patch_leaves_the_saved_object_untouched() -> None:
-    """The route validates a copy, so a 400 never reaches live settings."""
-    saved = NotifySettings(enabled=False, target="")
+    """路由校验的是副本，400 永远碰不到已保存的设置。"""
+    saved = NotifySettings(enabled=False, webhook_url="")
     candidate = replace(saved, enabled=True)
     with pytest.raises(HTTPException):
         _apply_notify(candidate, {})
     assert saved.enabled is False
+
+
+def test_an_address_without_a_scheme_is_rejected() -> None:
+    candidate = NotifySettings(enabled=False, webhook_url="")
+    with pytest.raises(HTTPException, match="http"):
+        _apply_notify(candidate, {"webhook_url": "qyapi.weixin.qq.com/send"})
+    assert candidate.webhook_url == ""
+
+
+def test_an_unknown_message_format_is_rejected() -> None:
+    candidate = NotifySettings(enabled=False)
+    with pytest.raises(HTTPException, match="消息格式"):
+        _apply_notify(candidate, {"msg_format": "telegram"})
+    assert candidate.msg_format == "auto"
+
+
+def test_only_the_given_fields_change() -> None:
+    candidate = NotifySettings(enabled=False)
+    _apply_notify(
+        candidate,
+        {"webhook_url": URL, "msg_format": "qyapi_text", "on_task": False},
+    )
+    assert candidate.webhook_url == URL
+    assert candidate.msg_format == "qyapi_text"
+    assert candidate.on_task is False
+    assert candidate.on_fill is True
+
+
+def test_unknown_fields_are_ignored() -> None:
+    """旧配置文件里的字段会一起被送进来，不能因为认不出来就 500。"""
+    candidate = NotifySettings(enabled=False)
+    _apply_notify(candidate, {"mode": "openclaw", "target": "XiaoJiaJian"})
+    assert not hasattr(candidate, "mode")
 
 
 def test_notify_settings_round_trip_through_the_config_file(tmp_path) -> None:
@@ -37,84 +71,45 @@ def test_notify_settings_round_trip_through_the_config_file(tmp_path) -> None:
     store = ConfigStore(path)
     store.settings.notify = NotifySettings(
         enabled=True,
-        mode="wecom_api",
-        target="wxid-9",
-        corp_id="ww123",
-        agent_id="1000002",
-        channel="weixin",
-        command=r"C:\npm\openclaw.cmd",
+        webhook_url=URL,
+        msg_format="qyapi_markdown",
+        webhook_headers="Authorization: Bearer abc",
+        webhook_template="",
+        on_task=False,
     )
     store.save()
 
     loaded = ConfigStore(path).settings.notify
     assert isinstance(loaded, NotifySettings)
     assert loaded.enabled is True
-    assert loaded.mode == "wecom_api"
-    assert loaded.target == "wxid-9"
-    assert loaded.corp_id == "ww123"
-    assert loaded.agent_id == "1000002"
-    assert loaded.channel == "weixin"
+    assert loaded.webhook_url == URL
+    assert loaded.msg_format == "qyapi_markdown"
+    assert loaded.webhook_headers == "Authorization: Bearer abc"
+    assert loaded.on_task is False
 
 
-def test_invalid_notification_mode_is_rejected() -> None:
-    with pytest.raises(HTTPException, match="openclaw"):
-        _apply_notify(NotifySettings(), {"mode": "webhook"})
+def test_old_openclaw_fields_are_dropped_on_load(tmp_path) -> None:
+    """旧配置文件里的 mode/target/corp_id 不再有含义，读的时候直接丢掉。"""
+    import json
 
-
-def test_api_mode_enabled_requires_corp_and_agent() -> None:
-    with pytest.raises(HTTPException, match="CorpID"):
-        _apply_notify(
-            NotifySettings(enabled=True, mode="wecom_api", target="Zhang"),
-            {},
-        )
-    with pytest.raises(HTTPException, match="AgentId"):
-        _apply_notify(
-            NotifySettings(
-                enabled=True, mode="wecom_api", target="Zhang", corp_id="ww123"
-            ),
-            {},
-        )
-
-
-def test_unknown_notify_keys_are_ignored() -> None:
-    target = NotifySettings()
-    _apply_notify(target, {"nonexistent_field": 1, "target": "wxid-1"})
-    assert target.target == "wxid-1"
-
-
-def test_missing_notify_block_keeps_defaults(tmp_path) -> None:
-    """A config written before this feature existed must still load."""
     path = tmp_path / "config.json"
-    path.write_text('{"network": "testnet"}', encoding="utf-8")
-    settings = ConfigStore(path).settings
-    assert isinstance(settings.notify, NotifySettings)
-    assert settings.notify.enabled is False
-    assert settings.notify.channel
+    path.write_text(
+        json.dumps(
+            {
+                "notify": {
+                    "enabled": True,
+                    "mode": "openclaw",
+                    "target": "XiaoJiaJian",
+                    "corp_id": "",
+                    "webhook_url": URL,
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    loaded = ConfigStore(path).settings.notify
+    assert loaded.webhook_url == URL
+    assert not hasattr(loaded, "mode")
+    assert not hasattr(loaded, "target")
 
-
-def test_attach_settings_rebinds_replaced_nested_objects() -> None:
-    """Reloading replaces ``risk``/``notify``; services must follow them.
-
-    ``AppContext`` keeps both by reference. After a reload the old object is
-    gone, so a service still holding it would silently ignore every later
-    change — the exact bug that made a saved breaker limit inert.
-    """
-
-    class Risk:
-        def __init__(self, settings: RiskSettings) -> None:
-            self.settings = settings
-
-    class Notifier:
-        def __init__(self, settings: NotifySettings) -> None:
-            self.settings = settings
-
-    fresh = AppSettings()
-    risk = Risk(RiskSettings())
-    notifier = Notifier(NotifySettings())
-
-    # The body of ``AppContext._attach_settings``.
-    risk.settings = fresh.risk
-    notifier.settings = fresh.notify
-
-    assert risk.settings is fresh.risk
-    assert notifier.settings is fresh.notify

@@ -103,7 +103,11 @@ class AISettings:
     model: str = ""
     base_url: str = ""
     temperature: float = 0.2
-    max_tokens: int = 1200
+    # Reasoning models (deepseek-v4.1-flash and friends) spend this budget on
+    # thinking before writing a single word of the answer. At 1200 the whole
+    # allowance went on the hidden reasoning and the visible answer came back
+    # empty, which read as "模型返回了空内容" for a request that was fine.
+    max_tokens: int = 3000
     timeout: float = 60.0
     # 0 disables the budget. Counted per local day, from the audit trail.
     daily_limit: int = DEFAULT_DAILY_LIMIT
@@ -562,7 +566,7 @@ class LLMService:
 
         text, tokens = _extract(style, data)
         if not text:
-            raise AIError("模型返回了空内容。")
+            raise AIError(_empty_answer_text(style, data, output_limit))
         return text, tokens
 
 
@@ -598,6 +602,40 @@ def _http_error_text(code: int, detail: str, provider: str) -> str:
     if detail:
         message += f" {detail}"
     return f"{PROVIDERS.get(provider, {}).get('label', provider)}：{message}"
+
+
+def _empty_answer_text(style: str, data: Any, limit: int) -> str:
+    """正文为空时说清楚原因：是被截断，还是模型只给了思考过程。
+
+    推理模型把 ``max_tokens`` 先花在隐藏的思考上。额度不够时整段预算都被
+    思考吃掉，``content`` 是空串、``finish_reason`` 是 length，用户看到的
+    “模型返回了空内容”完全指不到问题在哪。
+    """
+    finish = ""
+    reasoning = ""
+    if isinstance(data, dict):
+        if style == "openai":
+            choices = data.get("choices") or []
+            if choices and isinstance(choices[0], dict):
+                finish = str(choices[0].get("finish_reason") or "")
+                message = choices[0].get("message") or {}
+                reasoning = str(
+                    message.get("reasoning_content") or message.get("reasoning") or ""
+                )
+        elif style == "anthropic":
+            finish = str(data.get("stop_reason") or "")
+        elif style == "ollama":
+            finish = str(data.get("done_reason") or "")
+            reasoning = str((data.get("message") or {}).get("thinking") or "")
+    if finish == "length":
+        return (
+            f"回答被输出上限截断了（上限 {limit} tokens）。"
+            "推理模型先花额度思考，正文就没额度了。"
+            "到设置里把输出上限调到 2000 以上再试。"
+        )
+    if reasoning.strip():
+        return "模型只返回了思考过程，没有正文。把输出上限调大后重试。"
+    return "模型返回了空内容。"
 
 
 def _extract(style: str, data: Any) -> tuple[str, int]:

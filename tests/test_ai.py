@@ -700,17 +700,16 @@ def test_openai_request_has_the_documented_url_headers_and_payload(
     assert payload["model"] == "gpt-4o-mini"
     assert payload["stream"] is False
     assert payload["temperature"] == pytest.approx(0.2)
-    assert payload["max_tokens"] == 1200
+    assert payload["max_tokens"] == 3000
     assert payload["messages"][0] == {"role": "system", "content": "你是分析师"}
     assert payload["messages"][-1] == {"role": "user", "content": "问题"}
 
 
 def test_ask_can_override_output_tokens_per_call(tmp_path, monkeypatch) -> None:
-    """Strategy-lab code generation needs more than the global 1200 tokens.
+    """写策略代码要比默认上限更长。
 
-    The override must reach the wire payload for every provider style; silently
-    ignoring it truncates the JSON mid-string and the candidate is rejected for
-    reasons the user cannot see.
+    覆盖值必须真的进到请求体：被无声忽略的话，返回的 JSON 从字符串中间断掉，
+    候选策略被否掉，而用户看不到原因。
     """
     service = _service(tmp_path, monkeypatch, "openai")
     seen = _capture_request(monkeypatch, _COMPLETIONS["openai"])
@@ -744,7 +743,7 @@ def test_anthropic_request_uses_its_own_headers_and_a_system_field(
     # Anthropic takes the system prompt as a top-level field, not a message.
     assert payload["system"] == "你是分析师"
     assert payload["messages"] == [{"role": "user", "content": "问题"}]
-    assert payload["max_tokens"] == 1200
+    assert payload["max_tokens"] == 3000
 
 
 def test_ollama_request_is_local_and_sends_no_credentials(tmp_path, monkeypatch) -> None:
@@ -766,7 +765,7 @@ def test_ollama_request_is_local_and_sends_no_credentials(tmp_path, monkeypatch)
     payload = json.loads(request.data.decode("utf-8"))
     assert payload["stream"] is False
     assert payload["options"]["temperature"] == pytest.approx(0.2)
-    assert payload["options"]["num_predict"] == 1200
+    assert payload["options"]["num_predict"] == 3000
     assert payload["messages"][0] == {"role": "system", "content": "你是分析师"}
 
 
@@ -845,3 +844,57 @@ def test_ask_keeps_the_permission_wording_for_a_json_403(tmp_path, monkeypatch) 
     assert result["ok"] is False
     assert "没有访问该模型" in result["error"]
     assert "防火墙" not in result["error"]
+
+# ------------------------------------------------- reasoning models come back empty
+def test_a_truncated_reasoning_model_says_the_budget_ran_out(tmp_path, monkeypatch) -> None:
+    """思考过程也占输出上限。
+
+    推理模型把预算花在思考上，正文是空的。只说「模型返回了空内容」用户无从下手，
+    所以截断时要说明上限被用完了，并指出该往上调。
+    """
+    service = _service(tmp_path, monkeypatch, "openai")
+    _capture_request(
+        monkeypatch,
+        {
+            "choices": [
+                {
+                    "finish_reason": "length",
+                    "message": {"role": "assistant", "content": "", "reasoning_content": "用户在问…"},
+                }
+            ],
+            "usage": {"total_tokens": 1200},
+        },
+    )
+
+    result = service.ask("分析一下 BTCUSDT")
+
+    assert result["ok"] is False
+    assert "截断" in result["error"]
+    assert "输出上限" in result["error"]
+
+
+def test_reasoning_without_an_answer_asks_for_a_bigger_budget(tmp_path, monkeypatch) -> None:
+    service = _service(tmp_path, monkeypatch, "openai")
+    _capture_request(
+        monkeypatch,
+        {
+            "choices": [
+                {"finish_reason": "stop", "message": {"content": "", "reasoning_content": "想了想"}}
+            ]
+        },
+    )
+
+    result = service.ask("分析一下 BTCUSDT")
+
+    assert result["ok"] is False
+    assert "思考过程" in result["error"]
+
+
+def test_an_empty_answer_without_a_reason_keeps_the_plain_message(tmp_path, monkeypatch) -> None:
+    service = _service(tmp_path, monkeypatch, "openai")
+    _capture_request(monkeypatch, {"choices": [{"finish_reason": "stop", "message": {"content": ""}}]})
+
+    result = service.ask("分析一下 BTCUSDT")
+
+    assert result["ok"] is False
+    assert result["error"] == "模型返回了空内容。"

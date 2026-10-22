@@ -179,7 +179,7 @@ def test_slices_of_one_order_produce_a_single_message(tmp_path):
             ]
         }
     )
-    notifier = Recording(NotifySettings(enabled=True, target="wxid"))
+    notifier = Recording(NotifySettings(enabled=True, webhook_url="https://example.com/hook"))
     service, db = _service(tmp_path, rest)
     service.notifier = notifier
 
@@ -215,7 +215,7 @@ def test_daily_loss_breaker_is_announced_without_a_halt_reason(tmp_path):
             ]
         }
     )
-    notifier = Recording(NotifySettings(enabled=True, target="wxid"))
+    notifier = Recording(NotifySettings(enabled=True, webhook_url="https://example.com/hook"))
     service, db = _service(tmp_path, rest)
     service.notifier = notifier
     service.risk.settings.max_daily_loss = 5.0

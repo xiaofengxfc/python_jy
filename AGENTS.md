@@ -10,7 +10,7 @@ biTrader：后端 Python + FastAPI，在 `src/btrader/`。前端 React + TS，�
 | `web/src/**`（TS、TSX、CSS） | 在 `web` 目录执行 `npm run build`。产物直接写进 `src/btrader/web/static` |
 | `src/btrader/**`（Python） | 重启后端，没有热重载 |
 | 两者都改 | 先 build，再重启 |
-| `notify.cmd` 和文档 | 不用重启 |
+| 文档 | 不用重启 |
 
 重启后端（PowerShell，在仓库根目录执行）：
 
@@ -30,8 +30,8 @@ Node 不在 PATH 时，先把 Node 目录加进去。
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-提交前必须全绿。测试不依赖本机网关：`tests/conftest.py` 已经关掉
-`WeChatNotifier._preflight`。
+提交前必须全绿。测试不访问网络：`tests/conftest.py` 把 `notify._post_json` 换成
+一个直接报错的替身，暂存文件也指向临时目录。要验证发送的测试自己替换它。
 
 ## 3. 改代码的注意事项
 
@@ -62,18 +62,13 @@ Node 不在 PATH 时，先把 Node 目录加进去。
 
 ## 5. 已确认的限制
 
-- 推送通道默认是企业微信智能机器人，API 模式加长连接。本机 OpenClaw 网关主动连
-  `wss://openws.work.weixin.qq.com`。没有回调 URL，不用扫码，登录态不会过期。
-  凭证在 `~/.openclaw/openclaw.json` 的 `channels.wecom.{botId,secret}`，
-  发送命令带 `--channel wecom --target <成员 userid>`。
-- 设置页也支持企业微信自建应用 API 直连，填 CorpID、AgentId、Secret，
-  直接调 `qyapi.weixin.qq.com`，不用 OpenClaw。Secret 只存系统密钥环。
-  `notify.mode=openclaw|wecom_api` 决定走哪条通道，默认 `openclaw`。
-- 一次 `openclaw message send` 约 30 秒，时间花在 Node 启动和网关往返上。
-- 网关冷启动要 50 秒以上，`START_TIMEOUT` 设成 180 秒。
-- 企微机器人只能推到已存在的会话。目标成员要先给机器人发过一条消息，
-  否则接口返回 `errcode 93006 invalid chatid`。目标填错也是这个码。
-- 网关由终端启动时（`state=external`），本程序只能用 `openclaw gateway restart` 重启它。
+- 推送只有一条通道：用户自己填的 Webhook 地址。企业微信群机器人地址最省事，
+  发 `{"msgtype": "markdown"}`；别的地址发 `{"title", "content"}` 或用自定义模板。
+- 地址自带 key，等同密码。`config.json` 里存明文，界面只显示后四位，日志不打印。
+- 一次发送是普通 HTTP POST，超时 10 秒，不经过任何本地网关或 Node 进程。
+- 企业微信群机器人限流：每分钟 20 条，超了返回 `errcode 45009`。消息会暂存补发。
+- 群机器人只能发到机器人所在的群，没有「发给某个人」这一说。要发给人，改用自建应用。
+- 连续三次失败熔断五分钟；失败的消息留在 `notify-spool.jsonl`，六小时后过期。
 
 ## 6. AI 助手
 

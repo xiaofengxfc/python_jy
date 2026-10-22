@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,10 @@ from ..notify import NotifySettings
 from .types import MarketType, Network
 
 log = logging.getLogger(__name__)
+
+
+class ConfigError(RuntimeError):
+    """配置文件写入被拒绝。用户读到的话必须说明文件在哪、怎么修。"""
 
 
 @dataclass
@@ -65,6 +70,8 @@ class AIAutoSettings:
 
 @dataclass
 class AppSettings:
+    # 交易所。只有币安接了完整链路，其余平台先占位。
+    platform: str = "binance"
     network: str = Network.MAINNET.value
     market_type: str = MarketType.SPOT.value
     last_symbol: str = "BTC/USDT"
@@ -77,7 +84,7 @@ class AppSettings:
     risk: RiskSettings = field(default_factory=RiskSettings)
     notification_sound: bool = True
     theme: str = "light"
-    # WeChat push via the local OpenClaw gateway (see ``btrader.notify``).
+    # 企业微信通知：一条通用 Webhook（见 ``btrader.notify``）。
     notify: NotifySettings = field(default_factory=NotifySettings)
     # Optional LLM assistant (see ``btrader.llm``). The API key is not here: it
     # lives in the OS keyring, so a settings file that gets copied or shared
@@ -95,6 +102,10 @@ class ConfigStore:
 
     def __init__(self, path: Path | None = None) -> None:
         self._path = path or paths.config_file()
+        # 配置文件读不出来时置位：这时内存里是默认值，一旦保存就会把用户
+        # 原来的设置整份盖掉，所以保存要拒绝，等人把坏文件处理掉。
+        self._refuse_save = False
+        self._backup: Path | None = None
         self.settings = self._load()
 
     def _load(self) -> AppSettings:
@@ -103,7 +114,14 @@ class ConfigStore:
         try:
             raw = json.loads(self._path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
-            log.warning("读取配置失败，使用默认配置: %s", exc)
+            self._refuse_save = True
+            self._backup = self._back_up_broken_file()
+            log.error("配置文件读不出来，已备份，本次不保存任何设置: %s", exc)
+            return AppSettings()
+        if not isinstance(raw, dict):
+            self._refuse_save = True
+            self._backup = self._back_up_broken_file()
+            log.error("配置文件结构不对（顶层不是对象），已备份，本次不保存任何设置")
             return AppSettings()
 
         risk_raw = raw.pop("risk", {}) or {}
@@ -125,13 +143,34 @@ class ConfigStore:
         )
         ai_known = {f for f in AISettings.__dataclass_fields__}
         settings.ai = AISettings(**{k: v for k, v in ai_raw.items() if k in ai_known})
+        # 旧默认输出上限是 1200，推理模型会把整份额度花在思考上，正文成了空串。
+        # 只迁移还停在旧默认值的配置，用户自己调过的不动。
+        if settings.ai.max_tokens == 1200:
+            settings.ai.max_tokens = 3000
         ai_auto_known = {f for f in AIAutoSettings.__dataclass_fields__}
         settings.ai_auto = AIAutoSettings(
             **{k: v for k, v in ai_auto_raw.items() if k in ai_auto_known}
         )
         return settings
 
+    def _back_up_broken_file(self) -> Path | None:
+        """把读不出来的配置文件挪一份，留着用户手工救回。"""
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        backup = self._path.with_name(f"{self._path.stem}.bad-{stamp}.json")
+        try:
+            backup.write_bytes(self._path.read_bytes())
+            return backup
+        except OSError as exc:
+            log.error("备份坏配置失败: %s", exc)
+            return None
+
     def save(self) -> None:
+        if self._refuse_save:
+            where = f"，原文件已备份为 {self._backup.name}" if self._backup else ""
+            raise ConfigError(
+                f"配置文件读不出来，为避免覆盖你的设置，这次没有保存{where}。"
+                "修好或删掉坏文件后重启程序再改。"
+            )
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._path.with_suffix(".tmp")
         tmp.write_text(

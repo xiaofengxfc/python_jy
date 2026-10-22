@@ -40,6 +40,16 @@ PUBLIC_FUTURES_HOSTS: dict[MarketType, dict[str, str]] = {
     },
 }
 
+# 交易所清单。只有币安接了完整链路（下单、风控、模拟盘），其余先占位：
+# 界面上能看到，但选不了，避免「切过去了却下不了单」这种半成品状态。
+PLATFORMS: list[dict[str, Any]] = [
+    {"key": "binance", "label": "币安", "enabled": True},
+    {"key": "okx", "label": "OKX", "enabled": False},
+    {"key": "bybit", "label": "Bybit", "enabled": False},
+]
+SUPPORTED_PLATFORMS = {item["key"]: item["label"] for item in PLATFORMS if item["enabled"]}
+DEFAULT_PLATFORM = "binance"
+
 
 class BinanceREST:
     """One ccxt client per market type, created lazily.
@@ -57,7 +67,11 @@ class BinanceREST:
         *,
         market_data: bool = False,
         proxy: str = "",
+        platform: str = DEFAULT_PLATFORM,
     ) -> None:
+        self.platform = platform if platform in SUPPORTED_PLATFORMS else DEFAULT_PLATFORM
+        if platform != self.platform:
+            log.warning("暂不支持 %s 平台，改用币安", platform)
         self.network = network
         self.credentials = credentials or Credentials()
         self.market_data = market_data
@@ -93,12 +107,7 @@ class BinanceREST:
                 # Applied before the first request so no traffic leaks direct.
                 client.proxies = {"http": self.proxy, "https": self.proxy}
             if self.network is Network.TESTNET:
-                # ccxt exposes sandbox mode per exchange.
-                if getattr(client, "has", {}).get("sandbox", True):
-                    try:
-                        client.set_sandbox_mode(True)
-                    except Exception as exc:
-                        log.warning("无法启用 %s 测试网: %s", market.ccxt_id, exc)
+                self._apply_test_environment(client, market)
             if self.market_data:
                 self._prefer_public_data(client, market)
             if self.credentials.is_set:
@@ -106,6 +115,31 @@ class BinanceREST:
                 client.secret = self.credentials.api_secret
             self._clients[market] = client
             return client
+
+    @staticmethod
+    def _apply_test_environment(client: ccxt.Exchange, market: MarketType) -> None:
+        """Point a client at the exchange test environment.
+
+        Binance retired the futures testnet: ccxt raises "testnet/sandbox mode
+        is not supported for futures anymore" for binanceusdm and binancecoinm,
+        which surfaced as "连接测试失败" whatever the key was. Futures keys now
+        go to demo trading (demo-fapi / demo-dapi); spot keeps its testnet.
+        """
+        if market.is_futures:
+            enable = getattr(client, "enable_demo_trading", None)
+            if enable is None:
+                log.warning("%s 不支持合约模拟盘，ccxt 版本过旧", market.ccxt_id)
+                return
+            try:
+                enable(True)
+            except Exception as exc:
+                log.warning("无法启用 %s 模拟盘: %s", market.ccxt_id, exc)
+            return
+        if getattr(client, "has", {}).get("sandbox", True):
+            try:
+                client.set_sandbox_mode(True)
+            except Exception as exc:
+                log.warning("无法启用 %s 测试网: %s", market.ccxt_id, exc)
 
     def reset(self) -> None:
         with self._lock:
@@ -475,6 +509,15 @@ _BINANCE_CODES: dict[str, str] = {
     "-4164": "下单金额低于交易所的最小名义价值（通常 5 USDT）。",
 }
 
+# ccxt 抛的英文弃用公告。用户读到的第一句必须是中文，并且指向真正的下一步：
+# 合约测试网已停用，要换模拟盘（Demo）的 Key，而不是他填错了什么。
+_CCXT_DEPRECATION = "testnet/sandbox mode is not supported for futures"
+_DEMO_HINT = (
+    "币安已停用合约测试网。"
+    "到币安合约模拟盘（Demo Trading）申请一对新 Key，"
+    "凭证区的网络选「模拟盘」再填。现货测试网的 Key 不能用在合约上。"
+)
+
 
 def _binance_code(exc: Exception) -> str | None:
     text = str(exc)
@@ -499,6 +542,8 @@ def _binance_code(exc: Exception) -> str | None:
 
 def _message(exc: Exception) -> str:
     text = str(exc) or exc.__class__.__name__
+    if _CCXT_DEPRECATION in text:
+        return _DEMO_HINT
     code = _binance_code(exc)
     hint = _BINANCE_CODES.get(code or "")
     if hint:

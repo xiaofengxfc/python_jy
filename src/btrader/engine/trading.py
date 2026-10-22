@@ -16,7 +16,7 @@ from ..core.storage import Database
 from ..core.types import MarketType, Network, OrderSide, OrderType, RunMode
 from ..exchange.rest import BinanceREST, ExchangeError
 from ..exchange.symbols import format_amount
-from ..notify import WeChatNotifier
+from ..notify import Notifier
 from .risk import RiskDecision, RiskManager
 
 log = logging.getLogger(__name__)
@@ -87,7 +87,7 @@ class TradingService:
         rest: BinanceREST,
         risk: RiskManager,
         db: Database,
-        notifier: "WeChatNotifier | None" = None,
+        notifier: "Notifier | None" = None,
     ) -> None:
         self.settings = settings
         self.rest = rest
@@ -353,7 +353,7 @@ class TradingService:
             protection, warnings = self._arm_live_protection(req, order, exchange_amount)
             if warnings:
                 self._notify(
-                    WeChatNotifier.format_warning(
+                    Notifier.format_warning(
                         title=f"{req.symbol} 保护单未完全挂上",
                         detail="\n".join(warnings[:5]),
                     ),
@@ -508,7 +508,7 @@ class TradingService:
         # report a closed round.
         closed = float(order.get("closedQty") or 0.0)
         realized = order.get("realized") if closed > 1e-12 else None
-        text = WeChatNotifier.format_fill(
+        text = Notifier.format_fill(
             symbol=str(order.get("symbol") or ""),
             side=str(order.get("side") or ""),
             amount=amount,
@@ -549,7 +549,7 @@ class TradingService:
             return
         self._halt_announced = reason
         self._notify(
-            WeChatNotifier.format_halt(reason=reason, day_pnl=state.day_pnl),
+            Notifier.format_halt(reason=reason, day_pnl=state.day_pnl),
             kind="risk",
         )
 
@@ -643,7 +643,7 @@ class TradingService:
 
         for summary in announced.values():
             self._notify(
-                WeChatNotifier.format_fill(
+                Notifier.format_fill(
                     symbol=summary["symbol"],
                     side=summary["side"],
                     amount=summary["amount"],

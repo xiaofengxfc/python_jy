@@ -206,3 +206,68 @@ def test_cancel_symbol_orders_survives_a_vanished_order() -> None:
     rest = _rest_with(client)
     assert rest.cancel_symbol_orders(MarketType.USDM, "BTC/USDT:USDT") == 2
     assert client.canceled == ["live", "gone", "live-2"]
+
+
+# ----------------------------------------------------- 测试环境（模拟盘 / 测试网）
+class _FakeClient:
+    """记录测试环境怎么被打开的替身。"""
+
+    def __init__(self) -> None:
+        self.demo: bool | None = None
+        self.sandbox = False
+        self.has = {"sandbox": True}
+
+    def enable_demo_trading(self, on: bool) -> None:
+        self.demo = bool(on)
+
+    def set_sandbox_mode(self, on: bool) -> None:
+        raise AssertionError("合约不该走测试网：币安已经停用了")
+
+
+def test_futures_testnet_uses_demo_trading_not_sandbox() -> None:
+    """币安停用合约测试网，ccxt 直接拒 set_sandbox_mode。
+
+    报价、下单都要能通，所以合约必须切到模拟盘（demo-fapi / demo-dapi）。
+    """
+    from btrader.exchange.rest import BinanceREST
+
+    client = _FakeClient()
+    BinanceREST._apply_test_environment(client, MarketType.USDM)
+
+    assert client.demo is True
+
+
+def test_spot_testnet_still_uses_sandbox_mode() -> None:
+    from btrader.exchange.rest import BinanceREST
+
+    class SpotClient(_FakeClient):
+        def set_sandbox_mode(self, on: bool) -> None:
+            self.sandbox = bool(on)
+
+    client = SpotClient()
+    BinanceREST._apply_test_environment(client, MarketType.SPOT)
+
+    assert client.sandbox is True
+    assert client.demo is None
+
+
+def test_retired_futures_testnet_error_is_explained_in_chinese() -> None:
+    """ccxt 的英文弃用公告要翻成中文，并指向模拟盘。"""
+    exc = ccxt.ExchangeError(
+        "binanceusdm testnet/sandbox mode is not supported for futures anymore, "
+        "please check the deprecation announcement"
+    )
+
+    text = _message(exc)
+
+    assert "模拟盘" in text
+    assert "testnet/sandbox" not in text
+
+
+def test_credentials_are_kept_per_platform(store: CredentialStore) -> None:
+    """换平台不能读到上一个平台的 Key。"""
+    store.save(Network.MAINNET, MarketType.SPOT, Credentials("BINANCE_KEY", "S"), "binance")
+    store.save(Network.MAINNET, MarketType.SPOT, Credentials("OTHER_KEY", "S"), "okx")
+
+    assert store.load(Network.MAINNET, MarketType.SPOT, "binance").api_key == "BINANCE_KEY"
+    assert store.load(Network.MAINNET, MarketType.SPOT, "okx").api_key == "OTHER_KEY"

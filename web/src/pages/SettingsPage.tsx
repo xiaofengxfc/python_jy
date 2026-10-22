@@ -1,14 +1,13 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api";
 import { TIMEFRAMES } from "../format";
 import type {
   AISettings,
   AIStatus,
   AppSettings,
-  ChannelStatus,
   CredentialItem,
-  InstallStatus,
   NotifyStatus,
+  PlatformOption,
   RiskState,
 } from "../types";
 
@@ -47,6 +46,11 @@ const PCT_FIELDS: [keyof AppSettings["risk"], string, string][] = [
 
 export default function SettingsPage({ settings, onSaved }: Props) {
   const [draft, setDraft] = useState<AppSettings | null>(settings);
+  // 保存时只提交改过的字段：整份回传会把别处刚改的值盖回旧值。
+  const baseline = useRef<AppSettings | null>(settings);
+  const [platforms, setPlatforms] = useState<PlatformOption[]>([]);
+  const [platform, setPlatform] = useState(settings?.platform ?? "binance");
+  const [platformBusy, setPlatformBusy] = useState(false);
   const [credentials, setCredentials] = useState<CredentialItem[]>([]);
   const [credentialsError, setCredentialsError] = useState("");
   const [saving, setSaving] = useState(false);
@@ -58,24 +62,62 @@ export default function SettingsPage({ settings, onSaved }: Props) {
   const [riskBusy, setRiskBusy] = useState(false);
   const [notifyStatus, setNotifyStatus] = useState<NotifyStatus | null>(null);
   const [notifyBusy, setNotifyBusy] = useState(false);
-  const [wecomApiSecret, setWecomApiSecret] = useState("");
-  const [wecomSecretBusy, setWecomSecretBusy] = useState(false);
-  const [install, setInstall] = useState<InstallStatus | null>(null);
-  const [installBusy, setInstallBusy] = useState(false);
-  const [installError, setInstallError] = useState("");
-  const [installOpen, setInstallOpen] = useState(false);
-  const [installRegistry, setInstallRegistry] = useState("");
-  const [installNpmPath, setInstallNpmPath] = useState("");
-  const [installPlan, setInstallPlan] = useState<string[]>([]);
-  const [channel, setChannel] = useState<ChannelStatus | null>(null);
-  const [channelBusy, setChannelBusy] = useState(false);
-  const [channelNote, setChannelNote] = useState("");
-  const [wecomBotId, setWecomBotId] = useState("");
-  const [wecomSecret, setWecomSecret] = useState("");
   const [aiStatus, setAiStatus] = useState<AIStatus | null>(null);
   const [aiKey, setAiKey] = useState("");
   const [aiBusy, setAiBusy] = useState<"key" | "test" | "">("");
   const [aiNote, setAiNote] = useState<{ tone: "ok" | "err"; text: string } | null>(null);
+
+  /** 重新读服务端设置。进页面就读一次：别处改过的值必须先看到，再允许保存。 */
+  const loadSettings = useCallback(async () => {
+    try {
+      const data = await api<{
+        settings: AppSettings;
+        platform: string;
+        platforms: PlatformOption[];
+      }>("/api/settings");
+      setPlatforms(data.platforms ?? []);
+      setPlatform(data.platform ?? data.settings.platform ?? "binance");
+      baseline.current = data.settings;
+      setDraft(data.settings);
+      setNetwork(data.settings.network);
+      onSaved(data.settings);
+      return data.settings;
+    } catch (error) {
+      setFlash({ tone: "err", text: error instanceof Error ? error.message : String(error) });
+      return null;
+    }
+  }, [onSaved]);
+
+  useEffect(() => {
+    void loadSettings();
+  }, [loadSettings]);
+
+  const switchPlatform = async (next: string) => {
+    if (next === platform || platformBusy) return;
+    const target = platforms.find((item) => item.key === next);
+    if (target && !target.enabled) {
+      setFlash({ tone: "err", text: `${target.label} 还没接进来，现在只能选币安。` });
+      return;
+    }
+    setPlatformBusy(true);
+    setFlash(null);
+    try {
+      const result = await api<{ settings: AppSettings }>("/api/settings", {
+        method: "PUT",
+        body: JSON.stringify({ platform: next }),
+      });
+      baseline.current = result.settings;
+      setDraft(result.settings);
+      setPlatform(result.settings.platform);
+      onSaved(result.settings);
+      await loadCredentials();
+      setFlash({ tone: "ok", text: `已切到${target?.label ?? next}，凭据也换成这个平台的。` });
+    } catch (error) {
+      setFlash({ tone: "err", text: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setPlatformBusy(false);
+    }
+  };
 
   const loadAI = useCallback(async () => {
     try {
@@ -90,177 +132,6 @@ export default function SettingsPage({ settings, onSaved }: Props) {
   useEffect(() => {
     void loadAI();
   }, [loadAI]);
-
-  const loadChannel = useCallback(async () => {
-    try {
-      const next = await api<ChannelStatus>("/api/install/openclaw/channel");
-      setChannel(next);
-      if (next.bot_id) setWecomBotId((current) => current || next.bot_id || "");
-      return next;
-    } catch {
-      return null;
-    }
-  }, []);
-
-  useEffect(() => {
-    void loadChannel();
-  }, [loadChannel]);
-
-  // Re-read the channel state whenever a step finishes: registering the plugin
-  // and scanning the code both change what the page should offer next.
-  useEffect(() => {
-    if (install?.running) return;
-    if (install?.state === "running") return;
-    void loadChannel();
-  }, [install?.state, install?.running, loadChannel]);
-
-  const registerChannel = async () => {
-    setChannelBusy(true);
-    setChannelNote("");
-    try {
-      setInstall(await api<InstallStatus>("/api/install/openclaw/channel", { method: "POST" }));
-    } catch (error) {
-      setChannelNote(error instanceof Error ? error.message : String(error));
-    } finally {
-      setChannelBusy(false);
-    }
-  };
-
-  const saveChannelCredentials = async (restartAfter = false) => {
-    setChannelBusy(true);
-    setChannelNote("");
-    try {
-      const result = await api<{ note?: string; bot_id?: string }>(
-        "/api/install/openclaw/channel/config",
-        {
-          method: "PUT",
-          body: JSON.stringify({ bot_id: wecomBotId, secret: wecomSecret }),
-        },
-      );
-      setWecomSecret("");
-      if (restartAfter) {
-        const restarted = await api<{ state: string; error: string }>(
-          "/api/install/openclaw/gateway/restart",
-          { method: "POST" },
-        );
-        setChannelNote(
-          restarted.error || "API 凭证已保存，网关已重启，长连接会使用新凭证。",
-        );
-      } else {
-        setChannelNote(result.note || "API 凭证已保存。");
-      }
-      await loadChannel();
-    } catch (error) {
-      setChannelNote(error instanceof Error ? error.message : String(error));
-    } finally {
-      setChannelBusy(false);
-    }
-  };
-
-  const startGateway = async () => {
-    setChannelBusy(true);
-    setChannelNote("");
-    try {
-      const result = await api<{ state: string; error: string }>(
-        "/api/install/openclaw/gateway",
-        { method: "POST" },
-      );
-      setChannelNote(result.error || "网关已启动。");
-      await loadChannel();
-    } catch (error) {
-      setChannelNote(error instanceof Error ? error.message : String(error));
-    } finally {
-      setChannelBusy(false);
-    }
-  };
-
-  const restartGateway = async () => {
-    // The channel session lives inside the gateway process: after a fresh scan
-    // or an unbind, only a restart makes that change take effect there.
-    setChannelBusy(true);
-    setChannelNote("");
-    try {
-      const result = await api<{ state: string; error: string }>(
-        "/api/install/openclaw/gateway/restart",
-        { method: "POST" },
-      );
-      setChannelNote(result.error || "网关已重启。");
-      await loadChannel();
-    } catch (error) {
-      setChannelNote(error instanceof Error ? error.message : String(error));
-    } finally {
-      setChannelBusy(false);
-    }
-  };
-
-  const loadInstall = useCallback(async () => {
-    try {
-      const next = await api<InstallStatus>("/api/install/openclaw");
-      setInstall(next);
-      // Poll faster while npm is running: the log is the only feedback the
-      // user gets, and a 10 s gap looks like a hang.
-      return next;
-    } catch {
-      return null;
-    }
-  }, []);
-
-  useEffect(() => {
-    void loadInstall();
-  }, [loadInstall]);
-
-  useEffect(() => {
-    if (!install?.running) return;
-    const timer = window.setInterval(() => void loadInstall(), 2000);
-    return () => window.clearInterval(timer);
-  }, [install?.running, loadInstall]);
-
-  const previewInstall = async () => {
-    setInstallError("");
-    try {
-      const result = await api<{ command: string[] }>("/api/install/openclaw/plan", {
-        method: "POST",
-        body: JSON.stringify({
-          registry: installRegistry,
-          npm_path: installNpmPath,
-        }),
-      });
-      setInstallPlan(result.command);
-      setInstallOpen(true);
-    } catch (error) {
-      setInstallPlan([]);
-      setInstallOpen(true);
-      setInstallError(error instanceof Error ? error.message : String(error));
-    }
-  };
-
-  const startInstall = async () => {
-    setInstallBusy(true);
-    setInstallError("");
-    try {
-      const next = await api<InstallStatus>("/api/install/openclaw", {
-        method: "POST",
-        body: JSON.stringify({
-          registry: installRegistry,
-          npm_path: installNpmPath,
-        }),
-      });
-      setInstall(next);
-    } catch (error) {
-      setInstallError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setInstallBusy(false);
-    }
-  };
-
-  const cancelInstall = async () => {
-    setInstallError("");
-    try {
-      setInstall(await api<InstallStatus>("/api/install/openclaw/cancel", { method: "POST" }));
-    } catch (error) {
-      setInstallError(error instanceof Error ? error.message : String(error));
-    }
-  };
 
   const loadNotify = useCallback(async () => {
     try {
@@ -287,31 +158,21 @@ export default function SettingsPage({ settings, onSaved }: Props) {
     setNotifyBusy(true);
     setFlash(null);
     try {
-      // Send with the values currently in the form, not the saved ones: the
-      // button's job is to verify a target or path before the user commits it.
-      const result = await api<{ ok: boolean; warning?: string }>("/api/notify/test", {
+      // 用表单里当前的值发，不是已保存的值：按钮的作用就是在保存之前先验一遍。
+      const result = await api<{ sent: boolean; format: string; url: string }>("/api/notify/test", {
         method: "POST",
         body: JSON.stringify({
           message: "",
-          mode: draft.notify.mode,
-          channel: draft.notify.channel,
-          target: draft.notify.target,
-          account: draft.notify.account,
-          command: draft.notify.command,
-          corp_id: draft.notify.corp_id,
-          agent_id: draft.notify.agent_id,
-          api_base: draft.notify.api_base,
+          webhook_url: draft.notify.webhook_url,
+          msg_format: draft.notify.msg_format,
+          webhook_headers: draft.notify.webhook_headers,
+          webhook_template: draft.notify.webhook_template,
         }),
       });
-      // ``ok`` only means the gateway accepted the message. WeChat delivers
-      // only into a conversation the user opened, so without a context token
-      // the honest answer is "已提交，但手机可能收不到" plus the one action
-      // that fixes it.
-      setFlash(
-        result.warning
-          ? { tone: "err", text: result.warning }
-          : { tone: "ok", text: "测试消息已发送，请查看企业微信。" },
-      );
+      setFlash({
+        tone: "ok",
+        text: `已发出（${result.format}）。到企业微信群里看一眼，收到了就说明通道通了。`,
+      });
       await loadNotify();
     } catch (error) {
       setFlash({ tone: "err", text: error instanceof Error ? error.message : String(error) });
@@ -351,6 +212,8 @@ export default function SettingsPage({ settings, onSaved }: Props) {
     if (settings) {
       setDraft(settings);
       setNetwork(settings.network);
+      baseline.current = settings;
+      setPlatform(settings.platform ?? "binance");
     }
   }, [settings]);
 
@@ -435,62 +298,50 @@ export default function SettingsPage({ settings, onSaved }: Props) {
     }
   };
 
-  const saveWecomSecret = async () => {
-    if (!draft) return;
-    if (!wecomApiSecret.trim()) {
-      setFlash({ tone: "err", text: "请先填写企业微信应用 Secret。" });
-      return;
+  /** 只提交和最新值不一样的字段。整份回传会把别处刚改的值盖回旧值。 */
+  const changedPayload = (next: AppSettings, base: AppSettings | null) => {
+    const fields: Record<string, unknown> = {
+      network: next.network,
+      market_type: next.market_type,
+      last_symbol: next.last_symbol,
+      timeframe: next.timeframe,
+      default_order_quote: next.default_order_quote,
+      kline_limit: next.kline_limit,
+      proxy: next.proxy,
+      theme: next.theme,
+      notification_sound: next.notification_sound,
+      risk: next.risk,
+      notify: next.notify,
+      ai: next.ai,
+    };
+    if (!base) return fields;
+    const payload: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(fields)) {
+      const before = (base as unknown as Record<string, unknown>)[key];
+      if (JSON.stringify(before) !== JSON.stringify(value)) payload[key] = value;
     }
-    setWecomSecretBusy(true);
-    setFlash(null);
-    try {
-      await api("/api/notify/wecom/secret", {
-        method: "PUT",
-        body: JSON.stringify({ secret: wecomApiSecret.trim() }),
-      });
-      setWecomApiSecret("");
-      setFlash({ tone: "ok", text: "企业微信应用 Secret 已存入系统密钥环。" });
-      await loadNotify();
-    } catch (error) {
-      setFlash({ tone: "err", text: error instanceof Error ? error.message : String(error) });
-    } finally {
-      setWecomSecretBusy(false);
-    }
+    return payload;
   };
 
   const save = async () => {
     if (!draft) return;
+    const payload = changedPayload(draft, baseline.current);
+    if (Object.keys(payload).length === 0) {
+      setFlash({ tone: "ok", text: "没有改动，不用保存。" });
+      return;
+    }
     setSaving(true);
     setFlash(null);
     try {
       const result = await api<{ settings: AppSettings }>("/api/settings", {
         method: "PUT",
-        body: JSON.stringify({
-          network: draft.network,
-          market_type: draft.market_type,
-          last_symbol: draft.last_symbol,
-          timeframe: draft.timeframe,
-          default_order_quote: draft.default_order_quote,
-          kline_limit: draft.kline_limit,
-          proxy: draft.proxy,
-          theme: draft.theme,
-          notification_sound: draft.notification_sound,
-          risk: draft.risk,
-          notify: draft.notify,
-          ai: draft.ai,
-        }),
+        body: JSON.stringify(payload),
       });
-      // The secret is deliberately not part of the settings JSON; when the
-      // user pasted a new one, store it in the keyring in the same save click.
-      if (draft.notify.mode === "wecom_api" && wecomApiSecret.trim()) {
-        await api("/api/notify/wecom/secret", {
-          method: "PUT",
-          body: JSON.stringify({ secret: wecomApiSecret.trim() }),
-        });
-        setWecomApiSecret("");
-      }
+
       onSaved(result.settings);
+      baseline.current = result.settings;
       setNetwork(result.settings.network);
+      setPlatform(result.settings.platform ?? platform);
       setFlash({ tone: "ok", text: "设置已保存。" });
       await loadCredentials();
       await loadAI();
@@ -587,6 +438,28 @@ export default function SettingsPage({ settings, onSaved }: Props) {
             </div>
           </div>
           {credentialsError && <div className="banner error">{credentialsError}</div>}
+          <div className="cred-row">
+            <div className="cred-name">
+              <span>平台</span>
+              <span className="cred-state">
+                {platforms.find((item) => item.key === platform)?.label ?? "币安"}
+              </span>
+            </div>
+            <select
+              className="input"
+              value={platform}
+              disabled={platformBusy}
+              onChange={(event) => void switchPlatform(event.target.value)}
+            >
+              {(platforms.length ? platforms : [{ key: "binance", label: "币安", enabled: true }]).map(
+                (item) => (
+                  <option key={item.key} value={item.key} disabled={!item.enabled}>
+                    {item.enabled ? item.label : `${item.label}（暂未开放）`}
+                  </option>
+                ),
+              )}
+            </select>
+          </div>
           {credentials.map((item) => {
             const entry = credDrafts[item.market] ?? EMPTY_DRAFT;
             const busy = credBusy === item.market;
@@ -783,6 +656,24 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                   onChange={(event) => patchAI({ daily_limit: Number(event.target.value) })}
                 />
                 <span className="field-hint">填 0 表示不限制。超额后调用直接失败，不会继续计费。</span>
+              </div>
+
+              <div className="field">
+                <label className="field-label" htmlFor="set-ai-max-tokens">
+                  <span>输出上限</span>
+                </label>
+                <input
+                  id="set-ai-max-tokens"
+                  className="input"
+                  type="number"
+                  min={200}
+                  step={100}
+                  value={draft.ai.max_tokens}
+                  onChange={(event) => patchAI({ max_tokens: Number(event.target.value) })}
+                />
+                <span className="field-hint">
+                  一次回答最多花多少 token。推理模型先想再答，想的部分也占这个额度，填 2000 以上。
+                </span>
               </div>
 
               <div className="field">
@@ -1064,13 +955,9 @@ export default function SettingsPage({ settings, onSaved }: Props) {
               <span className="spacer" />
               <span className="faint" style={{ fontSize: 11 }}>
                 {notifyStatus
-                  ? notifyStatus.mode === "wecom_api"
-                    ? notifyStatus.available
-                      ? "自建应用 API 已配置"
-                      : "API 配置不完整"
-                    : notifyStatus.available
-                      ? "OpenClaw 已找到"
-                      : "未找到 OpenClaw"
+                  ? notifyStatus.available
+                    ? `地址已填 · ${notifyStatus.format}`
+                    : "还没填地址"
                   : "检测中…"}
               </span>
               <button
@@ -1083,563 +970,147 @@ export default function SettingsPage({ settings, onSaved }: Props) {
               </button>
             </div>
             <div className="card-body stack">
-              <div className="field">
-                <label className="field-label">
-                  <span>推送通道</span>
-                  <em>自建应用 API 不依赖 OpenClaw，适合企业微信管理员直接配置</em>
-                </label>
-                <div className="segmented" role="group" aria-label="企业微信通知模式">
-                  <button
-                    type="button"
-                    aria-pressed={draft.notify.mode === "wecom_api"}
-                    onClick={() => patchNotify({ mode: "wecom_api" })}
-                  >
-                    自建应用 API
-                  </button>
-                  <button
-                    type="button"
-                    aria-pressed={draft.notify.mode !== "wecom_api"}
-                    onClick={() => patchNotify({ mode: "openclaw" })}
-                  >
-                    OpenClaw 智能机器人
-                  </button>
-                </div>
-              </div>
               <label className="check">
                 <input
                   type="checkbox"
                   checked={draft.notify.enabled}
                   onChange={(event) => patchNotify({ enabled: event.target.checked })}
                 />
-                启用企业微信推送
+                启用微信推送
               </label>
-              {/* A bound channel plus a closed master switch is the state that
-                  looks like "已经登录但收不到通知"; say it instead of leaving
-                  the user to discover a checkbox. */}
-              {draft.notify.mode !== "wecom_api" && channel?.configured && !draft.notify.enabled && (
-                <div className="hint" style={{ color: "var(--warn, #b45309)" }}>
-                  渠道已配置，但推送总开关是关的。成交和风控通知不会发出。
-                  勾选上面的「启用企业微信推送」并保存。
-                </div>
-              )}
-              <div className="form-grid">
-                <div className="field">
-                  <label className="field-label" htmlFor="notify-target">
-                    <span>接收人 userid</span>
-                    <em>
-                      {draft.notify.mode === "wecom_api"
-                        ? "企业微信通讯录里的成员账号，多个用 | 分隔"
-                        : "企业微信通讯录里的成员账号"}
-                    </em>
-                  </label>
-                  <input
-                    id="notify-target"
-                    value={draft.notify.target}
-                    onChange={(event) => patchNotify({ target: event.target.value })}
-                    placeholder={
-                      draft.notify.mode === "wecom_api"
-                        ? "例：XiaoJiaJian"
-                        : "例：XiaoJiaJian（先给机器人发过消息的那个账号）"
-                    }
-                  />
-                </div>
-              {draft.notify.mode === "wecom_api" ? (
-                <div className="field">
-                  <label className="field-label" htmlFor="notify-agent-id">
-                    <span>AgentId</span>
-                    <em>企业微信自建应用的 AgentId</em>
-                  </label>
-                  <input
-                    id="notify-agent-id"
-                    value={draft.notify.agent_id}
-                    onChange={(event) => patchNotify({ agent_id: event.target.value })}
-                    placeholder="例：1000002"
-                    inputMode="numeric"
-                  />
-                </div>
-              ) : (
-                <div className="field">
-                  <label className="field-label" htmlFor="notify-channel">
-                    <span>通道名</span>
-                    <em>默认 wecom，一般不用改</em>
-                  </label>
-                  <input
-                    id="notify-channel"
-                    value={draft.notify.channel}
-                    onChange={(event) => patchNotify({ channel: event.target.value })}
-                    placeholder="wecom"
-                  />
-                </div>
-              )}
+          
+              <div className="field">
+                <label className="field-label" htmlFor="set-notify-url">
+                  <span>Webhook 地址</span>
+                  <em>企业微信群里加一个机器人，把它的地址粘进来。地址自带 key，等同密码。</em>
+                </label>
+                <input
+                  id="set-notify-url"
+                  className="input"
+                  value={draft.notify.webhook_url}
+                  placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=…"
+                  onChange={(event) => patchNotify({ webhook_url: event.target.value })}
+                />
               </div>
-              {notifyStatus?.target_warning && (
-                <div className="hint" style={{ color: "var(--warn, #b45309)" }}>
-                  {notifyStatus.target_warning}
+          
+              <div className="field">
+                <label className="field-label" htmlFor="set-notify-format">
+                  <span>消息格式</span>
+                  <em>自动：企业微信群机器人用 markdown，其它地址发 title 加 content 的 JSON</em>
+                </label>
+                <select
+                  id="set-notify-format"
+                  className="input"
+                  value={draft.notify.msg_format}
+                  onChange={(event) => patchNotify({ msg_format: event.target.value })}
+                >
+                  <option value="auto">自动判断</option>
+                  <option value="qyapi_markdown">企业微信群机器人（markdown）</option>
+                  <option value="qyapi_text">企业微信群机器人（纯文本）</option>
+                  <option value="custom">自定义模板</option>
+                </select>
+              </div>
+          
+              {draft.notify.msg_format === "custom" && (
+                <div className="field">
+                  <label className="field-label" htmlFor="set-notify-template">
+                    <span>自定义模板</span>
+                    <em>JSON，用 {"{title}"} 和 {"{content}"} 占位。留空就发默认的 title 加 content。</em>
+                  </label>
+                  <textarea
+                    id="set-notify-template"
+                    className="input"
+                    rows={3}
+                    value={draft.notify.webhook_template}
+                    placeholder='{"msgtype": "text", "text": {"content": "{content}"}}'
+                    onChange={(event) => patchNotify({ webhook_template: event.target.value })}
+                  />
                 </div>
               )}
-              {draft.notify.mode === "wecom_api" ? (
-                <>
-                  <div className="form-grid">
-                    <div className="field">
-                      <label className="field-label" htmlFor="notify-corp-id">
-                        <span>CorpID</span>
-                        <em>企业微信“我的企业”里的企业 ID</em>
-                      </label>
-                      <input
-                        id="notify-corp-id"
-                        value={draft.notify.corp_id}
-                        onChange={(event) => patchNotify({ corp_id: event.target.value })}
-                        placeholder="例：ww1234567890abcdef"
-                      />
-                    </div>
-                    <div className="field">
-                      <label className="field-label" htmlFor="notify-api-base">
-                        <span>API 地址</span>
-                        <em>一般不用改。代理环境可以填内网地址</em>
-                      </label>
-                      <input
-                        id="notify-api-base"
-                        value={draft.notify.api_base}
-                        onChange={(event) => patchNotify({ api_base: event.target.value })}
-                        placeholder="https://qyapi.weixin.qq.com"
-                      />
-                    </div>
-                  </div>
-                  <div className="form-grid">
-                    <div className="field">
-                      <label className="field-label" htmlFor="notify-wecom-secret">
-                        <span>Secret</span>
-                        <em>
-                          {notifyStatus?.secret_saved
-                            ? "已保存，留空保持不变"
-                            : "只存入系统密钥环，不写入配置文件"}
-                        </em>
-                      </label>
-                      <div className="ticket-row">
-                        <input
-                          id="notify-wecom-secret"
-                          type="password"
-                          value={wecomApiSecret}
-                          onChange={(event) => setWecomApiSecret(event.target.value)}
-                          placeholder={notifyStatus?.secret_saved ? "••••••••（留空不修改）" : "输入自建应用 Secret"}
-                          autoComplete="new-password"
-                        />
-                        <button
-                          type="button"
-                          className="btn-sm"
-                          disabled={wecomSecretBusy || !wecomApiSecret.trim()}
-                          onClick={() => void saveWecomSecret()}
-                        >
-                          {wecomSecretBusy ? "保存中…" : "保存 Secret"}
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                  <div className="hint">
-                    到企业微信后台的「应用管理 → 自建应用」取 CorpID、AgentId 和 Secret。
-                    “接收人”填应用可见范围内的成员 userid。Secret 只进系统密钥环。
-                  </div>
-                </>
-              ) : (
-                <>
-                  <div className="field">
-                    <label className="field-label" htmlFor="notify-account">
-                      <span>账号</span>
-                      <em>插件内的账号标识，留空用 default</em>
-                    </label>
-                    <input
-                      id="notify-account"
-                      value={draft.notify.account}
-                      onChange={(event) => patchNotify({ account: event.target.value })}
-                      placeholder="default"
-                    />
-                  </div>
-                  <div className="field">
-                    <label className="field-label" htmlFor="notify-command">
-                      <span>OpenClaw 路径</span>
-                      <em>可留空，默认从 PATH 查找</em>
-                    </label>
-                    <input
-                      id="notify-command"
-                      value={draft.notify.command}
-                      onChange={(event) => patchNotify({ command: event.target.value })}
-                      placeholder="openclaw"
-                    />
-                  </div>
-                </>
-              )}
-              <div className="form-grid">
-                <label className="check">
-                  <input
-                    type="checkbox"
-                    checked={draft.notify.on_fill}
-                    onChange={(event) => patchNotify({ on_fill: event.target.checked })}
-                  />
-                  成交回报
+          
+              <div className="field">
+                <label className="field-label" htmlFor="set-notify-headers">
+                  <span>自定义请求头</span>
+                  <em>每行一个「名称: 值」。地址里带鉴权参数时不用填。</em>
                 </label>
-                <label className="check">
-                  <input
-                    type="checkbox"
-                    checked={draft.notify.on_protection}
-                    onChange={(event) => patchNotify({ on_protection: event.target.checked })}
-                  />
-                  止损 / 止盈触发
+                <textarea
+                  id="set-notify-headers"
+                  className="input"
+                  rows={2}
+                  value={draft.notify.webhook_headers}
+                  placeholder="Authorization: Bearer …"
+                  onChange={(event) => patchNotify({ webhook_headers: event.target.value })}
+                />
+              </div>
+          
+              <div className="field">
+                <label className="field-label">
+                  <span>发哪些消息</span>
                 </label>
-                <label className="check">
-                  <input
-                    type="checkbox"
-                    checked={draft.notify.on_risk_halt}
-                    onChange={(event) => patchNotify({ on_risk_halt: event.target.checked })}
-                  />
-                  风控熔断
-                </label>
-                <label className="check">
-                  <input
-                    type="checkbox"
-                    checked={draft.notify.on_live_warning}
-                    onChange={(event) => patchNotify({ on_live_warning: event.target.checked })}
-                  />
-                  实盘保护单告警
-                </label>
-                <label className="check">
-                  <input
-                    type="checkbox"
-                    checked={draft.notify.on_task}
-                    onChange={(event) => patchNotify({ on_task: event.target.checked })}
-                  />
-                  任务状态（自动交易启停 / 回测完成或失败）
-                </label>
-                {draft.notify.mode !== "wecom_api" && (
+                <div className="risk-grid">
                   <label className="check">
                     <input
                       type="checkbox"
-                      checked={draft.notify.preflight}
-                      onChange={(event) => patchNotify({ preflight: event.target.checked })}
+                      checked={draft.notify.on_fill}
+                      onChange={(event) => patchNotify({ on_fill: event.target.checked })}
                     />
-                    发送前检查网关（连不上就立即报错，不必等 30 秒）
+                    成交
                   </label>
-                )}
+                  <label className="check">
+                    <input
+                      type="checkbox"
+                      checked={draft.notify.on_protection}
+                      onChange={(event) => patchNotify({ on_protection: event.target.checked })}
+                    />
+                    止损止盈触发
+                  </label>
+                  <label className="check">
+                    <input
+                      type="checkbox"
+                      checked={draft.notify.on_risk_halt}
+                      onChange={(event) => patchNotify({ on_risk_halt: event.target.checked })}
+                    />
+                    风控熔断
+                  </label>
+                  <label className="check">
+                    <input
+                      type="checkbox"
+                      checked={draft.notify.on_live_warning}
+                      onChange={(event) => patchNotify({ on_live_warning: event.target.checked })}
+                    />
+                    风险提示
+                  </label>
+                  <label className="check">
+                    <input
+                      type="checkbox"
+                      checked={draft.notify.on_task}
+                      onChange={(event) => patchNotify({ on_task: event.target.checked })}
+                    />
+                    任务开始与结束
+                  </label>
+                </div>
               </div>
-              {notifyStatus && !notifyStatus.available && (
+          
+              {notifyStatus && !notifyStatus.available && draft.notify.enabled && (
                 <div className="verdict bad">
-                  {draft.notify.mode === "wecom_api"
-                    ? "自建应用 API 配置不完整：请填写 CorpID、AgentId、Secret 和接收人。"
-                    : "未找到 OpenClaw：可点下方的“自动安装 OpenClaw”，或在上方填写 openclaw 的完整路径。"}
+                  开关打开但没填地址，消息发不出去。把企业微信群机器人的地址粘到上面。
                 </div>
               )}
-              <div
-                className="install-box"
-                style={{ display: draft.notify.mode === "wecom_api" ? "none" : undefined }}
-              >
-                <div className="install-head">
-                  <span className="card-title" style={{ fontSize: 12 }}>
-                    OpenClaw 环境
-                  </span>
-                  <span className="faint" style={{ fontSize: 11 }}>
-                    {install
-                      ? install.node
-                        ? `Node ${install.node}${install.npm ? ` · npm ${install.npm}` : ""}`
-                        : "未检测到 Node.js"
-                      : "检测中…"}
-                  </span>
-                  <span className="spacer" />
-                  {install?.running ? (
-                    <button type="button" className="btn-sm" onClick={() => void cancelInstall()}>
-                      取消安装
-                    </button>
-                  ) : (
-                    <button
-                      type="button"
-                      className="btn-sm"
-                      disabled={installBusy}
-                      onClick={() => void previewInstall()}
-                    >
-                      自动安装 OpenClaw
-                    </button>
-                  )}
-                </div>
-                {installError && <div className="verdict bad">{installError}</div>}
-                {installOpen && (
-                  <>
-                    <div className="form-grid">
-                      <div className="field">
-                        <label className="field-label" htmlFor="install-registry">
-                          <span>npm 镜像源</span>
-                          <em>装不下来时换一个</em>
-                        </label>
-                        <select
-                          id="install-registry"
-                          className="select"
-                          value={installRegistry}
-                          disabled={install?.running}
-                          onChange={(event) => {
-                            setInstallRegistry(event.target.value);
-                            setInstallPlan([]);
-                          }}
-                        >
-                          <option value="">官方源 registry.npmjs.org</option>
-                          {(install?.registries ?? [])
-                            .filter((item) => item !== "https://registry.npmjs.org")
-                            .map((item) => (
-                              <option key={item} value={item}>
-                                国内镜像 {item.replace("https://", "")}
-                              </option>
-                            ))}
-                        </select>
-                      </div>
-                      <div className="field">
-                        <label className="field-label" htmlFor="install-npm">
-                          <span>npm 路径</span>
-                          <em>可留空，默认从 PATH 查找</em>
-                        </label>
-                        <input
-                          id="install-npm"
-                          value={installNpmPath}
-                          disabled={install?.running}
-                          onChange={(event) => {
-                            setInstallNpmPath(event.target.value);
-                            setInstallPlan([]);
-                          }}
-                          placeholder={install?.npm_path || "npm"}
-                        />
-                      </div>
-                    </div>
-                    {install && !install.ready && (
-                      <div className="verdict bad">{install.reason}</div>
-                    )}
-                    {installPlan.length > 0 && (
-                      <pre className="install-cmd">{installPlan.join(" ")}</pre>
-                    )}
-                    {!install?.running && (
-                      <div className="install-head">
-                        <button
-                          type="button"
-                          className="btn-sm primary"
-                          disabled={installBusy || install?.ready === false}
-                          onClick={() => void startInstall()}
-                        >
-                          {installBusy ? "启动中…" : "开始安装"}
-                        </button>
-                        <button
-                          type="button"
-                          className="btn-sm"
-                          onClick={() => {
-                            setInstallOpen(false);
-                            setInstallPlan([]);
-                            setInstallError("");
-                          }}
-                        >
-                          收起
-                        </button>
-                        <span className="faint" style={{ fontSize: 11 }}>
-                          安装会执行 npm 全局安装，可能需要几分钟。
-                        </span>
-                      </div>
-                    )}
-                  </>
-                )}
-                {install && install.state !== "idle" && (
-                  <>
-                    <div className="hint">
-                      {install.state === "running"
-                        ? "正在安装…"
-                        : install.state === "done"
-                          ? "安装完成：openclaw 已可用。"
-                          : install.state === "canceled"
-                            ? "安装已取消。"
-                            : "安装失败。"}
-                      {install.error && install.state !== "done" ? ` ${install.error}` : ""}
-                    </div>
-                    {install.log.length > 0 && (
-                      <pre className="install-cmd">{install.log.join("\n")}</pre>
-                    )}
-                  </>
-                )}
-                {/* The plugin lives in the gateway's own ledger, not in npm's
-                    prefix: registering it is what makes ``message send`` know
-                    the channel. */}
-                <div className="install-head" style={{ marginTop: 10 }}>
-                  <span className="card-title" style={{ fontSize: 12 }}>
-                    企业微信渠道
-                  </span>
-                  <span className="faint" style={{ fontSize: 11 }}>
-                    {!channel
-                      ? "检测中…"
-                      : channel.state === "ready"
-                        ? "长连接已就绪，可直接推送"
-                        : channel.state === "installed"
-                          ? "插件已装，尚未填写 Bot ID / Secret"
-                          : channel.state === "missing"
-                            ? channel.cli
-                              ? "插件未注册到网关"
-                              : "未检测到 openclaw"
-                            : "状态未知"}
-                  </span>
-                  <span className="spacer" />
-                  <button
-                    type="button"
-                    className="btn-sm primary"
-                    disabled={channelBusy || install?.running || !install?.available}
-                    onClick={() => void registerChannel()}
-                  >
-                    注册企业微信插件
-                  </button>
-                  <button
-                    type="button"
-                    className="btn-sm"
-                    disabled={channelBusy}
-                    onClick={() => void loadChannel()}
-                  >
-                    刷新状态
-                  </button>
-                </div>
-                {channel?.state === "missing" && channel.cli && (
-                  <div className="verdict bad">
-                    网关还不认识企业微信渠道。请先点“注册企业微信插件”。
-                  </div>
-                )}
-                {channel?.state === "installed" && (
-                  <div className="verdict bad">
-                    插件已装，但还没有 Bot ID / Secret。请在下方填写 API 模式凭证。
-                  </div>
-                )}
-                <div className="install-head" style={{ marginTop: 8 }}>
-                  <span className="card-title" style={{ fontSize: 12 }}>
-                    API 模式凭证
-                  </span>
-                  <span className="faint" style={{ fontSize: 11 }}>
-                    Bot ID + Secret · 长连接，无需回调地址
-                  </span>
-                </div>
-                <div className="form-grid">
-                  <div className="field">
-                    <label className="field-label" htmlFor="wecom-bot-id">
-                      <span>Bot ID</span>
-                      <em>企业微信智能机器人后台的机器人 ID</em>
-                    </label>
-                    <input
-                      id="wecom-bot-id"
-                      value={wecomBotId}
-                      disabled={channelBusy}
-                      onChange={(event) => setWecomBotId(event.target.value)}
-                      placeholder="aibp..."
-                    />
-                  </div>
-                  <div className="field">
-                    <label className="field-label" htmlFor="wecom-secret">
-                      <span>Secret</span>
-                      <em>{channel?.configured ? "已保存，留空保持不变" : "只保存在 OpenClaw 配置中"}</em>
-                    </label>
-                    <input
-                      id="wecom-secret"
-                      type="password"
-                      value={wecomSecret}
-                      disabled={channelBusy}
-                      onChange={(event) => setWecomSecret(event.target.value)}
-                      placeholder={channel?.configured ? "••••••••（留空不修改）" : "输入机器人 Secret"}
-                      autoComplete="new-password"
-                    />
-                  </div>
-                </div>
-                <div className="install-head">
-                  <button
-                    type="button"
-                    className="btn-sm primary"
-                    disabled={channelBusy || !wecomBotId.trim()}
-                    onClick={() => void saveChannelCredentials()}
-                  >
-                    {channelBusy ? "保存中…" : "保存 API 凭证"}
-                  </button>
-                  <button
-                    type="button"
-                    className="btn-sm"
-                    disabled={channelBusy || !wecomBotId.trim()}
-                    onClick={() => void saveChannelCredentials(true)}
-                  >
-                    保存并重启
-                  </button>
-                  <span className="faint" style={{ fontSize: 11 }}>
-                    保存后需重启网关，长连接才会使用新凭证。
-                  </span>
-                </div>
-                {channelNote && <div className="hint">{channelNote}</div>}
-                {/* The gateway is its own process: the long connection lives
-                    inside it, so a configured channel still delivers nothing
-                    while it is down. */}
-                <div className="install-head" style={{ marginTop: 8 }}>
-                  <span className="faint" style={{ fontSize: 11 }}>
-                    {!channel?.gateway
-                      ? "网关状态检测中…"
-                      : channel.gateway.reachable
-                        ? `网关运行中（${channel.gateway.host}:${channel.gateway.port}${
-                            channel.gateway.managed ? "，随本程序启动" : "，由外部启动"
-                          }）`
-                        : channel.gateway.state === "starting"
-                          ? "网关正在启动…"
-                          : "网关未运行，推送会失败"}
-                  </span>
-                  <span className="spacer" />
-                  {channel?.gateway && !channel.gateway.reachable && (
-                    <button
-                      type="button"
-                      className="btn-sm"
-                      disabled={channelBusy}
-                      onClick={() => void startGateway()}
-                    >
-                      启动网关
-                    </button>
-                  )}
-                  {channel?.gateway?.reachable && (
-                    <button
-                      type="button"
-                      className="btn-sm"
-                      disabled={channelBusy}
-                      onClick={() => void restartGateway()}
-                    >
-                      重启网关
-                    </button>
-                  )}
-                </div>
-                {channel?.gateway?.error && (
-                  <div className="verdict bad">{channel.gateway.error}</div>
-                )}
-              </div>
               {notifyStatus?.last_error && (
-                <div className="verdict bad">
-                  {notifyStatus.last_error}
-                  {notifyStatus.last_error_at > 0 && (
-                    <span className="faint" style={{ marginLeft: 6 }}>
-                      （{new Date(notifyStatus.last_error_at * 1000).toLocaleTimeString()}）
-                    </span>
-                  )}
-                </div>
+                <div className="verdict bad">上次失败：{notifyStatus.last_error}</div>
               )}
-              {notifyStatus && notifyStatus.breaker_seconds > 0 && (
-                <div className="verdict bad">
-                  通道连续发送失败，已暂停 {notifyStatus.breaker_seconds} 秒。
-                  先确认网关在运行。点「发送测试」可以手动探活并恢复。
-                </div>
-              )}
-              {notifyStatus && notifyStatus.spooled > 0 && (
-                <div className="verdict bad">
-                  {notifyStatus.spooled} 条消息发送失败，暂存在本地。
-                  通道恢复后自动补发，标题带【补发】。超过 6 小时的丢弃。
-                </div>
-              )}
-              {notifyStatus && notifyStatus.last_success_at > 0 && (
+              {notifyStatus && (notifyStatus.spooled > 0 || notifyStatus.breaker_seconds > 0) && (
                 <div className="hint">
-                  最近一次成功发送：
-                  {new Date(notifyStatus.last_success_at * 1000).toLocaleString()}
-                  {notifyStatus.pending > 0 ? `，队列中还有 ${notifyStatus.pending} 条` : ""}
+                  {notifyStatus.spooled > 0 ? `已暂存 ${notifyStatus.spooled} 条，通道恢复后自动补发。` : ""}
+                  {notifyStatus.breaker_seconds > 0
+                    ? ` 连续失败，暂停发送 ${notifyStatus.breaker_seconds} 秒。`
+                    : ""}
                 </div>
               )}
-              <div className="hint">
-                {draft.notify.mode === "wecom_api"
-                  ? "自建应用 API 直接调用 qyapi.weixin.qq.com，不用 OpenClaw。接收人填应用可见范围内的成员 userid。Secret 存系统密钥环，保存设置时生效。"
-                  : "推送走本机 OpenClaw 网关的长连接，直接送到企业微信智能机器人。不用扫码，登录态不会过期。「接收人」填成员 userid，对方要先给机器人发过消息，推送才送得进去。「发送测试」直接用上面填的内容，不用先保存。"}
-              </div>
             </div>
           </div>
+
+
         </div>
 
         <div className="card">

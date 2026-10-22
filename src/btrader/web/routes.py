@@ -35,9 +35,8 @@ from ..core.types import (
 from ..engine.ai_trader import AITrader, AITraderConfig, TradeLease
 from ..engine.auto import AutoTrader, AutoTraderConfig
 from ..exchange import mirror
-from ..exchange.rest import BinanceREST
-from ..installer import InstallOptions, restart_gateway_process
-from ..notify import WeChatNotifier, load_wecom_secret, save_wecom_secret
+from ..exchange.rest import PLATFORMS, SUPPORTED_PLATFORMS, BinanceREST
+from ..notify import FORMATS, Notifier, NotifyError, check_webhook_url
 from ..strategy.candidates import CandidateError, default_store
 from ..strategy.source import StrategySourceError, rename_source
 from .. import ai, llm
@@ -59,7 +58,7 @@ def _notify_task(ctx, title: str, lines: list[str] | None = None) -> None:
     can be down, the CLI can be missing, and the backtest still has to finish.
     """
     try:
-        ctx.notifier.notify(WeChatNotifier.format_task(title, lines), kind="task")
+        ctx.notifier.notify(Notifier.format_task(title, lines), kind="task")
     except Exception:  # pragma: no cover - defensive
         log.debug("任务通知发送失败", exc_info=True)
 
@@ -178,6 +177,7 @@ def _number(value: Any) -> float | None:
 
 # -------------------------------------------------------------------- payloads
 class SettingsPayload(BaseModel):
+    platform: str | None = None
     network: str | None = None
     market_type: str | None = None
     last_symbol: str | None = None
@@ -215,57 +215,22 @@ class AITraderHaltPayload(BaseModel):
 
 
 class NotifyTestPayload(BaseModel):
-    """One-off message body for the settings page's “测试” button.
+    """设置页「测试」按钮的一次性请求体。
 
-    The optional overrides let the page verify a channel/target/path before it
-    saves them; an empty field keeps the saved value.
+    可选字段用来在保存之前先验证地址和格式，留空就用已保存的值。
     """
 
     message: str = ""
-    mode: str = ""
-    channel: str = ""
-    target: str = ""
-    account: str = ""
-    command: str = ""
-    corp_id: str = ""
-    agent_id: str = ""
-    api_base: str = ""
-
-
-class WeComApiSecretPayload(BaseModel):
-    """Secret for the direct 企业微信 self-built-app API.
-
-    The secret is posted once and stored in the OS keyring; it is never echoed
-    back by status endpoints or written to ``config.json``.
-    """
-
-    secret: str = ""
-
-
-class InstallPayload(BaseModel):
-    """Options for installing OpenClaw from the settings page.
-
-    ``with_wechat`` is the only switch with a real consequence, and it is on by
-    default: a gateway without the plugin cannot deliver the messages this
-    feature exists for.
-    """
-
-    with_wechat: bool = True
-    registry: str = ""
-    node_path: str = ""
-    npm_path: str = ""
-
-
-class WeComChannelPayload(BaseModel):
-    """API-mode credentials for the 企业微信 smart-bot long connection."""
-
-    bot_id: str = ""
-    secret: str = ""
+    webhook_url: str = ""
+    msg_format: str = ""
+    webhook_headers: str = ""
+    webhook_template: str = ""
 
 
 class CredentialsPayload(BaseModel):
     market: str = "spot"
     network: str | None = None
+    platform: str = ""
     api_key: str = ""
     api_secret: str = ""
     verify: bool = True
@@ -646,19 +611,6 @@ def _serialize_result(result, params: dict[str, Any], limit_points: int = 1200) 
     }
 
 
-def _install_options(payload: InstallPayload) -> InstallOptions:
-    """Translate the request body into installer options.
-
-    Kept apart from the routes so the mapping (and its empty-string handling) is
-    testable without an HTTP client.
-    """
-    return InstallOptions(
-        with_wechat=bool(payload.with_wechat),
-        registry=(payload.registry or "").strip(),
-        node_path=(payload.node_path or "").strip(),
-        npm_path=(payload.npm_path or "").strip(),
-    )
-
 
 class AITraderController:
     """单例：同一时刻只允许一个 AI 交易实例（INV-14）。"""
@@ -898,6 +850,8 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
         ctx = get_state().ctx
         return {
             "settings": ctx.settings.to_dict(),
+            "platform": ctx.platform,
+            "platforms": PLATFORMS,
             "market": ctx.market_type.value,
             "network": ctx.network.value,
             "has_credentials": ctx.rest.has_credentials,
@@ -906,60 +860,10 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
 
     @router.put("/api/settings")
     def update_settings(payload: SettingsPayload) -> dict[str, Any]:
-        state = get_state()
-        ctx = state.ctx
-
-        target_network = _network(payload.network)
-        if target_network is not None and target_network is not ctx.network:
-            ctx.set_network(target_network)
-
-        target_market = None
-        if payload.market_type:
-            try:
-                target_market = MarketType(payload.market_type)
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail=f"未知市场：{payload.market_type}") from exc
-        if target_market is not None and target_market is not ctx.market_type:
-            ctx.set_market_type(target_market)
-
-        settings = ctx.settings
-        if payload.last_symbol is not None:
-            settings.last_symbol = payload.last_symbol
-        if payload.timeframe is not None:
-            if payload.timeframe not in TIMEFRAME_SECONDS:
-                raise HTTPException(status_code=400, detail=f"不支持的周期：{payload.timeframe}")
-            settings.timeframe = payload.timeframe
-        if payload.default_order_quote is not None:
-            settings.default_order_quote = payload.default_order_quote
-        if payload.kline_limit is not None:
-            settings.kline_limit = payload.kline_limit
-        if payload.proxy is not None:
-            # Rebuilds the clients and drops their caches; ccxt reads
-            # ``proxies`` once, so an old client would keep going direct.
-            ctx.apply_proxy(payload.proxy)
-        if payload.theme in ("light", "dark"):
-            settings.theme = payload.theme
-        if payload.notification_sound is not None:
-            settings.notification_sound = payload.notification_sound
-        if payload.risk is not None:
-            _apply_risk(settings.risk, payload.risk)
-        if payload.notify is not None:
-            # Validate on a scratch copy first: rejecting the request halfway
-            # through must not leave the live object half-updated.
-            candidate = replace(settings.notify)
-            _apply_notify(candidate, payload.notify)
-            settings.notify = candidate
-        if payload.ai is not None:
-            candidate_ai = replace(settings.ai)
-            _apply_ai(candidate_ai, payload.ai)
-            settings.ai = candidate_ai
-        if payload.ai_auto is not None:
-            candidate_auto = replace(settings.ai_auto)
-            _apply_ai_auto(candidate_auto, payload.ai_auto)
-            settings.ai_auto = candidate_auto
-
-        ctx.save_settings()
-        return {"ok": True, "settings": settings.to_dict()}
+        ctx = get_state().ctx
+        changed = apply_settings(ctx, payload)
+        log.info("设置已保存：%s", "、".join(changed) or "无改动")
+        return {"ok": True, "settings": ctx.settings.to_dict()}
 
     # ---------------------------------------------------------------- risk
     @router.get("/api/risk")
@@ -1248,195 +1152,38 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
     # ------------------------------------------------------- wechat notify
     @router.get("/api/notify")
     def notify_status() -> dict[str, Any]:
-        """Whether the OpenClaw CLI can be found, plus the last outcome.
-
-        The settings page shows this instead of claiming success: a missing CLI
-        or an empty target is the ordinary failure, and the user needs the real
-        reason to fix it.
-        """
+        """配置状态和上一次结果。设置页拿它显示真实情况，不假装成功。"""
         return get_state().ctx.notifier.status()
 
     @router.post("/api/notify/test")
     def notify_test(payload: NotifyTestPayload) -> dict[str, Any]:
-        """Send one message synchronously so the user sees the real error.
+        """同步发一条，让用户当场看到真实结果。
 
-        The body may override channel/target/command for this single call, so
-        the user can try a value before saving it. Overrides are applied to a
-        copy — the saved settings are never mutated by a test.
+        请求体里的字段只覆盖这一次发送，用来在保存之前先验证地址和格式。
+        覆盖走副本，已保存的设置不会被测试改掉。
         """
         ctx = get_state().ctx
         notifier = ctx.notifier
-        text = payload.message.strip() or (
-            "biTrader 企业微信通知测试：收到这条消息说明推送正常。"
-        )
+        text = payload.message.strip() or "biTrader 通知测试：收到这条说明推送正常。"
         candidate = replace(
             notifier.settings,
-            mode=(payload.mode or "").strip() or notifier.settings.mode,
-            channel=(payload.channel or "").strip() or notifier.settings.channel,
-            target=(payload.target or "").strip() or notifier.settings.target,
-            account=(payload.account or "").strip() or notifier.settings.account,
-            command=(payload.command or "").strip() or notifier.settings.command,
-            corp_id=(payload.corp_id or "").strip() or notifier.settings.corp_id,
-            agent_id=(payload.agent_id or "").strip() or notifier.settings.agent_id,
-            api_base=(payload.api_base or "").strip() or notifier.settings.api_base,
+            webhook_url=check_webhook_url(payload.webhook_url) or notifier.settings.webhook_url,
+            msg_format=(payload.msg_format or "").strip() or notifier.settings.msg_format,
+            webhook_headers=(payload.webhook_headers or "").strip()
+            or notifier.settings.webhook_headers,
+            webhook_template=(payload.webhook_template or "").strip()
+            or notifier.settings.webhook_template,
         )
-        scratch = WeChatNotifier(
-            candidate, timeout=notifier.timeout, queue_size=1
-        )
+        scratch = Notifier(candidate, timeout=notifier.timeout, queue_size=1)
         try:
             result = scratch.send_now(text)
-        except Exception as exc:
+        except NotifyError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        # A successful test is also a success for the live notifier's status.
+        # 测试成功也算当前通知器的成功，状态面板要跟着变。
         notifier.last_error = ""
         notifier.last_error_at = 0.0
         notifier.last_success_at = scratch.last_success_at
         return result
-
-    @router.put("/api/notify/wecom/secret")
-    def notify_wecom_secret(payload: WeComApiSecretPayload) -> dict[str, Any]:
-        """Store the direct-API Secret in the OS keyring.
-
-        Deliberately separate from ``PUT /api/settings``: the rest of the
-        credentials are safe to serialize into ``config.json``, but this one is
-        not. An empty value clears the saved secret.
-        """
-        secret = payload.secret.strip()
-        if not save_wecom_secret(secret):
-            raise HTTPException(
-                status_code=503,
-                detail="无法写入系统凭据库（keyring），请检查系统钥匙串是否可用。",
-            )
-        return {"ok": True, "secret_saved": bool(secret)}
-
-    @router.get("/api/notify/wecom")
-    def notify_wecom_status() -> dict[str, Any]:
-        """Non-secret direct-API configuration, for the settings page."""
-        settings = get_state().ctx.settings.notify
-        return {
-            "mode": settings.mode,
-            "corp_id": settings.corp_id,
-            "agent_id": settings.agent_id,
-            "api_base": settings.api_base,
-            "secret_saved": bool(load_wecom_secret()),
-        }
-
-    # ------------------------------------------------------ openclaw install
-    @router.get("/api/install/openclaw")
-    def install_status() -> dict[str, Any]:
-        """Node/npm availability plus the state and log of the last install.
-
-        The page polls this while a run is in flight; the log tail is part of
-        the same payload so a slow npm cannot show up as a frozen button with no
-        explanation.
-        """
-        return get_state().ctx.installer.status()
-
-    @router.post("/api/install/openclaw/plan")
-    def install_plan(payload: InstallPayload) -> dict[str, Any]:
-        """Preview the exact command, so nothing runs unseen."""
-        ctx = get_state().ctx
-        options = _install_options(payload)
-        try:
-            argv = ctx.installer.plan(options)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {"command": argv, "options": asdict(options)}
-
-    @router.post("/api/install/openclaw")
-    def install_start(payload: InstallPayload) -> dict[str, Any]:
-        """Start ``npm install --global ...`` in the background.
-
-        Installing software is the one action on this page that changes the
-        machine, so it is a deliberate, separate call — never a side effect of
-        saving settings or of a status poll.
-        """
-        ctx = get_state().ctx
-        options = _install_options(payload)
-        try:
-            return ctx.installer.start(options)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    @router.post("/api/install/openclaw/cancel")
-    def install_cancel() -> dict[str, Any]:
-        """Stop the running install and the npm tree it spawned."""
-        return get_state().ctx.installer.cancel()
-
-    @router.get("/api/install/openclaw/channel")
-    def channel_status() -> dict[str, Any]:
-        """Whether the gateway knows the 企业微信 channel and is connected.
-
-        Read from the gateway rather than inferred from files on disk, because a
-        plugin can be installed and still be disabled or unconfigured. The
-        gateway's own process state rides along: the long connection lives in
-        that process, so a channel is useless when the gateway is down and the
-        page has to say which of the two is wrong.
-        """
-        ctx = get_state().ctx
-        status = ctx.installer.channel_status()
-        status["gateway"] = ctx.gateway.status()
-        return status
-
-    @router.put("/api/install/openclaw/channel/config")
-    def channel_configure(payload: WeComChannelPayload) -> dict[str, Any]:
-        """Save API-mode Bot ID/Secret into OpenClaw's channel config.
-
-        This is intentionally not part of the settings PUT: the secret belongs
-        to OpenClaw's own config, not biTrader's config.json, and saving it
-        should not be able to fail because an unrelated risk setting is invalid.
-        """
-        try:
-            result = get_state().ctx.installer.configure_channel(
-                payload.bot_id, payload.secret
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return result
-
-    @router.post("/api/install/openclaw/channel")
-    def channel_register() -> dict[str, Any]:
-        """Register the 企业微信 plugin with the gateway, streamed to the log."""
-        try:
-            return get_state().ctx.installer.register_channel()
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    @router.post("/api/install/openclaw/gateway")
-    def gateway_start() -> dict[str, Any]:
-        """Start the local gateway without restarting the app."""
-        return get_state().ctx.gateway.start()
-
-    @router.post("/api/install/openclaw/gateway/restart")
-    def gateway_restart() -> dict[str, Any]:
-        """Restart the gateway process.
-
-        A channel session lives inside that process: after a scan or an unbind,
-        the running gateway still holds the state it booted with, and only a
-        restart makes the new binding (or its removal) take effect.
-
-        A gateway this app did not spawn is not ours to kill, so it is restarted
-        through the CLI instead; otherwise the button would quietly do nothing
-        on exactly the machine where it matters.
-        """
-        ctx = get_state().ctx
-        if ctx.gateway.status().get("managed"):
-            ctx.gateway.stop()
-            return ctx.gateway.start()
-        code, output = restart_gateway_process()
-        status = ctx.gateway.status()
-        if not status.get("reachable"):
-            # The CLI can refuse — "listener changed before restart" is what it
-            # says when its own bookkeeping is stale — so fall back to launching
-            # a gateway ourselves instead of leaving push dead.
-            status = ctx.gateway.start()
-        if not status.get("reachable"):
-            status = {
-                **status,
-                "error": output.strip()[-300:] or f"openclaw 返回退出码 {code}",
-            }
-        return status
-
     # ------------------------------------------------------------------ news
     @router.get("/api/news")
     def news(symbol: str = "", limit: int = 20) -> dict[str, Any]:
@@ -1480,6 +1227,9 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
         ctx = state.ctx
         market = _market(payload.market)
         network = _network(payload.network) or ctx.network
+        platform = payload.platform or ctx.platform
+        if platform not in SUPPORTED_PLATFORMS:
+            raise HTTPException(status_code=400, detail="暂不支持这个平台。现在只有币安能下真单。")
         key = payload.api_key.strip()
         secret = payload.api_secret.strip()
         if not key or not secret:
@@ -1489,30 +1239,33 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
         if payload.verify:
             try:
                 with state.locks[market]:
-                    rest = BinanceREST(network, creds)
+                    rest = BinanceREST(network, creds, platform=platform)
                     rest.fetch_balance(market)
             except Exception as exc:
                 raise HTTPException(
                     status_code=400, detail=f"连接测试失败：{exc}"
                 ) from exc
 
-        if not ctx.credentials.save(network, market, creds):
+        if not ctx.credentials.save(network, market, creds, platform):
             raise HTTPException(
                 status_code=500,
                 detail="无法写入系统凭据库（keyring），请检查系统钥匙串是否可用",
             )
-        if network is ctx.network and market is ctx.market_type:
+        if network is ctx.network and market is ctx.market_type and platform == ctx.platform:
             ctx.creds = creds
             ctx.rest.credentials = creds
             ctx.rest.reset()
         return {"ok": True, "market": market.value, "network": network.value}
 
     @router.delete("/api/credentials")
-    def delete_credentials(market: str = "spot", network: str | None = None) -> dict[str, Any]:
+    def delete_credentials(
+        market: str = "spot", network: str | None = None, platform: str = ""
+    ) -> dict[str, Any]:
         ctx = get_state().ctx
+        platform = platform or ctx.platform
         market_type = _market(market)
         target = _network(network) or ctx.network
-        ctx.credentials.delete(target, market_type)
+        ctx.credentials.delete(target, market_type, platform)
         if target is ctx.network and market_type is ctx.market_type:
             ctx.creds = Credentials()
             ctx.rest.credentials = ctx.creds
@@ -1715,6 +1468,89 @@ def _last_price(state, market: MarketType, symbol: str) -> float | None:
         return None
 
 
+def apply_settings(ctx: Any, payload: "SettingsPayload") -> list[str]:
+    """把设置写进上下文，返回改动过的字段名。
+
+    所有字段先在一份草稿上校验，全部通过才动内存和磁盘。老实现里切网络、切市场
+    会先落盘：后面的字段一旦报 400，磁盘上就留下一半新一半旧的配置。
+    """
+    settings = ctx.settings
+    target_platform = None
+    if payload.platform:
+        if payload.platform not in SUPPORTED_PLATFORMS:
+            raise HTTPException(
+                status_code=400,
+                detail="暂不支持这个平台。现在只有币安能下真单。",
+            )
+        target_platform = payload.platform
+    target_network = _network(payload.network)
+    target_market = None
+    if payload.market_type:
+        try:
+            target_market = MarketType(payload.market_type)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail=f"未知市场：{payload.market_type}"
+            ) from exc
+    if payload.timeframe is not None and payload.timeframe not in TIMEFRAME_SECONDS:
+        raise HTTPException(status_code=400, detail=f"不支持的周期：{payload.timeframe}")
+    if payload.theme is not None and payload.theme not in ("light", "dark"):
+        raise HTTPException(status_code=400, detail="主题只有亮色和暗色两种。")
+
+    # 草稿副本：任何一项校验失败都不影响线上对象。
+    risk_draft = replace(settings.risk)
+    notify_draft = replace(settings.notify)
+    ai_draft = replace(settings.ai)
+    ai_auto_draft = replace(settings.ai_auto)
+    if payload.risk is not None:
+        _apply_risk(risk_draft, payload.risk)
+    if payload.notify is not None:
+        _apply_notify(notify_draft, payload.notify)
+    if payload.ai is not None:
+        _apply_ai(ai_draft, payload.ai)
+    if payload.ai_auto is not None:
+        _apply_ai_auto(ai_auto_draft, payload.ai_auto)
+
+    # 字段都合法了，开始落地。切换类操作不落盘，统一在最后保存一次。
+    changed: list[str] = []
+    if target_platform is not None and target_platform != ctx.platform:
+        ctx.set_platform(target_platform, persist=False)
+        changed.append("platform")
+    if target_network is not None and target_network is not ctx.network:
+        ctx.set_network(target_network, persist=False)
+        changed.append("network")
+    if target_market is not None and target_market is not ctx.market_type:
+        ctx.set_market_type(target_market, persist=False)
+        changed.append("market_type")
+    for name in ("last_symbol", "timeframe", "default_order_quote", "kline_limit"):
+        value = getattr(payload, name)
+        if value is not None and getattr(settings, name) != value:
+            setattr(settings, name, value)
+            changed.append(name)
+    if payload.proxy is not None and payload.proxy.strip() != settings.proxy:
+        # 重建客户端：ccxt 只读一次 proxies，旧客户端会继续直连。
+        ctx.apply_proxy(payload.proxy)
+        changed.append("proxy")
+    if payload.theme is not None and settings.theme != payload.theme:
+        settings.theme = payload.theme
+        changed.append("theme")
+    if payload.notification_sound is not None and settings.notification_sound != payload.notification_sound:
+        settings.notification_sound = payload.notification_sound
+        changed.append("notification_sound")
+    for name, draft in (
+        ("risk", risk_draft),
+        ("notify", notify_draft),
+        ("ai", ai_draft),
+        ("ai_auto", ai_auto_draft),
+    ):
+        if getattr(settings, name) != draft:
+            setattr(settings, name, draft)
+            changed.append(name)
+
+    ctx.save_settings()
+    return changed
+
+
 def _apply_risk(risk: RiskSettings, values: dict[str, Any]) -> None:
     """Only fields the dataclass declares; unknown keys are ignored."""
     for key, value in values.items():
@@ -1729,43 +1565,40 @@ def _apply_risk(risk: RiskSettings, values: dict[str, Any]) -> None:
 
 
 def _apply_notify(target: Any, values: dict[str, Any]) -> None:
-    """Same contract as :func:`_apply_risk`, for the WeChat push settings.
+    """同 :func:`_apply_risk` 的规矩，对象是通知设置。
 
-    ``enabled`` without a target would queue messages that can never be
-    delivered, so that combination is rejected up front instead of failing
-    silently on the first fill.
+    开启通知却没填地址，消息会永远发不出去，所以这一组合直接拒绝，
+    不留到第一次成交时才失败。
     """
     for key, value in values.items():
         if not hasattr(target, key):
             log.debug("忽略未知通知字段: %s", key)
             continue
-        if key == "mode":
-            mode = str(value or "").strip().lower()
-            if mode not in {"openclaw", "wecom_api"}:
-                raise HTTPException(status_code=400, detail="通知模式必须是 openclaw 或 wecom_api")
-            target.mode = mode
+        if key == "msg_format":
+            fmt = str(value or "").strip().lower()
+            if fmt not in FORMATS:
+                raise HTTPException(
+                    status_code=400,
+                    detail="消息格式只能是 auto、qyapi_markdown、qyapi_text 或 custom",
+                )
+            target.msg_format = fmt
+            continue
+        if key == "webhook_url":
+            try:
+                target.webhook_url = check_webhook_url(str(value or ""))
+            except NotifyError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
             continue
         current = getattr(target, key)
         try:
             setattr(target, key, bool(value) if isinstance(current, bool) else type(current)(value))
         except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail=f"通知字段 {key} 的值无效")
-    mode = str(target.mode or "openclaw").strip().lower()
-    if mode not in {"openclaw", "wecom_api"}:
-        raise HTTPException(status_code=400, detail="通知模式必须是 openclaw 或 wecom_api")
-    if target.enabled and not str(target.target or "").strip():
+            raise HTTPException(status_code=400, detail=f"通知字段 {key} 的值无效") from None
+    if target.enabled and not str(target.webhook_url or "").strip():
         raise HTTPException(
             status_code=400,
-            detail="开启企业微信通知前，请先填写接收人 userid（企业微信通讯录里的成员账号）。",
+            detail="开启通知前先填 Webhook 地址（企业微信群机器人的地址）。",
         )
-    if target.enabled and mode == "wecom_api":
-        if not str(target.corp_id or "").strip():
-            raise HTTPException(status_code=400, detail="API 模式需要填写企业微信 CorpID")
-        if not str(target.agent_id or "").strip():
-            raise HTTPException(status_code=400, detail="API 模式需要填写 AgentId")
-        if not str(target.agent_id).strip().isdigit():
-            raise HTTPException(status_code=400, detail="企业微信 AgentId 必须是数字")
-
 
 def _apply_ai(target: Any, values: dict[str, Any]) -> None:
     """Same contract as :func:`_apply_notify`, for the LLM assistant.

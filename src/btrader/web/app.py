@@ -19,12 +19,13 @@ from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from ..context import AppContext
+from ..core.config import ConfigError
 from ..core.types import (
     TIMEFRAME_SECONDS,
     MarketType,
@@ -494,12 +495,7 @@ def create_app() -> FastAPI:
         # Warm the symbol list in the background: the first paint must not wait
         # on a multi-second load_markets() call.
         threading.Thread(target=_warm, daemon=True).start()
-        # Bring the OpenClaw gateway up in the background. WeChat push needs it,
-        # and nothing else was starting it; doing it off-thread keeps a slow or
-        # missing gateway from delaying the first paint.
-        threading.Thread(
-            target=state.ctx.gateway.start, name="openclaw-gateway", daemon=True
-        ).start()
+
         state.stop_reconcile.clear()
         threading.Thread(
             target=_reconcile_live_fills, args=(state,), name="live-reconciler", daemon=True
@@ -516,6 +512,11 @@ def create_app() -> FastAPI:
                 log.debug("关闭上下文失败", exc_info=True)
 
     app = FastAPI(title="biTrader Web", lifespan=lifespan)
+
+    @app.exception_handler(ConfigError)
+    async def _config_error(_request: Request, exc: ConfigError) -> JSONResponse:
+        """配置文件写不进去时给 409：这是用户的文件出了问题，不是服务端崩了。"""
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
     app.include_router(build_router(get_state))
     # Candidate review and multi-round parameter reflection.
     app.include_router(build_lab_router(get_state))

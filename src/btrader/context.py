@@ -13,12 +13,11 @@ from .engine.account import AccountService
 from .engine.risk import RiskManager
 from .engine.trading import TradingService
 from .exchange.klines import KlineStore
-from .exchange.rest import BinanceREST
-from .gateway import GatewaySupervisor
-from .installer import OpenClawInstaller
+from .exchange.rest import DEFAULT_PLATFORM, SUPPORTED_PLATFORMS, BinanceREST
+
 from .llm import LLMService
 from .news import NewsService
-from .notify import WeChatNotifier
+from .notify import Notifier
 from .strategy.registry import StrategyRegistry
 
 log = logging.getLogger(__name__)
@@ -32,21 +31,30 @@ class AppContext:
 
         self.network = Network(self.settings.network)
         self.market_type = MarketType(self.settings.market_type)
+        self.platform = self.settings.platform or DEFAULT_PLATFORM
 
         self.credentials = CredentialStore()
-        self.creds: Credentials = self.credentials.load(self.network, self.market_type)
+        self.creds: Credentials = self.credentials.load(
+            self.network, self.market_type, self.platform
+        )
 
-        self.rest = BinanceREST(self.network, self.creds, proxy=self.settings.proxy)
+        self.rest = BinanceREST(
+            self.network, self.creds, proxy=self.settings.proxy, platform=self.platform
+        )
         # Charting reads Binance's read-only public feed so candles look like
         # the real market even while orders go to the test network. Credentials
         # are deliberately withheld: a charting client can never sign anything.
         self.market_rest = BinanceREST(
-            self.network, Credentials(), market_data=True, proxy=self.settings.proxy
+            self.network,
+            Credentials(),
+            market_data=True,
+            proxy=self.settings.proxy,
+            platform=self.platform,
         )
         self.risk = RiskManager(self.settings.risk, self.db)
         # Outbound WeChat push. Constructed even when disabled so the settings
         # page can report whether the OpenClaw CLI is actually reachable.
-        self.notifier = WeChatNotifier(self.settings.notify)
+        self.notifier = Notifier(self.settings.notify)
         # Optional LLM assistant. Built even when disabled so the settings page
         # can report the provider, the key and today's usage.
         self.ai = LLMService(self.settings.ai)
@@ -65,12 +73,7 @@ class AppContext:
             db=self.db,
             network=self.network,
         )
-        # Installs the CLI the notifier shells out to. Separate object because
-        # it owns a process, not a message queue.
-        self.installer = OpenClawInstaller()
-        # Starts the gateway the notifier talks to. WeChat push fails without it,
-        # and nothing else here was starting it.
-        self.gateway = GatewaySupervisor()
+
         # Keyless feed: announcements plus two RSS outlets, no token to manage.
         self.news = NewsService()
 
@@ -89,10 +92,10 @@ class AppContext:
             # Each market authorises against its own key slot: sending a spot
             # key to fapi/dapi makes Binance answer -2015.
             creds = self.creds if market == self.market_type else self.credentials.load(
-                self.network, market
+                self.network, market, self.platform
             )
             self._market_rest[market] = BinanceREST(
-                self.network, creds, proxy=self.settings.proxy
+                self.network, creds, proxy=self.settings.proxy, platform=self.platform
             )
         return self._market_rest[market]
 
@@ -111,6 +114,7 @@ class AppContext:
                 Credentials(),
                 market_data=True,
                 proxy=self.settings.proxy,
+                platform=self.platform,
             )
         return self._data_rest[market]
 
@@ -124,10 +128,10 @@ class AppContext:
         """
         return self.rest_for(market)
 
-    def set_network(self, network: Network) -> None:
+    def set_network(self, network: Network, *, persist: bool = True) -> None:
         self.network = network
         self.settings.network = network.value
-        self.creds = self.credentials.load(network, self.market_type)
+        self.creds = self.credentials.load(network, self.market_type, self.platform)
         self.rest.network = network
         self.rest.credentials = self.creds
         self.rest.reset()
@@ -137,25 +141,46 @@ class AppContext:
         self._data_rest = {self.market_type: self.market_rest}
         self.account.network = network
         self.account.invalidate()
-        self.config.save()
+        if persist:
+            self.config.save()
 
-    def set_market_type(self, market: MarketType) -> None:
+    def set_market_type(self, market: MarketType, *, persist: bool = True) -> None:
         self.market_type = market
         self.settings.market_type = market.value
         # Credentials are stored per margined type: a spot key cannot authorise
         # a futures endpoint (Binance answers -2015). Load the slot that belongs
         # to this market instead of carrying the previous key across.
-        creds = self.credentials.load(self.network, market)
+        creds = self.credentials.load(self.network, market, self.platform)
         self.creds = creds
         self.rest.credentials = creds
         self.rest.reset()
         self._market_rest = {}
         self._data_rest = {self.market_type: self.market_rest}
-        self.config.save()
+        if persist:
+            self.config.save()
+
+    def set_platform(self, platform: str, *, persist: bool = True) -> None:
+        """切换交易所。凭据按平台分开存，切过去就取那一份。"""
+        target = platform if platform in SUPPORTED_PLATFORMS else DEFAULT_PLATFORM
+        if target == self.platform:
+            return
+        self.platform = target
+        self.settings.platform = target
+        self.creds = self.credentials.load(self.network, self.market_type, target)
+        self.rest.platform = target
+        self.rest.credentials = self.creds
+        self.rest.reset()
+        self.market_rest.platform = target
+        self.market_rest.reset()
+        self._market_rest = {self.market_type: self.rest}
+        self._data_rest = {self.market_type: self.market_rest}
+        self.account.invalidate()
+        if persist:
+            self.config.save()
 
     def save_credentials(self, api_key: str, api_secret: str) -> bool:
         creds = Credentials(api_key.strip(), api_secret.strip())
-        ok = self.credentials.save(self.network, self.market_type, creds)
+        ok = self.credentials.save(self.network, self.market_type, creds, self.platform)
         if ok:
             self.creds = creds
             self.rest.credentials = creds
@@ -211,20 +236,6 @@ class AppContext:
         self.ai.settings = self.settings.ai
 
     def shutdown(self) -> None:
-        try:
-            self.installer.shutdown()
-        except Exception:  # pragma: no cover - best effort on exit
-            log.debug("停止安装进程失败", exc_info=True)
-        try:
-            # The gateway is deliberately left running. Restarting it costs the
-            # WeChat login: the ilink bot token is tied to the running plugin, so
-            # a restart makes it answer ``errcode -14 session timeout`` and the
-            # user has to scan the QR again. Keeping the process alive across
-            # app restarts is what stops "放久一点就要重新扫码".
-            self.gateway.detach()
-            log.info("OpenClaw 网关保持运行（避免微信重新扫码）")
-        except Exception:  # pragma: no cover - best effort on exit
-            log.debug("保留 OpenClaw 网关失败", exc_info=True)
         try:
             self.notifier.stop()
         except Exception:  # pragma: no cover - best effort on exit

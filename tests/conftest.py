@@ -19,14 +19,20 @@ def candles() -> pd.DataFrame:
 
 
 @pytest.fixture(autouse=True)
-def no_gateway_probe(monkeypatch):
-    """Keep the suite independent of whether a gateway runs on this machine.
+def no_real_http(monkeypatch, tmp_path):
+    """整轮测试都不许真的发 HTTP。
 
-    The notifier probes the gateway port before sending (fast failure instead of
-    a 30 s CLI stall). That probe is real I/O, so leaving it on would make tests
-    pass or fail depending on the developer's own OpenClaw state. Tests that are
-    *about* the probe re-enable it explicitly.
+    通知只走一条 Webhook，发送就是一次真实的 POST：不拦住的话，跑测试会给
+    某个群发消息，还会因为本机网络不同而时绿时红。需要验证发送的测试自己
+    替换 ``notify._post_json``。
     """
-    from btrader.notify import WeChatNotifier
+    from btrader import notify
 
-    monkeypatch.setattr(WeChatNotifier, "_preflight", lambda self: None)
+    def refuse(url, body, **kwargs):
+        raise AssertionError(f"测试里不该发真实请求：{url}")
+
+    monkeypatch.setattr(notify, "_post_json", refuse)
+    # 暂存文件也一样：测试写的补发消息不能留在真实数据目录里，
+    # 否则下一次 status() 会报出别的测试留下的条数。
+    monkeypatch.setattr(notify, "_spool_path", lambda: tmp_path / "notify-spool.jsonl")
+

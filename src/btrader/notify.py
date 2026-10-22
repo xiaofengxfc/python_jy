@@ -1,36 +1,20 @@
-"""Outbound 企业微信 notifications.
+"""企业微信通知：只发一条通用 Webhook，没有网关。
 
-Two transports are supported:
+以前推送要靠本机 OpenClaw 网关转发：起一次 Node 大约 30 秒，网关没在跑还要等
+50 秒超时，通道出问题时用户只看到「发送失败」。现在只做一件事：把消息 POST 到
+用户自己填的地址。
 
-* **Direct self-built-app API** — ``wecom_api`` mode calls
-  ``qyapi.weixin.qq.com`` with Corpid / AgentId / a keyring-stored Secret.
-* **OpenClaw smart bot** — ``openclaw`` mode uses the local gateway's outbound
-  WebSocket and its message CLI.
+参考 dsh-notifier 的「企业微信应用通知（通用 Webhook）」：
 
-The direct API is useful when the user has a 企业微信 administrator-created app
-but does not want to install OpenClaw. The openclaw bridge remains the default
-for compatibility with existing installations.
+* 企业微信群机器人地址（``/cgi-bin/webhook/send?key=…``）按它自己的格式发，
+  ``msgtype`` 选 text 或 markdown；
+* 别的地址发 ``{"title": …, "content": …}``，或者按用户写的模板发。
 
-The 企业微信 smart-bot plugin (``@wecom/wecom-openclaw-plugin``) keeps an
-outbound WebSocket (long connection) from the gateway on this machine to
-``wss://openws.work.weixin.qq.com``. Because the connection is outbound and
-authenticated with a Bot ID + Secret, there is no callback URL, no public IP and
-no QR code that can expire.
+三条规矩没变：
 
-Once the channel is configured, pushes go out through OpenClaw's own message
-CLI::
-
-    openclaw message send --channel wecom --target <userid> --message <text> --json
-
-That CLI is the stable, documented interface (``docs.openclaw.ai/cli/message``);
-there is no public per-message HTTP endpoint for a channel send, so this module
-shells out instead of inventing one. A missing CLI, a plugin that was never
-registered, or a gateway that is not running are normal, recoverable conditions:
-they are logged, surfaced to the settings page, and never allowed to interrupt
-trading.
-
-Sends go through a bounded background queue. A hanging gateway must not stall an
-order submission or the fill reconciler, which run on critical paths.
+* 通知不能拖住下单。发送走后台队列，队列满了就丢最新一条并计数。
+* 发不出去的消息写进 ``notify-spool.jsonl``，通道恢复后补发，不静默丢。
+* 连续失败三次熔断五分钟，避免拿超时把队列堆满。
 """
 
 from __future__ import annotations
@@ -39,10 +23,6 @@ import json
 import logging
 import os
 import queue
-import re
-import shutil
-import socket
-import subprocess
 import threading
 import time
 import urllib.error
@@ -55,202 +35,194 @@ from . import paths
 
 log = logging.getLogger(__name__)
 
-# Direct 企业微信 self-built-app API. The secret is kept in the OS keyring, not
-# in config.json, for the same reason the AI key is.
-WECOM_API_BASE = "https://qyapi.weixin.qq.com"
-WECOM_KEYRING_SERVICE = "biTrader-wecom"
-WECOM_KEYRING_USER = "corp_secret"
-
-
-# Both forms are used in the wild: the plugin's manifest id carries no scope
-# prefix, while older guides spell the channel after the npm package. The
-# settings page shows this value so a user whose gateway names it differently
-# can correct it instead of being told "send failed" with no context.
-# 企业微信智能机器人（长连接）的渠道名。由官方插件 `@wecom/wecom-openclaw-plugin`
-# 注册，连接方式为出站 WebSocket —— 不需要公网回调地址，也不会像个人微信 bot
-# 那样隔几小时就掉登录。
-DEFAULT_CHANNEL = "wecom"
-DEFAULT_COMMAND = "openclaw"
-# Chat text is cheap for us and a wall of it is unreadable on a lock screen.
+# 有的中转站会用 WAF 拦裸客户端（返回 403，正文是 error code: 1010），
+# 带上自己的 UA 才放行。和 llm.py / news.py 用同一个。
+USER_AGENT = "biTrader/0.5 (+desktop)"
+# 企业微信群机器人单条 markdown 上限 4096 字节，中文一个字三字节，
+# 2000 字留足余量，也够把锁屏那一屏说完。
 MAX_MESSAGE_CHARS = 2000
-# npm's Windows shim embeds the real script path in a quoted string, e.g.
-# ``"%dp0%\node_modules\openclaw\openclaw.mjs" %*``. Lifting that out lets the
-# notifier call node directly instead of handing the text to cmd.exe.
-_SHIM_SCRIPT_RE = re.compile(r'"([^"]+\.(?:js|mjs|cjs))"', re.IGNORECASE)
-
-# A dead gateway costs one CLI round trip per message (~30 s) because the CLI
-# waits for a gateway that is not there. Three failures in a row open the
-# breaker for a few minutes, so the queue drains instead of stacking timeouts —
-# Parallel sends would make ten already-doomed messages fail five minutes
-# sooner, which tells the user nothing new.
+# 一次 HTTP POST 的正常耗时是几百毫秒。10 秒还没回来就是网络有问题，
+# 继续等只会让后台队列越堆越长。
+WEBHOOK_TIMEOUT = 10.0
+# 连续失败几次算通道坏了。三次足够排除偶发抖动。
 BREAKER_THRESHOLD = 3
 BREAKER_COOLDOWN = 300.0
-# The CLI's own failure takes ~30 s; a TCP probe answers "is anything listening"
-# in a fraction of that, so a down gateway is reported before the wait starts.
-PREFLIGHT_TIMEOUT = 0.4
-# Failed messages are kept on disk and replayed once the channel is back: losing
-# a 熔断 warning because the gateway restarted mid-send is not acceptable.
+# 失败的消息留在盘上，通道恢复后补发：
+# 因为一次网络抖动就丢掉「熔断」告警，是最不该丢的那一条。
 SPOOL_LIMIT = 200
 SPOOL_MAX_AGE = 6 * 3600.0
 SPOOL_BATCH = 5
 SPOOL_FILE = "notify-spool.jsonl"
 SPOOL_PREFIX = "【补发】"
 
+# 消息格式。auto 按地址判断，用户一般不用管。
+FORMATS = ("auto", "qyapi_markdown", "qyapi_text", "custom")
+DEFAULT_FORMAT = "auto"
+QYAPI_SEND_MARKER = "/cgi-bin/webhook/send"
+
 
 class NotifyError(RuntimeError):
-    """A message could not be handed to the WeChat channel."""
+    """消息没发出去。文案要能直接告诉用户下一步做什么。"""
 
 
-def load_wecom_secret() -> str:
-    """Read the self-built-app Secret from the OS keyring, never config.json."""
-    try:
-        import keyring
-
-        return keyring.get_password(WECOM_KEYRING_SERVICE, WECOM_KEYRING_USER) or ""
-    except Exception as exc:  # a broken keyring must not break the page
-        log.warning("读取企业微信 Secret 失败: %s", exc)
+def check_webhook_url(url: str) -> str:
+    """校验并归整 Webhook 地址。空串表示没配，交给调用方决定怎么说。"""
+    text = (url or "").strip()
+    if not text:
         return ""
+    lowered = text.lower()
+    if not (lowered.startswith("http://") or lowered.startswith("https://")):
+        raise NotifyError("Webhook 地址要以 http:// 或 https:// 开头。")
+    parsed = urllib.parse.urlsplit(text)
+    if not parsed.netloc:
+        raise NotifyError("Webhook 地址不完整，缺少域名部分。")
+    return text
 
 
-def save_wecom_secret(value: str) -> bool:
-    """Store (or clear) the self-built-app Secret in the OS keyring."""
-    try:
-        import keyring
+def mask_url(url: str) -> str:
+    """给界面看的形式：域名留着，key 只留后四位。"""
+    text = (url or "").strip()
+    if not text:
+        return ""
+    parsed = urllib.parse.urlsplit(text)
+    query = parsed.query
+    if "key=" in query:
+        parts = []
+        for item in query.split("&"):
+            if item.startswith("key="):
+                value = item[4:]
+                parts.append("key=…" + value[-4:] if len(value) > 4 else "key=…")
+            else:
+                parts.append(item)
+        query = "&".join(parts)
+    base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    return f"{base}?{query}" if query else base
 
-        if value:
-            keyring.set_password(WECOM_KEYRING_SERVICE, WECOM_KEYRING_USER, value)
-        else:
-            try:
-                keyring.delete_password(WECOM_KEYRING_SERVICE, WECOM_KEYRING_USER)
-            except Exception:
-                pass
-        return True
-    except Exception as exc:
-        log.warning("保存企业微信 Secret 失败: %s", exc)
-        return False
+
+def parse_headers(text: str) -> dict[str, str]:
+    """把「每行一个 Key: Value」解析成字典。空行和没有冒号的行忽略。"""
+    result: dict[str, str] = {}
+    for line in str(text or "").splitlines():
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip()
+        if key:
+            result[key] = value.strip()
+    return result
 
 
-def _wecom_http_json(
-    url: str,
-    *,
-    params: dict | None = None,
-    body: dict | None = None,
-    timeout: float = 15.0,
+def _post_json(
+    url: str, body: dict, *, headers: dict[str, str] | None = None, timeout: float = WEBHOOK_TIMEOUT
 ) -> dict:
-    """Minimal JSON client for qyapi.weixin.qq.com.
+    """POST 一段 JSON，返回解析后的响应体（不是 JSON 就当空对象）。
 
-    ``urllib`` is used deliberately: it is part of the standard library and
-    honours the same HTTPS proxy environment as the rest of the process, so a
-    desktop proxy setup does not need an extra dependency just for notifications.
+    用标准库：桌面端没有额外的 HTTP 客户端，通知也不该为它引入依赖。
     """
-    if params:
-        url = f"{url}?{urllib.parse.urlencode(params)}"
-    data = None
-    headers = {"User-Agent": "biTrader/0.5"}
-    if body is not None:
-        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
-        headers["Content-Type"] = "application/json; charset=utf-8"
-    request = urllib.request.Request(url, data=data, headers=headers)
+    payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    request_headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+    }
+    request_headers.update(headers or {})
+    request = urllib.request.Request(url, data=payload, headers=request_headers, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             raw = response.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
-        raise NotifyError(f"企业微信接口 HTTP {exc.code}：{detail[:300]}") from exc
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")[:300]
+        except Exception:
+            pass
+        raise NotifyError(_http_text(exc.code, detail)) from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise NotifyError(f"连接企业微信接口失败：{exc}") from exc
+        reason = getattr(exc, "reason", exc)
+        raise NotifyError(f"连不上 Webhook 地址：{reason}。检查网络、代理或地址。") from exc
     try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise NotifyError(f"企业微信接口返回了非 JSON 内容：{raw[:300]}") from exc
-    if not isinstance(payload, dict):
-        raise NotifyError("企业微信接口返回格式不正确")
-    return payload
+        value = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
-def _wecom_error(payload: dict) -> str:
-    code = str(payload.get("errcode") or "")
+def _http_text(code: int, detail: str) -> str:
+    hint = {
+        400: "Webhook 地址不认这个请求体，检查消息格式选对了没有。",
+        401: "Webhook 要求鉴权，把 token 放进地址或自定义请求头。",
+        403: "Webhook 拒绝了这次请求，可能是 key 失效或来源被拦。",
+        404: "Webhook 地址不存在，检查是不是复制少了字符。",
+        413: "消息太长，超过 Webhook 的限制。",
+        429: "发得太快被限流，稍后会重试。",
+    }.get(code)
+    if code >= 500:
+        hint = "Webhook 服务端出错，稍后会自动重试。"
+    message = hint or f"Webhook HTTP {code}。"
+    return f"{message}（{detail}）" if detail else message
+
+
+def _qyapi_error(payload: dict) -> str:
+    """企业微信群机器人的错误码，翻成中文。"""
+    try:
+        code = int(payload.get("errcode") or 0)
+    except (TypeError, ValueError):
+        return "企业微信返回了无法识别的错误码。"
+    if code == 0:
+        return ""
     message = str(payload.get("errmsg") or "").strip()
-    if code in {"40001", "40014", "42001"}:
-        return "企业微信 Secret 无效或 access_token 已过期，请重新保存 Secret。"
-    if code == "60020":
-        return "企业微信接口提示 IP 不在可信 IP 范围，请在应用后台配置可信 IP。"
-    if code == "81013":
-        return "企业微信接收人不存在或不在应用可见范围内。"
-    return f"企业微信接口错误 {code or '未知'}：{message or '未返回原因'}"
-
-
-def _wecom_errcode(payload: dict) -> int:
-    try:
-        return int(payload.get("errcode") or 0)
-    except (TypeError, ValueError) as exc:
-        raise NotifyError("企业微信接口返回了无法识别的错误码") from exc
+    hint = {
+        40058: "参数不对，检查消息格式。",
+        45009: "触发频率限制（每分钟 20 条），消息已暂存，稍后补发。",
+        93000: "Webhook key 无效，重新复制机器人地址。",
+    }.get(code)
+    text = hint or f"企业微信接口错误 {code}"
+    return f"{text}（{message}）" if message else text
 
 
 @dataclass
 class NotifySettings:
-    """Where and whether to push notifications.
+    """发不发、发到哪、按什么格式发。
 
-    Two transports are supported:
-
-    * ``wecom_api`` — direct 企业微信 self-built-app HTTP API using
-      Corpid / AgentId / Secret. The secret lives in the OS keyring.
-    * ``openclaw`` — the existing smart-bot long connection through the local
-      OpenClaw gateway, addressed by a conversation/userid.
-
-    ``target`` is the 企业微信 userid in either mode. An empty value makes the
-    send refuse with an explanation instead of guessing a recipient.
+    ``webhook_url`` 就是企业微信群机器人的地址，或者任何接收 JSON 的自建地址。
+    地址里已经带着 key，所以它等同于一个密码：不进日志，界面上只显示后四位。
     """
 
     enabled: bool = False
-    mode: str = "openclaw"
-    channel: str = DEFAULT_CHANNEL
-    target: str = ""
-    # Direct self-built-app credentials. The secret is not a dataclass field:
-    # it is stored in the OS keyring (see load_wecom_secret/save_wecom_secret).
-    corp_id: str = ""
-    agent_id: str = ""
-    api_base: str = WECOM_API_BASE
-    # The plugin's own account id inside the gateway. Empty means "the default
-    # account", which is what a single-bot setup should leave alone.
-    account: str = ""
-    command: str = DEFAULT_COMMAND
-    # Events are opt-in individually so an active strategy cannot spam the phone.
+    webhook_url: str = ""
+    msg_format: str = DEFAULT_FORMAT
+    # custom 格式用的模板：两个占位符 {title} 和 {content}。
+    webhook_template: str = ""
+    # 自定义请求头，每行一个 "Key: Value"。
+    webhook_headers: str = ""
+    # 事件开关：一条策略忙起来时，手机不该被同一种消息刷屏。
     on_fill: bool = True
     on_protection: bool = True
     on_risk_halt: bool = True
     on_live_warning: bool = True
-    # Long-running work (自动交易启停、回测/优化完成) reports progress here too,
-    # so the phone is not only about fills.
+    # 自动交易启停、回测/优化结束这类长任务也报一声，手机不只知道成交。
     on_task: bool = True
-    # Probe the gateway port before spawning the CLI. Turn off only for a
-    # gateway on a non-default port, where the probe would be a false negative.
-    preflight: bool = True
-
 
 
 @dataclass
 class _Job:
     text: str
+    title: str = ""
     queued_at: float = field(default_factory=time.time)
 
 
-class WeChatNotifier:
-    """Queue + worker around ``openclaw message send``.
+class Notifier:
+    """队列 + 后台线程 + 一条 Webhook。
 
-    ``settings`` is read on every send, so the web layer can change it at runtime
-    without rebuilding the notifier.
+    ``settings`` 每次发送都重读，网页改完立刻生效，不用重建对象。
     """
 
     def __init__(
         self,
         settings: NotifySettings,
         *,
-        # A single ``message send`` is a full Node start plus a gateway round
-        # trip; measured at ~30 s on a warm machine. The old 20 s deadline
-        # fired first every time, so every notification "failed" while the
-        # message actually went through.
-        timeout: float = 90.0,
+        timeout: float = WEBHOOK_TIMEOUT,
         queue_size: int = 50,
     ) -> None:
         self.settings = settings
@@ -259,122 +231,77 @@ class WeChatNotifier:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
-        # Last outcome, shown in the settings page. Deliberately not persisted:
-        # a stale failure from last week is noise, not status. ``*_at`` values
-        # are wall-clock seconds, so the page can say how long ago it happened.
+        # 最后一次结果，给设置页看。故意不落盘：上周的失败是噪音，不是状态。
         self.last_error: str = ""
         self.last_error_at: float = 0.0
         self.last_success_at: float = 0.0
         self.dropped: int = 0
-        # Circuit breaker state: consecutive failures and the wall-clock time
-        # until which sends fail fast instead of waiting out the CLI.
+        # 熔断：连续失败几次后先失败快一点，别让队列一条条等满 10 秒。
         self._failures: int = 0
         self._open_until: float = 0.0
-        # Cached self-built-app access token. WeCom tokens last ~2 hours; a
-        # notification should not pay a gettoken round trip every time.
-        self._wecom_token: str = ""
-        self._wecom_token_until: float = 0.0
 
     # ------------------------------------------------------------------- public
     def notify(self, text: str, *, kind: str = "") -> bool:
-        """Queue one message. Returns ``False`` when it was not accepted.
+        """把一条消息放进队列。不接受时返回 ``False``。
 
-        Never raises and never blocks: a notification is best-effort by design.
+        永不抛异常、永不阻塞：通知是尽力而为，成交处理器不能等它。
         """
         if not self.settings.enabled:
             return False
         if not self._event_enabled(kind):
             return False
-        text = _prepare(text)
-        if not text:
+        content = _prepare(text)
+        if not content:
             return False
         self._ensure_worker()
         try:
-            self._queue.put_nowait(_Job(text))
+            self._queue.put_nowait(_Job(content))
         except queue.Full:
-            # Dropping the newest is honest: the channel is wedged, and blocking
-            # the caller (a fill handler) to wait for it would be worse.
+            # 丢最新的一条是诚实的做法：通道已经堵了，让调用方去等更糟。
             with self._lock:
                 self.dropped += 1
-            log.warning("企业微信通知队列已满，丢弃一条消息")
+            log.warning("通知队列已满，丢掉一条消息")
             return False
         return True
 
-    def send_now(self, text: str) -> dict:
-        """Send synchronously, for the settings page's “测试” button.
+    def send_now(self, text: str, *, title: str = "") -> dict:
+        """同步发一条，给设置页的「测试」按钮用。
 
-        Raises :class:`NotifyError` with the CLI's own message so the user can
-        fix the cause (未安装 / 未登录 / target 为空).
-
-        This checks the target and the CLI but deliberately *not*
-        ``settings.enabled``: the button exists to verify the wiring before the
-        user trusts the stream with real fills, and a successful test is what
-        justifies turning the stream on. It also ignores an open breaker: an
-        explicit click is how the user proves the channel recovered.
+        失败抛 :class:`NotifyError`，把原因原样给用户。这里不看 ``enabled``：
+        按钮就是用来在打开开关之前先验证通道的。也不看熔断：点一次就
+        证明通道恢复了。
         """
-        text = _prepare(text)
-        if not text:
-            raise NotifyError("消息内容为空")
-        if not self._resolve_target()[0]:
-            raise NotifyError("尚未填写企业微信接收人（userid），无法发送。")
+        content = _prepare(text)
+        if not content:
+            raise NotifyError("消息内容是空的。")
         try:
-            return self._run(text, respect_breaker=False)
+            return self._deliver(content, title=title)
         except NotifyError as exc:
-            self._record_failure(str(exc))
-            self._note_failure()
+            self._fail(str(exc))
             raise
 
     def status(self) -> dict:
-        mode = self._mode()
-        secret_saved = bool(load_wecom_secret()) if mode == "wecom_api" else False
-        if mode == "wecom_api":
-            available = bool(
-                str(self.settings.corp_id or "").strip()
-                and str(self.settings.agent_id or "").strip()
-                and secret_saved
-            )
-        else:
-            available = bool(self._resolve_command())
+        """设置页要的一屏信息：配好没有、上次成功/失败、堆了多少。"""
+        settings = self.settings
+        url = (settings.webhook_url or "").strip()
         return {
-            "enabled": self.settings.enabled,
-            "mode": mode,
-            "channel": self.settings.channel,
-            "target": self.settings.target,
-            "account": self.settings.account,
-            "command": self.settings.command,
-            "corp_id": self.settings.corp_id,
-            "agent_id": self.settings.agent_id,
-            "api_base": self.settings.api_base,
-            "secret_saved": secret_saved,
-            "available": available,
-            # Surface a target the plugin cannot match before the user saves it;
-            # an empty string means "no complaint".
-            "target_warning": target_warning(self.settings.target) if self.settings.enabled else "",
+            "enabled": settings.enabled,
+            "format": self._format(),
+            "url": mask_url(url),
+            "available": bool(url),
             "last_error": self.last_error,
             "last_error_at": self.last_error_at,
             "last_success_at": self.last_success_at,
             "dropped": self.dropped,
             "pending": self._queue.qsize(),
-            # Spooled + paused are states the page must show: without them the
-            # channel looks idle while messages are stacking up off-screen.
+            # 暂存和熔断必须露出来：不显示的话，通道看起来闲着一句话没发。
             "spooled": len(_spool_load()),
             "breaker_seconds": max(0, int(self._open_until - time.time())),
         }
 
-    def session_state(self, *, refresh: bool = False) -> dict:
-        """Kept for API compatibility: the 企业微信 bot has no expiring login.
-
-        The personal-WeChat bot needed a QR scan every few hours; the 企业微信
-        intelligent bot authenticates once with Bot ID + Secret and holds an
-        outbound WebSocket, so there is nothing to re-scan. Returning a fixed
-        verdict keeps older callers (and saved JSON) working.
-        """
-        return {"state": "ok", "detail": "", "account": self.settings.account}
-
     def stop(self) -> None:
         self._stop.set()
-        # Wake the worker so it can observe the flag instead of waiting out the
-        # queue-timeout on an empty queue.
+        # 叫醒工作线程，让它看到停止标记，而不是空等队列超时。
         try:
             self._queue.put_nowait(_Job(""))
         except queue.Full:
@@ -404,34 +331,34 @@ class WeChatNotifier:
             if not job.text:
                 continue
             try:
-                if not self._resolve_target()[0]:
-                    # Enqueued while a target was set, target cleared before we
-                    # got here. Retrying would only repeat the same refusal.
-                    continue
-                self._run(job.text, from_queue=True)
+                self._deliver(job.text, title=job.title)
             except NotifyError as exc:
-                self._record_failure(str(exc))
+                self._fail(str(exc))
                 self._note_failure()
-                # Keep the message: the gateway being down is exactly when a
-                # 熔断 warning matters, and it is worth replaying later.
+                # 留着：通道不通的时候，熔断告警正是最该补发的那条。
                 _spool_add(job.text)
-                log.warning("企业微信通知发送失败：%s", exc)
-            except Exception as exc:  # pragma: no cover - defensive
-                self._record_failure(f"发送异常：{exc}")
+                log.warning("通知发送失败：%s", exc)
+            except Exception as exc:  # pragma: no cover - 兜底
+                self._fail(f"发送异常：{exc}")
                 self._note_failure()
                 _spool_add(job.text)
-                log.warning("企业微信通知异常", exc_info=True)
+                log.warning("通知发送异常", exc_info=True)
             else:
-                # Proof the channel works again: drain what piled up meanwhile.
-                self._replay_spool()
+                self._note_success()
+                # 通道刚证明能用，把堆着的补上。补发出意外也不能让工作线程死掉：
+                # 线程一死，后面的通知就静默不发了。
+                try:
+                    self._replay_spool()
+                except Exception:  # pragma: no cover - 防御
+                    log.warning("补发暂存消息失败", exc_info=True)
 
     # -------------------------------------------------------------------- guard
     def _check_breaker(self) -> None:
-        """Refuse instantly while the channel is known to be broken."""
+        """通道已知坏着的时候，立刻失败，别让每条消息都等满 10 秒。"""
         remaining = self._open_until - time.time()
         if remaining > 0:
             raise NotifyError(
-                f"通道连续发送失败，已暂停 {int(remaining)} 秒。请检查网关或 OpenClaw 后重试。"
+                f"连续发送失败，已暂停 {int(remaining)} 秒。检查 Webhook 地址后点测试。"
             )
 
     def _note_success(self) -> None:
@@ -443,22 +370,14 @@ class WeChatNotifier:
         if self._failures >= BREAKER_THRESHOLD:
             self._failures = 0
             self._open_until = time.time() + BREAKER_COOLDOWN
-            log.warning("企业微信通道连续失败，暂停发送 %g 秒", BREAKER_COOLDOWN)
+            log.warning("通知通道连续失败，暂停发送 %g 秒", BREAKER_COOLDOWN)
 
-    def _preflight(self) -> None:
-        """Fail in 0.4 s when nothing is listening on the gateway port.
-
-        The CLI cannot tell us quickly: it starts Node, then waits for a gateway
-        that is not there, then exits — about 30 s per message. A TCP probe on
-        the port the app itself starts the gateway on answers the same question
-        immediately, so the user gets "先启动网关" instead of a 30 s stall.
-        """
-        if not self.settings.preflight:
-            return
-        _probe_gateway()
+    def _fail(self, message: str) -> None:
+        self.last_error = message
+        self.last_error_at = time.time()
 
     def _replay_spool(self) -> None:
-        """Send what failed earlier, oldest first, a few at a time."""
+        """补发之前失败的，从旧的开始，一次几条。"""
         items = _spool_load()
         if not items:
             return
@@ -466,9 +385,9 @@ class WeChatNotifier:
         _spool_save(rest)
         for index, item in enumerate(batch):
             try:
-                self._run(_spool_text(item), from_queue=True)
+                self._deliver(_spool_text(item))
             except NotifyError as exc:
-                # Put this one and the untouched remainder back, in order.
+                # 这条和后面没动的按原顺序放回去。
                 _spool_save([item, *batch[index + 1:], *rest])
                 log.warning("补发失败：%s", exc)
                 return
@@ -485,223 +404,57 @@ class WeChatNotifier:
             "manual": True,
         }.get(kind, True)
 
-    def _mode(self) -> str:
-        mode = str(self.settings.mode or "").strip().lower()
-        return "wecom_api" if mode == "wecom_api" else "openclaw"
+    def _format(self) -> str:
+        value = str(self.settings.msg_format or DEFAULT_FORMAT).strip().lower()
+        return value if value in FORMATS else DEFAULT_FORMAT
 
-    def _resolve_command(self) -> str | None:
-        command = (self.settings.command or DEFAULT_COMMAND).strip()
-        if not command:
-            return None
-        # ``shutil.which`` on Windows appends PATHEXT, so a bare "openclaw" finds
-        # the npm ``openclaw.cmd`` shim as well as a real .exe.
-        found = shutil.which(command)
-        if found:
-            return found
-        # An absolute path that exists is usable even when it is not on PATH.
+    def _custom_body(self, title: str, text: str) -> dict:
+        template = (self.settings.webhook_template or "").strip()
+        if not template:
+            return {"title": title, "content": text}
+        filled = template.replace("{title}", title).replace("{content}", text)
         try:
-            if os.path.isfile(command):
-                return command
-        except OSError:
-            pass
-        return None
-
-    def _resolve_target(self) -> tuple[str, str]:
-        """The recipient (WeCom userid) and account to send to.
-
-        The aibot API addresses a conversation: for a single chat the chatid is
-        the member's userid. It only exists after that member has written to the
-        bot once, so an empty target is reported rather than guessed.
-        """
-        return normalize_target(self.settings.target), str(
-            self.settings.account or ""
-        ).strip()
-
-    def _run(
-        self, text: str, *, from_queue: bool = False, respect_breaker: bool = True
-    ) -> dict:
-        if respect_breaker:
-            self._check_breaker()
-        if self._mode() == "wecom_api":
-            payload = self._run_wecom_api(text)
-            if from_queue:
-                log.info("企业微信 API 通知已发出")
-            self.last_error = ""
-            self.last_error_at = 0.0
-            self.last_success_at = time.time()
-            self._note_success()
-            return payload
-        command = self._resolve_command()
-        if not command:
+            value = json.loads(filled)
+        except ValueError as exc:
             raise NotifyError(
-                f"未找到 {self.settings.command or DEFAULT_COMMAND}，请安装 OpenClaw，"
-                "或在设置中填写可执行文件的完整路径。"
-            )
-        channel = (self.settings.channel or DEFAULT_CHANNEL).strip() or DEFAULT_CHANNEL
-        target, account = self._resolve_target()
-        if not target:
-            raise NotifyError("尚未填写企业微信接收人（userid），无法发送。")
-        self._preflight()
-        args = [
-            command,
-            "message",
-            "send",
-            "--channel",
-            channel,
-            "--target",
-            target,
-            "--message",
-            text,
-            "--json",
-        ]
-        if account:
-            # Only when the user named one: an explicit ``--account`` selects that
-            # account, while omitting it lets the plugin pick its default (and
-            # disambiguate by context token when several are bound).
-            args.extend(["--account", account])
-        try:
-            completed = subprocess.run(
-                self._wrap_launcher(args),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=self.timeout,
-                shell=False,
-            )
-        except FileNotFoundError as exc:
-            raise NotifyError(f"未找到 {command}：{exc}") from exc
-        except subprocess.TimeoutExpired as exc:
-            raise NotifyError(
-                f"OpenClaw 在 {self.timeout:g} 秒内没有响应，请检查网关是否在运行。"
+                "自定义模板不是合法 JSON。正文里带引号或换行时，模板里要用转义。"
             ) from exc
-        except OSError as exc:
-            raise NotifyError(f"调用 OpenClaw 失败：{exc}") from exc
+        if not isinstance(value, dict):
+            raise NotifyError("自定义模板必须是一段 JSON 对象。")
+        return value
 
-        stdout = (completed.stdout or "").strip()
-        if completed.returncode != 0:
-            detail = (completed.stderr or stdout or "").strip()
-            raise NotifyError(_explain_failure(detail, completed.returncode))
-        # A non-zero exit is not the only failure mode: a suppressed or partially
-        # delivered send exits nonzero too, but a gateway that answers with
-        # ``{"ok": false}`` and status 0 must not be reported as success.
-        payload = _parse_json(stdout)
-        if isinstance(payload, dict) and payload.get("ok") is False:
-            reason = str(payload.get("error") or "OpenClaw 报告发送失败")
-            raise NotifyError(reason[:500])
-        if from_queue:
-            log.info("企业微信通知已发出（%s）", str(payload.get("messageId") or "") if payload else "")
+    def _deliver(self, text: str, *, title: str = "") -> dict:
+        """真正发出去的那一步。地址没填就是明确报错，不猜。"""
+        url = check_webhook_url(self.settings.webhook_url)
+        if not url:
+            raise NotifyError("还没填 Webhook 地址。到设置页把企业微信群机器人的地址粘进来。")
+        content = f"{title}\n{text}" if title else text
+        fmt = self._format()
+        if fmt == "custom":
+            body = self._custom_body(title, text)
+        elif fmt == "qyapi_text":
+            body = {"msgtype": "text", "text": {"content": content}}
+        elif fmt == "qyapi_markdown":
+            body = {"msgtype": "markdown", "markdown": {"content": content}}
+        elif QYAPI_SEND_MARKER in url:
+            # auto：企业微信群机器人就按它的格式发，markdown 比纯文本好读。
+            body = {"msgtype": "markdown", "markdown": {"content": content}}
+        else:
+            body = {"title": title, "content": text}
+        payload = _post_json(
+            url,
+            body,
+            headers=parse_headers(self.settings.webhook_headers),
+            timeout=self.timeout,
+        )
+        if "errcode" in payload:
+            error = _qyapi_error(payload)
+            if error:
+                raise NotifyError(error)
         self.last_error = ""
         self.last_error_at = 0.0
         self.last_success_at = time.time()
-        self._note_success()
-        return {"ok": True, "stdout": stdout[:2000]}
-
-    def _run_wecom_api(self, text: str) -> dict:
-        """Send one text message through the 企业微信 self-built-app API."""
-        settings = self.settings
-        target, _ = self._resolve_target()
-        if not target:
-            raise NotifyError("尚未填写企业微信接收人（userid），无法发送。")
-        corp_id = str(settings.corp_id or "").strip()
-        if not corp_id:
-            raise NotifyError("尚未填写企业微信 CorpID。")
-        agent_raw = str(settings.agent_id or "").strip()
-        if not agent_raw:
-            raise NotifyError("尚未填写企业微信 AgentId。")
-        try:
-            agent_id = int(agent_raw)
-        except ValueError as exc:
-            raise NotifyError("企业微信 AgentId 必须是数字。") from exc
-        if agent_id <= 0:
-            raise NotifyError("企业微信 AgentId 必须是正整数。")
-        secret = load_wecom_secret()
-        if not secret:
-            raise NotifyError("尚未保存企业微信应用 Secret。")
-
-        base = (str(settings.api_base or "").strip() or WECOM_API_BASE).rstrip("/")
-        token = self._wecom_access_token(base, corp_id, secret)
-        url = f"{base}/cgi-bin/message/send"
-        payload = _wecom_http_json(
-            url,
-            params={"access_token": token},
-            body={
-                "touser": target,
-                "msgtype": "text",
-                "agentid": agent_id,
-                "text": {"content": text},
-                "safe": 0,
-            },
-            timeout=min(self.timeout, 15.0),
-        )
-        if _wecom_errcode(payload) != 0:
-            raise NotifyError(_wecom_error(payload))
-        log.info("企业微信 API 通知已发出（agentid=%s）", agent_id)
-        return {
-            "ok": True,
-            "stdout": json.dumps(
-                {"errcode": 0, "errmsg": payload.get("errmsg") or "ok"},
-                ensure_ascii=False,
-            )[:2000],
-        }
-
-    def _wecom_access_token(self, base: str, corp_id: str, secret: str) -> str:
-        now = time.time()
-        key = f"{base}|{corp_id}|{secret}"
-        if self._wecom_token and now < self._wecom_token_until and getattr(
-            self, "_wecom_token_key", ""
-        ) == key:
-            return self._wecom_token
-        payload = _wecom_http_json(
-            f"{base}/cgi-bin/gettoken",
-            params={"corpid": corp_id, "corpsecret": secret},
-            timeout=min(self.timeout, 15.0),
-        )
-        token = str(payload.get("access_token") or "").strip()
-        if _wecom_errcode(payload) != 0 or not token:
-            raise NotifyError(_wecom_error(payload))
-        try:
-            expires = float(payload.get("expires_in") or 7200)
-        except (TypeError, ValueError):
-            expires = 7200.0
-        self._wecom_token = token
-        self._wecom_token_key = key
-        # Refresh two minutes early; never cache a token for longer than the
-        # server said it is valid.
-        self._wecom_token_until = now + max(60.0, expires - 120.0)
-        return token
-
-    def _record_failure(self, message: str) -> None:
-        self.last_error = message
-        self.last_error_at = time.time()
-
-    @staticmethod
-    def _wrap_launcher(args: list[str]) -> list[str]:
-        """Make a Windows ``.cmd``/``.bat`` shim executable without a shell.
-
-        npm installs the CLI as ``openclaw.cmd``, and Windows cannot exec that
-        directly with ``shell=False``. The obvious workaround — ``cmd.exe /c`` —
-        is wrong for this payload: ``cmd`` treats a newline as a command
-        separator and ``&``, ``|``, ``>``, ``<``, ``^`` as operators, so a
-        multi-line notification arrived truncated at the first line and a
-        message containing ``&`` could run part of itself as a command.
-
-        The shim is a tiny batch file whose real work is one quoted script path,
-        so that path is lifted out and run through ``node`` directly. Only when
-        the shim cannot be read does this fall back to ``cmd.exe``, with the
-        text flattened onto one line so the argument at least survives intact.
-        """
-        first = args[0] if args else ""
-        if os.name != "nt" or not first.lower().endswith((".cmd", ".bat")):
-            return args
-        direct = _node_entry_argv(first, args[1:])
-        if direct:
-            return direct
-        comspec = os.environ.get("COMSPEC") or "cmd.exe"
-        # ``/d`` skips AutoRun scripts and ``/s`` keeps the quoting we build here
-        # instead of letting cmd re-parse it.
-        command_line = " ".join(_quote_for_cmd(arg) for arg in args)
-        return [comspec, "/d", "/s", "/c", command_line]
+        return {"sent": True, "format": fmt, "url": mask_url(url)}
 
     # --------------------------------------------------------------- formatting
     @staticmethod
@@ -750,11 +503,10 @@ class WeChatNotifier:
 
     @staticmethod
     def format_task(title: str, lines: list[str] | None = None) -> str:
-        """A 任务 message: what started, stopped, or finished.
+        """任务消息：开始了、停了、跑完了。
 
-        Kept separate from the trading formatters because these are not trading
-        events: an optimisation that took an hour is the reason someone walks
-        away from the desk, and the phone is how they learn it ended.
+        和成交消息分开：这些不是交易事件。一次跑了一小时的优化，才是让人离开
+        工位的原因，手机是它结束时唯一的告知方式。
         """
         body = [line for line in (lines or []) if line]
         return "\n".join([f"【{title}】", *body])
@@ -765,22 +517,25 @@ class WeChatNotifier:
         return f"{text}\n{detail}" if detail else text
 
 
-def _venue_label(mode: str) -> str:
-    """Where a fill happened.
+# 兼容旧名字。外部代码和测试还这么叫，留着当别名比重命名一遍省事。
+WeChatNotifier = Notifier
 
-    The testnet is a real venue with fake money, so its fills must not be
-    announced as paper: the label tells the reader whether the money was real.
+
+def _venue_label(mode: str) -> str:
+    """成交发生在哪个场子。
+
+    模拟盘也是真下单，只是里面的钱是假的，所以标签要说清楚钱是真的还是假的。
     """
     if mode == "testnet":
         return "测试网"
     return "实盘"
 
-def _action_label(side: str) -> str:
-    """Name the trade direction without inventing one.
 
-    The old code said "卖出" for anything that was not exactly ``"buy"``, so a
-    missing or unexpected side produced a confidently wrong message. An unknown
-    side now says so, which is honest and still readable on a lock screen.
+def _action_label(side: str) -> str:
+    """说清楚方向，不猜。
+
+    老代码对任何不是 ``"buy"`` 的方向都说「卖出」，方向字段缺失时会理直气壮地
+    报错方向。现在认不出来就说「成交」，读着不别扭，也不误导。
     """
     key = str(side or "").strip().lower()
     if key in ("buy", "long"):
@@ -791,13 +546,7 @@ def _action_label(side: str) -> str:
 
 
 def _format_price(value: float) -> str:
-    """Render a price with enough precision to be meaningful.
-
-    A fixed four decimals is wrong for both ends of the market: a 82,000 USDT
-    price gained two noise digits, and a 0.00001234 alt price was printed as
-    ``0.0000`` — a fill message that told the user nothing. Decimals therefore
-    scale with magnitude, and thousands separators are kept.
-    """
+    """按量级决定小数位：8 万的价格不需要 4 位，0.00001234 会被四舍五入成 0。"""
     try:
         price = float(value)
     except (TypeError, ValueError):
@@ -817,11 +566,7 @@ def _format_price(value: float) -> str:
 
 
 def _format_amount(value: float) -> str:
-    """Render a base-asset quantity without scientific notation.
-
-    ``"{:.8g}"`` turned a dust-sized exit into ``1e-07``; a chat message should
-    show the number the exchange does.
-    """
+    """数量不用科学计数法：``1e-07`` 没人看得懂，交易所也不会这么显示。"""
     try:
         amount = float(value)
     except (TypeError, ValueError):
@@ -831,132 +576,24 @@ def _format_amount(value: float) -> str:
 
 
 def _prepare(text: str) -> str:
-    """Trim and clamp a message. Returns ``""`` for anything not worth sending."""
-    # A NUL byte cannot cross CreateProcess at all; dropping it is better than
-    # failing the whole send on a stray control character.
+    """去掉多余空白并截断。没内容可发的返回空串。"""
     cleaned = (text or "").replace("\x00", "").strip()
     if len(cleaned) > MAX_MESSAGE_CHARS:
         cleaned = cleaned[: MAX_MESSAGE_CHARS - 1] + "…"
     return cleaned
 
 
-def normalize_target(raw: str) -> str:
-    """Trim a recipient id, tolerating a pasted label or channel prefix."""
-    text = str(raw or "").strip().strip("\"'").strip()
-    lowered = text.lower()
-    for prefix in ("wecom:", "qywx:", "wework:", "wechatwork:"):
-        if lowered.startswith(prefix):
-            text = text.split(":", 1)[1].strip()
-            break
-    return text
-
-
-def _explain_failure(detail: str, code: int) -> str:
-    """Turn the CLI's generic failure into something actionable."""
-    text = (detail or "").strip()
-    lowered = text.lower()
-    # WeCom's aibot API addresses conversations, not people: the chatid for a
-    # single chat is the member's userid, and it only exists after that member
-    # has written to the bot once. Naming the fix beats "invalid chatid".
-    if "93006" in lowered or "invalid chatid" in lowered:
-        return (
-            "企业微信返回 93006（invalid chatid）：接收人 userid 不存在或还没和机器人说过话。"
-            "请先在企业微信里给这个机器人发一条消息，再把你的 userid 填进设置。"
-        )
-    if "45009" in lowered or "api freq" in lowered:
-        return "企业微信接口触发频率限制（45009），消息已暂存，几分钟后会自动补发。"
-    return text[:500] or f"OpenClaw 返回退出码 {code}"
-
-
-def target_warning(target: str) -> str:
-    """Warn about a target the WeCom bot cannot address yet."""
-    text = normalize_target(target)
-    if not text:
-        return ""
-    if "@" in text or text.endswith(".wechat"):
-        return (
-            "这看起来是个人微信的 ID。企业微信智能机器人要用成员 userid"
-            "（如 XiaoJiaJian），不是你微信的 wxid。"
-        )
-    return ""
-
-
-def _node_entry_argv(shim: str, args: list[str]) -> list[str] | None:
-    """Return ``[node, script, *args]`` for an npm shim, or ``None``.
-
-    Works from the shim's own text rather than from a guessed package layout, so
-    it keeps working when npm changes its global prefix or the package is
-    installed under a scope. ``%dp0%`` is the shim's directory.
-    """
-    try:
-        with open(shim, "r", encoding="utf-8", errors="replace") as handle:
-            text = handle.read()
-    except OSError:
-        return None
-    script = ""
-    for match in _SHIM_SCRIPT_RE.finditer(text):
-        script = match.group(1)
-    if not script:
-        return None
-    folder = os.path.dirname(os.path.abspath(shim))
-    script = re.sub(r"%dp0%", lambda _m: folder, script, flags=re.IGNORECASE)
-    script = re.sub(r"%~dp0", lambda _m: folder + os.sep, script, flags=re.IGNORECASE)
-    if not os.path.isabs(script):
-        script = os.path.join(folder, script)
-    if not os.path.isfile(script):
-        return None
-    # npm ships a private node.exe beside the shim when it manages the runtime;
-    # otherwise the PATH lookup that found the shim will find node too.
-    local_node = os.path.join(folder, "node.exe")
-    node = local_node if os.path.isfile(local_node) else (shutil.which("node") or "node")
-    return [node, script, *args]
-
-
-def _quote_for_cmd(arg: str) -> str:
-    """Quote one argv element for the ``cmd.exe`` fallback path.
-
-    Newlines are flattened because ``cmd`` would otherwise end the command
-    there, which is exactly the truncation this fallback exists to survive.
-    """
-    clean = str(arg).replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
-    return '"' + clean.replace('"', '""') + '"'
-
-
-
-def _probe_gateway() -> None:
-    """Raise :class:`NotifyError` when nothing listens on the gateway port.
-
-    Module-level so the check can be exercised directly (and disabled wholesale
-    in tests) without constructing a notifier around it.
-    """
-    try:
-        # Imported lazily: ``gateway`` pulls in the supervisor machinery.
-        from .gateway import GATEWAY_HOST, GATEWAY_PORT
-    except Exception:  # pragma: no cover - defensive
-        return
-    try:
-        with socket.create_connection((GATEWAY_HOST, GATEWAY_PORT), PREFLIGHT_TIMEOUT):
-            return
-    except OSError:
-        pass
-    raise NotifyError(
-        f"网关没有在 {GATEWAY_HOST}:{GATEWAY_PORT} 监听，请到设置页启动网关后再试"
-        "（若你用自定义端口，可关闭「发送前检查网关」）。"
-    )
-
-
 # ---------------------------------------------------------------------- spool
 def _spool_path() -> Path:
-    """Where undeliverable messages are kept between attempts."""
+    """发不出去的消息留在哪。"""
     return paths.data_dir() / SPOOL_FILE
 
 
 def _spool_load() -> list[dict]:
-    """Read the spool, dropping entries too old to be worth sending.
+    """读暂存，丢掉太老的。
 
-    A fill from six hours ago is not news; replaying it would be worse than the
-    silence that preceded it. Corruption is treated as "nothing to replay" —
-    a bad spool must never block a new send.
+    六小时前的成交已经不是新闻，补发反而更吵。文件坏了就当没有：
+    一个坏文件绝不能挡住新消息。
     """
     try:
         raw = _spool_path().read_text(encoding="utf-8")
@@ -985,7 +622,7 @@ def _spool_load() -> list[dict]:
 
 
 def _spool_save(items: list[dict]) -> None:
-    """Replace the spool atomically: a half-written file loses messages."""
+    """整体替换，写一半的文件会丢消息。"""
     path = _spool_path()
     trimmed = items[-SPOOL_LIMIT:]
     if not trimmed:
@@ -1019,51 +656,8 @@ def _spool_add(text: str) -> None:
     _spool_save(items)
 
 
-def spool_message(text: str) -> int:
-    """Keep a message for later delivery; returns how many are waiting.
-
-    Used by the one-shot CLI (``btrader.notify_cli``): that process dies right
-    after the send, so a failure would otherwise lose the report entirely. The
-    app's worker replays whatever is here once the channel recovers.
-    """
-    try:
-        _spool_add(_prepare(text))
-    except Exception:  # pragma: no cover - a broken data dir must not raise
-        log.debug("暂存消息失败", exc_info=True)
-        return 0
-    try:
-        return len(_spool_load())
-    except Exception:  # pragma: no cover
-        return 0
-
-
 def _spool_text(item: dict) -> str:
-    """Mark a replayed message so it reads as late news, not a fresh event."""
+    """补发时标一下，读起来像迟到的旧闻，不是刚发生的事。"""
     text = str(item.get("text") or "")
     return text if text.startswith(SPOOL_PREFIX) else f"{SPOOL_PREFIX}\n{text}"
 
-
-def _parse_json(stdout: str) -> dict | None:
-    """Best-effort decode of ``--json`` output; non-JSON output is not an error.
-
-    The CLI is allowed to print warnings before the payload, so the last line is
-    tried as well as the whole body.
-    """
-    if not stdout:
-        return None
-    try:
-        value = json.loads(stdout)
-        return value if isinstance(value, dict) else None
-    except ValueError:
-        pass
-    for line in reversed(stdout.splitlines()):
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            value = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(value, dict):
-            return value
-    return None
