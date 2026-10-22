@@ -396,12 +396,40 @@ def _ledger_entry_price(state: _State, market: MarketType, symbol: str) -> float
     return 0.0
 
 
-def _live_held(state: _State, symbol: str, market: MarketType) -> float:
+def _booked_held(state: _State, symbol: str) -> float | None:
+    """The app's own record of the open leg on ``symbol``, signed; None if none.
+
+    ``sync_live_fills`` folds every live fill into a cost book per symbol, so the
+    process knows what it is holding even at the moment the venue will not answer.
+    Used only to answer "is this order an exit?": being wrong there costs a
+    reduce-only order the venue rejects, never an unproven entry that slips
+    through.
+    """
+    try:
+        books = state.ctx.trading._live_ledger()["books"]
+    except Exception:  # pragma: no cover - reading our own ledger should work
+        log.debug("读取本地成交账本失败 %s", symbol, exc_info=True)
+        return None
+    book = books.get(symbol)
+    if not isinstance(book, dict):
+        return None
+    try:
+        return float(book.get("contracts") or 0.0)
+    except (TypeError, ValueError):  # pragma: no cover - ledger writes numbers
+        return None
+
+
+def _live_held(state: _State, symbol: str, market: MarketType) -> float | None:
     """Signed live position size: positive long, negative short.
 
     Spot has no position object, so what is held is the base balance. Futures
     report contracts with a side; the sign is what this function owes its
     callers, because the close route picks the opposite side from it.
+
+    ``None`` means "nobody knows": the venue read failed and the app has no
+    booked leg either. It is deliberately not 0.0 — a failed read used to come
+    back as "flat", so a sell of a held position was judged as an entry and
+    refused by the entry breakers, leaving the user locked in during a halt.
     """
     with state.locks[market]:
         rest = state.ctx.rest_for(market)
@@ -409,8 +437,8 @@ def _live_held(state: _State, symbol: str, market: MarketType) -> float:
             try:
                 positions = rest.fetch_positions(market, [symbol])
             except Exception:
-                log.warning("读取实盘持仓失败 %s", symbol, exc_info=True)
-                return 0.0
+                log.warning("读取实盘持仓失败 %s，改用本地成交账本", symbol, exc_info=True)
+                return _booked_held(state, symbol)
             for item in positions:
                 if item.get("symbol") != symbol:
                     continue
@@ -437,13 +465,19 @@ def _is_reducing(
     held position impossible to sell.
 
     The position is read from the venue, because that is where the real
-    exposure is. Spot sells are always exits: spot cannot short, and the
-    unheld-sell case is rejected earlier with its own message.
+    exposure is; when that read fails, the app's own fill book answers instead
+    (see :func:`_live_held`). Spot sells are always exits: spot cannot short, and
+    the unheld-sell case is rejected earlier with its own message.
     """
     if market is MarketType.SPOT:
         held = _live_spot_available(state, symbol, market)
         return side == "sell" and held > 0 and amount <= held * (1 + 1e-6) + 1e-12
     held = _live_held(state, symbol, market)
+    if held is None:
+        # 持仓读不到、本地账本也没有：这笔单子证明不了是减仓。当作开仓处理，
+        # 让 precheck 用「无法读取当前持仓」明确拒掉，别拿交易所的 reduceOnly
+        # 去赌——赌输的代价是先把该交易对的挂单撤了。
+        return False
     if side == "sell" and held > 0:
         return amount <= held * (1 + 1e-6) + 1e-12
     if side == "buy" and held < 0:
@@ -825,9 +859,6 @@ def create_app() -> FastAPI:
         if amount <= 0:
             raise HTTPException(status_code=400, detail="下单数量必须大于 0")
 
-        if state.ctx.market_type is not mt:
-            state.ctx.set_market_type(mt)
-
         # Spot sells are capped by the coins actually held. "100%" is budgeted
         # from a price that ticks between render and submit, so the quantity
         # derived from it can exceed the balance by a fraction of a percent;
@@ -881,9 +912,25 @@ def create_app() -> FastAPI:
             )
             request.stop_loss = payload.stop_loss
             request.take_profit = payload.take_profit
+
+        # 订单落在哪个市场由 OrderRequest.market_type 决定，可签名用的是那个市场的
+        # Key 槽，所以得借用那个市场的客户端。以前这里调 set_market_type(mt)（默认
+        # persist=True）：下一张现货单就把侧栏、图表、设置页一起切成现货，还把市场
+        # 写进 config.json；配置文件坏了更是在下单前 409。现在只借不落盘，
+        # 请求结束就还回去。整段在 account_lock 里，两张跨市场的单子不会互相盖。
+        previous_market = state.ctx.market_type
         try:
             with state.account_lock:
-                result = state.ctx.trading.submit(request)
+                if previous_market is not mt:
+                    state.ctx.set_market_type(mt, persist=False)
+                try:
+                    result = state.ctx.trading.submit(request)
+                finally:
+                    if state.ctx.market_type is not previous_market:
+                        try:
+                            state.ctx.set_market_type(previous_market, persist=False)
+                        except Exception:  # 还原失败也不能盖掉真正的错误
+                            log.warning("下单后还原市场失败", exc_info=True)
         except OrderRejected as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
@@ -950,6 +997,11 @@ def create_app() -> FastAPI:
             network=state.ctx.network,
         )
         held = _live_held(state, payload.symbol, mt)
+        if held is None:
+            raise HTTPException(
+                status_code=503,
+                detail="无法读取当前持仓，暂时无法平仓，请稍后再试。",
+            )
         if abs(held) <= 1e-12:
             raise HTTPException(status_code=400, detail="当前没有该交易对的持仓")
         size = abs(held) if payload.size is None else min(abs(payload.size), abs(held))
@@ -1125,6 +1177,11 @@ def create_app() -> FastAPI:
         )
 
         held = _live_held(state, payload.symbol, mt)
+        if held is None:
+            raise HTTPException(
+                status_code=503,
+                detail="无法读取当前持仓，暂时无法挂保护单，请稍后再试。",
+            )
         if abs(held) <= 1e-12:
             raise HTTPException(status_code=400, detail="当前没有该交易对的持仓")
         long = held > 0
