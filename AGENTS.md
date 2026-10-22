@@ -80,11 +80,34 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   策略实验室的优化打分（`routes_lab.start_optimize`）同一口径：`allow_short=market.is_futures`、
   杠杆恒 1。以前它用 `BacktestConfig` 的默认值 `allow_short=True`，现货优化把「靠做空吃到的收益」
   当成绩顶上排名，和合约的打分逐位相同。
+- 止损、止盈、条件单在交易所侧是**算法单**，跟普通挂单不是一套接口：`fetch_open_orders` 里一条
+  都没有，要读 `fapiPrivateGetOpenAlgoOrders`、撤 `fapiPrivateDeleteAlgoOrder`（币本位把 fapi 换成
+  dapi），返回的是 `algoId` + `algoType: CONDITIONAL` 而不是 `orderId`。以前三处都只读普通挂单，
+  于是挂出去的止损在面板上看不见、重挂时 `cleared` 恒为 0（旧单没撤，连挂四次四张止损并存）、
+  按 algoId 撤单报 -2011、平仓前 `cancel_symbol_orders` 也看不见它们——「平仓前撤掉 reduceOnly
+  止损」这条保证曾经是假的。现在 `rest.fetch_algo_orders` / `cancel_algo_order` 单独处理，
+  两个 `cancel_*` 合并两条链路，`cancel_order` 遇 -2011 回退算法单，`account._open_orders`
+  把算法单映射成同样的 order 形状交给 `_protections`。加新接口时别忘了这一路。
 - 现货没有 reduce-only 触发单。止损、止盈、条件单只在合约市场挂到交易所侧。
   现货请求会返回明确文案：`PUT /api/positions/protection` 和
   `POST /api/orders/conditional`。
+- 现货平仓只平**本地成交账本**记录的数量，不平钱包。现货没有持仓对象，所谓持仓就是钱包里那个币的
+  可用余额，里面混着用户自己充提的币：不带 size 的「全平」在现货上等于清空钱包，实测把用户自己的
+  1 BTC 一次卖掉。现在 `POST /api/positions/close` 不带 size 时，合约照旧全平，现货只平
+  `trading._live_ledger()["books"][symbol]["contracts"]` 并封顶于钱包余额；账本没有这一对就 400
+  让调用方显式给 size。界面上的钱包余额那一行因此是「卖出」（预填该行余额），账本行才是「平仓」。
 - 保护单接口是重挂语义。先调 `cancel_protective_orders`，只撤该交易对的止损止盈，
   不会撤掉挂着的限价单。条件单的类型由触发价和现价的相对位置决定，不要自己猜。
+- 符号有两种写法：现货是 `BTC/USDT`，合约带结算币 `BTC/USDT:USDT`，币本位 `BTC/USD:BTC`，
+  交割还多一段 `-YYMMDD`。分两类入口：**下单与预览要求写法与实际市场一致**（`_check_symbol_shape`，
+  合约必须带结算币、现货不许带，写错直接 400 并给出该写的名字）——因为写错不会报错，ccxt 会把裸名
+  解析成同一个 swap 真把单挂出去，比报错难发现得多；撤单、平仓、保护单、条件单这些则两种写法都收，
+  先过 `_venue_symbol` 补齐再往下走，别在各自的函数里各猜一次。反过来 `/api/symbols` 按市场类型过滤：
+  ccxt 的 `load_markets()` 一次把现货与三种合约全取回来，只按报价过滤会让 600 条合约混进现货列表
+  （1461 项里真正能交易的现货只有 861）。
+- 合约的 24 小时 ticker 响应里没有 `bidPrice/askPrice`（只有现货有），ccxt 的 unified `bid/ask`
+  因此是 None，别用 `float(raw.get("bid") or 0.0)` 把它压成 0——那样界面是「有最新价但没有买卖价」。
+  取价顺序：unified → 原始 payload → 盘口顶档（`rest.ticker_bid_ask`），都没有才留 0，前端按 0 判空。
 - SQLite 里 `mode='paper'` 的旧成交还在库里，界面只显示 `live` 的成交。
 
 ## 5. 已确认的限制
