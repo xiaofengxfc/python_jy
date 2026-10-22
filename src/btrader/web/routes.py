@@ -644,7 +644,7 @@ class AITraderController:
     def _build(self, state, payload: AITraderStartPayload) -> AITrader:
         """把请求 + 已保存设置变成一个「还没启动」的实例。
 
-        start（轮询）和 decide（立即决策一次）共用这一段：启用检查、实盘条件、
+        start（轮询）和 decide（立即决策一次）共用这一段：启用检查、凭据、
         策略参数校验只写一份，两个入口就不会慢慢长出两套规则。
         """
         ctx = state.ctx
@@ -668,14 +668,9 @@ class AITraderController:
             signal_strategy = ctx.strategies.get(strategy_key)
         except KeyError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        # Arming rules, identical for testnet and mainnet except for the
-        # confirmation: live_enabled is the master switch, credentials decide
-        # whether an order can be signed at all, and mainnet additionally needs
-        # the caller to have said out loud that this is real money.
-        if not cfg.live_enabled:
-            raise HTTPException(
-                status_code=400, detail="AI 交易未在设置中显式开启（ai_auto.live_enabled）"
-            )
+        # 这里没有「允许实盘」总闸：配了凭据就是能签名下单，没凭据下面就拦住。
+        # 主网多要一句 confirm_live，让调用方把「这是真钱」说出口；测试网的钱是假的，
+        # 排练一次不该多花一次点击。
         if not ctx.rest_for(market).has_credentials:
             raise HTTPException(status_code=400, detail="AI 交易需要先配置 API Key")
         if ctx.network is Network.MAINNET and not payload.confirm_live:
@@ -688,7 +683,6 @@ class AITraderController:
             raise HTTPException(status_code=400, detail=f"未知的决策深度：{depth}")
         config = AITraderConfig(
             enabled=True,
-            live_enabled=cfg.live_enabled,
             confirm_live=payload.confirm_live,
             network=ctx.network.value,
             symbol=symbol,

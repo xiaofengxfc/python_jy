@@ -44,12 +44,12 @@ class RiskSettings:
 class AIAutoSettings:
     """AI 自主交易的持久化配置（默认关闭）。
 
-    live_enabled 是“允许真下单”的总闸：每次启动仍要显式传
-    confirm_live，并且必须未急停（见 engine/ai_trader.py）。
+    启动条件只有三条：AI 助手已启用、这条市场配了凭据、主网还要调用方显式
+    说清这是真钱（confirm_live）。急停、AIGuard、风控各自在
+    engine/ai_trader.py 里独立把关，这里没有多余的开关。
     """
 
     enabled: bool = False
-    live_enabled: bool = False
     symbol: str = ""
     timeframe: str = ""
     leverage: float = 1.0
@@ -91,7 +91,7 @@ class AppSettings:
     # lives in the OS keyring, so a settings file that gets copied or shared
     # never carries a credential.
     ai: AISettings = field(default_factory=AISettings)
-    # AI 交易：默认关闭，实盘另有显式开关。
+    # AI 交易：默认关闭。没有单独的实盘总闸，凭据决定能不能下单。
     ai_auto: AIAutoSettings = field(default_factory=AIAutoSettings)
 
     def to_dict(self) -> dict[str, Any]:

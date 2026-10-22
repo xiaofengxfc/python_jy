@@ -4,8 +4,9 @@
 下单出口是注入的 ``TradingService.submit()``（INV-1）。风控仍然以
 ``RiskManager`` 为准，``AIGuard`` 只在它前面加一层 AI 自己的收紧（INV-2）。
 
-构造完成后是停止状态。真下单要同时满足 ``live_enabled``、``confirm_live``
-和未急停（INV-9）。测试网和主网走同一条路径，只差 ``network`` 指向谁。
+构造完成后是停止状态。真下单没有单独的开关，只要三条同时成立：AI 助手已启用、
+这条市场配了凭据，主网还要调用方显式确认这是真钱（``confirm_live``）；另外未急停
+（INV-9）。测试网和主网走同一条路径，只差 ``network`` 指向谁。
 """
 
 from __future__ import annotations
@@ -67,10 +68,9 @@ class AIDecision:
 
 @dataclass
 class AITraderConfig:
-    """一份自包含的运行配置。实盘开关默认关闭。"""
+    """一份自包含的运行配置。有没有凭据决定能不能下单，配置本身不设闸。"""
 
     enabled: bool = False
-    live_enabled: bool = False
     confirm_live: bool = False
     network: str = "mainnet"
     symbol: str = "BTC/USDT"
@@ -306,8 +306,6 @@ class AITrader:
         c = self.config
         if not c.enabled:
             return False, "AI 交易未启用"
-        if not c.live_enabled:
-            return False, "真下单未显式开启（live_enabled）"
         # The testnet has fake money: rehearsing must not cost an extra click.
         if c.network == "mainnet" and not c.confirm_live:
             return False, "缺少二次确认"
@@ -683,7 +681,6 @@ class AITrader:
                 "strategy": self.config.strategy_key,
                 "market_type": self.config.market_type,
                 "timeframe": self.config.timeframe,
-                "live_enabled": self.config.live_enabled,
                 "depth": self.config.depth,
                 "max_order_quote": self.config.max_order_quote,
                 "max_position_quote": self.config.max_position_quote,

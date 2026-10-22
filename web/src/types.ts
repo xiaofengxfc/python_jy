@@ -296,7 +296,6 @@ export interface AIAnalysis {
 /** AI 交易自己的运行配置，存在设置的 ai_auto 里。 */
 export interface AIAutoSettings {
   enabled: boolean;
-  live_enabled: boolean;
   symbol: string;
   timeframe: string;
   leverage: number;
@@ -361,7 +360,6 @@ export interface AITraderStatus {
     strategy?: string;
     market_type?: string;
     timeframe?: string;
-    live_enabled?: boolean;
     depth?: string;
     max_order_quote?: number;
     max_position_quote?: number;
@@ -461,7 +459,7 @@ export interface AppSettings {
   theme: string;
   notify: NotifySettings;
   ai: AISettings;
-  /** AI 交易的运行配置。默认关闭，实盘另有显式开关。 */
+  /** AI 交易的运行配置。默认关闭；没有单独的实盘总闸，主网启动时再确认一次。 */
   ai_auto?: AIAutoSettings;
 }
 

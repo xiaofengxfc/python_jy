@@ -51,7 +51,6 @@ const DEPTHS: [string, string, string][] = [
 
 const FALLBACK_AUTO: AIAutoSettings = {
   enabled: false,
-  live_enabled: false,
   symbol: "",
   timeframe: "",
   leverage: 1,
@@ -186,10 +185,6 @@ export default function AITradePage({ settings, health }: Props) {
     }
     if (!strategyKey) {
       setError("先选一个产生信号的策略。");
-      return;
-    }
-    if (!auto.live_enabled) {
-      setError("设置里没打开「允许实盘」，启动会被拒绝。");
       return;
     }
     const mainnet = (health?.network ?? "testnet") === "mainnet";
@@ -453,7 +448,6 @@ export default function AITradePage({ settings, health }: Props) {
             </div>
             <div className="hint" style={{ gridColumn: "1 / -1" }}>
               上限在启动时生效。改完要重新启动一次。
-              {auto.live_enabled ? "" : " 设置里还没允许实盘，启动会被拒绝。"}
             </div>
           </div>
         </section>

@@ -113,9 +113,6 @@ def make_trader(
     **cfg,
 ) -> tuple[AITrader, FakeLLM, FakeTrading, FakeRisk]:
     cfg.setdefault("enabled", True)
-    # These tests exercise the running machinery, so the arming switch is on.
-    # Whether it *should* be on is what the gate tests below check.
-    cfg.setdefault("live_enabled", True)
     cfg.setdefault("confirm_live", True)
     # These tests are about the decision machinery, not about protective
     # stops; the stop requirement has its own gate test below.
@@ -237,12 +234,44 @@ def test_kill_switch_blocks_and_releases_lease(tmp_path):
     assert trader.step() is None
 
 
-def test_start_requires_arming_conditions(tmp_path):
-    """Testnet and mainnet share one path; only the confirmation differs."""
-    unarmed = make_trader(tmp_path, live_enabled=False, market_type="usdm")[0]
-    ok, message = unarmed.start()
-    assert not ok and "live_enabled" in message
+def test_start_has_no_live_enabled_gate(tmp_path):
+    """「允许实盘」这道总闸删了：没有它照样能启动，凭据和 confirm_live 才是闸。
 
+    ``AITraderConfig`` 上已经没有 live_enabled 这个字段了，所以这里连传都不传；
+    真传了会 TypeError（字段删干净了，不是留着不读）。
+    """
+    trader = make_trader(tmp_path, market_type="usdm")[0]
+
+    ok, message = trader.start()
+
+    assert ok, message
+    trader.stop()
+
+    with pytest.raises(TypeError):
+        make_trader(tmp_path, live_enabled=True)
+
+
+def test_status_payload_no_longer_has_live_enabled(tmp_path):
+    """老前端可能还读 status.config.live_enabled：删掉就是删掉，不留个假值。"""
+    trader = make_trader(tmp_path, market_type="usdm")[0]
+
+    payload = json.loads(json.dumps(trader.status()))
+
+    assert "live_enabled" not in payload["config"]
+    assert set(payload["config"]) == {
+        "network",
+        "symbol",
+        "strategy",
+        "market_type",
+        "timeframe",
+        "depth",
+        "max_order_quote",
+        "max_position_quote",
+    }
+
+
+def test_start_requires_arming_conditions(tmp_path):
+    """测试网和主网共用一条路径，只差那句确认。"""
     unconfirmed = make_trader(tmp_path, confirm_live=False, market_type="usdm")[0]
     ok, message = unconfirmed.start()
     assert not ok and "二次确认" in message

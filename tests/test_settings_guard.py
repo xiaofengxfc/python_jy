@@ -139,3 +139,38 @@ def test_the_app_context_starts_from_the_saved_platform(tmp_path, monkeypatch) -
     ctx = AppContext()
 
     assert ctx.platform == "binance"
+
+
+def test_an_old_config_with_live_enabled_still_loads(tmp_path) -> None:
+    """ai_auto.live_enabled 删了，旧配置里残留的这个键要被安静忽略。
+
+    用户手上的 config.json 还留着 "live_enabled": true。加载按字段白名单过滤，
+    多一个键不该让整份配置报错、也不该退回默认值——真报错了，界面一保存就会把
+    用户原来的设置整份盖掉。
+    """
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "network": "testnet",
+                "ai_auto": {
+                    "enabled": True,
+                    "live_enabled": True,
+                    "symbol": "ETH/USDT",
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    store = ConfigStore(path)
+
+    assert store.settings.network == "testnet"
+    assert store.settings.ai_auto.enabled is True
+    assert store.settings.ai_auto.symbol == "ETH/USDT"
+    assert not hasattr(store.settings.ai_auto, "live_enabled")
+    # 存回去时这个键也不会再出现，等于下一次保存顺手清干净。
+    store.save()
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert "live_enabled" not in saved["ai_auto"]
