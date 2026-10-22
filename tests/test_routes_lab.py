@@ -88,6 +88,12 @@ class FakeStrategies:
     def source_path(self, key: str):
         return self.registry.source_path(key)
 
+    def is_builtin(self, key: str) -> bool:
+        return self.registry.is_builtin(key)
+
+    def is_overridden(self, key: str) -> bool:
+        return self.registry.is_overridden(key)
+
     def discover(self, directories: list[Path] | None = None) -> None:
         self.registry.discover(directories)
 

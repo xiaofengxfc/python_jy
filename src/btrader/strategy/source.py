@@ -1,8 +1,9 @@
 """Read, validate and save user strategy source files.
 
-Only files inside the per-user strategy directory are writable. Built-in
-strategies are read-only; the UI can copy one into a new user plugin instead of
-editing the package source.
+Only files inside the per-user strategy directory are writable. A built-in can
+be edited too, but the edit lands as a same-key file in that directory and
+shadows the package copy; the package source never changes and "restore" throws
+the user file away.
 
 This module deliberately keeps the same static checks as the AI candidate
 sandbox. It is *not* a security boundary: a user plugin is local Python code and
@@ -14,6 +15,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import logging
 import re
 import sys
 import uuid
@@ -22,6 +24,8 @@ from typing import Any
 
 from .registry import StrategyRegistry
 from .sandbox import check_code
+
+log = logging.getLogger(__name__)
 
 _KEY_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 
@@ -48,6 +52,10 @@ class MyStrategy(Strategy):
         target = (df["close"] > ma).astype(float)
         return pd.DataFrame({"target": target}, index=df.index)
 '''
+
+
+# Refused for both a plain built-in and one that is currently overridden.
+BUILTIN_RENAME_REFUSED = "内置策略不能改名，先还原或另存为新策略"
 
 
 class StrategySourceError(RuntimeError):
@@ -152,11 +160,11 @@ def _class_source(cls: type) -> str:
     return "\n\n\n".join(chunks) if chunks else inspect.getsource(cls)
 
 
-def read_source(registry: StrategyRegistry, key: str, directory: Path | None = None) -> dict[str, Any]:
-    directory = _user_dir(directory)
+def read_source(registry: StrategyRegistry, key: str) -> dict[str, Any]:
     strategy = registry.get(key)  # raises KeyError for an unknown key
     path = registry.source_path(key)
     if path is not None:
+        # A user file, either a standalone plugin or the override of a built-in.
         code = path.read_text(encoding="utf-8")
         return {
             "key": key,
@@ -164,10 +172,11 @@ def read_source(registry: StrategyRegistry, key: str, directory: Path | None = N
             "code": code,
             "filename": path.name,
             "editable": True,
-            "builtin": False,
+            "builtin": registry.is_builtin(key),
+            "overridden": registry.is_overridden(key),
         }
-    # Built-ins are shown read-only so the user can copy them. `inspect` is
-    # safe here: the class was imported by this process already.
+    # Untouched built-in: show the package class so it can be edited or copied.
+    # `inspect` is safe here: the class was imported by this process already.
     try:
         code = _class_source(type(strategy))
     except (OSError, TypeError):
@@ -177,8 +186,9 @@ def read_source(registry: StrategyRegistry, key: str, directory: Path | None = N
         "name": strategy.meta.name,
         "code": code,
         "filename": "",
-        "editable": False,
+        "editable": True,
         "builtin": True,
+        "overridden": False,
     }
 
 
@@ -225,6 +235,43 @@ def validate_source(code: str) -> dict[str, Any]:
     return report
 
 
+def _short_reason(errors: list[str], fallback: str) -> str:
+    """One readable line out of the registry's load errors.
+
+    The entries carry a full traceback, and the editor shows the message in a
+    banner: the last error's first line ("<file>: 加载失败") is the part that
+    says what happened, the frames below it are noise there.
+    """
+    if not errors:
+        return fallback
+    for line in str(errors[-1]).splitlines():
+        text = line.strip()
+        if text:
+            return text
+    return fallback
+
+
+def _undo_write(
+    target: Path, previous: str | None, directory: Path, registry: StrategyRegistry
+) -> None:
+    """Put the file back the way it was and reload the registry.
+
+    previous is None when this save created the file, so undoing means
+    deleting it. The reload afterwards leaves the registry exactly as it was
+    before the attempt: no half-broken plugin, no leftover error entries.
+    """
+    try:
+        if previous is None:
+            target.unlink(missing_ok=True)
+        else:
+            tmp = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+            tmp.write_text(previous, encoding="utf-8", newline="\n")
+            tmp.replace(target)
+    except OSError:
+        log.warning("保存失败后回滚文件失败: %s", target, exc_info=True)
+    registry.discover([directory])
+
+
 def save_source(
     registry: StrategyRegistry,
     *,
@@ -249,8 +296,6 @@ def save_source(
     _file_for(key, directory)
 
     existing = registry.source_path(key)
-    if existing is None and key in registry:
-        raise StrategySourceError("内置策略只读。请复制为新策略后再修改", status=403)
     if existing is not None:
         if create:
             raise StrategySourceError(f"策略 {key} 已存在")
@@ -258,21 +303,42 @@ def save_source(
         if target.parent != directory:
             raise StrategySourceError("只能编辑自己策略目录里的文件", status=403)
     else:
-        if not create:
-            # Saving under a new key is still useful: treat it as a new plugin.
-            pass
+        if create and key in registry:
+            # Creating a strategy that already exists is a mistake even when it
+            # is a built-in: editing one is PUT on its source, not POST.
+            raise StrategySourceError(f"策略 {key} 已存在")
+        # No file yet. For a built-in this is how an override starts: the file
+        # lands in the user directory and shadows the package class.
         target = _file_for(key, directory)
         if target.exists():
             raise StrategySourceError(f"文件 {target.name} 已存在，请换一个 key 或先删除")
+
+    # Kept so a save that does not load can be undone. A broken file left on
+    # disk is invisible from the UI (the registry falls back to the built-in)
+    # and keeps failing on every reload, so the user could only fix it by
+    # editing the data directory by hand.
+    previous = target.read_text(encoding="utf-8") if target.exists() else None
 
     tmp = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
     tmp.write_text(code, encoding="utf-8", newline="\n")
     tmp.replace(target)
 
     registry.discover([directory])
+    problem = ""
     if key not in registry:
-        detail = "\n".join(registry.errors[-3:]) or "策略没有被注册"
-        raise StrategySourceError(f"保存后加载失败：{detail}", status=422)
+        reason = _short_reason(registry.errors, "策略没有被注册")
+        problem = f"保存后加载失败：{reason}"
+    elif registry.source_path(key) != target.resolve():
+        # The file is on disk but something else is in effect: a broken
+        # override leaves the built-in registered, so checking "key in
+        # registry" alone would report success while nothing changed.
+        reason = _short_reason(registry.errors, "")
+        problem = "保存后没有生效，内置版本仍在生效"
+        if reason:
+            problem = f"{problem}：{reason}"
+    if problem:
+        _undo_write(target, previous, directory, registry)
+        raise StrategySourceError(problem, status=422)
     if filename and target.name != filename:
         # The editor may have opened a file and the user changed its key. The
         # new file is what matters; the old one is left alone on purpose.
@@ -283,6 +349,58 @@ def save_source(
         "filename": target.name,
         "source_name": target.name,
         "editable": True,
+        "builtin": registry.is_builtin(key),
+        "overridden": registry.is_overridden(key),
+    }
+
+
+def restore_builtin(
+    registry: StrategyRegistry, key: str, directory: Path | None = None
+) -> dict[str, Any]:
+    """Throw away the user file overriding a built-in, bringing the original back.
+
+    Only an active override can be restored: otherwise the key belongs either
+    to the untouched built-in or to an ordinary user strategy, and deleting
+    either one would not mean what the button says.
+    """
+    directory = _user_dir(directory)
+    if not registry.is_overridden(key):
+        raise StrategySourceError("这个策略不是覆盖版本")
+    path = registry.source_path(key)
+    if path is None:
+        raise StrategySourceError("这个策略不是覆盖版本")
+    path = path.resolve()
+    # The file is deleted, not rewritten, so it has to hold nothing but this
+    # override. One file may define several strategies; deleting it would take
+    # the others with it.
+    shared = sorted(
+        other for other in registry.keys if other != key and registry.source_path(other) == path
+    )
+    if shared:
+        raise StrategySourceError(f"该文件还定义了 {', '.join(shared)}，先拆开再还原")
+    if path.parent != directory:
+        raise StrategySourceError("只能还原自己策略目录里的文件", status=403)
+    path.unlink(missing_ok=True)
+    registry.discover([directory])
+    if key not in registry:
+        detail = "\n".join(registry.errors[-3:]) or "内置策略没有被注册"
+        raise StrategySourceError(f"还原后内置策略没有回来：{detail}", status=422)
+    # Reported as measured: another user file may take the key over the moment
+    # this one disappears, and then the strategy is still overridden. The
+    # deletion has already happened, so the message says so instead of
+    # pretending the call did nothing.
+    if registry.is_overridden(key):
+        rival = registry.source_path(key)
+        still = rival.name if rival is not None else "另一个用户文件"
+        raise StrategySourceError(
+            f"还原后仍有别的用户文件覆盖这个策略：已删除 {path.name}，{still} 仍在覆盖",
+            status=400,
+        )
+    return {
+        "ok": True,
+        "key": key,
+        "builtin": registry.is_builtin(key),
+        "overridden": registry.is_overridden(key),
     }
 
 
@@ -296,16 +414,22 @@ def rename_source(
 ) -> dict[str, Any]:
     """Rename a user strategy: new key (and file name), optional display name.
 
-    Built-ins are refused: they live in the package and the UI already offers
-    "复制为新策略" for that. The new file is written and hot-loaded *before*
+    Built-ins are refused, including one that is currently overridden: the
+    package copy would come back under the old key. The new file is written and
+    hot-loaded *before*
     the old one is deleted, and rolled back if the reload fails, so a bad
     rename cannot leave the user without the strategy they had.
     """
     directory = _user_dir(directory)
+    # An override is a built-in with a user file behind it. Renaming it would
+    # leave the built-in behind under the old key, which is not what the user
+    # asked for: restore first, or save it as a new strategy.
+    if registry.is_overridden(key):
+        raise StrategySourceError(BUILTIN_RENAME_REFUSED, status=403)
     old_path = registry.source_path(key)
     if old_path is None:
         if key in registry:
-            raise StrategySourceError("内置策略只读。请先「复制为新策略」再改名", status=403)
+            raise StrategySourceError(BUILTIN_RENAME_REFUSED, status=403)
         raise StrategySourceError(f"未知策略：{key}", status=404)
     new_key = (new_key or "").strip()
     if new_key == key:

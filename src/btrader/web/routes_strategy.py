@@ -1,8 +1,13 @@
-"""Strategy source-editor endpoints.
+"""Strategy source-editor endpoints that need no engine handle.
 
 Kept outside `routes.py` so the large trading router stays readable. The
 controller-free functions are thin wrappers over `strategy/source.py`; all
 validation and file confinement lives there and is covered by offline tests.
+
+The two routes that *write* source (``PUT /api/strategies/{key}/source`` and
+``POST /api/strategies/{key}/restore``) live in `routes.py` instead: they must
+refuse while an engine is trading the key, and the engine controllers are
+created there.
 """
 
 from __future__ import annotations
@@ -53,19 +58,6 @@ def build_strategy_router(get_state: Callable[[], Any]) -> APIRouter:
             return read_source(registry(), key)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=f"未知策略：{key}") from exc
-
-    @router.put("/api/strategies/{key}/source")
-    def save(key: str, payload: SourcePayload) -> dict[str, Any]:
-        try:
-            result = save_source(
-                registry(),
-                key=key,
-                code=payload.code,
-                create=payload.create,
-            )
-        except StrategySourceError as exc:
-            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
-        return result
 
     @router.post("/api/strategies")
     def create(payload: SourcePayload) -> dict[str, Any]:

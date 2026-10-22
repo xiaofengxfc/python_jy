@@ -39,7 +39,12 @@ from ..exchange import mirror
 from ..exchange.rest import PLATFORMS, SUPPORTED_PLATFORMS, BinanceREST
 from ..notify import FORMATS, Notifier, NotifyError, check_webhook_url
 from ..strategy.candidates import CandidateError, default_store
-from ..strategy.source import StrategySourceError, rename_source
+from ..strategy.source import (
+    StrategySourceError,
+    rename_source,
+    restore_builtin,
+    save_source,
+)
 from .. import ai, llm
 from .. import paths
 
@@ -108,21 +113,26 @@ def _record_candidate_backtest(key: str, metrics: dict[str, Any], *, symbol: str
         log.warning("写入候选回测记录失败", exc_info=True)
 
 
-def _strategy_in_use(auto, ai_ctl, key: str) -> str:
-    """Why renaming ``key`` is refused right now, or an empty string."""
+def _strategy_in_use(auto, ai_ctl, key: str, action: str = "重命名") -> str:
+    """Why changing ``key`` right now is refused, or an empty string.
+
+    A running engine keeps its own strategy instance, so swapping the file
+    underneath it would change what the next tick trades without the user
+    noticing. ``action`` is the verb that finishes "请先停止再…".
+    """
     try:
         status = auto.status() or {}
     except Exception:  # pragma: no cover - defensive
         status = {}
     if status.get("running") and str((status.get("config") or {}).get("strategy") or "") == key:
-        return "自动交易正在使用该策略，请先停止再重命名"
+        return f"自动交易正在使用该策略，请先停止再{action}"
     try:
         ai_status = ai_ctl.status() or {}
     except Exception:  # pragma: no cover - defensive
         ai_status = {}
     if str(ai_status.get("state") or "stopped") in ("running", "paused"):
         if str((ai_status.get("config") or {}).get("strategy") or "") == key:
-            return "AI 交易正在使用该策略，请先停止再重命名"
+            return f"AI 交易正在使用该策略，请先停止再{action}"
     return ""
 
 def _engine_clash(auto_running: bool, ai_state: str, *, starting: str) -> str:
@@ -319,6 +329,10 @@ class OptimizePayload(BacktestPayload):
 class StrategyRenamePayload(BaseModel):
     new_key: str
     new_name: str = ""
+
+
+class StrategySourcePayload(BaseModel):
+    code: str = ""
 
 
 class AIFilterPayload(BacktestPayload):
@@ -1292,6 +1306,10 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
                     **{k: v for k, v in meta.items() if k != "params_spec"},
                     "params": [asdict(spec) for spec in meta["params_spec"]],
                     "defaults": ctx.strategies.get(meta["key"]).default_params(),
+                    # "builtin": a package implementation of this key exists,
+                    # overridden or not. "overridden": the user file wins.
+                    "builtin": ctx.strategies.is_builtin(meta["key"]),
+                    "overridden": ctx.strategies.is_overridden(meta["key"]),
                 }
             )
         return {"items": items}
@@ -1337,6 +1355,38 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
         except Exception:
             log.warning("迁移策略引用失败", exc_info=True)
         return {**result, "candidates_updated": moved}
+
+    @router.put("/api/strategies/{key}/source")
+    def strategy_source_save(key: str, payload: StrategySourcePayload) -> dict[str, Any]:
+        """Save the editor buffer as a user file.
+
+        Saving a built-in key writes an override into the user directory; the
+        package source is never touched. Refused while an engine trades it.
+        """
+        ctx = get_state().ctx
+        blocked = _strategy_in_use(auto, ai_ctl, key, "修改")
+        if blocked:
+            raise HTTPException(status_code=409, detail=blocked)
+        try:
+            return save_source(ctx.strategies, key=key, code=payload.code)
+        except StrategySourceError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+    @router.post("/api/strategies/{key}/restore")
+    def strategy_restore(key: str) -> dict[str, Any]:
+        """Delete the user file that overrides a built-in, restoring the original.
+
+        Only an active override can be restored; anything else is a 400 with a
+        message the button can show as is.
+        """
+        ctx = get_state().ctx
+        blocked = _strategy_in_use(auto, ai_ctl, key, "还原")
+        if blocked:
+            raise HTTPException(status_code=409, detail=blocked)
+        try:
+            return restore_builtin(ctx.strategies, key)
+        except StrategySourceError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
 
     # ------------------------------------------------------- automated trade
     @router.get("/api/auto/status")
