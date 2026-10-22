@@ -1624,36 +1624,6 @@ input[type="range"].input:focus {
   }
 }
 
-/* ------------------------------------------------- openclaw install panel */
-.install-box {
-  border: 1px dashed var(--border-strong);
-  border-radius: var(--radius-sm);
-  padding: 10px 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.install-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-.install-cmd {
-  margin: 0;
-  padding: 8px 10px;
-  max-height: 180px;
-  overflow: auto;
-  border-radius: var(--radius-sm);
-  background: var(--bg-hover);
-  color: var(--text-2);
-  font-size: 11px;
-  line-height: 1.55;
-  white-space: pre-wrap;
-  word-break: break-all;
-}
 
 .ticket-note {
   padding: 0 13px 12px;
@@ -2713,8 +2683,7 @@ input[type="range"].input:focus {
   font-size: 11.5px;
 }
 
-/* 自动交易合并进交易页：图表下面一整块，配置在左、日志在右。
-   与 .trading 网格同宽（不受其它页面 1080px 居中列的限制），窄屏落成一列。 */
+/* AI 量化页下方的执行引擎：配置在左、日志在右，窄屏落成一列。 */
 main.main > .auto-section:not(.page-head),
 main.main > .auto-head:not(.page-head) {
   width: 100%;
@@ -2736,8 +2705,7 @@ main.main > .auto-head:not(.page-head) {
   gap: 10px;
 }
 
-/* The head is rendered as a sibling before the grid (AutoPage returns a
-   fragment), so it needs its own spacing and full-width row. */
+/* 标题栏是网格的兄弟节点（组件返回一个片段），所以要自带间距和整行宽度。 */
 .auto-head {
   margin-top: 12px;
   background: var(--bg);

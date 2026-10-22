@@ -38,9 +38,9 @@ log = logging.getLogger(__name__)
 # 有的中转站会用 WAF 拦裸客户端（返回 403，正文是 error code: 1010），
 # 带上自己的 UA 才放行。和 llm.py / news.py 用同一个。
 USER_AGENT = "biTrader/0.5 (+desktop)"
-# 企业微信群机器人单条 markdown 上限 4096 字节，中文一个字三字节，
-# 2000 字留足余量，也够把锁屏那一屏说完。
-MAX_MESSAGE_CHARS = 2000
+# 企业微信群机器人单条上限 4096 字节，一个汉字三字节，所以按 1200 字截断，
+# 留出标题和格式的余量。
+MAX_MESSAGE_CHARS = 1200
 # 一次 HTTP POST 的正常耗时是几百毫秒。10 秒还没回来就是网络有问题，
 # 继续等只会让后台队列越堆越长。
 WEBHOOK_TIMEOUT = 10.0
@@ -331,6 +331,8 @@ class Notifier:
             if not job.text:
                 continue
             try:
+                # 通道已知坏着就立刻失败：一次成交通知不值得等十秒超时。
+                self._check_breaker()
                 self._deliver(job.text, title=job.title)
             except NotifyError as exc:
                 self._fail(str(exc))
@@ -366,6 +368,9 @@ class Notifier:
         self._open_until = 0.0
 
     def _note_failure(self) -> None:
+        if self._open_until > time.time():
+            # 熔断期间那几条是被熔断挡回来的，不算新的失败，否则冷却永远走不完。
+            return
         self._failures += 1
         if self._failures >= BREAKER_THRESHOLD:
             self._failures = 0

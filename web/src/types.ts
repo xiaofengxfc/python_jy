@@ -362,7 +362,7 @@ export interface AIFilterResult {
   truncated: boolean;
 }
 
-/** Reachability of the local OpenClaw gateway, as reported by the backend. */
+/** 通知通道的当前状态，来自 GET /api/notify。 */
 export interface NotifyStatus {
   enabled: boolean;
   format: string;
