@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from enum import Enum
 
 TIMEFRAME_SECONDS: dict[str, int] = {
@@ -136,16 +137,40 @@ class RunMode(str, Enum):
         return {"backtest": "回测", "live": "实盘"}[self.value]
 
 
+# 交割合约的符号在结算币后面还挂一段到期日，例如 BTC/USDT:USDT-250328。
+_SYMBOL_EXPIRY = re.compile(r"-\d{6}$")
+
+
+def split_symbol(symbol: str) -> tuple[str, str, str]:
+    """(base, quote, settle) of a ccxt symbol; settle is "" for a spot pair.
+
+    ``BTC/USDT`` -> (BTC, USDT, ""), ``BTC/USDT:USDT`` -> (BTC, USDT, USDT),
+    交割 ``BTC/USDT:USDT-250328`` -> settle 也是 USDT —— 到期日要先切掉再判，
+    否则 USDT-250328 不等于 USDT，这张交割单会被当成币本位，走错市场的客户端。
+    判定市场类型的地方都从这里取，别再各写一份冒号切分。
+    """
+    text = str(symbol or "").strip()
+    pair, _, settle = text.partition(":")
+    base, _, quote = pair.partition("/")
+    return base, quote, _SYMBOL_EXPIRY.sub("", settle)
+
+
+def symbol_is_contract(symbol: str) -> bool:
+    """合约写法（带结算币，交割还多一段到期日）；现货写法是 ``BASE/QUOTE``。"""
+    return bool(split_symbol(symbol)[2])
+
+
 def market_for_symbol(symbol: str) -> MarketType:
     """Infer the market from a ccxt symbol when the caller did not say.
 
     ``BTC/USDT`` -> spot, ``BTC/USDT:USDT`` -> USDT-margined,
-    ``BTC/USD:BTC`` -> coin-margined.  Shared so that pricing a position
-    and routing an order can never disagree about its venue.
+    ``BTC/USD:BTC`` -> coin-margined, ``BTC/USDT:USDT-250328`` -> USDT-margined
+    (交割合约属于它结算币那一侧的市场).  Shared so that pricing a position and
+    routing an order can never disagree about its venue.
     """
-    if ":" not in symbol:
+    settle = split_symbol(symbol)[2]
+    if not settle:
         return MarketType.SPOT
-    settle = symbol.rsplit(":", 1)[1]
     return MarketType.USDM if settle.upper() in ("USDT", "USDC") else MarketType.COINM
 
 

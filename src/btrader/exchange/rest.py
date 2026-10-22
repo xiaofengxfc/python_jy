@@ -10,7 +10,7 @@ import ccxt
 
 from ..core.contracts import DEFAULT_SPEC, ContractSpec
 from ..core.credentials import Credentials
-from ..core.types import PROTECTIVE_TYPES, MarketType, Network
+from ..core.types import PROTECTIVE_TYPES, MarketType, Network, split_symbol
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +33,42 @@ def _looks_unknown_order(exc: BaseException) -> bool:
     """交易所说这张单不存在（币安 -2011），也就是该换算法单端点再试一次。"""
     text = str(exc).lower()
     return "-2011" in text or "unknown order" in text
+
+
+# 币安的深度只认这几档（现货与三种合约同一套）。别的数字不会「凑合返回」，直接回
+# -4021「12 is not valid depth limit」——GET /api/orderbook 的默认值曾经是 12，
+# 于是合约盘口每次都 503，现货恰好能用，看着像「只有合约坏了」。
+DEPTH_LIMITS: tuple[int, ...] = (5, 10, 20, 50, 100, 500, 1000)
+# 路由的默认档位也走这个数：写死 12 就是当年那条 503。
+DEFAULT_DEPTH = 20
+
+
+def snap_depth(limit: Any) -> int:
+    """把想要的档数换成交所认的那一档：向上取，超过最大档就取最大档。"""
+    try:
+        want = int(limit)
+    except (TypeError, ValueError):
+        want = DEPTH_LIMITS[0]
+    for step in DEPTH_LIMITS:
+        if want <= step:
+            return step
+    return DEPTH_LIMITS[-1]
+
+
+# ccxt 把 BadSymbol 压成普通 ExchangeError 之后只剩一句英文，调用方只能靠这组词根
+# 把「没有这个交易对」和「交易所暂时连不上」分开：前者 400，后者才是 503。
+SYMBOL_MISSING_MARKERS: tuple[str, ...] = (
+    "does not have market symbol",
+    "invalid symbol",
+    "market symbol not found",
+    "invalid market",
+)
+
+
+def looks_unknown_symbol(exc: BaseException) -> bool:
+    """这个错误是不是「交易所没有这个交易对」（而不是网络或限流）。"""
+    text = str(exc).lower()
+    return any(marker in text for marker in SYMBOL_MISSING_MARKERS)
 
 
 def _as_float(value: Any) -> float:
@@ -241,14 +277,17 @@ class BinanceREST:
             client = self.client(market)
             client.load_markets()
             raw = client.market(symbol) or {}
-            limits = (raw.get("limits") or {}).get("amount") or {}
+            limits = raw.get("limits") or {}
+            amount_limit = limits.get("amount") or {}
+            cost_limit = limits.get("cost") or {}
             spec = ContractSpec(
                 contract_size=float(raw.get("contractSize") or 1.0),
                 inverse=bool(raw.get("inverse", False)),
                 base=raw.get("base") or "",
                 quote=raw.get("quote") or "",
                 settle=raw.get("settle") or "",
-                min_amount=float(limits.get("min") or 0.0),
+                min_amount=float(amount_limit.get("min") or 0.0),
+                min_cost=float(cost_limit.get("min") or 0.0),
             )
             resolved = True
         except Exception as exc:
@@ -335,11 +374,14 @@ class BinanceREST:
     @classmethod
     def _venue_symbol(cls, client: ccxt.Exchange, symbol: str) -> str:
         """ccxt symbol -> venue id, with a plain-text fallback for odd clients."""
-        return cls._market_id(client, symbol) or symbol.replace("/", "").split(":")[0]
+        base, quote, _settle = split_symbol(symbol)
+        return cls._market_id(client, symbol) or f"{base}{quote}"
 
     def fetch_order_book(self, market: MarketType, symbol: str, limit: int = 20) -> dict:
+        # 先换成交易所认的那一档再发：ccxt 不会替我们凑，币安对 12 这种数直接回
+        # -4021，合约盘口就整条 503。
         try:
-            return self.client(market).fetch_order_book(symbol, limit)
+            return self.client(market).fetch_order_book(symbol, snap_depth(limit))
         except Exception as exc:
             raise ExchangeError(_message(exc)) from exc
 

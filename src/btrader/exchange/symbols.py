@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 
 from ..core.models import SymbolInfo, Ticker
-from ..core.types import MarketType
+from ..core.types import MarketType, market_for_symbol, split_symbol
 from .rest import BinanceREST
 
 log = logging.getLogger(__name__)
@@ -55,19 +55,21 @@ def _market_kind(symbol: str, raw: dict) -> MarketType:
     fallback, a ccxt version that stops filling ``swap``/``contract`` would
     quietly put contracts back into the spot list.
     """
-    settle_part = symbol.split(":")[-1] if ":" in symbol else ""
-    settle = settle_part.split("-")[0]
-    declared = str(raw.get("settle") or settle)
+    base, _quote, settle = split_symbol(symbol)
     contract = bool(
-        raw.get("contract")
+        settle
+        or raw.get("contract")
         or raw.get("swap")
         or raw.get("future")
         or raw.get("option")
-        or settle_part
     )
     if not contract:
         return MarketType.SPOT
-    base = str(raw.get("base") or symbol.split("/")[0])
+    if settle:
+        # 符号自带结算币（交割的到期日已切掉）：这是唯一权威的判据。
+        return market_for_symbol(symbol)
+    declared = str(raw.get("settle") or "")
+    base = str(raw.get("base") or base)
     inverse = bool(raw.get("inverse")) or (bool(declared) and declared == base)
     return MarketType.COINM if inverse else MarketType.USDM
 
