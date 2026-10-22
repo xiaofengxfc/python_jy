@@ -6,6 +6,7 @@ import { useMarketStream } from "../hooks/useMarketStream";
 import type { Account, AILevel, AppSettings, Candle, Health, SymbolInfo } from "../types";
 import AIPanel from "../components/AIPanel";
 import BottomTabs, { type BottomTab } from "../components/BottomTabs";
+import SymbolFallbackNote from "../components/SymbolFallbackNote";
 import TradingViewChart from "../chart/TradingViewChart";
 import {
   INDICATOR_SPECS,
@@ -441,9 +442,14 @@ export default function TradingPage({
   }, [market, symbol]);
 
   /* ----------------------------------------------------------- account */
-  const refreshAccount = useCallback(async () => {
+  /** `freshPair` 只在成交那一刻用：缓存里那一行还是「钱包余额」，面板会把刚买来的
+   *  持仓标成「卖出」并预填整笔余额（t49 实测，最长约 10 秒）。后端只对单个交易对
+   *  给现读，没有 symbol 时它会照旧给缓存（全钱包现读是 /api/portfolio 的活）。 */
+  const refreshAccount = useCallback(async (freshPair = false) => {
     try {
-      const data = await api<Account>(`/api/account?${query({ market, symbol })}`);
+      const data = await api<Account>(
+        `/api/account?${query({ market, symbol, refresh: freshPair && symbol ? 1 : undefined })}`,
+      );
       setAccount(data);
       setLiveError("");
       // Server-side equity (cash + marked positions) so the sidebar quotes the
@@ -458,13 +464,33 @@ export default function TradingPage({
             0,
           );
       onAccountChange(equity);
+      return data;
     } catch (error) {
       // A read failure must be visible: an empty account would look like the
       // user owns nothing instead of "the key or the network failed".
       setLiveError(error instanceof Error ? error.message : String(error));
       /* the sidebar keeps the last known value */
+      return null;
     }
   }, [market, symbol, onAccountChange]);
+
+  /** 成交之后把面板追到「账本口径」。刚成交这一对在本地成交账本里还没有记录，
+   *  回填线程 5 秒一轮才登记，这之前现读返回的行仍是「钱包余额」；登记之后，按交易对
+   *  缓存又不肯更新（10 秒）。所以成交后连读几次现读，看到这一对变成账本行就停，
+   *  最多 6 次（约 12 秒）——一次成交最多几次签名读，不是每次轮询都读。 */
+  const fillSeq = useRef(0);
+  const refreshAfterFill = useCallback(async () => {
+    const token = ++fillSeq.current;
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      const data = await refreshAccount(true);
+      if (fillSeq.current !== token) return;
+      const row = data?.positions.find((item) => item.symbol === symbol);
+      // 合约的持仓天生就是账本口径，一次就够。
+      if (!row || market !== "spot" || row.origin === "ledger") return;
+      await new Promise((resolve) => window.setTimeout(resolve, 2400));
+      if (fillSeq.current !== token) return;
+    }
+  }, [refreshAccount, symbol, market]);
 
   useEffect(() => {
     void refreshAccount();
@@ -505,9 +531,6 @@ export default function TradingPage({
     setSymbolFallback(null);
   };
 
-  /** 说明里用全长市场名（「U 本位合约」），比行情头那个简称更好读。 */
-  const marketLabel =
-    health?.markets.find((item) => item.value === market)?.label ?? MARKET_LABELS[market] ?? market;
 
   const banner = actionError || healthError || liveError || symbolError;
 
@@ -597,11 +620,11 @@ export default function TradingPage({
             </div>
           </div>
 
-          {symbolFallback && (
-            <div className="symbol-note faint">
-              {symbolFallback.from} 在「{marketLabel}」市场不可用，已切到 {symbolFallback.to}
-            </div>
-          )}
+          <SymbolFallbackNote
+            from={symbolFallback?.from ?? ""}
+            to={symbolFallback?.to ?? ""}
+            market={market}
+          />
 
           <div className="card">
             <div className="card-head">
@@ -790,7 +813,8 @@ export default function TradingPage({
             network={health?.network ?? "mainnet"}
             onChanged={() => {
               setActionError("");
-              void refreshAccount();
+              // 刚成交/刚平完，把这一对追到账本口径（见 refreshAfterFill）。
+              void refreshAfterFill();
             }}
             onError={(message) => setActionError(message)}
             activeTab={bottomTab}
@@ -840,7 +864,7 @@ export default function TradingPage({
             protection={account?.protections?.find((item) => item.symbol === symbol) ?? null}
             network={health?.network ?? "mainnet"}
             onPickedPriceConsumed={() => setPickedPrice(null)}
-            onFilled={refreshAccount}
+            onFilled={() => void refreshAfterFill()}
           />
         </div>
       </div>

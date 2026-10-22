@@ -13,18 +13,161 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import NamedTuple
 
 ROOT = Path(__file__).resolve().parents[1]
 UI_DIR = ROOT / "web" / "src"
 WEB_PKG = ROOT / "src" / "btrader" / "web"
 
-# 三种字符串字面量：双引号、单引号、模板字符串。
-STRING_RE = re.compile(
-    r'"([^"\n]*)"'
-    r"|'([^'\n]*)'"
-    # 模板字符串可能跨行（拼 query 那种），所以不排除换行。
-    r"|`([^`]*)`"
-)
+# 扫描器：逐字符走一遍源码，认出「会变成请求路径的字面量」。
+#
+# 以前这里是一条正则 `` `([^`]*)` ``，遇到嵌套模板就翻车：
+#
+#     await api<Portfolio>(`/api/portfolio${view ? `?market=${view}` : ""}`);
+#
+# 匹配到第一个反引号就收，切出 `/api/portfolio${view ? `，于是报「前端在调后端
+# 没有的接口」——前端没写错，是扫描器不会数层级。现在按字符扫：模板里遇到 ${
+# 就进表达式上下文，表达式里再遇到反引号又进下一层，一路配到最外层结束。
+#
+# 顺带把三件事理清（以前都靠运气）：
+#   * 注释整段跳过：注释里写着 "/api/old" 不是调用；
+#   * 散文里提到 /api 的字符串不算调用，但 T/api/orders 这种拼错的路径要抓；
+#   * `"/api/strategies/" + encodeURIComponent(k) + "/rename"` 拼出来的路径也检查
+#     （以前只看得到 "/api/strategies/"，后缀写错一样能过）。
+HOLE = "${}"
+
+
+class Piece(NamedTuple):
+    start: int
+    end: int
+    text: str
+
+
+def _scan_code(text: str, index: int, pieces: list[Piece], *, in_expression: bool) -> int:
+    """扫一段代码。in_expression=True 时停在配对的 } 上（模板的 ${...} 里）。"""
+    depth = 0
+    while index < len(text):
+        char = text[index]
+        if text.startswith("//", index):
+            newline = text.find("\n", index)
+            index = len(text) if newline < 0 else newline + 1
+            continue
+        if text.startswith("/*", index):
+            close = text.find("*/", index + 2)
+            index = len(text) if close < 0 else close + 2
+            continue
+        if char in "\"'":
+            index = _scan_plain(text, index, char, pieces)
+            continue
+        if char == "`":
+            index = _scan_template(text, index, pieces)
+            continue
+        if in_expression:
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                if depth == 0:
+                    return index + 1
+                depth -= 1
+        index += 1
+    return index
+
+
+def _scan_plain(text: str, index: int, quote: str, pieces: list[Piece]) -> int:
+    """普通字符串：扫到同种引号或行尾为止。"""
+    cursor = index + 1
+    buffer: list[str] = []
+    while cursor < len(text):
+        char = text[cursor]
+        if char == "\\":
+            buffer.append(text[cursor : cursor + 2])
+            cursor += 2
+            continue
+        if char == quote:
+            pieces.append(Piece(index, cursor + 1, "".join(buffer)))
+            return cursor + 1
+        if char == "\n":
+            break
+        buffer.append(char)
+        cursor += 1
+    pieces.append(Piece(index, cursor, "".join(buffer)))
+    return cursor
+
+
+def _scan_template(text: str, index: int, pieces: list[Piece]) -> int:
+    """模板字符串：静态片段攒成一条，${...} 折成一个洞，里面的代码再扫一遍。"""
+    cursor = index + 1
+    buffer: list[str] = []
+    while cursor < len(text):
+        char = text[cursor]
+        if char == "\\":
+            buffer.append(text[cursor : cursor + 2])
+            cursor += 2
+            continue
+        if char == "`":
+            pieces.append(Piece(index, cursor + 1, "".join(buffer)))
+            return cursor + 1
+        if text.startswith("${", cursor):
+            buffer.append(HOLE)
+            # 表达式里的模板/字符串各自入列：内层的 `/api/x` 也是一条路径
+            cursor = _scan_code(text, cursor + 2, pieces, in_expression=True)
+            continue
+        buffer.append(char)
+        cursor += 1
+    pieces.append(Piece(index, len(text), "".join(buffer)))
+    return len(text)
+
+
+def _scan_strings(text: str) -> list[Piece]:
+    pieces: list[Piece] = []
+    _scan_code(text, 0, pieces, in_expression=False)
+    return pieces
+
+
+def _looks_like_api_call(skeleton: str) -> bool:
+    """这条字面量像不像一个请求路径（而不是散文里提到的 /api）。"""
+    value = skeleton.lstrip()
+    while value.startswith(HOLE):
+        value = value[len(HOLE) :]
+    # 前缀里不含点：./api 和 ../api 是相对导入，不是请求路径。
+    return bool(re.match(r"[\w$\-]*/api(?:/|$|\?|\{|:)", value))
+
+
+def _is_concat_gap(gap: str) -> bool:
+    """两个字面量之间只有「+ 一个表达式 +」：它们拼的是同一条路径。"""
+    core = gap.strip()
+    return core.startswith("+") and core.endswith("+")
+
+
+def _api_skeletons(text: str) -> list[str]:
+    """源码里出现的请求路径骨架（洞写成 ${}），按出现顺序、去重。"""
+    ordered = sorted(_scan_strings(text), key=lambda piece: (piece.start, -piece.end))
+    inner = [
+        piece
+        for piece in ordered
+        if any(
+            other is not piece and other.start <= piece.start and piece.end <= other.end
+            for other in ordered
+        )
+    ]
+    outer = [piece for piece in ordered if piece not in inner]
+    merged: list[Piece] = []
+    for piece in outer:
+        if merged:
+            gap = text[merged[-1].end : piece.start]
+            if _is_concat_gap(gap):
+                merged[-1] = Piece(
+                    merged[-1].start, piece.end, merged[-1].text + HOLE + piece.text
+                )
+                continue
+        merged.append(piece)
+    found: list[str] = []
+    # 嵌套模板里的静态片段单独过一遍：拼 query 的那截也可能自带 /api
+    for piece in merged + inner:
+        if _looks_like_api_call(piece.text) and piece.text not in found:
+            found.append(piece.text)
+    return found
+
 
 # 路由有两种写法：装饰器和 add_api_route。
 ROUTE_RES = (
@@ -43,12 +186,8 @@ def _api_literals() -> dict[str, set[str]]:
     found: dict[str, set[str]] = {}
     for path in _ui_files():
         text = path.read_text(encoding="utf-8")
-        for match in STRING_RE.finditer(text):
-            literal = next((group for group in match.groups() if group), "")
-            # 只要真正发请求的路径：相对导入的 ../api 和厂商域名不算。
-            if "/api/" not in literal and literal != "/api":
-                continue
-            found.setdefault(literal, set()).add(str(path.relative_to(ROOT)))
+        for skeleton in _api_skeletons(text):
+            found.setdefault(skeleton, set()).add(str(path.relative_to(ROOT)))
     return found
 
 
@@ -59,6 +198,24 @@ def _backend_routes() -> set[str]:
         for pattern in ROUTE_RES:
             routes.update(pattern.findall(text))
     return routes
+
+
+def _path_variants(path: str) -> list[str]:
+    """一条骨架可能对应的几种真实路径。
+
+    ${} 洞里既可能是一个路径段（/api/backtest/jobs/${}），也可能是整条查询串
+    （`/api/portfolio${view ? `?market=${view}` : ""}` 里就是）。两种都算：
+    后面那截被丢掉的写法也要试一遍，不然「拼 query 的模板」会一直被判成不存在的接口。
+    """
+    variants = [path]
+    trimmed = path
+    while trimmed.endswith(HOLE):
+        trimmed = trimmed[: -len(HOLE)]
+        if trimmed.endswith("/"):
+            trimmed = trimmed.rstrip("/")
+        if trimmed and trimmed not in variants:
+            variants.append(trimmed)
+    return variants
 
 
 def _route_pattern(path: str) -> re.Pattern[str]:
@@ -92,9 +249,97 @@ def test_every_api_path_the_ui_calls_exists_on_the_backend() -> None:
             path = path.rstrip("/")
         if path == "/api/":
             path = "/api"
-        if not any(pattern.match(path) for pattern in patterns):
+        variants = _path_variants(path)
+        if not any(pattern.match(variant) for pattern in patterns for variant in variants):
             unmatched[literal] = sorted(files)
     assert not unmatched, f"前端在调后端没有的接口：{unmatched}"
+
+
+def _routes_match(path: str) -> bool:
+    """这条骨架能不能对上一个真实后端路由（和主检查同口径：先砍掉查询串）。"""
+    patterns = [_route_pattern(route) for route in _backend_routes()]
+    path = path.split("?")[0]
+    if path.endswith("/") and path != "/api/":
+        path = path.rstrip("/")
+    if path == "/api/":
+        path = "/api"
+    return any(
+        pattern.match(variant)
+        for pattern in patterns
+        for variant in _path_variants(path)
+    )
+
+
+def test_nested_template_strings_are_scanned_whole() -> None:
+    """模板里再套模板：按层级配到最外层，不能碰到第一个反引号就收。
+
+    这行真实代码曾经被切成半截（反引号包着的 /api/portfolio${view ? 反引号），于是
+    报「前端在调后端没有的接口」。要求：外层前缀 /api/portfolio 要认出来，模板里
+    任何一个静态路径片段都要检查——动态的不等于整条跳过。
+    """
+    source = (
+        '  const next = await api<Portfolio>(`/api/portfolio${view ? `?market=${view}` : ""}`);\n'
+    )
+    skeletons = _api_skeletons(source)
+    assert '/api/portfolio${}' in skeletons, skeletons
+    assert not [item for item in skeletons if '`' in item or ' ? ' in item], skeletons
+    assert _routes_match('/api/portfolio${}')
+
+    # 模板里再套一个「后端没有的接口」：不能因为它在洞里就放过
+    nested_missing = (
+        '  const x = await api(`/api/nonexistent${view ? `?market=${view}` : ""}`);\n'
+    )
+    assert '/api/nonexistent${}' in _api_skeletons(nested_missing)
+    assert not _routes_match('/api/nonexistent${}')
+
+
+def test_the_real_portfolio_fetch_is_scanned_as_a_plain_path() -> None:
+    """PortfolioPage 里那一行真源码（现在已经是 query 写法）也要被整条认出来。"""
+    text = (UI_DIR / 'pages' / 'PortfolioPage.tsx').read_text(encoding='utf-8')
+    skeletons = _api_skeletons(text)
+    portfolios = [item for item in skeletons if item.startswith('/api/portfolio')]
+    assert portfolios, skeletons
+    for item in portfolios:
+        assert '`' not in item, f"扫出了半截模板：{item}"
+        assert item.split('?')[0].startswith('/api/portfolio')
+    assert any(_routes_match(item) for item in portfolios), portfolios
+
+
+def test_comments_and_prose_are_not_api_calls() -> None:
+    """注释里、散文里出现的 /api 不是调用；拼错的路径仍然是调用。"""
+    source = "\n".join(
+        [
+            '  // 以前这里写的是 "/api/fake-in-comment"，别当成调用',
+            '  /* "/api/fake-in-block-comment" */',
+            '  const note = "already /api/ticker was the old path";',
+            '  const broken = "T/api/orders";',
+            '  const real = await api("/api/positions/close");',
+        ]
+    )
+    skeletons = _api_skeletons(source)
+    assert '/api/fake-in-comment' not in skeletons, skeletons
+    assert '/api/fake-in-block-comment' not in skeletons, skeletons
+    assert not [item for item in skeletons if item.startswith('already ')], skeletons
+    # 拼错的路径（少了开头的斜杠）必须留住：test_..._starts_at_the_root 要抓它
+    assert 'T/api/orders' in skeletons, skeletons
+    assert '/api/positions/close' in skeletons
+    assert _routes_match('/api/positions/close')
+
+
+def test_concatenated_paths_are_checked_with_their_suffix() -> None:
+    """字符串拼出来的路径要拼成一条再查。
+
+    以前只看得到 /api/strategies/ 这一截，后缀写成 /rename2 也能过：真接口是
+    DELETE /api/strategies/{key} 和 POST /api/strategies/{key}/rename。
+    """
+    source = (
+        '  await api("/api/strategies/" + encodeURIComponent(key) + "/rename", { method: "POST" });\n'
+    )
+    skeletons = _api_skeletons(source)
+    assert '/api/strategies/${}/rename' in skeletons, skeletons
+    assert _routes_match('/api/strategies/${}/rename')
+    # 后缀写错就该红：证明这条检查真的看后缀
+    assert not _routes_match('/api/strategies/${}/rename2')
 
 
 def test_cancel_order_call_targets_the_real_backend_route() -> None:
@@ -284,8 +529,10 @@ def test_trading_page_explains_a_cross_market_symbol_fallback() -> None:
     page = (UI_DIR / "pages" / "TradingPage.tsx").read_text(encoding="utf-8")
 
     assert "const [symbolFallback, setSymbolFallback] = useState" in page
-    assert "{symbolFallback && (" in page, "说明没有按条件渲染"
-    assert "市场不可用，已切到" in page
+    # 句子本身搬到了共用件 SymbolFallbackNote（见 test_cross_market_symbol_fallback_speaks_up_on_three_pages），
+    # 这里只钉住「退回时才算出来、三处共用、可用时清掉」。
+    assert "<SymbolFallbackNote" in page, "说明没有渲染"
+    assert "market={market}" in page
     assert "settings?.last_symbol && chosen && chosen !== settings.last_symbol" in page
     # 用户自己选、换市场、以及默认交易对可用时都要清掉
     assert page.count("setSymbolFallback(null)") >= 3, "说明不会消失"
@@ -377,3 +624,105 @@ def test_pages_do_not_spin_forever_when_the_backend_is_down() -> None:
     assert '{high > 0 ? fmtPrice(high) : "—"}' in page
     assert '{low > 0 ? fmtPrice(low) : "—"}' in page
     assert "{volume > 0 ? (" in page
+
+def test_cross_market_symbol_fallback_speaks_up_on_three_pages() -> None:
+    """默认交易对跨市场被换掉时，三处都要说出来，而且说的是同一句话。
+
+    交易页行情头、回测页交易对下拉、设置页默认交易对，都会在「列表里没有原来那一对」时
+    退到列表第一项。以前只有交易页说，另两处静默换掉。三处共用
+    components/SymbolFallbackNote.tsx，页面里不许再各写一段同样的文案。
+    """
+    note = (UI_DIR / "components" / "SymbolFallbackNote.tsx").read_text(encoding="utf-8")
+    assert "if (!from || !to || from === to) return null;" in note, "可用时也会显示"
+    assert "市场不可用，已切到" in note
+    assert 'layout === "form"' in note
+
+    for rel in ("pages/TradingPage.tsx", "pages/BacktestPage.tsx", "pages/SettingsPage.tsx"):
+        page = (UI_DIR / rel).read_text(encoding="utf-8")
+        assert 'import SymbolFallbackNote from "../components/SymbolFallbackNote"' in page, rel
+        assert "<SymbolFallbackNote" in page, rel
+        assert "市场不可用，已切到" not in page, f"{rel} 又自己写了一套文案"
+        assert "setSymbolFallback(null)" in page, f"{rel} 的说明不会消失"
+
+    for rel in ("pages/BacktestPage.tsx", "pages/SettingsPage.tsx"):
+        assert 'layout="form"' in (UI_DIR / rel).read_text(encoding="utf-8"), rel
+
+def test_portfolio_page_can_switch_market() -> None:
+    """资产页要能切市场，页头要说清看的是哪个账户。
+
+    以前 /api/portfolio 不带 market，永远读设置的默认市场：装了现货 Key 的人
+    在资产页上根本看不到现货账户，页头也不写是哪个市场。实测现货账户权益 39 万、
+    合约账户 4999，页面只有一个数字时没人分得清。
+    """
+    page = (UI_DIR / "pages" / "PortfolioPage.tsx").read_text(encoding="utf-8")
+    app = (UI_DIR / "App.tsx").read_text(encoding="utf-8")
+
+    assert "defaultMarket" in page and "defaultMarket={settings?.market_type" in app
+    assert "const [market, setMarket] = useState<string | null>(null);" in page
+    assert "query({ market: view })" in page, "读的还是默认市场"
+    assert "}账户 · 每 5 秒刷新" in page, "页头没说市场"
+    assert "onClick={() => setMarket(item.value)}" in page
+
+def test_selling_a_wallet_row_keeps_the_balance_prefilled() -> None:
+    """钱包行卖完之后，数量框要回到「整笔余额」，不能留一个空框。
+
+    实测（桩账户，钱包 0.997 ETH）：预填 0.997 → 点「卖出」→ 请求体 size=0.997 正确，
+    但成交后输入框变成空串，行还是钱包行、按钮还是「卖出」；再点一次请求体就只剩
+    {"symbol","market"}，现货后端回 400「本地成交账本里没有该交易对…请显式指定 size」。
+    空串把钱包行的默认值顶掉了，所以成交后要删键而不是写空串。
+    """
+    source = (UI_DIR / "components" / "BottomTabs.tsx").read_text(encoding="utf-8")
+    assert "delete next[position.symbol];" in source
+    assert '[position.symbol]: ""' not in source, "成交后又把数量写成空串了"
+
+
+def test_refreshing_the_strategy_list_cannot_drop_unsaved_edits() -> None:
+    """策略页的「刷新」不能把没保存的改动换掉。
+
+    刷新本身只换列表；只有当手上这条已经不在列表里（磁盘上被删、被改名）时，选中项
+    才会挪到第一条、编辑器跟着换成另一条源码。这条路径以前不问题就换，和切换/新建/
+    复制三条一样处理：先 hasUnsaved() 再 window.confirm，用户不肯就让手上的原样留着。
+    """
+    page = (UI_DIR / "pages" / "StrategiesPage.tsx").read_text(encoding="utf-8")
+    assert "onClick={() => void reload()}" in page, "刷新按钮没走守卫"
+    assert "const reload = async () => {" in page
+    assert "confirmDiscard(`刷新（" in page
+    assert page.count("confirmDiscard(") >= 4, "切策略/新建/复制/刷新四条都要问"
+    # 用户拒绝时只换列表，不动编辑器
+    assert "      setStrategies(items);" in page and "      return;" in page
+
+
+def test_spot_pnl_says_it_is_booked_quantity_only() -> None:
+    """现货行的浮动盈亏只按账本数量算，界面必须说明白。
+
+    钱包余额里混着用户自己充的币：买进来 0.0041 而钱包有 1.0041 时，盈亏是 0.02
+    （按 0.0041 算），可数量列写的是 1.0041，两个数摆一起像算错了。后端为此给了
+    unrealized_basis / ledger_size 两个字段，界面不读它们就是「界面说的和后端做的不一样」。
+    """
+    fmt = (UI_DIR / "format.ts").read_text(encoding="utf-8")
+    types = (UI_DIR / "types.ts").read_text(encoding="utf-8")
+    assert "export function ledgerBasisNote(" in fmt
+    assert 'unrealized_basis !== "ledger"' in fmt
+    assert "Math.abs(booked - Math.abs(position.contracts)) < 1e-9" in fmt, "数量一致时不该加说明"
+    assert "账本口径 ${fmt(booked, 6)}" in fmt, "浮盈旁边要说清是账本口径"
+    assert 'unrealized_basis?: "" | "ledger";' in types
+    assert "ledger_size?: number;" in types
+    for rel in ("components/BottomTabs.tsx", "pages/PortfolioPage.tsx"):
+        page = (UI_DIR / rel).read_text(encoding="utf-8")
+        assert "ledgerBasisNote(position) && (" in page, rel
+
+
+def test_order_ticket_refuses_orders_below_the_venue_minimums() -> None:
+    """低于交易所最小量/最小名义额的单不发出去。
+
+    实测 0.002 ETH（4.77 USDT）被交易所按 NOTIONAL 拒（-1013），界面以前把这发出去、
+    再把交易所报文念一遍。preview 现在带 min_amount / min_notional，下单框据此先拦。
+    """
+    ticket = (UI_DIR / "components" / "OrderTicket.tsx").read_text(encoding="utf-8")
+    types = (UI_DIR / "types.ts").read_text(encoding="utf-8")
+    assert "min_amount?: number | null;" in types and "min_notional?: number | null;" in types
+    assert "const minimumProblem = (amount: number): string => {" in ticket
+    assert "if (tooSmall) return setFlash({ tone: \"err\", text: tooSmall });" in ticket
+    # 预检必须在 fetch 之前：否则单已经发出去了才提示
+    assert ticket.index("const tooSmall = minimumProblem(amount);") < ticket.index('api<{\n        order: Record<string, unknown>;')
+    assert "交易所最低" in ticket, "下单框要显示交易所的最低下单额度"

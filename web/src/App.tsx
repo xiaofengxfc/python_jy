@@ -132,7 +132,10 @@ export default function App() {
             onNavigate={(next) => setPage(next)}
           />
         )}
-        {page === "portfolio" && <PortfolioPage onEquity={handleAccountChange} />}
+        {page === "portfolio" && <PortfolioPage
+            onEquity={handleAccountChange}
+            defaultMarket={settings?.market_type ?? ""}
+          />}
         {page === "backtest" && (
           <BacktestPage
             onEditStrategy={(key) => {

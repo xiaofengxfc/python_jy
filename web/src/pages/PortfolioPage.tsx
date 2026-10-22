@@ -1,31 +1,44 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { api } from "../api";
-import { fmt, fmtPrice } from "../format";
+import { api, query } from "../api";
+import { MARKET_LABELS, fmt, fmtPrice, ledgerBasisNote } from "../format";
 import type { Portfolio } from "../types";
 import LineChart from "../components/LineChart";
 import Table from "../components/Table";
 
 interface Props {
   onEquity: (value: number) => void;
+  /** 设置里的默认市场：用户没在本页切过时就看它。 */
+  defaultMarket?: string;
 }
+
+/** 和交易页同一套市场名（顺序也一致）。 */
+const MARKETS = [
+  { value: "spot", label: MARKET_LABELS.spot },
+  { value: "usdm", label: MARKET_LABELS.usdm },
+  { value: "coinm", label: MARKET_LABELS.coinm },
+];
 
 type Ledger = "trades" | "orders";
 
-export default function PortfolioPage({ onEquity }: Props) {
+export default function PortfolioPage({ onEquity, defaultMarket = "" }: Props) {
+  /** 本页自己切过的市场。以前这里写死跟设置走：装了现货 Key 的人，资产页只看得到
+   *  默认市场那一个账户，另一位市场的钱在界面上根本不存在，页头也不说是哪个市场。 */
+  const [market, setMarket] = useState<string | null>(null);
+  const view = market ?? defaultMarket;
   const [data, setData] = useState<Portfolio | null>(null);
   const [error, setError] = useState("");
   const [ledger, setLedger] = useState<Ledger>("trades");
 
   const load = useCallback(async () => {
     try {
-      const next = await api<Portfolio>("/api/portfolio");
+      const next = await api<Portfolio>(`/api/portfolio?${query({ market: view })}`);
       setData(next);
       setError("");
       onEquity(next.equity);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     }
-  }, [onEquity]);
+  }, [onEquity, view]);
 
   useEffect(() => {
     void load();
@@ -79,8 +92,22 @@ export default function PortfolioPage({ onEquity }: Props) {
     <>
       <div className="page-head">
         <h1 className="page-title">资产</h1>
-        <span className="page-sub">交易所账户 · 每 5 秒刷新</span>
+        <span className="page-sub">
+          {MARKET_LABELS[view] ?? view}账户 · 每 5 秒刷新
+        </span>
         <span className="spacer" />
+        <div className="segmented">
+          {MARKETS.map((item) => (
+            <button
+              key={item.value}
+              type="button"
+              aria-pressed={view === item.value}
+              onClick={() => setMarket(item.value)}
+            >
+              {item.label}
+            </button>
+          ))}
+        </div>
       </div>
 
       {error && <div className="banner error">{error}</div>}
@@ -186,6 +213,12 @@ export default function PortfolioPage({ onEquity }: Props) {
               fmtPrice(position.last),
               <span className={position.unrealized >= 0 ? "up" : "down"}>
                 {fmt(position.unrealized, 2)}
+                {/* 现货行数量取钱包、盈亏只算账本，两个数不一样时说明一句。 */}
+                {ledgerBasisNote(position) && (
+                  <span className="faint" style={{ marginLeft: 4, fontSize: "var(--fs-12)" }}>
+                    {ledgerBasisNote(position)}
+                  </span>
+                )}
               </span>,
               fmt(Math.abs(position.quote_value), 2),
             ])}

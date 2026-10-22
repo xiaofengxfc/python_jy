@@ -10,6 +10,7 @@ import type {
   SymbolInfo,
 } from "../types";
 import { ParamFields } from "../components/ParamFields";
+import SymbolFallbackNote from "../components/SymbolFallbackNote";
 import LineChart, { Legend, type Series } from "../components/LineChart";
 import Table from "../components/Table";
 
@@ -184,16 +185,23 @@ export default function BacktestPage({ onEditStrategy }: Props) {
       .catch(() => setCandidates([]));
   }, []);
 
+  /** 市场列表里没有当前这一对时只能退到列表第一项：退回要说出来，别默默换掉。
+   *  和交易页、设置页共用 SymbolFallbackNote 那一行。 */
+  const [symbolFallback, setSymbolFallback] = useState<{ from: string; to: string } | null>(null);
+  // effect 里读当前交易对：直接写进依赖会让「换市场」这个触发条件变成「换交易对」。
+  const symbolRef = useRef(config.symbol);
+  symbolRef.current = config.symbol;
+
   useEffect(() => {
     api<{ items: SymbolInfo[] }>(`/api/symbols?${query({ market: config.market })}`)
       .then((data) => {
-        setSymbols(data.items);
-        setConfig((current) => ({
-          ...current,
-          symbol: data.items.some((item) => item.symbol === current.symbol)
-            ? current.symbol
-            : (data.items[0]?.symbol ?? current.symbol),
-        }));
+        const items = data.items ?? [];
+        setSymbols(items);
+        const from = symbolRef.current;
+        const known = items.some((item) => item.symbol === from);
+        const to = known ? from : (items[0]?.symbol ?? from);
+        setConfig((current) => ({ ...current, symbol: to }));
+        setSymbolFallback(known || to === from ? null : { from, to });
       })
       .catch(() => setSymbols([]));
   }, [config.market]);
@@ -493,7 +501,10 @@ export default function BacktestPage({ onEditStrategy }: Props) {
                     id="bt-symbol"
                     className="select"
                     value={config.symbol}
-                    onChange={(event) => patch({ symbol: event.target.value })}
+                    onChange={(event) => {
+                      patch({ symbol: event.target.value });
+                      setSymbolFallback(null);
+                    }}
                   >
                     {symbols.map((item) => (
                       <option key={item.symbol} value={item.symbol}>
@@ -501,6 +512,12 @@ export default function BacktestPage({ onEditStrategy }: Props) {
                       </option>
                     ))}
                   </select>
+                  <SymbolFallbackNote
+                    from={symbolFallback?.from ?? ""}
+                    to={symbolFallback?.to ?? ""}
+                    market={config.market}
+                    layout="form"
+                  />
                 </div>
                 <div className="field">
                   <label className="field-label" htmlFor="bt-timeframe">

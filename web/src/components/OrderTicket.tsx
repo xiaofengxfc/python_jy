@@ -270,10 +270,30 @@ export default function OrderTicket({
     );
   };
 
+  /** 交易所的最小下单量和最小名义额，preview 已经报上来了。低于它的单必然被交易所拒
+   *  （实测 0.002 ETH = 4.77 USDT 被 -1013 Filter failure: NOTIONAL 拒），与其发出去
+   *  再把交易所报文念一遍，不如在这里先拦下来。拿不到这两个数就不拦。 */
+  const minimumProblem = (amount: number): string => {
+    const minAmount = preview?.min_amount ?? null;
+    const minNotional = preview?.min_notional ?? null;
+    if (!minAmount && !minNotional) return "";
+    const baseAmount = preview?.amount_base ?? (sizeMode === "amount" ? amount : amount / (referencePrice || 1));
+    const notional = preview?.quote_notional ?? (sizeMode === "quote" ? amount : amount * referencePrice);
+    if (minAmount && baseAmount > 0 && baseAmount < minAmount) {
+      return `最小下单数量 ${fmt(minAmount, 8)} ${base}，这一单只有 ${fmt(baseAmount, 8)} ${base}，交易所会直接拒。`;
+    }
+    if (minNotional && notional > 0 && notional < minNotional) {
+      return `最小下单金额 ${fmt(minNotional, 2)} ${quote}，这一单只有 ${fmt(notional, 2)} ${quote}，交易所会直接拒。`;
+    }
+    return "";
+  };
+
   const send = async () => {
     const amount = parseNumber(size);
     if (!symbol) return setFlash({ tone: "err", text: "请先选择交易对。" });
     if (amount <= 0) return setFlash({ tone: "err", text: "请填写数量或金额。" });
+    const tooSmall = minimumProblem(amount);
+    if (tooSmall) return setFlash({ tone: "err", text: tooSmall });
     if (orderType === "limit" && referencePrice <= 0) {
       return setFlash({ tone: "err", text: "限价单需要填写价格。" });
     }
@@ -769,6 +789,20 @@ export default function OrderTicket({
               {preview ? `${fmt(preview.exchange_amount, 6)} ${base}` : "—"}
             </strong>
           </div>
+          {/* 交易所的最小量/最小名义额：只报数，不猜（拿不到就不显示）。 */}
+          {(preview?.min_amount || preview?.min_notional) && (
+            <div className="preview-row">
+              <span>交易所最低</span>
+              <strong className="faint">
+                {[
+                  preview?.min_amount ? `${fmt(preview.min_amount, 8)} ${base}` : "",
+                  preview?.min_notional ? `${fmt(preview.min_notional, 2)} ${quote}` : "",
+                ]
+                  .filter(Boolean)
+                  .join(" ／ ")}
+              </strong>
+            </div>
+          )}
           {previewError ? (
             <div className="verdict bad">无法预览：{previewError}</div>
           ) : preview ? (

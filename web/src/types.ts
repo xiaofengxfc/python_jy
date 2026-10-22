@@ -55,6 +55,12 @@ export interface Position {
    * show one number for one position. */
   last: number;
   unrealized: number;
+  /** 这个浮动盈亏是按什么数量算的。现货行数量取钱包余额、盈亏取账本数量，
+   *  两个数不一样时界面必须说清楚，否则 0.02 挂在 1.0041 上看着像算错了。
+   *  合约、钱包里白送的行是空串。 */
+  unrealized_basis?: "" | "ledger";
+  /** 账本里这一对的数量（已封顶于钱包余额）。origin=ledger 时才有意义。 */
+  ledger_size?: number;
   quote_value: number;
   /** 现货才分得出来：ledger 是买来的（有成交记录和成本价），wallet 是钱包里
    * 本来就有的（充值、空投、测试网赠送），成本价未知。合约恒为 ledger。 */
@@ -143,6 +149,10 @@ export interface OrderPreview {
   amount_base: number;
   exchange_amount: number;
   quote_notional: number;
+  /** 交易所的最小下单量（基础币）与最小名义额（计价币），取自 limits.amount.min /
+   *  limits.cost.min。拿不到就是 null——不拿「最小数量 × 现价」凑一个数。 */
+  min_amount?: number | null;
+  min_notional?: number | null;
   fee_estimate: number;
   fee_rate: number;
   slippage_bps: number;

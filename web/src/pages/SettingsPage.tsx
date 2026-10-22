@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, query } from "../api";
 import { TIMEFRAMES } from "../format";
+import SymbolFallbackNote from "../components/SymbolFallbackNote";
 import type {
   AISettings,
   AIStatus,
@@ -49,6 +50,11 @@ const PCT_FIELDS: [keyof AppSettings["risk"], string, string][] = [
 
 export default function SettingsPage({ settings, settingsError = "", onSaved }: Props) {
   const [draft, setDraft] = useState<AppSettings | null>(settings);
+  /** 拉列表用：effect 里要读「用户原来选的那一对」，放进依赖会让它反复触发。 */
+  const draftRef = useRef<AppSettings | null>(draft);
+  draftRef.current = draft;
+  /** 原来选的那一对不在当前市场列表里、被换成别的时要说明白。 */
+  const [symbolFallback, setSymbolFallback] = useState<{ from: string; to: string } | null>(null);
   // 保存时只提交改过的字段：整份回传会把别处刚改的值盖回旧值。
   const baseline = useRef<AppSettings | null>(settings);
   const [platforms, setPlatforms] = useState<PlatformOption[]>([]);
@@ -252,15 +258,18 @@ export default function SettingsPage({ settings, settingsError = "", onSaved }: 
         const items = data.items ?? [];
         setSymbols(items);
         // 老配置里可能存着这个市场没有的交易对（以前是自由输入框）。
-        // 落到列表里，否则下拉会显示空白。
-        setDraft((current) => {
-          if (!current) return current;
-          if (!items.length || items.some((item) => item.symbol === current.last_symbol)) {
-            return current;
-          }
-          const fallback = items.find((item) => item.symbol === "BTC/USDT") ?? items[0];
-          return fallback ? { ...current, last_symbol: fallback.symbol } : current;
-        });
+        // 落到列表里，否则下拉会显示空白。换掉了要说一句，不然用户不知道自己的选择被改了。
+        const current = draftRef.current;
+        if (!current) return;
+        const from = current.last_symbol;
+        if (!items.length || items.some((item) => item.symbol === from)) {
+          setSymbolFallback(null);
+          return;
+        }
+        const fallback = items.find((item) => item.symbol === "BTC/USDT") ?? items[0];
+        if (!fallback) return;
+        setDraft((draftNow) => (draftNow ? { ...draftNow, last_symbol: fallback.symbol } : draftNow));
+        setSymbolFallback({ from, to: fallback.symbol });
       })
       .catch(() => {
         if (!cancelled) setSymbols([]);
@@ -853,7 +862,10 @@ export default function SettingsPage({ settings, settingsError = "", onSaved }: 
                     id="set-symbol"
                     className="select"
                     value={draft.last_symbol}
-                    onChange={(event) => patch({ last_symbol: event.target.value })}
+                    onChange={(event) => {
+                      patch({ last_symbol: event.target.value });
+                      setSymbolFallback(null);
+                    }}
                   >
                     {!symbols.some((item) => item.symbol === draft.last_symbol) && (
                       <option value={draft.last_symbol}>{draft.last_symbol || "先选市场"}</option>
@@ -864,6 +876,12 @@ export default function SettingsPage({ settings, settingsError = "", onSaved }: 
                       </option>
                     ))}
                   </select>
+                  <SymbolFallbackNote
+                    from={symbolFallback?.from ?? ""}
+                    to={symbolFallback?.to ?? ""}
+                    market={symbolMarket}
+                    layout="form"
+                  />
                   <span className="field-hint">
                     选项跟着「默认市场」走，和交易页的下拉是同一份。
                   </span>

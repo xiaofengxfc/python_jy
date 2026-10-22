@@ -1,7 +1,7 @@
 import { useState } from "react";
 import type { ReactNode } from "react";
 import { api, query } from "../api";
-import { fmt, fmtPrice, parseNumber } from "../format";
+import { fmt, fmtPrice, ledgerBasisNote, parseNumber } from "../format";
 import type { Account, OrderRow, Position, Protection, TradeRow } from "../types";
 import NewsPanel from "./NewsPanel";
 import ProtectionDialog from "./ProtectionDialog";
@@ -137,7 +137,15 @@ export default function BottomTabs({
           size,
         }),
       });
-      setCloseSizes((current) => ({ ...current, [position.symbol]: "" }));
+      // 成交后把这个交易对的临时数量删掉，而不是留一个空串。空串不是「没填过」：
+      // 它会把钱包行的预填（整笔余额）顶掉，界面上变成一个空框，再点一次就变成
+      // 「不带数量」——现货那等于让调用方自己给 size，后端直接 400。删掉键，
+      // 下一帧又回到默认：钱包行给最新余额，账本行留空（空 = 全平）。
+      setCloseSizes((current) => {
+        const next = { ...current };
+        delete next[position.symbol];
+        return next;
+      });
     });
   };
 
@@ -176,6 +184,12 @@ export default function BottomTabs({
     // pages cannot show a different PnL for one position.
     <span className={position.unrealized >= 0 ? "up" : "down"}>
       {fmt(position.unrealized, 2)}
+      {/* 现货行的数量是钱包余额、盈亏只算账本那部分：不说明这个数看着像算错。 */}
+      {ledgerBasisNote(position) && (
+        <span className="faint" style={{ marginLeft: 4, fontSize: "var(--fs-12)" }}>
+          {ledgerBasisNote(position)}
+        </span>
+      )}
     </span>,
     <span className={position.realized_pnl >= 0 ? "up" : "down"}>
       {fmt(position.realized_pnl, 2)}

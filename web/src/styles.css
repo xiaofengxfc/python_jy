@@ -1096,6 +1096,12 @@ input[type="range"].input:focus {
   line-height: 1.45;
 }
 
+/* 表单里贴着字段的那一份：不要行情头那套左右内边距，也不往上贴。 */
+.symbol-note.inline {
+  padding: 0;
+  margin: 6px 0 0;
+}
+
 /* ------------------------------------------------------ pair picker */
 .picker {
   position: relative;

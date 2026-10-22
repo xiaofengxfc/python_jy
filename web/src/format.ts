@@ -1,3 +1,18 @@
+/** 现货行的浮动盈亏是按账本数量算的：钱包余额里混着用户自己的币，多出来的那部分
+ *  不是本程序买的，不该摊进盈亏。两个数不一样时补一句「账本口径 0.0041」，
+ *  像是算错了。数量一致（合约行、纯账本行）时返回空串，界面上什么都不加。 */
+export function ledgerBasisNote(position: {
+  contracts: number;
+  unrealized_basis?: "" | "ledger";
+  ledger_size?: number;
+}): string {
+  if (position.unrealized_basis !== "ledger") return "";
+  const booked = Math.abs(position.ledger_size ?? 0);
+  if (booked <= 0) return "";
+  if (Math.abs(booked - Math.abs(position.contracts)) < 1e-9) return "";
+  return `账本口径 ${fmt(booked, 6)}`;
+}
+
 export function fmt(value: number | null | undefined, digits = 2): string {
   if (value === null || value === undefined || !Number.isFinite(value)) return "—";
   return value.toLocaleString("en-US", {

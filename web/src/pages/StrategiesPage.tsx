@@ -23,18 +23,21 @@ export default function StrategiesPage({ focus }: Props) {
   const [notice, setNotice] = useState("");
   const editor = useRef<StrategyEditorHandle>(null);
 
+  const applyList = (items: Strategy[], selectKey?: string) => {
+    setStrategies(items);
+    setSelected((current) => {
+      const want = selectKey || current;
+      if (want && items.some((item) => item.key === want)) return want;
+      return items[0]?.key ?? "";
+    });
+  };
+
   const refresh = useCallback(async (selectKey?: string) => {
     setLoading(true);
     setError("");
     try {
       const data = await api<{ items: Strategy[] }>("/api/strategies");
-      const items = data.items ?? [];
-      setStrategies(items);
-      setSelected((current) => {
-        const want = selectKey || current;
-        if (want && items.some((item) => item.key === want)) return want;
-        return items[0]?.key ?? "";
-      });
+      applyList(data.items ?? [], selectKey);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -47,6 +50,30 @@ export default function StrategiesPage({ focus }: Props) {
   }, [refresh, focus]);
 
   /** 内置被覆盖的仍算内置：它显示在「内置」组里，只是挂一个「已覆盖」。 */
+  /** 点「刷新」：刷新本身不动编辑器。只有当手上这条已经不在列表里（磁盘上被删、被改名）
+   *  时，选中项才会挪到第一条、编辑器跟着换成另一条源码——那等于把没保存的改动丢掉。
+   *  所以先问一句；用户不肯丢，就只更新列表，手上这份原样留着。 */
+  const reload = async () => {
+    setLoading(true);
+    setError("");
+    let items: Strategy[] = [];
+    try {
+      const data = await api<{ items: Strategy[] }>("/api/strategies");
+      items = data.items ?? [];
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+      setLoading(false);
+      return;
+    }
+    setLoading(false);
+    const gone = Boolean(selected) && !items.some((item) => item.key === selected);
+    if (gone && !confirmDiscard(`刷新（「${selected}」已经不在列表里，会切到别的策略）`)) {
+      setStrategies(items);
+      return;
+    }
+    applyList(items);
+  };
+
   const customItems = useMemo(
     () => strategies.filter((item) => !item.builtin),
     [strategies],
@@ -125,7 +152,7 @@ export default function StrategiesPage({ focus }: Props) {
         >
           复制为新策略
         </button>
-        <button type="button" className="btn-sm" onClick={() => void refresh()}>
+        <button type="button" className="btn-sm" onClick={() => void reload()}>
           刷新
         </button>
         <span className="spacer" />
