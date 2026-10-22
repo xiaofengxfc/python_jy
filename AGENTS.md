@@ -137,6 +137,14 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   `AITraderConfig.depth` 默认 quick（测试和「决策一次」用），界面默认 standard。
 - 裁决段的提示词只有一份，在 `ai_pipeline.DECISION_PROMPT`，`engine/ai_trader` 直接引用。
   改格式要同时改 `parse_decision`。
+- AI 交易没有单独的「允许实盘」总闸：`ai_auto` 里没有 `live_enabled`，`AITraderConfig` 也没有。
+  删它的理由很直接——设置页八张卡里从来没有这个控件，接口却拿它当启动前提，于是启动必定 400。
+  旧的 `config.json` 里残留 `"live_enabled": true` 不会报错：读盘按 dataclass 字段白名单过滤，
+  写盘只写 `to_dict()`，下一次保存顺手清掉；`PUT /api/settings` 带上它也走「未知字段忽略」。
+  启动条件就三条：AI 助手已启用、这条市场配了 API Key、主网调用方显式传 `confirm_live`
+  （测试网不需要）；现货还多一条，`require_stop` 时现货挂不了交易所侧的止损单，启动直接拒。
+  真正拦住乱下单的是凭据、`AIGuard`、`RiskManager`、急停/熔断和交易权 `TradeLease`，
+  别再补一道「实盘开关」回来。
 - 三个页面共用 `main.main > .ai-grid / .quant-grid / .lab-grid` 这套三列骨架：1400 起三列，
   1360 起两列，1024 以下单列交回页面滚动。列内卡片等高靠网格 stretch，卡内列表自己滚，
   空数据用 `.empty-note` / `.cand-empty` 的虚线框，不要再退回 1080 的单列。

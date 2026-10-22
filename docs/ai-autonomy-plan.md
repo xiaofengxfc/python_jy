@@ -89,7 +89,7 @@ schema 里没有 `leverage`。杠杆由启动参数决定，模型改不了。
 | INV-6 | 杠杆不能由模型改。要改杠杆只能停了再启动 | `AITraderConfig` |
 | INV-7 | 熔断和急停优先于一切。熔断时只允许减仓 | `RiskManager.check_order` |
 | INV-8 | 急停一个接口可达：`POST /api/risk/kill` 打开急停，停掉自动交易和 AI 交易，再发通知 | `web/routes.py` |
-| INV-9 | 主网下单要同时满足：`live_enabled`、`confirm_live`、主网、未急停 | `AITrader.start()` |
+| INV-9 | 真下单要同时满足：AI 已启用、该市场有凭据、主网还要 `confirm_live`、未急停。没有单独的实盘总闸 | `AITraderController._build`、`AITrader.start()` |
 | INV-10 | 模型失败或答案读不懂：不下单，保留原仓，也不重试下单 | `_decide_and_trade` |
 | INV-11 | 行情不可达就不下单。不拿 Gate 备用行情给实盘单定价 | `frame_provider` |
 | INV-12 | 决策有有效期和价格漂移两个闸门，过期或偏离就跳过 | `AIGuard` |
@@ -101,9 +101,11 @@ schema 里没有 `leverage`。杠杆由启动参数决定，模型改不了。
 
 存在 `config.json` 的 `ai_auto` 段里。密钥不在配置里，在系统密钥环。
 
+这里没有「允许实盘」开关：能不能真下单由这条市场的凭据决定，主网再要一次 `confirm_live`。
+旧配置里残留的 `live_enabled` 在读盘和写盘时都按未知字段丢掉（`ConfigStore` 的字段过滤、`_apply_ai_auto` 的 `hasattr` 检查）。
+
 | 字段 | 默认 | 作用 |
 |---|---|---|
-| `live_enabled` | `false` | 允许真下单的总闸。每次启动还要显式传 `confirm_live` |
 | `max_order_quote` | 50 | 单笔上限，单位 USDT |
 | `max_position_quote` | 200 | 最大持仓，单位 USDT |
 | `max_decisions_per_day` | 96 | 每天最多问模型几次 |
