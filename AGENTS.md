@@ -154,6 +154,20 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   回测 / 策略 / 实验室 / 设置。`StageBar`、`CandidateList`、`MetricGrid`、`ExecutionConsole`
   是共用件，别再各写一份。
 - 执行台和 AI 交易共用同一个账户，同时只能开一个，撞上了返回 409。
+- 熔断就是当场把交易权还回去：`halt()` 之后 `TradeLease` 立刻释放。熔断的实例本来就不
+  会再下单（`step()` 看 state、`_submit()` 看 `_stop_event`、`AIGuard` 看 halted_reason），
+  拦住「熔断期间新开仓」的是 `STATE_HALTED` 和 AIGuard，不是租约。别为了拦开仓把整个账户
+  锁死——以前 halt 不释放租约，熔断一次自动交易和 AI 量化就再也起不来。
+- `start()` 里租约拿到、决策线程却起不来时，state 回 `stopped`、租约放回、记一条
+  `start_failed` 审计，异常照旧抛出去。界面显示在跑而实际没有 poller 是最坏的一种状态。
+- 下单不改全局市场：订单落在哪个市场由 `OrderRequest.market_type` 决定，`POST /api/orders`
+  只是借用那个市场的 Key 槽，`set_market_type(..., persist=False)`，用完还原。以前默认
+  `persist=True`，下一张现货单就把侧栏、图表、设置页和 `config.json` 一起切成现货，
+  配置文件坏的时候还会在下单前 409。
+- 读持仓失败不等于没有持仓：`_live_held` 读不到就退回本地成交账本
+  （`trading._live_ledger()["books"]`），两边都不知道才返回 `None`——平仓和挂保护单报 503
+  说实话，`_is_reducing` 返回 False，不冒充减仓去赌交易所的 reduceOnly。以前读失败返回 0，
+  卖出不算减仓，熔断或急停期间想平仓都平不掉。
 
 ## 8. 策略
 
