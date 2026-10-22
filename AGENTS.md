@@ -52,8 +52,9 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   令牌名就是像素值，整体再抬一档要连名字一起改，别只改数值。窄窗口靠收 `.table` 的内边距，
   不靠缩字号。图表刻度也跟着令牌走：`chart/theme.ts` 用 `cssPx("--fs-12", 12)` 把令牌换成
   lightweight-charts 要的数字，令牌改了图表跟着变。
-- 内容列宽上限分两档：默认表单页 1080；资产页 `.stack.portfolio` 和三个 AI 页
-  `.ai-grid` / `.quant-grid` / `.lab-grid` 都是 1400。列靠 `margin: auto` 居中。
+- 内容列宽上限分两档：默认表单页 1080；1400 档是资产页 `.stack.portfolio`、回测页
+  `.stack.backtest`、策略页 `.strategy-page`，加三个 AI 页 `.ai-grid` / `.quant-grid` / `.lab-grid`。
+  列靠 `margin: auto` 居中。
   左右内边距不等：`.main` 左 22、右 12，右边 10px 由 `scrollbar-gutter: stable` 预留给滚动条，
   视觉上两边都是 22；别把右边改回 22，否则内容会横向跳。页面标题条用负 margin 反向出血铺满整行，
   `.page-head` 是 `margin: 0 -12px 0 -22px` 配 `padding: 0 12px 0 22px`；加新页照抄这套，别自己另写边距。
@@ -117,7 +118,38 @@ Node 不在 PATH 时，先把 Node 目录加进去。
 - 三个页面共用 `main.main > .ai-grid / .quant-grid / .lab-grid` 这套三列骨架：1400 起三列，
   1360 起两列，1024 以下单列交回页面滚动。列内卡片等高靠网格 stretch，卡内列表自己滚，
   空数据用 `.empty-note` / `.cand-empty` 的虚线框，不要再退回 1080 的单列。
+  策略页不走这套：`.strategy-page` 是两列，见第 8 节。
 - 三个页面各自独立，侧栏进：`AITradePage`（全自动交易）、`AIQuantPage`（候选 → 部署）、
-  `StrategyLabPage`（生成与调参）。`StageBar`、`CandidateList`、`MetricGrid`、`ExecutionConsole`
+  `StrategyLabPage`（生成与调参）。侧栏现在八项，顺序是交易 / AI 交易 / AI 量化 / 资产 /
+  回测 / 策略 / 实验室 / 设置。`StageBar`、`CandidateList`、`MetricGrid`、`ExecutionConsole`
   是共用件，别再各写一份。
 - 执行台和 AI 交易共用同一个账户，同时只能开一个，撞上了返回 409。
+
+## 8. 策略
+
+- 内置策略在包里：`src/btrader/strategy/builtin/*.py`，跟着程序升级走。用户策略是数据目录
+  `%APPDATA%/biTrader/strategies/*.py`（`paths.user_strategies_dir()`）下的普通 `.py` 文件。
+  AI 候选在 `strategies/candidates/`，不参与正式注册。策略是本机 Python 代码，权限和本程序相同。
+- 加载顺序是先内置、再用户目录。用户目录里的同名 `key` 顶掉内置，这就是「改内置」的实现：
+  顶替只在用户目录落盘，包内源码一个字节都不动。两个用户文件用同一个 key 仍然算冲突，
+  照旧报「策略 key 重复」并只留先加载的那个。
+- 覆盖状态由 registry 现算，不要自己再记一份：`is_builtin(key)` 是「包里有同名实现」（覆盖之后
+  仍为真），`is_overridden(key)` 是「现在跑的是用户目录里那份」。`GET /api/strategies` 里的
+  `builtin` / `overridden` 就是这两位。`editable` 现在恒为 true（内置也能改），别拿它判断来源。
+- 还原是 `POST /api/strategies/{key}/restore`：删掉覆盖文件，内置原版回来。不是覆盖版本返回 400
+  「这个策略不是覆盖版本」；一个文件里定义了多条策略时拒绝，要先把文件拆开；删完还有别的文件
+  占着这个 key 也返回 400，而不是假装成功。
+- 覆盖中的内置不能改名（`POST /api/strategies/{key}/rename` 返回 403）：改名会把内置留在旧 key
+  上。要换名字先还原，或者「复制为新策略」。只有纯自定义策略才走「写新文件 → 热加载 → 删旧文件」。
+- 保存（`PUT /api/strategies/{key}/source`）和还原在引擎正在跑这条策略时返回 409，自动交易和
+  AI 交易都算（`routes._strategy_in_use`）。引擎握着的是旧实例，换了文件也要重启引擎才生效，
+  别把这个 409 当成多余的检查。
+- 保存先过静态检查，写盘后如果加载不通过，会把文件回滚成原样再返回 422。这一步别去掉：坏文件
+  留在磁盘上界面上是看不见的（registry 会退回内置），用户只能去数据目录手删。
+- 三处入口的分工：侧栏「策略」页（`web/src/pages/StrategiesPage.tsx`）是唯一的源码编辑处；
+  回测页的「编辑源码」只跳过去并带上当前策略的 key；策略实验室详情卡的「在策略页编辑」同理，
+  带的是候选注册后的 key。三处共用 `components/StrategyEditor.tsx`，`layout="page"` 撑满策略页
+  卡片，回测页原来那个源码弹窗已经删了，别再恢复。
+- 策略页是两列骨架 `.strategy-page`：列表固定 300px，编辑器吃掉剩下的宽度，宽度上限跟三个 AI 页
+  一样走 1400 档。它本来就是两列，所以没有 1360 那一档；断点只有 1024 —— 变单列后代码区改成
+  固定 460px 自己滚，CodeMirror 外面那层 `.cm-theme` 的高度要一层层传下去，否则整页被源码撑长。
