@@ -245,6 +245,42 @@ class PreviewPayload(BaseModel):
     price: float | None = None
 
 
+class ConditionalPayload(BaseModel):
+    """A standalone trigger order: nothing is sent until the price touches.
+
+    ``direction`` is the ticket's own wording (below = 跌破, above = 涨破).
+    It is optional because the trigger compared with the mark price already
+    says the same thing, but when it is supplied it must agree — a ticket
+    that says 跌破 while the trigger sits above the market is a typo, and
+    arming it would fire on the next tick.
+    """
+
+    market: str = "spot"
+    symbol: str
+    side: str
+    order_type: str = "market"
+    size_mode: str = "amount"
+    size: float = Field(gt=0)
+    trigger: float = Field(gt=0)
+    price: float | None = Field(default=None, gt=0)
+    direction: str | None = None
+    reduce_only: bool = False
+    confirm_live: bool = False
+
+
+class ProtectionPayload(BaseModel):
+    """Arm / replace the exchange-side guard of a position that already exists.
+
+    Both levels are optional (setting only a stop is normal), ``market`` is
+    inferred from the symbol when omitted.
+    """
+
+    symbol: str
+    market: str | None = None
+    stop_loss: float | None = Field(default=None, gt=0)
+    take_profit: float | None = Field(default=None, gt=0)
+    confirm_live: bool = False
+
 class ClosePayload(BaseModel):
     """Close (or reduce) a position with a market order.
 
@@ -337,6 +373,27 @@ def _require_live_ready(
             status_code=400,
             detail="现货暂无交易所侧止损/止盈，请切换到合约市场或手动盯盘。",
         )
+
+
+def _ledger_entry_price(state: _State, market: MarketType, symbol: str) -> float:
+    """Average entry of the open leg for one pair, 0.0 when unknown.
+
+    The venue reports size, not cost basis, so this comes from the app's own
+    fill ledger. It is only used as a fallback reference when validating a
+    protective level against a market that has already run past it.
+    """
+    try:
+        snapshot = state.ctx.account.snapshot(market, symbol, refresh=True)
+    except Exception:
+        log.debug("读取持仓成本失败 %s", symbol, exc_info=True)
+        return 0.0
+    for position in getattr(snapshot, "positions", []) or []:
+        if position.get("symbol") == symbol:
+            try:
+                return float(position.get("entry_price") or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+    return 0.0
 
 
 def _live_held(state: _State, symbol: str, market: MarketType) -> float:
@@ -933,7 +990,244 @@ def create_app() -> FastAPI:
             "side": side,
         }
 
+    # ------------------------------------------------- conditional orders
+    def _reference_price(state: _State, mt: MarketType, symbol: str) -> float:
+        """Mark price from the venue that will execute, never from the chart."""
+        try:
+            with state.locks[mt]:
+                value = float(
+                    state.ctx.quote_rest(mt).fetch_ticker(mt, symbol).get("last") or 0.0
+                )
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=f"无法获取最新价：{exc}") from exc
+        if value <= 0:
+            raise HTTPException(status_code=400, detail="无法获取有效的参考价格")
+        return value
+
+    @app.post("/api/orders/conditional")
+    def api_place_conditional(payload: ConditionalPayload) -> dict[str, Any]:
+        """Arm a trigger order at the exchange (跌破 / 涨破 才真正下单).
+
+        Spot has no venue-side conditional order, so it is refused with a
+        message that says what to do instead. Turning it into a plain market
+        order would fill immediately at a price the user never agreed to.
+
+        Binance splits these by direction: for a BUY, a trigger above the mark
+        is a stop (breakout) and below it a take-profit (dip entry); a SELL is
+        the mirror image. The route picks the type from that rule, so the
+        caller only has to send side + trigger.
+        """
+        if payload.side not in ("buy", "sell"):
+            raise HTTPException(status_code=400, detail="方向必须是 buy 或 sell")
+        if payload.size_mode not in ("amount", "quote"):
+            raise HTTPException(status_code=400, detail="数量模式必须是 amount 或 quote")
+        if payload.direction not in (None, "below", "above"):
+            raise HTTPException(status_code=400, detail="触发方向必须是 below 或 above")
+
+        mt = _market(payload.market)
+        if not mt.is_futures:
+            raise HTTPException(
+                status_code=400,
+                detail="现货没有交易所侧条件单：请切到合约市场，或用币安自带的条件单。",
+            )
+        state = get_state()
+        with state.locks[mt]:
+            signed = state.ctx.rest_for(mt).has_credentials
+        _require_live_ready(
+            signed=signed,
+            confirm_live=payload.confirm_live,
+            network=state.ctx.network,
+        )
+
+        reference = _reference_price(state, mt, payload.symbol)
+        above = payload.trigger > reference
+        if payload.direction and (payload.direction == "above") != above:
+            asked = "涨破" if payload.direction == "above" else "跌破"
+            where = "上方" if above else "下方"
+            raise HTTPException(
+                status_code=400,
+                detail=f"触发方向对不上：触发价 {payload.trigger} 在现价 {reference} 的{where}，但选择的是{asked}。",
+            )
+        take_profit = (payload.side == "buy") != above
+
+        amount = (
+            payload.size / payload.trigger
+            if payload.size_mode == "quote"
+            else payload.size
+        )
+        try:
+            exchange_amount, base_qty = state.ctx.trading.exchange_amount(
+                mt, payload.symbol, amount, payload.trigger
+            )
+        except OrderRejected as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        try:
+            with state.locks[mt]:
+                order = state.ctx.rest_for(mt).create_conditional(
+                    mt,
+                    payload.symbol,
+                    payload.side,
+                    exchange_amount,
+                    payload.trigger,
+                    take_profit=take_profit,
+                    reduce_only=payload.reduce_only,
+                )
+        except ExchangeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            log.exception("条件单挂单失败")
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        state.ctx.trading.save_external_order(mt, order)
+        state.ctx.account.invalidate()
+        return {
+            "ok": True,
+            "order": order,
+            "price": reference,
+            "trigger": payload.trigger,
+            "kind": "take_profit" if take_profit else "stop",
+            "amount_base": base_qty,
+            "amount_exchange": exchange_amount,
+        }
+
+    # ------------------------------------------------------- protections
+    @app.put("/api/positions/protection")
+    def api_set_protection(payload: ProtectionPayload) -> dict[str, Any]:
+        """Arm, replace or clear the venue-side guard of an existing position.
+
+        Kept apart from ordering so a position opened bare (or a stop that has
+        to move as the trade develops) can be protected without touching the
+        entry. Futures only: spot has no reduce-only trigger order, and
+        pretending otherwise would leave the position naked.
+        """
+        mt = (
+            _market(payload.market)
+            if payload.market
+            else _market_for_symbol(payload.symbol)
+        )
+        if not mt.is_futures:
+            raise HTTPException(
+                status_code=400,
+                detail="现货没有交易所侧止损/止盈：现货仓位请手动卖出，或用币安自带的止损。",
+            )
+        if payload.stop_loss is None and payload.take_profit is None:
+            raise HTTPException(status_code=400, detail="至少要填止损或止盈其中之一")
+
+        state = get_state()
+        with state.locks[mt]:
+            signed = state.ctx.rest_for(mt).has_credentials
+        _require_live_ready(
+            signed=signed,
+            confirm_live=payload.confirm_live,
+            network=state.ctx.network,
+            market=mt,
+        )
+
+        held = _live_held(state, payload.symbol, mt)
+        if abs(held) <= 1e-12:
+            raise HTTPException(status_code=400, detail="当前没有该交易对的持仓")
+        long = held > 0
+        exit_side = "sell" if long else "buy"
+        entry_side = "buy" if long else "sell"
+
+        reference = _reference_price(state, mt, payload.symbol)
+        try:
+            _check_protection_levels(
+                reference, payload.stop_loss, payload.take_profit, entry_side
+            )
+        except HTTPException:
+            # The market may already have run past the level the user wants.
+            # The position entry is the honest reference for "is this a stop?",
+            # so only reject when the level is wrong for that too.
+            entry = _ledger_entry_price(state, mt, payload.symbol)
+            if entry <= 0:
+                raise
+            _check_protection_levels(
+                entry, payload.stop_loss, payload.take_profit, entry_side
+            )
+
+        try:
+            size_exchange, _ = state.ctx.trading.exchange_amount(
+                mt, payload.symbol, abs(held), reference
+            )
+        except OrderRejected as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        rest = state.ctx.rest_for(mt)
+        try:
+            with state.locks[mt]:
+                cleared = rest.cancel_protective_orders(mt, payload.symbol)
+        except ExchangeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        placed: list[dict] = []
+        warnings: list[str] = []
+        for level, take_profit, label in (
+            (payload.stop_loss, False, "止损"),
+            (payload.take_profit, True, "止盈"),
+        ):
+            if not level:
+                continue
+            try:
+                with state.locks[mt]:
+                    if take_profit:
+                        order = rest.create_take_profit_market(
+                            mt, payload.symbol, exit_side, size_exchange, level
+                        )
+                    else:
+                        order = rest.create_stop_market(
+                            mt, payload.symbol, exit_side, size_exchange, level
+                        )
+            except ExchangeError as exc:
+                warnings.append(f"{label}单挂单失败：{exc}")
+                continue
+            placed.append(order)
+            state.ctx.trading.save_external_order(mt, order)
+        state.ctx.account.invalidate()
+        if not placed:
+            raise HTTPException(
+                status_code=400,
+                detail="；".join(warnings) if warnings else "止损/止盈都没有挂上",
+            )
+        return {
+            "ok": True,
+            "protection": {
+                "symbol": payload.symbol,
+                "stop_loss": payload.stop_loss or 0.0,
+                "take_profit": payload.take_profit or 0.0,
+                "orders": [item.get("id") for item in placed],
+            },
+            "price": reference,
+            "size": abs(held),
+            "cleared": cleared,
+            "warnings": warnings,
+        }
+
+    @app.delete("/api/positions/protection")
+    def api_clear_protection(
+        symbol: str, market: str | None = None
+    ) -> dict[str, Any]:
+        """Disarm the stop-loss / take-profit guard of one symbol."""
+        if not symbol:
+            raise HTTPException(status_code=400, detail="缺少交易对")
+        mt = _market(market) if market else _market_for_symbol(symbol)
+        if not mt.is_futures:
+            raise HTTPException(
+                status_code=400,
+                detail="现货没有交易所侧止损/止盈，无需撤销。",
+            )
+        state = get_state()
+        try:
+            with state.locks[mt]:
+                cleared = state.ctx.rest_for(mt).cancel_protective_orders(mt, symbol)
+        except ExchangeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        state.ctx.account.invalidate()
+        return {"ok": True, "cleared": cleared}
+
     # -------------------------------------------------------------- logs
+
     @app.get("/api/logs")
     def api_logs(limit: int = 200) -> dict[str, Any]:
         """Recent warnings/errors for the in-app log viewer."""

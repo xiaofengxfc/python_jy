@@ -736,6 +736,7 @@ export default function TradingPage({
             account={account}
             symbol={symbol}
             market={market}
+            network={health?.network ?? "mainnet"}
             onChanged={() => {
               setActionError("");
               void refreshAccount();

@@ -24,6 +24,21 @@ TIMEFRAME_SECONDS: dict[str, int] = {
 TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d", "1w"]
 
 
+# Exchange-side protective orders, recognised by ccxt's normalized type.
+STOP_TYPES = {
+    "stop",
+    "stop_market",
+    "stop_loss",
+    "stop_loss_limit",
+    "trading_stop",
+}
+TAKE_PROFIT_TYPES = {
+    "take_profit",
+    "take_profit_market",
+    "take_profit_limit",
+}
+PROTECTIVE_TYPES = STOP_TYPES | TAKE_PROFIT_TYPES
+
 class MarketType(str, Enum):
     SPOT = "spot"
     USDM = "usdm"

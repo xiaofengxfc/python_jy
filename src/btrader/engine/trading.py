@@ -239,6 +239,23 @@ class TradingService:
             # No key means no position to protect: a fresh testnet account is
             # genuinely flat, and refusing every order would be useless.
             return 0.0
+        if req.market_type is MarketType.SPOT:
+            # Spot has no position endpoint — the holding IS the balance. Asking
+            # ccxt for positions raised NotSupported, which made every spot
+            # order fail as "cannot read the position".
+            try:
+                balance = self.rest.fetch_balance(req.market_type)
+            except Exception:
+                log.warning("读取现货余额失败，无法校验持仓上限", exc_info=True)
+                return None
+            totals = balance.get("total") if isinstance(balance, dict) else None
+            if not isinstance(totals, dict):
+                return None
+            base = req.symbol.split("/")[0]
+            try:
+                return max(0.0, float(totals.get(base) or 0.0)) * price
+            except (TypeError, ValueError):
+                return None
         try:
             positions = self.rest.fetch_positions(req.market_type, [req.symbol])
         except Exception:
@@ -406,6 +423,20 @@ class TradingService:
             except Exception:  # pragma: no cover - history is best effort
                 log.warning("保护单写库失败", exc_info=True)
         return placed, warnings
+
+    def save_external_order(self, market_type: MarketType, order: dict) -> None:
+        """Record an order that was placed outside :meth:`submit`.
+
+        Protective stops and standalone trigger orders are armed by the routes,
+        not by an :class:`OrderRequest`, but the history table should still know
+        about them — otherwise "全部委托" silently loses every guard.
+        """
+        try:
+            self.db.save_order(
+                self._account_id(), market_type.value, order, RunMode.LIVE.value
+            )
+        except Exception:  # pragma: no cover - history is best effort
+            log.warning("外部挂单写库失败", exc_info=True)
 
     # ------------------------------------------------------------------ cancel
     def cancel(

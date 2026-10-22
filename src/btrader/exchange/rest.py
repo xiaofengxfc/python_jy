@@ -10,7 +10,7 @@ import ccxt
 
 from ..core.contracts import DEFAULT_SPEC, ContractSpec
 from ..core.credentials import Credentials
-from ..core.types import MarketType, Network
+from ..core.types import PROTECTIVE_TYPES, MarketType, Network
 
 log = logging.getLogger(__name__)
 
@@ -325,6 +325,34 @@ class BinanceREST:
             market, symbol, side, amount, target_price, take_profit=True
         )
 
+    def create_conditional(
+        self,
+        market: MarketType,
+        symbol: str,
+        side: str,
+        amount: float,
+        trigger_price: float,
+        *,
+        take_profit: bool,
+        reduce_only: bool = False,
+    ) -> dict:
+        """Arm a standalone trigger order: it only reaches the market once
+        the price touches the trigger.
+
+        ``reduce_only=False`` is an entry, ``True`` an exit. The protective
+        wrappers above always pass ``True``, because a stop that cannot close
+        is worse than no stop at all.
+        """
+        return self._create_conditional(
+            market,
+            symbol,
+            side,
+            amount,
+            trigger_price,
+            take_profit=take_profit,
+            reduce_only=reduce_only,
+        )
+
     def _create_conditional(
         self,
         market: MarketType,
@@ -334,13 +362,14 @@ class BinanceREST:
         trigger_price: float,
         *,
         take_profit: bool,
+        reduce_only: bool = True,
     ) -> dict:
         self._require_auth()
         if not market.is_futures:
             raise ExchangeError("现货暂不支持交易所侧条件单，请使用合约或手动盯盘。")
         price = self.price_to_precision(market, symbol, trigger_price)
         params: dict = {
-            "reduceOnly": True,
+            "reduceOnly": reduce_only,
             "takeProfitPrice" if take_profit else "stopLossPrice": price,
         }
         try:
@@ -349,6 +378,30 @@ class BinanceREST:
             )
         except Exception as exc:
             raise ExchangeError(_message(exc)) from exc
+
+    def cancel_protective_orders(self, market: MarketType, symbol: str) -> int:
+        """Cancel just the stop / take-profit orders on a symbol.
+
+        Re-arming a guard must replace the old one, but blanket-cancelling
+        everything would also kill a resting limit entry the user still wants.
+        """
+        self._require_auth()
+        client = self.client(market)
+        try:
+            resting = client.fetch_open_orders(symbol)
+        except Exception as exc:
+            raise ExchangeError(_message(exc)) from exc
+        canceled = 0
+        for order in resting or []:
+            kind = str(order.get("type") or "").lower()
+            if kind not in PROTECTIVE_TYPES:
+                continue
+            try:
+                client.cancel_order(order.get("id"), symbol, order.get("params") or {})
+                canceled += 1
+            except Exception:  # already filled or canceled by the venue
+                log.debug("撤销保护单失败 %s", order.get("id"), exc_info=True)
+        return canceled
 
     def cancel_symbol_orders(self, market: MarketType, symbol: str) -> int:
         """Cancel every resting order on a symbol, returning how many went.

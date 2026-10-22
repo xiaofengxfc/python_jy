@@ -53,6 +53,8 @@ class FakeVenue:
     leverage_calls: list[tuple] = field(default_factory=list)
     canceled: list[tuple] = field(default_factory=list)
     stop_orders: list[tuple] = field(default_factory=list)
+    conditional_orders: list[dict] = field(default_factory=list)
+    protections_cleared: list[str] = field(default_factory=list)
     open_orders: list[dict] = field(default_factory=list)
     spec_overrides: dict[MarketType, ContractSpec] = field(default_factory=dict)
     _book: dict[str, float] = field(default_factory=dict)
@@ -178,11 +180,64 @@ class FakeVenue:
 
     def create_stop_market(self, market: MarketType, symbol: str, side: str, amount: float, stop_price: float) -> dict:
         self.stop_orders.append(("stop", symbol, side, amount, stop_price))
-        return {"id": f"stop-{len(self.stop_orders)}", "status": "open", "type": "STOP_MARKET"}
+        return self._protective("stop_market", symbol, side, amount, stop_price)
 
     def create_take_profit_market(self, market: MarketType, symbol: str, side: str, amount: float, target_price: float) -> dict:
         self.stop_orders.append(("target", symbol, side, amount, target_price))
-        return {"id": f"tp-{len(self.stop_orders)}", "status": "open", "type": "TAKE_PROFIT_MARKET"}
+        return self._protective("take_profit_market", symbol, side, amount, target_price)
+
+    def create_conditional(
+        self,
+        market: MarketType,
+        symbol: str,
+        side: str,
+        amount: float,
+        trigger_price: float,
+        *,
+        take_profit: bool = False,
+        reduce_only: bool = False,
+    ) -> dict:
+        order = self._protective(
+            "take_profit_market" if take_profit else "stop_market",
+            symbol,
+            side,
+            amount,
+            trigger_price,
+            prefix="cond",
+        )
+        order["take_profit"] = take_profit
+        order["reduce_only"] = reduce_only
+        self.conditional_orders.append(order)
+        return order
+
+    def cancel_protective_orders(self, market: MarketType, symbol: str) -> int:
+        cleared = len(self.stop_orders)
+        self.stop_orders.clear()
+        self.protections_cleared.append(symbol)
+        return cleared
+
+    def _protective(
+        self,
+        kind: str,
+        symbol: str,
+        side: str,
+        amount: float,
+        trigger: float,
+        prefix: str = "",
+    ) -> dict:
+        """The shape ccxt returns for a trigger order (only the fields we read)."""
+        name = prefix or ("tp" if kind.startswith("take_profit") else "stop")
+        return {
+            "id": f"{name}-{len(self.stop_orders)}",
+            "symbol": symbol,
+            "side": side,
+            "type": kind,
+            "amount": amount,
+            "price": trigger,
+            "trigger": trigger,
+            "status": "open",
+            "timestamp": int(time.time() * 1000),
+        }
 
     # ---------------------------------------------------------------- helpers
     def position_base(self, symbol: str) -> float:

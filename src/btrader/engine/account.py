@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from ..core.storage import Database
-from ..core.types import MarketType, Network
+from ..core.types import STOP_TYPES, TAKE_PROFIT_TYPES, MarketType, Network
 
 log = logging.getLogger(__name__)
 
@@ -34,19 +34,6 @@ log = logging.getLogger(__name__)
 # starts from its own first-seen equity instead of a made-up starting balance.
 BASELINE_KEY = "account.baseline.v1"
 
-# Exchange-side protective orders, recognised by ccxt's normalized type.
-STOP_TYPES = {
-    "stop",
-    "stop_market",
-    "stop_loss",
-    "stop_loss_limit",
-    "trading_stop",
-}
-TAKE_PROFIT_TYPES = {
-    "take_profit",
-    "take_profit_market",
-    "take_profit_limit",
-}
 
 # How many stored fills the ledger replay reads. Long enough to cover a busy
 # day of scalping, short enough that the replay stays microseconds.

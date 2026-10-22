@@ -4,6 +4,7 @@ import { api, query } from "../api";
 import { fmt, fmtPrice, parseNumber } from "../format";
 import type { Account, OrderRow, Position, Protection, TradeRow } from "../types";
 import NewsPanel from "./NewsPanel";
+import ProtectionDialog from "./ProtectionDialog";
 import Table from "./Table";
 import TradeDetailDialog from "./TradeDetailDialog";
 
@@ -14,6 +15,8 @@ interface Props {
   /** Venue the panel is showing; closes must name it, or a futures exit is
    * looked up in the spot book and reported as "没有该交易对的持仓". */
   market?: string;
+  /** mainnet or testnet: arming a guard on mainnet needs an acknowledgement. */
+  network?: string;
   /** Reload the account after a cancel or close. */
   onChanged?: () => void;
   onError?: (message: string) => void;
@@ -42,6 +45,7 @@ export default function BottomTabs({
   account,
   symbol = "",
   market = "spot",
+  network = "mainnet",
   onChanged,
   onError,
   aiPanel,
@@ -60,6 +64,8 @@ export default function BottomTabs({
   const [closeSizes, setCloseSizes] = useState<Record<string, string>>({});
   // Fill whose full record is open.
   const [tradeDetail, setTradeDetail] = useState<TradeRow | null>(null);
+  // Position whose exchange-side guard is being edited.
+  const [guarded, setGuarded] = useState<Position | null>(null);
 
   const orders = (account?.orders ?? []).filter((order) => order.status === "open");
   const trades = account?.trades ?? [];
@@ -330,6 +336,18 @@ export default function BottomTabs({
                   }
                 />,
                 <div className="row-actions">
+                  {/* Spot has no venue-side stop, so the button would only
+                      lead to a rejection. Futures only. */}
+                  {market !== "spot" && (
+                    <button
+                      type="button"
+                      className="btn-sm"
+                      disabled={busy !== null}
+                      onClick={() => setGuarded(position)}
+                    >
+                      止损止盈
+                    </button>
+                  )}
                   <button
                     type="button"
                     className="btn-sm"
@@ -355,6 +373,17 @@ export default function BottomTabs({
 
       {tradeDetail && (
         <TradeDetailDialog trade={tradeDetail} onClose={() => setTradeDetail(null)} />
+      )}
+
+      {guarded && (
+        <ProtectionDialog
+          position={guarded}
+          protection={guardFor(guarded.symbol)}
+          market={market}
+          network={network}
+          onClose={() => setGuarded(null)}
+          onSaved={onChanged}
+        />
       )}
     </>
   );

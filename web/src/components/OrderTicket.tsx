@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api } from "../api";
+import { api, query } from "../api";
 import { fmt, fmtPrice, parseNumber } from "../format";
 import type { OrderPreview, OrderType, Protection, Side, SizeMode } from "../types";
 
@@ -78,6 +78,10 @@ export default function OrderTicket({
   });
   const [stopLoss, setStopLoss] = useState("");
   const [takeProfit, setTakeProfit] = useState("");
+  // Trigger order: waits for the market to cross a level before it is sent.
+  const [trigger, setTrigger] = useState("");
+  const [triggerDirection, setTriggerDirection] = useState<"below" | "above">("below");
+  const [conditionalBusy, setConditionalBusy] = useState(false);
   const [preview, setPreview] = useState<OrderPreview | null>(null);
   const [previewError, setPreviewError] = useState("");
   const [flash, setFlash] = useState<Flash | null>(null);
@@ -116,6 +120,7 @@ export default function OrderTicket({
     );
     setStopLoss("");
     setTakeProfit("");
+    setTrigger("");
     setPreview(null);
     setPreviewError("");
     setFlash(null);
@@ -342,6 +347,105 @@ export default function OrderTicket({
     }
   };
 
+  /** Arm a standalone trigger order: nothing reaches the exchange until the
+   * price crosses the level, then it becomes a market order. Futures only —
+   * the block below explains that instead of silently doing nothing. */
+  const submitConditional = async () => {
+    const amount = parseNumber(size);
+    const level = parseNumber(trigger);
+    if (amount <= 0) return setFlash({ tone: "err", text: "请填写数量或金额。" });
+    if (level <= 0) return setFlash({ tone: "err", text: "请填写触发价。" });
+    setConditionalBusy(true);
+    setFlash(null);
+    try {
+      const result = await api<{
+        trigger: number;
+        amount_base: number;
+        kind: string;
+      }>("/api/orders/conditional", {
+        method: "POST",
+        body: JSON.stringify({
+          market,
+          symbol,
+          side,
+          order_type: "market",
+          size_mode: sizeMode,
+          size: amount,
+          trigger: level,
+          direction: triggerDirection,
+          reduce_only: side === "sell" && positionQty > 0,
+          confirm_live: live,
+        }),
+      });
+      setFlash({
+        tone: "ok",
+        text:
+          "条件单已挂出：" +
+          (triggerDirection === "below" ? "跌破 " : "涨破 ") +
+          fmtPrice(result.trigger) +
+          " 后" +
+          (side === "buy" ? "买入 " : "卖出 ") +
+          fmt(result.amount_base, 6) +
+          " " +
+          base,
+      });
+      setTrigger("");
+      onFilled();
+    } catch (error) {
+      setFlash({ tone: "err", text: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setConditionalBusy(false);
+    }
+  };
+
+  /** Move the levels above onto the position that is already open. The server
+   * knows which side that position is, so it is the one that validates them. */
+  const applyProtection = async () => {
+    const stop = parseNumber(stopLoss);
+    const target = parseNumber(takeProfit);
+    if (!stop && !target) return setFlash({ tone: "err", text: "请填写止损或止盈价。" });
+    setBusy(true);
+    setFlash(null);
+    try {
+      await api("/api/positions/protection", {
+        method: "PUT",
+        body: JSON.stringify({
+          symbol,
+          market,
+          stop_loss: stop > 0 ? stop : null,
+          take_profit: target > 0 ? target : null,
+          confirm_live: live,
+        }),
+      });
+      const parts = [
+        stop > 0 ? "止损 " + fmtPrice(stop) : "",
+        target > 0 ? "止盈 " + fmtPrice(target) : "",
+      ].filter(Boolean);
+      setFlash({ tone: "ok", text: "已挂到持仓：" + parts.join(" · ") });
+      onFilled();
+    } catch (error) {
+      setFlash({ tone: "err", text: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const clearProtection = async () => {
+    setBusy(true);
+    setFlash(null);
+    try {
+      await api("/api/positions/protection?" + query({ symbol, market }), {
+        method: "DELETE",
+      });
+      setFlash({ tone: "ok", text: "已撤销该交易对的止损/止盈。" });
+      onFilled();
+    } catch (error) {
+      setFlash({ tone: "err", text: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setBusy(false);
+    }
+  };
+
   /** One button, one dialog on mainnet: send or don't. */
   const submit = () => {
     if (live) {
@@ -555,6 +659,19 @@ export default function OrderTicket({
               </span>
               <span className="faint">按交易所触发价成交</span>
             </div>
+            {positionQty !== 0 && (
+              <div className="protect-hint">
+                <span className="faint">也可以直接改挂到当前持仓</span>
+                <button
+                  type="button"
+                  className="link-btn"
+                  disabled={busy || (!parseNumber(stopLoss) && !parseNumber(takeProfit))}
+                  onClick={() => void applyProtection()}
+                >
+                  应用到持仓
+                </button>
+              </div>
+            )}
             {protection && (protection.stop_loss > 0 || protection.take_profit > 0) && (
               <div className="protect-hint">
                 <span>
@@ -566,11 +683,82 @@ export default function OrderTicket({
                     <b className="num up"> 止盈 {fmtPrice(protection.take_profit)}</b>
                   ) : null}
                 </span>
-                <span className="faint">在交易所撤单页调整</span>
+                <button
+                  type="button"
+                  className="link-btn"
+                  disabled={busy}
+                  onClick={() => void clearProtection()}
+                >
+                  撤销
+                </button>
               </div>
             )}
           </div>
         )}
+
+        {/* Step 3.6 — a standalone trigger order. It is not tied to a position,
+            so it can wait for a pullback entry or pre-place an exit. Spot has
+            no venue-side trigger order at all, so the block says so rather than
+            pretending to arm one. */}
+        <div className="field">
+          <label className="field-label" htmlFor="trigger-input">
+            <span>条件单</span>
+            <em>{market === "spot" ? "仅合约市场支持" : "触发后按市价成交"}</em>
+          </label>
+          {market === "spot" ? (
+            <div className="protect-hint">
+              <span className="faint">
+                现货没有交易所侧条件单，请用币安自带的「止盈止损」下单。
+              </span>
+            </div>
+          ) : (
+            <>
+              <div className="conditional-row">
+                <div className="segmented">
+                  <button
+                    type="button"
+                    aria-pressed={triggerDirection === "below"}
+                    onClick={() => setTriggerDirection("below")}
+                  >
+                    跌破
+                  </button>
+                  <button
+                    type="button"
+                    aria-pressed={triggerDirection === "above"}
+                    onClick={() => setTriggerDirection("above")}
+                  >
+                    涨破
+                  </button>
+                </div>
+                <input
+                  id="trigger-input"
+                  className="input"
+                  type="text"
+                  inputMode="decimal"
+                  autoComplete="off"
+                  placeholder="触发价"
+                  value={trigger}
+                  onChange={(event) => setTrigger(event.target.value)}
+                />
+              </div>
+              <div className="protect-hint">
+                <span className="faint">
+                  数量沿用上方填写值（
+                  {triggerDirection === "below" ? "跌到触发价才下单" : "涨到触发价才下单"}
+                  ）
+                </span>
+                <button
+                  type="button"
+                  className="link-btn"
+                  disabled={conditionalBusy || !trigger || !size}
+                  onClick={() => void submitConditional()}
+                >
+                  {conditionalBusy ? "挂出中…" : "挂条件单"}
+                </button>
+              </div>
+            </>
+          )}
+        </div>
 
         {/* Step 4 — fees and the risk verdict. */}
         <div className="preview">

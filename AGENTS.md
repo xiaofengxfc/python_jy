@@ -53,7 +53,10 @@ Node 不在 PATH 时：`$env:Path = "D:\tool\node;" + $env:Path`。
   全钱包的权益（`wallet_ttl` 10 秒），所以侧栏和资产页永远是同一个数。
 - 权益基线（`account.baseline.v1:<network>:<market>`）只由**全钱包**读写入，
   单交易对读只继承；否则第一次读的那一对会把一个偏小的金额冻成「起始资金」。
-- 现货没有 reduce-only 触发单：止损/止盈只在合约市场挂到交易所侧；条件单尚未开放。
+- 现货没有 reduce-only 触发单：止损/止盈和条件单都只在合约市场挂到交易所侧，
+  现货请求会返回明确文案（`PUT /api/positions/protection`、`POST /api/orders/conditional`）。
+- 保护单接口是「重挂」语义：先 `cancel_protective_orders` 只撤该交易对的止损/止盈，
+  不会连挂着的限价单一起撤掉；条件单的类型由触发价与现价的相对位置决定，别自己猜。
 - 历史 SQLite 里 `mode='paper'` 的旧成交仍在库里，界面只显示 `live` 的成交。
 
 ## 4. 已验证的现实约束（别重新踩）
