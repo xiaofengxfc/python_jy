@@ -54,12 +54,34 @@ export default function StrategiesPage({ focus }: Props) {
     [strategies],
   );
 
+  /** 编辑器里有没保存的改动时先问一句：换策略等于把它丢掉。
+   *  这里用的是 app 里其他破坏性操作同一个办法（window.confirm），不另做弹窗。 */
+  const confirmDiscard = (what: string) =>
+    !editor.current?.hasUnsaved() ||
+    window.confirm(`当前策略还有没保存的修改，${what}就丢了。继续？`);
+
+  const pick = (key: string) => {
+    if (key === selected) return;
+    if (!confirmDiscard(`切到「${key}」`)) return;
+    setSelected(key);
+  };
+
+  const startNew = () => {
+    if (!confirmDiscard("新建")) return;
+    editor.current?.startNew();
+  };
+
+  const fork = () => {
+    if (!confirmDiscard("复制为新策略")) return;
+    editor.current?.fork();
+  };
+
   const row = (item: Strategy) => (
     <li key={item.key}>
       <button
         type="button"
         className={`cand-item${item.key === selected ? " active" : ""}`}
-        onClick={() => setSelected(item.key)}
+        onClick={() => pick(item.key)}
       >
         <span className="cand-top">
           <b>{item.name}</b>
@@ -88,7 +110,7 @@ export default function StrategiesPage({ focus }: Props) {
         <button
           type="button"
           className="btn-sm"
-          onClick={() => editor.current?.startNew()}
+          onClick={startNew}
         >
           新建
         </button>
@@ -96,7 +118,7 @@ export default function StrategiesPage({ focus }: Props) {
           type="button"
           className="btn-sm"
           disabled={!selected}
-          onClick={() => editor.current?.fork()}
+          onClick={fork}
         >
           复制为新策略
         </button>

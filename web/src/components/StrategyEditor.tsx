@@ -55,10 +55,12 @@ interface ValidationReport {
   imports?: string[];
 }
 
-/** 「新建」「复制为新策略」两个动作的状态在编辑器里，策略页的工具条要能远程触发。 */
+/** 「新建」「复制为新策略」两个动作的状态在编辑器里，策略页的工具条要能远程触发。
+ *  hasUnsaved 让外面在换策略之前问一句：换过去等于把没保存的改动丢掉。 */
 export interface StrategyEditorHandle {
   startNew: () => void;
   fork: () => void;
+  hasUnsaved: () => boolean;
 }
 
 interface Props {
@@ -182,7 +184,7 @@ export default function StrategyEditor({
     setNotice(`已复制为「${key}」，保存后会生成新文件，原策略不变。`);
   };
 
-  useImperativeHandle(ref, () => ({ startNew, fork }));
+  useImperativeHandle(ref, () => ({ startNew, fork, hasUnsaved: () => code !== original }));
 
   /** Drop the override file and go back to the package copy. Only offered when
    * the current source is an override, which the detail payload tells us. */

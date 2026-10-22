@@ -315,3 +315,23 @@ def test_spot_backtest_cannot_ask_for_shorts() -> None:
     assert "现货不能做空" in page
     # 合约还是能勾
     assert "允许做空（仅合约市场生效）" in page
+
+def test_switching_strategy_asks_before_dropping_unsaved_edits() -> None:
+    """左边换策略会把右边没保存的改动直接丢掉，得先问一句。
+
+    策略页的列表在页面里、编辑器在组件里，页面拿不到 dirty，只能通过编辑器暴露的
+    hasUnsaved() 问一次；「新建」「复制为新策略」同样会覆盖编辑区，也走这条路。
+    """
+    page = (UI_DIR / "pages" / "StrategiesPage.tsx").read_text(encoding="utf-8")
+    editor = (UI_DIR / "components" / "StrategyEditor.tsx").read_text(encoding="utf-8")
+
+    assert "hasUnsaved: () => boolean;" in editor
+    assert "hasUnsaved: () => code !== original" in editor
+
+    assert "const confirmDiscard" in page
+    assert "window.confirm(`当前策略还有没保存的修改" in page
+    # 三个入口都要过这道问句
+    assert page.count("confirmDiscard(") >= 3
+    assert "if (!confirmDiscard(`切到" in page
+    assert 'onClick={() => pick(item.key)}' in page
+    assert "onClick={startNew}" in page and "onClick={fork}" in page
