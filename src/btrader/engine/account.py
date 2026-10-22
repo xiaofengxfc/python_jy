@@ -443,6 +443,10 @@ class AccountService:
             # 有的东西：充值的、测试网白送的、空投的。它们的成本价是 0，硬算盈亏
             # 会得到一个假数字，所以单独标出来。
             origin = "ledger" if amount_in_ledger > 0 and entry > 0 else "wallet"
+            # 盈亏只能按账本数量算。以前 entry 取账本、数量取钱包，两边混用：钱包
+            # 1.00042 而账本 0.00042 时按 1.00042 算，报出 +1000 USDT 的假浮盈。
+            # 封顶于钱包余额：账本比钱包多说明币已经被提走，那部分不再是我们的敞口。
+            booked = min(amount, amount_in_ledger) if origin == "ledger" else 0.0
             out.append(
                 {
                     "symbol": name,
@@ -450,7 +454,10 @@ class AccountService:
                     "side": "long",
                     "entry_price": entry,
                     "last": last,
-                    "unrealized": (last - entry) * amount if entry and origin == "ledger" else 0.0,
+                    "unrealized": (last - entry) * booked if origin == "ledger" else 0.0,
+                    # 盈亏口径写在数据里：界面据此标「账本口径」，不是凭空的数。
+                    "unrealized_basis": "ledger" if origin == "ledger" else "",
+                    "ledger_size": booked,
                     "quote_value": amount * last,
                     "realized_pnl": float(state.get("realized") or 0.0),
                     "fees": float(state.get("fees") or 0.0),

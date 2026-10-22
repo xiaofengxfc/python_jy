@@ -15,7 +15,14 @@ from typing import Any, Callable
 
 from ..core.config import AppSettings
 from ..core.storage import Database
-from ..core.types import MarketType, Network, OrderSide, OrderType, RunMode
+from ..core.types import (
+    MarketType,
+    Network,
+    OrderSide,
+    OrderType,
+    RunMode,
+    market_for_symbol,
+)
 from ..exchange.rest import BinanceREST, ExchangeError
 from ..exchange.symbols import format_amount
 from ..notify import Notifier
@@ -46,6 +53,15 @@ def venue_rejection_message(exc: Exception) -> str:
 # charge the same exit twice.
 LIVE_LEDGER_KEY = "live.ledger.v1"
 LIVE_TRADE_LIMIT = 800
+
+
+def _symbol_market(symbol: str) -> MarketType:
+    """Which market one ccxt symbol belongs to: spot has no settle part.
+
+    判定只有一份，在 core.types.market_for_symbol（交割合约的到期日先切掉再判）；
+    这里以前自己又写了一份，和 web 那两份各说各话。
+    """
+    return market_for_symbol(symbol)
 
 
 class OrderRejected(RuntimeError):
@@ -130,6 +146,11 @@ class TradingService:
         # Leverage already pushed to the venue, keyed by (market, symbol).
         # Setting it on every order would burn a signed request each time.
         self._leverage_applied: dict[tuple[MarketType, str], float] = {}
+        # Pairs this process has actually sent an order for, per market. The fill
+        # sync can only poll pairs it can name: spot has no position object, and
+        # the settings pair usually points at a contract, so a freshly bought
+        # spot pair was invisible and its fills never reached the local ledger.
+        self._traded: dict[MarketType, set[str]] = {}
 
     # ------------------------------------------------------------------ sizing
     def amount_from_quote(self, market_type: MarketType, symbol: str, quote: float, price: float) -> float:
@@ -187,6 +208,10 @@ class TradingService:
         minimum (e.g. less than one contract on coin-M).
         """
         rest = self.rest_for(market_type)
+        # 账本里的数量是浮点累加出来的（0.00012 + 0.0003 = 0.00041999999999999996），
+        # 直接交给交易所截位会掉一个最小步长（0.00041），全平之后账本上还剩下
+        # 0.00001 的尘埃，低于最小下单额再也卖不掉。先收敛掉浮点噪声再截。
+        base_qty = round(float(base_qty), 12)
         spec = rest.contract_spec(
             market_type, symbol, allow_network=not offline
         )
@@ -294,9 +319,15 @@ class TradingService:
             # genuinely flat, and refusing every order would be useless.
             return 0.0
         if req.market_type is MarketType.SPOT:
-            # Spot has no position endpoint — the holding IS the balance. Asking
-            # ccxt for positions raised NotSupported, which made every spot
-            # order fail as "cannot read the position".
+            # 现货没有持仓端点，钱包里的币就是能卖的东西——但里面混着用户自己充提
+            # 的币。仓位上限量的是「本程序买了多少」：数量取本地成交账本里这一对的
+            # 持仓，再按钱包余额封顶（账本比钱包多说明币已经被提走，那部分不再是敞口）。
+            # 以前直接拿钱包余额当持仓：用户自己有 1 BTC（约 8.1 万）而上限是 5000，
+            # 于是任何现货买单都回「持仓金额将达 81225.76，超过上限 5000.00」，
+            # 现货一个都买不进来。合约侧读的是交易所那份持仓，本来就是对的。
+            booked = self._spot_booked_base(req.symbol)
+            if booked is None:
+                return None
             try:
                 balance = rest.fetch_balance(req.market_type)
             except Exception:
@@ -307,9 +338,10 @@ class TradingService:
                 return None
             base = req.symbol.split("/")[0]
             try:
-                return max(0.0, float(totals.get(base) or 0.0)) * price
+                wallet = max(0.0, float(totals.get(base) or 0.0))
             except (TypeError, ValueError):
                 return None
+            return min(booked, wallet) * price
         try:
             positions = rest.fetch_positions(req.market_type, [req.symbol])
         except Exception:
@@ -322,6 +354,20 @@ class TradingService:
             mark = float(position.get("markPrice") or price or 0)
             total += spec.notional(contracts, mark)
         return total
+
+    def _spot_booked_base(self, symbol: str) -> float | None:
+        """本程序在这一对上还持有多少（本地成交账本，正数=多头）。
+
+        读不到账本返回 ``None`` 而不是 0：0 会让仓位上限看起来「什么都没持有」，
+        等于把闸门关掉。没记过这一对是另一回事——那确实是我们一个币都没买。
+        """
+        try:
+            books = self._live_ledger()["books"] or {}
+            book = books.get(symbol) or {}
+            return max(0.0, float(book.get("contracts") or 0.0))
+        except Exception:
+            log.warning("读取本地成交账本失败，无法校验现货持仓上限", exc_info=True)
+            return None
 
     # ------------------------------------------------------------------ submit
     def submit(self, req: OrderRequest) -> OrderResult:
@@ -415,6 +461,9 @@ class TradingService:
             # 交易所的拒单以前原样抛到路由，变成 500 + 一段英文（"binanceusdm {"code":-4061..."）。
             # 用户看不出该改什么；换成 400 加一句能照做的中文。
             raise OrderRejected(venue_rejection_message(exc)) from exc
+        # 记住这一对：成交同步（sync_live_fills）只能去问它能叫出名字的交易对，
+        # 现货又没有任何持仓对象可读（见 _live_symbols）。
+        self._traded.setdefault(req.market_type, set()).add(req.symbol)
         quote = abs(base_qty) * price
         self.risk.record_order()
         try:
@@ -683,8 +732,39 @@ class TradingService:
         Everything is persisted and de-duplicated by trade id, so repeated
         polling (and restarts) never charge the same exit twice.
         """
-        if not self.rest.has_credentials:
+        return self._sync_pairs(self._sync_targets(markets))
+
+    def sync_symbol_fills(self, market: MarketType, symbol: str) -> list[dict]:
+        """Pull one pair's fills right now, without waiting for the poller.
+
+        成交同步是 5 秒一轮的：刚买完就点「平仓」，账本还是上一轮的数字——轻则少平
+        一截，重则账本还空着，直接回「账本里没有这一对」。平仓本身已经要发签名请求，
+        这里多一次不改变延迟量级，换来的是「平的就是账本上那个数」。
+        """
+        if not self.rest_for(market).has_credentials:
             return []
+        return self._sync_pairs([(market, symbol)])
+
+    def _sync_targets(self, markets: list[MarketType] | None) -> list[tuple[MarketType, str]]:
+        """Every (market, symbol) the poller should ask the venue about."""
+        pairs: list[tuple[MarketType, str]] = []
+        for market in markets or list(MarketType):
+            # 每个市场用自己的客户端：拿 U 本位的 Key 去问现货成交，币安回
+            # -2015（那把 Key 没有现货权限），这里以前 catch 掉只留一行 debug，
+            # 于是现货成交从来没进过账本，风控也收不到现货平仓的盈亏。
+            client = self.rest_for(market)
+            if not client.has_credentials:
+                log.debug("实盘成交同步跳过 %s：未配置该市场的 API Key", market.value)
+                continue
+            try:
+                symbols = self._live_symbols(market)
+            except Exception as exc:
+                log.debug("实盘成交同步跳过 %s：%s", market.value, exc)
+                continue
+            pairs.extend((market, symbol) for symbol in symbols)
+        return pairs
+
+    def _sync_pairs(self, pairs: list[tuple[MarketType, str]]) -> list[dict]:
         ledger = self._live_ledger()
         seen = set(ledger["seen"])
         books = ledger["books"]
@@ -694,42 +774,36 @@ class TradingService:
         # turned one close into a burst of near-identical WeChat messages, so
         # the slices are announced once per order, with the merged PnL.
         announced: dict[str, dict] = {}
-
-        for market in markets or list(MarketType):
+        for market, symbol in pairs:
+            client = self.rest_for(market)
             try:
-                symbols = self._live_symbols(market)
-            except Exception as exc:
-                log.debug("实盘成交同步跳过 %s：%s", market.value, exc)
+                trades = client.fetch_my_trades(market, symbol, limit=50)
+            except ExchangeError as exc:
+                log.debug("拉取成交失败 %s %s：%s", market.value, symbol, exc)
                 continue
-            for symbol in symbols:
+            except Exception:  # network hiccup: try again next round
+                log.debug("拉取成交异常 %s %s", market.value, symbol, exc_info=True)
+                continue
+            for trade in sorted(trades, key=lambda item: item.get("timestamp") or 0):
+                trade_id = str(trade.get("id") or "")
+                if not trade_id or trade_id in seen:
+                    continue
+                seen.add(trade_id)
+                result = self._book_live_trade(trade, books)
+                if result is not None:
+                    booked.append(result)
+                    self.risk.record_trade(result["realized"])
+                    log.info(
+                        "实盘平仓 %s %s 已实现 %.4f",
+                        symbol,
+                        trade.get("side"),
+                        result["realized"],
+                    )
+                    self._merge_exit(announced, trade, result, market.value)
                 try:
-                    trades = self.rest.fetch_my_trades(market, symbol, limit=50)
-                except ExchangeError as exc:
-                    log.debug("拉取成交失败 %s %s：%s", market.value, symbol, exc)
-                    continue
-                except Exception:  # network hiccup: try again next round
-                    log.debug("拉取成交异常 %s %s", market.value, symbol, exc_info=True)
-                    continue
-                for trade in sorted(trades, key=lambda item: item.get("timestamp") or 0):
-                    trade_id = str(trade.get("id") or "")
-                    if not trade_id or trade_id in seen:
-                        continue
-                    seen.add(trade_id)
-                    result = self._book_live_trade(trade, books)
-                    if result is not None:
-                        booked.append(result)
-                        self.risk.record_trade(result["realized"])
-                        log.info(
-                            "实盘平仓 %s %s 已实现 %.4f",
-                            symbol,
-                            trade.get("side"),
-                            result["realized"],
-                        )
-                        self._merge_exit(announced, trade, result, market.value)
-                    try:
-                        self.db.save_trade(self._account_id(), trade, RunMode.LIVE.value)
-                    except Exception:  # pragma: no cover - history is best effort
-                        log.warning("实盘成交写库失败", exc_info=True)
+                    self.db.save_trade(self._account_id(), trade, RunMode.LIVE.value)
+                except Exception:  # pragma: no cover - history is best effort
+                    log.warning("实盘成交写库失败", exc_info=True)
 
         for summary in announced.values():
             self._notify(
@@ -785,10 +859,23 @@ class TradingService:
         entry["realized"] = float(entry["realized"]) + float(result.get("realized") or 0.0)
 
     def _live_symbols(self, market: MarketType) -> list[str]:
-        """Symbols worth polling: open orders, positions and the active pair."""
+        """Symbols worth polling: open orders, positions, the active pair, and
+        everything this program has already traded in that market.
+
+        最后一条是现货能不能平仓的关键：现货没有持仓对象，`settings.last_symbol`
+        通常指向合约，一个刚买进来的现货对既不在挂单里也不在持仓里，于是
+        `fetch_my_trades` 根本不会被问到那一对——本地成交账本永远是空的，不带 size
+        的现货平仓只能回「账本里没有这一对」，风控也收不到现货平仓的已实现盈亏。
+        账本里记着的对（跨重启）和本进程下过单的对（重启后第一笔之前）合起来才是
+        「本程序自己的」交易对。
+        """
+        client = self.rest_for(market)
         symbols: set[str] = set()
+        for name in self._ledger_symbols(market):
+            symbols.add(name)
+        symbols.update(self._traded.get(market, set()))
         try:
-            for order in self.rest.fetch_open_orders(market):
+            for order in client.fetch_open_orders(market):
                 symbol = order.get("symbol")
                 if symbol:
                     symbols.add(str(symbol))
@@ -796,7 +883,7 @@ class TradingService:
             log.debug("读取实盘挂单失败 %s", market.value, exc_info=True)
         if market.is_futures:
             try:
-                for position in self.rest.fetch_positions(market):
+                for position in client.fetch_positions(market):
                     contracts = abs(float(position.get("contracts") or 0.0))
                     if contracts > 0 and position.get("symbol"):
                         symbols.add(str(position["symbol"]))
@@ -805,6 +892,15 @@ class TradingService:
         if market is self.settings_market_type():
             symbols.add(self.settings.last_symbol)
         return sorted(symbols)
+
+    def _ledger_symbols(self, market: MarketType) -> list[str]:
+        """Pairs the local cost ledger still holds in this market."""
+        try:
+            books = self._live_ledger()["books"]
+        except Exception:  # pragma: no cover - reading our own ledger should work
+            log.debug("读取本地成交账本失败", exc_info=True)
+            return []
+        return [str(name) for name in books if _symbol_market(str(name)) is market]
 
     def settings_market_type(self) -> MarketType:
         try:
