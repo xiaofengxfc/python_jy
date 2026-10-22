@@ -12,7 +12,7 @@ from btrader.core.types import MarketType
 from btrader.engine.auto import AutoTrader, AutoTraderConfig
 from btrader.engine.risk import RiskManager
 from btrader.engine.trading import OrderRejected, OrderRequest, TradingService
-from btrader.strategy.base import Strategy
+from btrader.strategy.base import IntParam, Strategy
 
 from fakes import FakeVenue
 from helpers import make_candles
@@ -323,3 +323,40 @@ def test_history_write_failure_is_not_reported_as_a_failed_order(tmp_path):
         assert venue.position_base("BTC/USDT") == pytest.approx(1.0)
     finally:
         db.close()
+
+
+class WarmupTarget(Strategy):
+    """周期可调的固定目标：用来验证预热门槛是不是按实际参数算的。"""
+
+    key = "warmup_target"
+    name = "warmup target"
+    params_spec = [IntParam("period", "周期", 20, 2, 500)]
+
+    def generate(self, df, params):
+        return pd.DataFrame({"target": np.ones(len(df))}, index=df.index)
+
+
+def test_auto_waits_for_the_warmup_the_parameters_ask_for(service) -> None:
+    """慢线填 500 要 501 根：门槛按默认值算的 22 根，会在指标还没有值时就开始下单。"""
+    trading, venue = service
+    frame = make_candles(120, price=100.0, drift=0.0, volatility=0.0)
+    trader = AutoTrader(
+        AutoTraderConfig(
+            symbol="BTC/USDT",
+            market_type=MarketType.SPOT,
+            timeframe="1h",
+            params={"period": 500},
+            position_pct=0.5,
+            leverage=1.0,
+        ),
+        WarmupTarget(),
+        trading,
+        StubKlines(frame),
+    )
+
+    trader._tick()
+    assert venue.fills == []
+
+    trader.config.params = {"period": 20}
+    trader._tick()
+    assert venue.sides() == ["buy"]

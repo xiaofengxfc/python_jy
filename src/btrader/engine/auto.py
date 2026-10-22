@@ -159,12 +159,15 @@ class AutoTrader:
 
     def _tick(self) -> None:
         cfg = self.config
+        # 预热根数要按实际参数算：慢线填 200 就得 201 根，按默认值算的 22 根
+        # 会让策略在指标还没有值的时候空转（目标恒为 0）。
+        min_bars = self.strategy.min_bars(cfg.params)
         # Live runs always hit the API: the cache may be a full bar behind.
         df = self.klines.fetch(
             cfg.market_type, cfg.symbol, cfg.timeframe,
             limit=cfg.kline_limit, use_cache=False,
         )
-        if df is None or len(df) < self.strategy.meta.min_bars + 2:
+        if df is None or len(df) < min_bars + 2:
             return
 
         # Drop the still-forming candle: signals use closed bars only.
@@ -173,7 +176,7 @@ class AutoTrader:
         now = int(time.time() * 1000)
         closed = df if last_open + step <= now else df.iloc[:-1]
         closed = closed.reset_index(drop=True)
-        if len(closed) < self.strategy.meta.min_bars + 1:
+        if len(closed) < min_bars + 1:
             return
         last_ts = int(closed["timestamp"].iloc[-1])
         if last_ts == self._last_candle_ts:

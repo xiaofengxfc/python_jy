@@ -34,6 +34,8 @@ BANNED_NAMES = {
     "eval", "exec", "compile", "open", "input", "breakpoint", "globals", "locals",
     "vars", "__import__", "getattr", "setattr", "delattr", "memoryview", "help",
 }
+# 参数构造器：候选里用到就必须在模块顶层导入，否则类定义时就 NameError。
+PARAM_FACTORIES = {"IntParam", "FloatParam", "BoolParam", "ChoiceParam", "ParamSpec"}
 
 
 @dataclass
@@ -94,6 +96,34 @@ def check_code(code: str) -> CheckReport:
             False, [CheckIssue("syntax", f"语法错误：{exc.msg}", int(exc.lineno or 0))]
         )
 
+    # 模块顶层能看见哪些名字：候选是数据目录里的独立模块，只有导入过或赋值过的
+    # 名字在类定义时能直接用。少了这一条，`class X(Strategy)` 这种漏了 import 的
+    # 代码静态检查过得去（基类名对得上），导入时却直接 NameError。
+    bound: set[str] = set()
+    star_import = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                bound.add(alias.asname or alias.name.split(".", 1)[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "*":
+                    star_import = True
+                else:
+                    bound.add(alias.asname or alias.name)
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    bound.add(target.id)
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name):
+                bound.add(node.target.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+
+    used_params: dict[str, int] = {}
+
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -115,11 +145,19 @@ def check_code(code: str) -> CheckReport:
             module = node.module or ""
             imports.append(module)
             root = _root_module(module)
-            # A relative import inside a candidate only matters once a human
-            # copies the file into a package; it cannot reach the network or
-            # the filesystem, so it is not treated as an escape hatch. Banned
-            # module names are still rejected.
+            # 候选是数据目录里的独立模块，`from ..base import Strategy` 这种相对
+            # 导入解析不了。以前只在「能不能越权」上放行，结果是静态检查通过、
+            # 批准时 ImportError；同一条 import 换成绝对模块名就能用，所以直接
+            # 判不通过，让模型在生成阶段就改对。
             if node.level:
+                dots = "." * node.level
+                issues.append(
+                    CheckIssue(
+                        "relative_import",
+                        f"候选不能用相对导入 from {dots}{module}，请写绝对模块名（如 btrader.strategy.base）",
+                        node.lineno,
+                    )
+                )
                 if module in BANNED_MODULES or root in BANNED_MODULES:
                     issues.append(
                         CheckIssue("banned_import", f"禁止从 {module} 导入", node.lineno)
@@ -134,6 +172,8 @@ def check_code(code: str) -> CheckReport:
                     CheckIssue("unknown_import", f"未在白名单中的模块 {module}", node.lineno)
                 )
         elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id in PARAM_FACTORIES:
+                used_params.setdefault(node.func.id, node.lineno)
             if node.func.id == "getattr" and _safe_getattr(node):
                 # `getattr(params, "period", 20)` is ordinary strategy code.
                 # The dangerous form is a computed or dunder name, which can
@@ -165,8 +205,30 @@ def check_code(code: str) -> CheckReport:
                         node.lineno,
                     )
                 )
+            # 基类名必须在模块顶层看得见，否则类定义时就 NameError（漏 import 的
+            # 候选全卡在这一条上）。`import *` 时名字集合不可知，只放过这种情况。
+            for base in sorted(bases):
+                if base not in bound and not star_import:
+                    issues.append(
+                        CheckIssue(
+                            "unbound_base",
+                            f"类 {node.name} 的基类 {base} 没有在模块顶层导入",
+                            node.lineno,
+                        )
+                    )
         elif isinstance(node, ast.While) and isinstance(node.test, ast.Constant) and node.test.value is True:
             issues.append(CheckIssue("infinite_loop", "禁止 while True 无限循环", node.lineno))
+
+    if not star_import:
+        for name, lineno in sorted(used_params.items()):
+            if name not in bound:
+                issues.append(
+                    CheckIssue(
+                        "unbound_param",
+                        f"用了 {name} 却没有在模块顶层导入（from btrader.strategy.base import {name}）",
+                        lineno,
+                    )
+                )
 
     if not classes:
         issues.append(CheckIssue("no_class", "候选代码必须定义一个 Strategy 子类"))

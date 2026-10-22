@@ -101,12 +101,22 @@ class Strategy(ABC):
     def meta(self) -> StrategyMeta:
         return self._meta
 
-    def min_bars(self) -> int:
-        """Bars required before the first signal can be produced."""
+    def min_bars(self, params: dict[str, Any] | None = None) -> int:
+        """Bars required before the first signal can be produced.
+
+        ``params`` 传实际在用的参数：spec 里的默认值只说明「什么都不填」时的情况，
+        用户把慢线填成 200 就要 201 根才有第一个值，而默认的 21 只报 22。
+        手里有真实参数的地方（自动交易）必须传进来，否则预热判断是按默认值算的。
+        """
+        values = self.default_params() if params is None else params
         warmup = 2
         for spec in self.params_spec:
             if isinstance(spec.default, int) and not isinstance(spec.default, bool):
-                warmup = max(warmup, int(spec.default) + 1)
+                try:
+                    value = int(values.get(spec.name, spec.default))
+                except (TypeError, ValueError):
+                    value = int(spec.default)
+                warmup = max(warmup, value + 1)
         return warmup
 
     def default_params(self) -> dict[str, Any]:

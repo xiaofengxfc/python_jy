@@ -22,8 +22,11 @@ class MaCrossStrategy(Strategy):
     def generate(self, df: pd.DataFrame, params: dict) -> pd.DataFrame:
         fast_n = int(params["fast"])
         slow_n = int(params["slow"])
-        if fast_n >= slow_n:
-            fast_n = max(2, slow_n // 2)
+        if fast_n > slow_n:
+            # 快慢填反了就换过来：两个周期都还是用户填的数，谁也不丢。以前是把
+            # fast 静默改成 slow//2，用户填的 9 直接作废。相等时两条均线永远重合，
+            # 没有交叉，自然也不出信号。
+            fast_n, slow_n = slow_n, fast_n
         avg = ta.ema if params["ema"] else ta.sma
         fast = avg(df["close"], fast_n)
         slow = avg(df["close"], slow_n)
@@ -53,5 +56,8 @@ class MaCrossStrategy(Strategy):
     def plot_series(self, df, params):
         fast_n = int(params["fast"])
         slow_n = int(params["slow"])
+        if fast_n > slow_n:
+            # 和 generate 一样换过来，画出来的线必须是出信号的那条。
+            fast_n, slow_n = slow_n, fast_n
         avg = ta.ema if params["ema"] else ta.sma
         return {"快线": avg(df["close"], fast_n), "慢线": avg(df["close"], slow_n)}

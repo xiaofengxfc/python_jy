@@ -10,6 +10,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from btrader.core import indicators as ta
 from btrader.strategy.builtin import (
     BollingerStrategy,
     DonchianBreakoutStrategy,
@@ -118,3 +119,54 @@ def test_a_window_longer_than_the_data_emits_no_signal() -> None:
 
     for strategy, params in cases:
         assert _targets(strategy, closes, params) == [0.0] * len(closes), strategy.key
+
+
+def test_ma_cross_swaps_fast_and_slow_instead_of_dropping_the_users_number() -> None:
+    """快慢填反了：两个周期都留着，只换角色。
+
+    以前是把 fast 静默改成 slow//2——用户填 9、慢线填 3，实际跑的是 2 和 3，
+    9 直接作废。换过来以后填反和填正跑出来的 target 完全一样。
+    """
+    closes = [1.0, 2.0, 3.0, 4.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0]
+    swapped = _targets(MaCrossStrategy(), closes, {"fast": 3, "slow": 2, "trend": 0, "ema": False})
+    forward = _targets(MaCrossStrategy(), closes, {"fast": 2, "slow": 3, "trend": 0, "ema": False})
+
+    assert swapped == [0.0, 0.0, 1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0]
+    assert swapped == forward
+
+
+def test_ma_cross_draws_the_same_averages_it_signals_on() -> None:
+    """plot_series 也得换：图上画的那条快线就是出信号的快线。"""
+    strategy = MaCrossStrategy()
+    df = _frame([10.0, 11.0, 12.0, 11.0, 10.0, 9.0, 10.0, 11.0, 12.0, 13.0])
+    lines = strategy.plot_series(df, {"fast": 5, "slow": 2, "trend": 0, "ema": False})
+
+    assert np.allclose(lines["快线"], ta.sma(df["close"], 2), equal_nan=True)
+    assert np.allclose(lines["慢线"], ta.sma(df["close"], 5), equal_nan=True)
+
+
+def test_equal_fast_and_slow_periods_produce_no_crossover() -> None:
+    """快慢相等：两条均线永远重合，本来就没有交叉，不该偷偷换成别的周期。"""
+    closes = [1.0, 2.0, 3.0, 4.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0]
+    targets = _targets(MaCrossStrategy(), closes, {"fast": 5, "slow": 5, "trend": 0, "ema": False})
+
+    assert targets == [0.0] * len(closes)
+
+
+def test_min_bars_follows_the_parameters_actually_in_use() -> None:
+    """预热根数按实际参数算：慢线 200 要 201 根，不是默认值算出来的 22。"""
+    strategy = MaCrossStrategy()
+
+    assert strategy.min_bars() == 22
+    assert strategy.min_bars(strategy.default_params()) == 22
+    assert strategy.min_bars({"fast": 9, "slow": 200}) == 201
+    assert strategy.min_bars({"fast": 2, "slow": 3}) == 4
+    assert strategy.meta.min_bars == 22  # meta 报的还是默认值那一份
+
+
+def test_min_bars_ignores_junk_values() -> None:
+    """脏参数不能把预热判断炸掉：取不出来就退回默认值。"""
+    strategy = MaCrossStrategy()
+
+    assert strategy.min_bars({"fast": "bad", "slow": 21}) == 22
+    assert strategy.min_bars({"fast": None, "slow": 21}) == 22
