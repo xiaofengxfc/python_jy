@@ -57,6 +57,21 @@ MAX_JOBS = 40
 ERROR_NOTIFY_INTERVAL = 600.0
 
 
+def require_credential_market(market: str) -> str:
+    """DELETE /api/credentials must be told what to delete.
+
+    It used to default to "spot", so a request without any query string
+    silently deleted the spot key and answered "ok" — a destructive default on
+    a route whose whole job is deleting things.
+    """
+    value = (market or "").strip()
+    if not value:
+        raise HTTPException(
+            status_code=400,
+            detail="请指定要删除凭据的市场：spot / usdm / coinm。",
+        )
+    return value
+
 def _notify_task(ctx, title: str, lines: list[str] | None = None) -> None:
     """Push a task event (启动/结束/失败) to WeChat. Never raises.
 
@@ -240,7 +255,13 @@ class AITraderStartPayload(BaseModel):
 
 
 class AITraderPausePayload(BaseModel):
-    paused: bool = True
+    """暂停 / 继续的请求体。
+
+    ``paused`` 只认真正的布尔：pydantic 会把 ``"yes"``、``"1"`` 这类字符串悄悄
+    转成 True，界面传错类型也「成功」了。所以这里放开类型，由路由用中文说明拒绝。
+    """
+
+    paused: Any = True
 
 
 class AITraderHaltPayload(BaseModel):
@@ -674,6 +695,11 @@ class AITraderController:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._trader: AITrader | None = None
+        # 停掉之后还要答得出「刚才在跑什么、今天决策了几次、最后一条决策是什么」。
+        # 实例一扔，config / last_decision / events 就跟着没了，可这些数并不过期：
+        # 当日决策次数在控制器自己的 budget 里，最近发生了什么在审计里。留一份最后
+        # 的状态快照，停掉之后接着报它。
+        self._last: dict[str, Any] = {}
         self.lease = TradeLease()
         # 轮询和「立即决策」都从 _build 出去，budget 由控制器持有：当日决策次数、
         # 每小时下单数、冷却时间是同一个账户的账，不能跟着实例走一遍。
@@ -808,19 +834,27 @@ class AITraderController:
                 status_code=409, detail="AI 交易正在运行，请先停止再用「立即决策」"
             )
         trader = self._build(state, payload)
-        return trader.decide_once() or {}
+        record = trader.decide_once() or {}
+        # 「立即决策」点一次 new 一个实例，跑完就扔：这条路径的配置、这条决策和
+        # 事件同样要留给 status，否则刚点完就只看到空状态。
+        self._remember(trader)
+        return record
 
     def stop(self) -> dict[str, Any]:
         with self._lock:
             trader, self._trader = self._trader, None
         if trader is not None:
             trader.stop()
+            self._remember(trader)
         return self.status()
 
     def pause(self, paused: bool) -> dict[str, Any]:
         trader = self.trader
-        if trader is not None:
-            trader.pause(paused)
+        if trader is None:
+            # 没在跑就没有「暂停」这回事。回 200 加 paused=false，点的人只会以为
+            # 自己操作成功了。
+            raise HTTPException(status_code=400, detail="AI 交易没有在运行，无法暂停或继续。")
+        trader.pause(paused)
         return self.status()
 
     def halt(self, reason: str) -> dict[str, Any]:
@@ -836,20 +870,56 @@ class AITraderController:
             trader.kill(reason)
         return {"state": "halted", "reason": reason}
 
+    def _remember(self, trader: AITrader) -> None:
+        """留下最后一次可报的状态（停掉之后 status 接着报它）。"""
+        try:
+            # since=0：留完整的一份，谁带 since 来查都能自己截。
+            snapshot = trader.status(0)
+        except Exception:  # pragma: no cover - 自家实例的 status 不该炸
+            log.warning("读取 AI 交易状态失败", exc_info=True)
+            return
+        with self._lock:
+            self._last = snapshot
+
+    def _counters(self, base: dict[str, Any]) -> dict[str, Any]:
+        """计数的真身在控制器自己的预算里，不跟着实例走。"""
+        now = time.time()
+        self.budget.roll(now)
+        return {
+            "decisions_today": self.budget.decisions_today,
+            "orders_last_hour": self.budget.orders_last_hour(now),
+            "max_decisions_per_day": base.get("max_decisions_per_day", 0),
+            "max_orders_per_hour": base.get("max_orders_per_hour", 0),
+        }
+
     def status(self, since: int = 0) -> dict[str, Any]:
         trader = self.trader
+        if trader is not None:
+            snapshot = trader.status(0)
+            with self._lock:
+                self._last = snapshot
+        else:
+            with self._lock:
+                snapshot = dict(self._last or {})
+        events = [
+            item
+            for item in (snapshot.get("events") or [])
+            if int(item.get("seq") or 0) > since
+        ]
+        counters = dict(snapshot.get("counters") or {})
         if trader is None:
-            return {
-                "state": "stopped",
-                "paused": False,
-                "halted_reason": "",
-                "config": {},
-                "counters": {},
-                "last_decision": None,
-                "events": [],
-                "seq": 0,
-            }
-        return trader.status(since)
+            # 停掉之后报的仍是「刚才那份配置 + 控制器里的真数」，不留空白。
+            counters = self._counters(counters)
+        return {
+            "state": "stopped" if trader is None else snapshot.get("state", "stopped"),
+            "paused": False if trader is None else bool(snapshot.get("paused")),
+            "halted_reason": "" if trader is None else snapshot.get("halted_reason", ""),
+            "config": dict(snapshot.get("config") or {}),
+            "counters": counters,
+            "last_decision": snapshot.get("last_decision"),
+            "events": events,
+            "seq": int(snapshot.get("seq") or 0),
+        }
 
 
 def build_router(get_state: Callable[[], Any]) -> APIRouter:
@@ -1323,9 +1393,10 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
 
     @router.delete("/api/credentials")
     def delete_credentials(
-        market: str = "spot", network: str | None = None, platform: str = ""
+        market: str = "", network: str | None = None, platform: str = ""
     ) -> dict[str, Any]:
         ctx = get_state().ctx
+        market = require_credential_market(market)
         platform = platform or ctx.platform
         market_type = _market(market)
         target = _network(network) or ctx.network
@@ -1478,6 +1549,8 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
 
     @router.post("/api/ai/trader/pause")
     def ai_trader_pause(payload: AITraderPausePayload) -> dict[str, Any]:
+        if not isinstance(payload.paused, bool):
+            raise HTTPException(status_code=400, detail="paused 只接受 true / false。")
         return {"ok": True, "status": ai_ctl.pause(payload.paused)}
 
     @router.post("/api/ai/trader/halt")

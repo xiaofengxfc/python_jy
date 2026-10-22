@@ -35,7 +35,7 @@ from ..core.types import (
 from ..engine.trading import OrderRejected, OrderRequest
 from ..exchange.symbols import format_amount, load_symbols
 from ..exchange import mirror
-from ..exchange.rest import ExchangeError
+from ..exchange.rest import ExchangeError, ticker_bid_ask
 from ..logging_setup import error_buffer
 from .routes import build_router
 from .routes_lab import build_lab_router
@@ -129,10 +129,10 @@ def _mirror_candles(
     except Exception as exc:
         log.warning("备用行情也不可用：%s", exc)
         # Both failures are worth reporting: the first says why the primary is
-        # down, the second says the fallback could not rescue it either.
-        raise HTTPException(
-            status_code=503,
-            detail=_market_data_hint(market, f"{primary}。备用源：{exc}"),
+        # down, the second says the fallback could not rescue it either. 但状态码
+        # 由原始错误定：交易对根本不存在时，两个源都查不到，这是 400，不是 503。
+        raise _venue_http_error(
+            primary, _market_data_hint(market, f"{primary}。备用源：{exc}"), symbol
         ) from exc
     if not rows:
         return None
@@ -225,16 +225,23 @@ def _symbols_for(state: _State, market: MarketType) -> tuple[list[dict[str, Any]
 
 # -------------------------------------------------------------------- payload
 class OrderPayload(BaseModel):
+    """下单请求。
+
+    数量、价格这些字段不在模型上判 gt=0：pydantic 拦下来返回的是 422 加一句英文
+    「Input should be greater than 0」，界面没有中文可显示。交给路由用中文说明
+    拒绝，状态码统一 400，和其余失败场景一致。
+    """
+
     market: str = "spot"
     symbol: str
     side: str
     order_type: str = "limit"
     size_mode: str = "amount"
-    size: float = Field(gt=0)
+    size: float
     price: float | None = None
     # Protective exits for a new entry (absolute prices). Omit to trade bare.
-    stop_loss: float | None = Field(default=None, gt=0)
-    take_profit: float | None = Field(default=None, gt=0)
+    stop_loss: float | None = None
+    take_profit: float | None = None
     # Mainnet requires an explicit acknowledgement; testnet ignores it.
     confirm_live: bool = False
 
@@ -245,7 +252,7 @@ class PreviewPayload(BaseModel):
     side: str = "buy"
     order_type: str = "limit"
     size_mode: str = "amount"
-    size: float = Field(gt=0)
+    size: float
     price: float | None = None
 
 
@@ -264,9 +271,9 @@ class ConditionalPayload(BaseModel):
     side: str
     order_type: str = "market"
     size_mode: str = "amount"
-    size: float = Field(gt=0)
-    trigger: float = Field(gt=0)
-    price: float | None = Field(default=None, gt=0)
+    size: float
+    trigger: float
+    price: float | None = None
     direction: str | None = None
     reduce_only: bool = False
     confirm_live: bool = False
@@ -281,22 +288,25 @@ class ProtectionPayload(BaseModel):
 
     symbol: str
     market: str | None = None
-    stop_loss: float | None = Field(default=None, gt=0)
-    take_profit: float | None = Field(default=None, gt=0)
+    stop_loss: float | None = None
+    take_profit: float | None = None
     confirm_live: bool = False
 
 class ClosePayload(BaseModel):
     """Close (or reduce) a position with a market order.
 
-    ``size`` is in base coins; omitted means the whole position. ``market`` is
-    optional: when a caller omits it the venue is inferred from the ccxt
-    symbol, because defaulting to spot made a futures position look absent
-    ("当前没有该交易对的持仓") and the exit impossible.
+    ``size`` is in base coins. Omitted means the whole position on futures; on
+    spot it means the size booked in the local fill ledger, and an unbooked pair
+    is refused (400) instead of selling the coin balance — that balance also
+    holds what the user deposited, so "the whole position" is not a thing spot
+    can infer. ``market`` is optional: when a caller omits it the venue is
+    inferred from the ccxt symbol, because defaulting to spot made a futures
+    position look absent ("当前没有该交易对的持仓") and the exit impossible.
     """
 
     symbol: str
     market: str | None = None
-    size: float | None = Field(default=None, gt=0)
+    size: float | None = None
     confirm_live: bool = False
 
 
@@ -421,6 +431,30 @@ def _booked_held(state: _State, symbol: str) -> float | None:
         return None
 
 
+def _venue_symbol(state: _State, market: MarketType, symbol: str) -> str:
+    """The symbol the venue actually lists, from either spelling a caller uses.
+
+    界面传的是持仓行上的 ccxt 符号（``ETH/USDT:USDT``），手敲接口的人传的是
+    「币/计价」（``ETH/USDT``）。合约市场里这一对叫 ``ETH/USDT:USDT``：照原样
+    拿去读持仓只会回「当前没有该交易对的持仓」，明明有仓。所以这里把两种写法
+    都收进来，统一成交易所认的那一个。
+
+    现货本来就是 ``BASE/QUOTE``，原样返回——不能给现货也补一个结算币出来。
+    合约缺结算币时按市场的结算规则补：U 本位用计价币（USDT / USDC），币本位
+    用基础币（``BTC/USD`` -> ``BTC/USD:BTC``）。补错了交易所会自己回错，路由
+    已经把它翻成 400 加原因，不会变成「没有持仓」这种误导。
+    """
+    text = (symbol or "").strip()
+    if not text or not market.is_futures or ":" in text:
+        return text
+    base, _, tail = text.partition("/")
+    quote = tail.split(":")[0].upper()
+    if market is MarketType.COINM:
+        return f"{text}:{base.upper()}"
+    settle = quote if quote in ("USDT", "USDC") else "USDT"
+    return f"{text}:{settle}"
+
+
 def _live_held(state: _State, symbol: str, market: MarketType) -> float | None:
     """Signed live position size: positive long, negative short.
 
@@ -524,6 +558,47 @@ def _check_protection_levels(
 
 
 # ----------------------------------------------------------------------- app
+_SYMBOL_MISSING_MARKERS: tuple[str, ...] = (
+    "does not have market symbol",
+    "invalid symbol",
+    "market symbol not found",
+    "invalid market",
+)
+
+def _unknown_symbol(exc: BaseException) -> bool:
+    """True when the venue says this pair does not exist.
+
+    ccxt raises BadSymbol for a typo'd pair, but the exchange layer flattens
+    every failure into ExchangeError, so by the time a route sees it only the
+    message is left. It matters: a 503 tells the caller to try again later,
+    and this answer will never change until the symbol does.
+    """
+    text = str(exc).lower()
+    return any(marker in text for marker in _SYMBOL_MISSING_MARKERS)
+
+
+def _venue_http_error(
+    exc: BaseException, prefix: str, symbol: str = ""
+) -> HTTPException:
+    """Map a venue failure onto the status the caller can act on."""
+    if _unknown_symbol(exc):
+        detail = f"没有这个交易对：{symbol}" if symbol else "这条市场没有这个交易对"
+        return HTTPException(status_code=400, detail=detail)
+    return HTTPException(status_code=503, detail=f"{prefix}：{exc}")
+
+
+def _cancel_http_error(order_id: str, exc: BaseException) -> HTTPException:
+    """A cancel that cannot match an order is a 400/404, never a 503."""
+    if not str(order_id).strip().isdigit():
+        return HTTPException(
+            status_code=400,
+            detail=f"订单号不合法：{order_id}。币安的订单号是纯数字。",
+        )
+    text = str(exc).lower()
+    if "unknown order" in text or "-2011" in text:
+        return HTTPException(status_code=404, detail=f"没有这个挂单：{order_id}")
+    return _venue_http_error(exc, "撤单失败")
+
 def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -626,8 +701,9 @@ def create_app() -> FastAPI:
             # 让界面能标明「这不是币安的价格」。
             rows = _mirror_candles(mt, symbol, timeframe, limit, since, exc)
             if rows is None:
-                raise HTTPException(
-                    status_code=503, detail=_market_data_hint(mt, exc)
+                # 不存在的交易对不是「服务暂时不可用」：备用源也查不到就是 400。
+                raise _venue_http_error(
+                    exc, _market_data_hint(mt, exc), symbol
                 ) from exc
             return {
                 "symbol": symbol,
@@ -664,14 +740,25 @@ def create_app() -> FastAPI:
         mt = _market(market)
         try:
             with state.locks[mt]:
-                raw = state.ctx.market_rest_for(mt).fetch_ticker(mt, symbol)
+                rest = state.ctx.market_rest_for(mt)
+                raw = rest.fetch_ticker(mt, symbol)
+                bid, ask = ticker_bid_ask(raw)
+                if not bid or not ask:
+                    # 币安合约的 24 小时 ticker 里没有买一卖一，去 bookTicker 补一档。
+                    # 补不上就留 0：前端据此显示「—」，不要编一个价出来。
+                    try:
+                        bid, ask = ticker_bid_ask(
+                            raw, *rest.fetch_bid_ask(mt, symbol)
+                        )
+                    except Exception as exc:
+                        log.warning("读取买卖一失败 %s：%s", symbol, exc)
         except Exception as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
+            raise _venue_http_error(exc, "无法获取行情", symbol) from exc
         return {
             "symbol": symbol,
             "last": float(raw.get("last") or 0.0),
-            "bid": float(raw.get("bid") or 0.0),
-            "ask": float(raw.get("ask") or 0.0),
+            "bid": bid,
+            "ask": ask,
             "high": float(raw.get("high") or 0.0),
             "low": float(raw.get("low") or 0.0),
             "base_volume": float(raw.get("baseVolume") or 0.0),
@@ -691,7 +778,7 @@ def create_app() -> FastAPI:
             with state.locks[mt]:
                 book = state.ctx.market_rest_for(mt).fetch_order_book(mt, symbol, limit)
         except Exception as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
+            raise _venue_http_error(exc, "无法获取盘口", symbol) from exc
         return {
             "bids": [[float(p), float(q)] for p, q in (book.get("bids") or [])[:limit]],
             "asks": [[float(p), float(q)] for p, q in (book.get("asks") or [])[:limit]],
@@ -726,6 +813,10 @@ def create_app() -> FastAPI:
         access to the contract spec endpoint; a market order falls back to the
         last trade price as its reference.
         """
+        if payload.size <= 0:
+            raise HTTPException(status_code=400, detail="下单数量必须大于 0")
+        if payload.price is not None and payload.price <= 0:
+            raise HTTPException(status_code=400, detail="下单价格必须大于 0")
         state = get_state()
         mt = _market(payload.market)
         reference = payload.price if payload.order_type == "limit" else None
@@ -740,8 +831,8 @@ def create_app() -> FastAPI:
                         quote.fetch_ticker(mt, payload.symbol).get("last") or 0.0
                     )
             except Exception as exc:
-                raise HTTPException(
-                    status_code=503, detail=f"无法获取最新价：{exc}"
+                raise _venue_http_error(
+                    exc, "无法获取最新价", payload.symbol
                 ) from exc
         if not reference or reference <= 0:
             raise HTTPException(status_code=400, detail="缺少有效的参考价格")
@@ -818,6 +909,21 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail="订单类型必须是 limit 或 market")
         if payload.size_mode not in ("amount", "quote"):
             raise HTTPException(status_code=400, detail="数量模式必须是 amount 或 quote")
+        # 这几条以前靠 pydantic 的 gt=0 拦，返回的是 422 加英文；界面上没有中文可显示，
+        # 而且限价单不填价格时会被下面「按现价取参考价」的逻辑悄悄改成现价挂单。
+        if payload.size <= 0:
+            raise HTTPException(status_code=400, detail="下单数量必须大于 0")
+        if payload.order_type == "limit" and payload.price is None:
+            raise HTTPException(
+                status_code=400,
+                detail="限价单必须填写价格：不填会按现价挂出去，可能立刻成交。",
+            )
+        if payload.price is not None and payload.price <= 0:
+            raise HTTPException(status_code=400, detail="下单价格必须大于 0")
+        if (payload.stop_loss is not None and payload.stop_loss <= 0) or (
+            payload.take_profit is not None and payload.take_profit <= 0
+        ):
+            raise HTTPException(status_code=400, detail="止损 / 止盈价格必须大于 0")
 
         state = get_state()
         mt = _market(payload.market)
@@ -849,8 +955,8 @@ def create_app() -> FastAPI:
                         quote.fetch_ticker(mt, payload.symbol).get("last") or 0.0
                     )
             except Exception as exc:
-                raise HTTPException(
-                    status_code=503, detail=f"无法获取最新价：{exc}"
+                raise _venue_http_error(
+                    exc, "无法获取最新价", payload.symbol
                 ) from exc
         if not reference or reference <= 0:
             raise HTTPException(status_code=400, detail="缺少有效的参考价格")
@@ -957,15 +1063,23 @@ def create_app() -> FastAPI:
         """
         if not symbol:
             raise HTTPException(status_code=400, detail="缺少交易对")
+        if not str(order_id).strip().isdigit():
+            # 币安的订单号是纯数字。带着 "nope" 去签名，交易所只会回 -1102，
+            # 那串东西再往上抛就是 503，用户以为交易所挂了。
+            raise HTTPException(
+                status_code=400,
+                detail=f"订单号不合法：{order_id}。币安的订单号是纯数字。",
+            )
         state = get_state()
         mt = _market(market) if market else _market_for_symbol(symbol)
+        symbol = _venue_symbol(state, mt, symbol)
         try:
             with state.account_lock:
                 order = state.ctx.trading.cancel(mt, symbol, order_id, market=mt.value)
         except OrderRejected as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
+            raise _cancel_http_error(order_id, exc) from exc
         return {"ok": True, "order": order}
 
     # ---------------------------------------------------------------- closing
@@ -976,11 +1090,17 @@ def create_app() -> FastAPI:
         Kept separate from /api/orders so the caller does not have to know the
         signed size or the direction: the server reads the position from the
         venue and sends the opposite side with reduceOnly.
+
+        Spot is sized from the local fill ledger, never from the coin balance:
+        the wallet holds what the user deposited too, and one size-less spot
+        close used to sell all of it.
         """
         # An omitted market is inferred from the symbol: a futures pair carries
         # its settle currency ("BTC/USDT:USDT"), spot does not. Defaulting to
         # spot here made every futures exit fail as "没有该交易对的持仓".
         mt = _market(payload.market) if payload.market else _market_for_symbol(payload.symbol)
+        if payload.size is not None and payload.size <= 0:
+            raise HTTPException(status_code=400, detail="平仓数量必须大于 0")
         state = get_state()
 
         with state.locks[mt]:
@@ -990,7 +1110,9 @@ def create_app() -> FastAPI:
             confirm_live=payload.confirm_live,
             network=state.ctx.network,
         )
-        held = _live_held(state, payload.symbol, mt)
+        # 两种写法都收：内部一律用交易所认的那个符号，报错文案也跟着它走。
+        symbol = _venue_symbol(state, mt, payload.symbol)
+        held = _live_held(state, symbol, mt)
         if held is None:
             raise HTTPException(
                 status_code=503,
@@ -998,21 +1120,39 @@ def create_app() -> FastAPI:
             )
         if abs(held) <= 1e-12:
             raise HTTPException(status_code=400, detail="当前没有该交易对的持仓")
-        size = abs(held) if payload.size is None else min(abs(payload.size), abs(held))
+        if payload.size is not None:
+            size = min(abs(payload.size), abs(held))
+        elif mt.is_futures:
+            # 合约的「持仓」就是这台机器在该市场上的敞口，全平就是全平。
+            size = abs(held)
+        else:
+            # 现货的「持仓」是币余额，里面混着用户自己充进来的钱：不带 size 时只平
+            # 本程序成交账本记着的数量。以前这里拿钱包余额当全部持仓，一次不带
+            # size 的平仓把钱包里本来就有的币一起卖了（t33 实测：1 BTC 全没了）。
+            booked = _booked_held(state, symbol)
+            if booked is None or abs(booked) <= 1e-12:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"现货平仓只平本程序记录的数量：本地成交账本里没有 {symbol}"
+                        f" 的持仓记录，请显式指定要卖的 size（钱包可用 {abs(held):g}）。"
+                    ),
+                )
+            size = min(abs(booked), abs(held))
         try:
             quote = state.ctx.quote_rest(mt)
             with state.locks[mt]:
                 reference = float(
-                    quote.fetch_ticker(mt, payload.symbol).get("last") or 0.0
+                    quote.fetch_ticker(mt, symbol).get("last") or 0.0
                 )
         except Exception as exc:
-            raise HTTPException(status_code=503, detail=f"无法获取最新价：{exc}") from exc
+            raise _venue_http_error(exc, "无法获取最新价", symbol) from exc
         if reference <= 0:
             raise HTTPException(status_code=400, detail="无法获取有效的参考价格")
 
         side = "sell" if held > 0 else "buy"
         request = OrderRequest(
-            symbol=payload.symbol,
+            symbol=symbol,
             side=side,
             order_type="market",
             amount=size,
@@ -1045,7 +1185,7 @@ def create_app() -> FastAPI:
                     state.ctx.quote_rest(mt).fetch_ticker(mt, symbol).get("last") or 0.0
                 )
         except Exception as exc:
-            raise HTTPException(status_code=503, detail=f"无法获取最新价：{exc}") from exc
+            raise _venue_http_error(exc, "无法获取最新价", symbol) from exc
         if value <= 0:
             raise HTTPException(status_code=400, detail="无法获取有效的参考价格")
         return value
@@ -1069,6 +1209,12 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail="数量模式必须是 amount 或 quote")
         if payload.direction not in (None, "below", "above"):
             raise HTTPException(status_code=400, detail="触发方向必须是 below 或 above")
+        if payload.size <= 0:
+            raise HTTPException(status_code=400, detail="下单数量必须大于 0")
+        if payload.trigger <= 0:
+            raise HTTPException(status_code=400, detail="触发价必须大于 0")
+        if payload.price is not None and payload.price <= 0:
+            raise HTTPException(status_code=400, detail="委托价必须大于 0")
 
         mt = _market(payload.market)
         if not mt.is_futures:
@@ -1085,7 +1231,8 @@ def create_app() -> FastAPI:
             network=state.ctx.network,
         )
 
-        reference = _reference_price(state, mt, payload.symbol)
+        symbol = _venue_symbol(state, mt, payload.symbol)
+        reference = _reference_price(state, mt, symbol)
         above = payload.trigger > reference
         if payload.direction and (payload.direction == "above") != above:
             asked = "涨破" if payload.direction == "above" else "跌破"
@@ -1103,7 +1250,7 @@ def create_app() -> FastAPI:
         )
         try:
             exchange_amount, base_qty = state.ctx.trading.exchange_amount(
-                mt, payload.symbol, amount, payload.trigger
+                mt, symbol, amount, payload.trigger
             )
         except OrderRejected as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1112,7 +1259,7 @@ def create_app() -> FastAPI:
             with state.locks[mt]:
                 order = state.ctx.rest_for(mt).create_conditional(
                     mt,
-                    payload.symbol,
+                    symbol,
                     payload.side,
                     exchange_amount,
                     payload.trigger,
@@ -1159,6 +1306,10 @@ def create_app() -> FastAPI:
             )
         if payload.stop_loss is None and payload.take_profit is None:
             raise HTTPException(status_code=400, detail="至少要填止损或止盈其中之一")
+        if (payload.stop_loss is not None and payload.stop_loss <= 0) or (
+            payload.take_profit is not None and payload.take_profit <= 0
+        ):
+            raise HTTPException(status_code=400, detail="止损 / 止盈价格必须大于 0")
 
         state = get_state()
         with state.locks[mt]:
@@ -1170,7 +1321,8 @@ def create_app() -> FastAPI:
             market=mt,
         )
 
-        held = _live_held(state, payload.symbol, mt)
+        symbol = _venue_symbol(state, mt, payload.symbol)
+        held = _live_held(state, symbol, mt)
         if held is None:
             raise HTTPException(
                 status_code=503,
@@ -1182,7 +1334,7 @@ def create_app() -> FastAPI:
         exit_side = "sell" if long else "buy"
         entry_side = "buy" if long else "sell"
 
-        reference = _reference_price(state, mt, payload.symbol)
+        reference = _reference_price(state, mt, symbol)
         try:
             _check_protection_levels(
                 reference, payload.stop_loss, payload.take_profit, entry_side
@@ -1191,7 +1343,7 @@ def create_app() -> FastAPI:
             # The market may already have run past the level the user wants.
             # The position entry is the honest reference for "is this a stop?",
             # so only reject when the level is wrong for that too.
-            entry = _ledger_entry_price(state, mt, payload.symbol)
+            entry = _ledger_entry_price(state, mt, symbol)
             if entry <= 0:
                 raise
             _check_protection_levels(
@@ -1200,7 +1352,7 @@ def create_app() -> FastAPI:
 
         try:
             size_exchange, _ = state.ctx.trading.exchange_amount(
-                mt, payload.symbol, abs(held), reference
+                mt, symbol, abs(held), reference
             )
         except OrderRejected as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1208,7 +1360,7 @@ def create_app() -> FastAPI:
         rest = state.ctx.rest_for(mt)
         try:
             with state.locks[mt]:
-                cleared = rest.cancel_protective_orders(mt, payload.symbol)
+                cleared = rest.cancel_protective_orders(mt, symbol)
         except ExchangeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1224,11 +1376,11 @@ def create_app() -> FastAPI:
                 with state.locks[mt]:
                     if take_profit:
                         order = rest.create_take_profit_market(
-                            mt, payload.symbol, exit_side, size_exchange, level
+                            mt, symbol, exit_side, size_exchange, level
                         )
                     else:
                         order = rest.create_stop_market(
-                            mt, payload.symbol, exit_side, size_exchange, level
+                            mt, symbol, exit_side, size_exchange, level
                         )
             except ExchangeError as exc:
                 warnings.append(f"{label}单挂单失败：{exc}")
@@ -1244,7 +1396,7 @@ def create_app() -> FastAPI:
         return {
             "ok": True,
             "protection": {
-                "symbol": payload.symbol,
+                "symbol": symbol,
                 "stop_loss": payload.stop_loss or 0.0,
                 "take_profit": payload.take_profit or 0.0,
                 "orders": [item.get("id") for item in placed],
@@ -1269,6 +1421,8 @@ def create_app() -> FastAPI:
                 detail="现货没有交易所侧止损/止盈，无需撤销。",
             )
         state = get_state()
+        # 撤单也要用交易所认的符号：传裸写法撤的是另一个名字，等于没撤。
+        symbol = _venue_symbol(state, mt, symbol)
         try:
             with state.locks[mt]:
                 cleared = state.ctx.rest_for(mt).cancel_protective_orders(mt, symbol)

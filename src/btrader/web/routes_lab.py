@@ -201,6 +201,12 @@ class LabController:
         if payload.base_key:
             try:
                 base_source = _strategy_source(ctx.strategies.get(payload.base_key))
+            except KeyError as exc:
+                # 参考策略写错时静默当空源码，模型就凭空造一个，用户还以为是改的
+                # 那条。这里的 key 是调用方给的，说清楚是哪个。
+                raise HTTPException(
+                    status_code=400, detail=f"没有这个策略：{payload.base_key}"
+                ) from exc
             except Exception:
                 base_source = ""
         taken = self._taken_keys(ctx)
@@ -219,9 +225,14 @@ class LabController:
         )
         text = str(answer.get("text") or "")
         if not answer.get("ok") and not text.strip():
-            raise HTTPException(
-                status_code=502, detail=f"模型调用失败：{answer.get('error') or '未知错误'}"
-            )
+            reason = str(answer.get("error") or "未知错误")
+            if "API Key" in reason:
+                # 没配 Key 是设置问题，502 会让人以为是上游抖了一下、重试就好。
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{reason.strip()}请先在设置里填写 AI Key，再生成候选。",
+                )
+            raise HTTPException(status_code=502, detail=f"模型调用失败：{reason}")
         # 先解析再判截断：代码抠出来了就是完整的一段，被截断的往往只是后面的散文。
         # 真的抠不出来才按原因分：额度用完 vs 回答里根本没代码。
         try:
