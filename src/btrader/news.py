@@ -21,6 +21,7 @@ rather than "the network broke".
 from __future__ import annotations
 
 import html
+import http.client
 import json
 import logging
 import re
@@ -198,6 +199,10 @@ def _http_get(url: str, timeout: float, *, as_text: bool = False) -> Any:
         raise NewsError(f"新闻源返回 HTTP {exc.code}") from exc
     except urllib.error.URLError as exc:
         raise NewsError(f"无法连接新闻源：{exc.reason}") from exc
+    except http.client.HTTPException as exc:
+        # 被截断的响应抛 IncompleteRead / BadStatusLine，它们不是 OSError。
+        # 漏掉这一类，异常会一路穿出 snapshot()，面板拿到的是 500 而不是这一行错误。
+        raise NewsError(f"无法连接新闻源：{exc}") from exc
     except OSError as exc:
         raise NewsError(f"无法连接新闻源：{exc}") from exc
 

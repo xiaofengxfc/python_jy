@@ -114,3 +114,41 @@ def test_grid_search_sorted_by_metric():
     assert len(frame) == 4
     sharpes = frame["m_sharpe"].to_list()
     assert sharpes == sorted(sharpes, reverse=True)
+
+def test_a_partial_scale_out_keeps_the_remaining_cost_basis():
+    """半仓平掉之后，剩下那半的成本价不能跟着成交价漂。
+
+    部分平仓时如果把成交价按数量加权进 entry_price，已经落袋的那部分盈亏会被
+    算第二次：所有 trade.pnl 之和不再等于权益变化，avg_trade / profit_factor 也跟着失真。
+    """
+
+    class ScaleOut(Strategy):
+        key = "scale_out"
+        name = "scale out"
+        allow_short = False
+
+        def generate(self, df, params):
+            targets = np.zeros(len(df))
+            targets[2:6] = 1.0
+            targets[6:] = 0.5
+            return pd.DataFrame({"target": targets}, index=df.index)
+
+    prices = 100.0 + np.arange(12, dtype=float)
+    df = pd.DataFrame(
+        {
+            "timestamp": np.arange(12, dtype=np.int64) * 3_600_000,
+            "open": prices,
+            "high": prices,
+            "low": prices,
+            "close": prices,
+            "volume": np.ones(12),
+        }
+    )
+    cfg = BacktestConfig(initial_capital=10_000.0, fee_rate=0.0, slippage_bps=0.0)
+    result = run_backtest(df, ScaleOut(), {}, cfg)
+
+    assert len(result.trades) == 2
+    # 减仓不减成本：两笔交易的开仓价必须是同一个数。
+    assert abs(result.trades[1].entry_price - result.trades[0].entry_price) < 1e-9
+    total_pnl = sum(t.pnl for t in result.trades)
+    assert abs(result.metrics["final_equity"] - (cfg.initial_capital + total_pnl)) < 1e-6

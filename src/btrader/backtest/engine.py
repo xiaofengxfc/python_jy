@@ -199,8 +199,11 @@ def run_backtest(
                             entry_price, entry_time, entry_index, entry_fee = 0.0, 0, 0, 0.0
                     elif closed_qty > 0:
                         # Partial close; the fee for the remaining part stays booked.
+                        # The units that stay keep their original cost basis:
+                        # averaging the exit price into entry_price would book the
+                        # closed part's result twice — once in the trade appended
+                        # above, and again on the next exit.
                         entry_fee += remaining_fee
-                        entry_price = _weighted_entry(entry_price, old_qty, fill, new_qty - old_qty)
                     else:
                         entry_price = _weighted_entry(entry_price, old_qty, fill, delta)
                         entry_fee += fee

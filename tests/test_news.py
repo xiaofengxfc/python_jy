@@ -8,7 +8,9 @@ the network once per TTL.
 
 from __future__ import annotations
 
+import http.client
 import json
+import urllib.request
 
 from btrader.news import (
     NewsError,
@@ -243,3 +245,28 @@ def test_service_reports_a_total_outage_without_raising() -> None:
 
 def test_sources_are_listed_for_the_settings_copy() -> None:
     assert NewsService.sources() == ["币安公告", "CoinTelegraph", "Decrypt"]
+
+def test_a_truncated_response_is_reported_not_raised(monkeypatch) -> None:
+    """半截响应（IncompleteRead）不是 OSError，别让它穿出 snapshot()。
+
+    漏掉这一类，新闻接口对前端就是 500，面板只能显示「请求失败」，
+    而不是它设计好的「这个源读不到」。
+    """
+
+    class _Truncated:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def read(self):
+            raise http.client.IncompleteRead(b"partial")
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: _Truncated())
+
+    feed = NewsService().snapshot("BTC/USDT", limit=5)
+
+    assert feed["items"] == []
+    assert "CoinTelegraph" in feed["error"]
+    assert "Decrypt" in feed["error"]

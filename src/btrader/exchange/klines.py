@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from pathlib import Path
 
@@ -19,6 +20,10 @@ COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
 # forming, so any longer window leaves the chart showing a stale close while
 # the ticker has already moved on.
 CACHE_TTL_MS = 3_000
+
+# One klines request may ask for this many candles at most; the venue rejects
+# anything larger ("Limit is too large"), so a longer window has to be paged.
+MAX_REQUEST_BARS = 1_000
 
 
 class KlineStore:
@@ -46,6 +51,10 @@ class KlineStore:
         # identical requests shares one download without letting the tail
         # candle go stale.
         self._refreshed: dict[tuple[str, str, str], float] = {}
+        # The chart, the auto-trader and a backtest can ask for the same file at
+        # the same moment. Windows refuses to replace (or open) a file another
+        # handle still holds, so reading and writing the cache share one lock.
+        self._io_lock = threading.Lock()
 
     def _path(self, market: MarketType, symbol: str, timeframe: str) -> Path:
         safe = symbol.replace("/", "_").replace(":", "-")
@@ -55,21 +64,23 @@ class KlineStore:
 
     # ------------------------------------------------------------------ cache
     def _read_cache(self, path: Path) -> pd.DataFrame:
-        if not path.exists():
-            return pd.DataFrame(columns=COLUMNS)
-        try:
-            df = pd.read_parquet(path)
-        except Exception as exc:  # corrupted cache should not break the app
-            log.warning("K 线缓存损坏，将重新下载: %s (%s)", path, exc)
-            return pd.DataFrame(columns=COLUMNS)
-        return df
+        with self._io_lock:
+            if not path.exists():
+                return pd.DataFrame(columns=COLUMNS)
+            try:
+                df = pd.read_parquet(path)
+            except Exception as exc:  # corrupted cache should not break the app
+                log.warning("K 线缓存损坏，将重新下载: %s (%s)", path, exc)
+                return pd.DataFrame(columns=COLUMNS)
+            return df
 
     def _write_cache(self, path: Path, df: pd.DataFrame) -> None:
         if df.empty:
             return
-        tmp = path.with_suffix(".tmp.parquet")
-        df.to_parquet(tmp, index=False, compression="snappy")
-        tmp.replace(path)
+        with self._io_lock:
+            tmp = path.with_suffix(".tmp.parquet")
+            df.to_parquet(tmp, index=False, compression="snappy")
+            tmp.replace(path)
 
     @staticmethod
     def _merge(old: pd.DataFrame, new: pd.DataFrame) -> pd.DataFrame:
@@ -101,7 +112,11 @@ class KlineStore:
         """
         step_ms = timeframe_seconds(timeframe) * 1000
         path = self._path(market, symbol, timeframe)
-        cache = self._read_cache(path) if use_cache else pd.DataFrame(columns=COLUMNS)
+        # "use_cache" only decides whether the stored copy may be served as-is.
+        # The file is read either way, because the fresh window is merged into it:
+        # writing back just the window would cut the stored series down to
+        # whatever length the caller happened to ask for.
+        cache = self._read_cache(path)
 
         if since is not None:
             return self._fetch_range(market, symbol, timeframe, since, limit, step_ms, path, cache)
@@ -117,6 +132,15 @@ class KlineStore:
                 return cache.tail(limit).reset_index(drop=True)
 
         from_ts = int(time.time() * 1000) - limit * step_ms
+        if limit > MAX_REQUEST_BARS:
+            # Only the backtest page asks for more than one request's worth (up
+            # to 5000 bars). Sent as a single request the venue answers "Limit
+            # is too large" and the run dies before the first bar; page it.
+            frame = self._fetch_range(
+                market, symbol, timeframe, from_ts, limit, step_ms, path, cache
+            )
+            self._refreshed[key] = time.monotonic()
+            return frame
         fresh = self._rest.fetch_ohlcv(market, symbol, timeframe, since=from_ts, limit=limit)
         fresh = self._normalize(fresh)
         merged = self._merge(cache, fresh)
