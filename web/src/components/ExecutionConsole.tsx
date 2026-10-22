@@ -111,6 +111,7 @@ export default function ExecutionConsole({ strategies, market, symbol, timeframe
   };
 
   const lastSignal = status?.last_signal ?? null;
+  const data = status?.data ?? null;
   const events = [...(status?.events ?? [])].reverse().slice(0, 60);
 
   return (
@@ -213,6 +214,14 @@ export default function ExecutionConsole({ strategies, market, symbol, timeframe
           )}
         </div>
 
+        {/* data 是这一轮的 K 线供给：根数不够时引擎在跑却什么都不做，
+            只有后端那句话能说清原因。够用时就整块不出现。 */}
+        {data?.short && (
+          <div className="banner warn" role="status">
+            {data.message || "K 线不够，这一轮不会出信号。"}
+          </div>
+        )}
+
         <div className="gate-list">
           <div className="gate-row">
             <span>当前信号</span>
@@ -222,6 +231,14 @@ export default function ExecutionConsole({ strategies, market, symbol, timeframe
                 : "还没有信号"}
             </b>
           </div>
+          {data?.short && (
+            <div className="gate-row">
+              <span>K 线</span>
+              <b>
+                {data.fetched_bars} / {data.required_bars} 根 · 单次上限 {data.max_bars}
+              </b>
+            </div>
+          )}
         </div>
 
         <div className="exec-log">

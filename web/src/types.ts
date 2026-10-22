@@ -604,6 +604,23 @@ export interface RiskState {
   };
 }
 
+/** 自动交易这一轮的 K 线供给情况，来自 GET /api/auto/status 的 data 字段。
+ *
+ * 引擎在跑不等于在决策：预热根数不够时它每轮直接 return，界面上这一行
+ * 是唯一能解释「为什么没有信号」的地方。 */
+export interface AutoDataStatus {
+  /** 这一轮策略要多少根收盘 K 线（min_bars + 预热）。 */
+  required_bars: number;
+  /** 这一轮实际拿到多少根。 */
+  fetched_bars: number;
+  /** 交易所单次请求上限，现在是 1000。 */
+  max_bars: number;
+  /** true 表示根数不够，这一轮不会出信号。 */
+  short: boolean;
+  /** 不够时的完整说明，直接拿去显示。 */
+  message: string;
+}
+
 export interface AutoStatus {
   running: boolean;
   config: {
@@ -612,13 +629,15 @@ export interface AutoStatus {
     timeframe: string;
     strategy: string;
     params: Record<string, unknown>;
-    mode: string;
+    network: string;
     position_pct: number;
     leverage: number;
   } | null;
   last_signal: { target: number; reason: string; when: string } | null;
   seq: number;
   events: { seq: number; kind: string; level: string; message: string; when: string }[];
+  /** 没在跑的时候是 null。 */
+  data: AutoDataStatus | null;
 }
 
 export interface EquityPoint {

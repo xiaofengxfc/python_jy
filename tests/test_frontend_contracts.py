@@ -182,3 +182,41 @@ def test_backtest_trade_rows_read_the_fields_the_backend_sends() -> None:
     ):
         assert used in page, f"成交明细没有读 {used}"
     assert 'trade.side === "short"' in page, "side 是 long / short，不是 buy / sell"
+
+AUTO_ENGINE = ROOT / "src" / "btrader" / "engine" / "auto.py"
+
+
+def _auto_data_keys() -> set[str]:
+    """后端 AutoTrader 报给界面的 K 线供给字段。"""
+    source = AUTO_ENGINE.read_text(encoding="utf-8")
+    block = source.split("self._data_status", 1)[1].split("}", 1)[0]
+    return set(re.findall(r'"([a-z_]+)":', block))
+
+
+def test_auto_trading_page_shows_the_kline_shortfall_the_backend_reports() -> None:
+    """执行台要显示 /api/auto/status 的 data：不够根数时用后端那句话提示。
+
+    引擎在跑不等于在决策：预热不够时它每轮直接 return，日志一个字都没有，
+    界面只显示 running=true。这一行是唯一能把原因说出来的地方。
+    """
+    backend = _auto_data_keys()
+    assert backend == {
+        "required_bars",
+        "fetched_bars",
+        "max_bars",
+        "short",
+        "message",
+    }, f"后端 data 字段变了，types.ts 要跟着改：{sorted(backend)}"
+
+    declared = _typescript_fields("AutoDataStatus")
+    assert declared == backend, f"types.ts 的 AutoDataStatus 和后端对不上：{declared ^ backend}"
+
+    types_source = (UI_DIR / "types.ts").read_text(encoding="utf-8")
+    assert "data: AutoDataStatus | null;" in types_source, "AutoStatus 没挂上 data"
+
+    console = (UI_DIR / "components" / "ExecutionConsole.tsx").read_text(encoding="utf-8")
+    assert "status?.data" in console, "执行台没读 status.data"
+    assert "data?.short" in console, "执行台没按 short 决定显不显示"
+    assert "{data.message" in console, "执行台没把后端的 message 显示出来"
+    for used in ("data.fetched_bars", "data.required_bars", "data.max_bars"):
+        assert used in console, f"执行台没显示 {used}"
