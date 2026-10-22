@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import threading
 import time
 from contextlib import asynccontextmanager, suppress
@@ -455,6 +456,50 @@ def _venue_symbol(state: _State, market: MarketType, symbol: str) -> str:
     return f"{text}:{settle}"
 
 
+# 交割合约的符号在结算币后面还挂一段到期日，例如 BTC/USDT:USDT-250328。
+_SYMBOL_EXPIRY = re.compile(r"-\d{6}$")
+
+
+def _check_symbol_shape(market: MarketType, symbol: str) -> str:
+    """交易对写法与市场对不上时当场 400，别放它去花一次交易所请求。
+
+    ccxt 的 load_markets 一次把现货和三种合约全取回来，符号写错了也不会在本地
+    撞墙：{market: spot, symbol: BTC/USDT:USDT} 的预览照样回 allowed: true，一路
+    放行到下单才可能失败；反过来 {market: usdm, symbol: BTC/USDT} 也能过。带结算币
+    的写法只属于合约（BASE/QUOTE:SETTLE，交割再多一段 -YYMMDD），现货是
+    BASE/QUOTE，一个冒号都没有。
+
+    补齐结算币的那条路（_venue_symbol）留给撤单、平仓、保护单这些能同时收到两种
+    写法的地方，这里只负责说清该写哪一种。返回去掉首尾空白的写法，调用方直接用它。
+    """
+    text = (symbol or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="缺少交易对。")
+    base, slash, rest = text.partition("/")
+    quote = rest.split(":")[0]
+    if not slash or not base or not quote or "/" in rest:
+        raise HTTPException(
+            status_code=400,
+            detail=f"交易对写法不对：「{text}」要写成「币/计价」，例如 BTC/USDT。",
+        )
+    contract_shape = ":" in text or bool(_SYMBOL_EXPIRY.search(text))
+    if contract_shape and not market.is_futures:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"「{text}」是合约符号（结算币写在冒号后面，交割合约还带到期日），"
+                f"现货要写成 {base}/{quote}。"
+            ),
+        )
+    if market.is_futures and not contract_shape:
+        suggested = _venue_symbol(None, market, text)  # 只借它的补齐规则，不读 state
+        raise HTTPException(
+            status_code=400,
+            detail=f"「{text}」是现货写法：合约符号要带结算币，这里应写成 {suggested}。",
+        )
+    return text
+
+
 def _live_held(state: _State, symbol: str, market: MarketType) -> float | None:
     """Signed live position size: positive long, negative short.
 
@@ -819,6 +864,8 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail="下单价格必须大于 0")
         state = get_state()
         mt = _market(payload.market)
+        # 形状校验放在取价与风控之前：写错的符号不该花掉一次交易所请求。
+        payload.symbol = _check_symbol_shape(mt, payload.symbol)
         reference = payload.price if payload.order_type == "limit" else None
         if reference is None:
             # A preview is an estimate for the ticket; quoting it from the
@@ -927,6 +974,8 @@ def create_app() -> FastAPI:
 
         state = get_state()
         mt = _market(payload.market)
+        # 形状校验同样在取价、凭据、风控之前：写错的符号连一次签名请求都不该花。
+        payload.symbol = _check_symbol_shape(mt, payload.symbol)
 
         # Every order is real now, so the gates are always on: the account must
         # be able to sign, and on mainnet the caller must acknowledge that this
