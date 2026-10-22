@@ -289,7 +289,7 @@ export default function AIQuantPage({ settings, health, onNavigate }: Props) {
           <div className="card-head">
             <span className="card-title">候选策略</span>
             <span className="spacer" />
-            <span className="faint" style={{ fontSize: 11 }}>
+            <span className="faint" style={{ fontSize: "var(--fs-12)"}}>
               {candidates.length} 条
             </span>
           </div>
@@ -386,7 +386,7 @@ export default function AIQuantPage({ settings, health, onNavigate }: Props) {
                     {selected.checks?.ok ? "静态检查通过" : "静态检查未通过"}
                   </div>
                   {(selected.checks?.issues ?? []).map((issue, index) => (
-                    <div key={index} className="faint" style={{ fontSize: 11.5 }}>
+                    <div key={index} className="faint" style={{ fontSize: "var(--fs-12-5)"}}>
                       {issue.line ? `第 ${issue.line} 行：` : ""}
                       {issue.message || issue.code}
                     </div>

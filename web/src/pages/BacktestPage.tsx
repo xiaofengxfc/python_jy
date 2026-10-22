@@ -454,7 +454,7 @@ export default function BacktestPage() {
           ))}
         </div>
         <span className="spacer" />
-        {busy && <span className="faint" style={{ fontSize: 11 }}>{(progress * 100).toFixed(0)}%</span>}
+        {busy && <span className="faint" style={{ fontSize: "var(--fs-12)"}}>{(progress * 100).toFixed(0)}%</span>}
         <button
           type="button"
           className="btn-sm primary"
@@ -472,7 +472,7 @@ export default function BacktestPage() {
         </div>
       )}
 
-      <div className="stack">
+      <div className="stack backtest">
         <div className="stack">
           <div className="card">
             <div className="card-head">
@@ -601,7 +601,7 @@ export default function BacktestPage() {
                     编辑源码
                   </button>
                   {isCandidate && (
-                    <span className="faint" style={{ fontSize: 11 }}>
+                    <span className="faint" style={{ fontSize: "var(--fs-12)"}}>
                       批准后在策略实验室生成正式策略
                     </span>
                   )}
@@ -816,7 +816,7 @@ export default function BacktestPage() {
                 <div className="card-head">
                   <span className="card-title">历史回测</span>
                   <span className="spacer" />
-                  <span className="faint" style={{ fontSize: 11 }}>{runs.length} 条</span>
+                  <span className="faint" style={{ fontSize: "var(--fs-12)"}}>{runs.length} 条</span>
                 </div>
                 <Table
                   headers={["时间", "交易对", "周期", "策略", "收益", "夏普", "回撤", ""]}
@@ -859,7 +859,7 @@ export default function BacktestPage() {
                 <div className="card-head">
                   <span className="card-title">优化结果</span>
                   <span className="spacer" />
-                  <span className="faint" style={{ fontSize: 11 }}>
+                  <span className="faint" style={{ fontSize: "var(--fs-12)"}}>
                     按夏普排序 · {optimizeRows.length} 组
                   </span>
                 </div>
@@ -948,7 +948,7 @@ export default function BacktestPage() {
                   <div className="card-head">
                     <span className="card-title">成交明细</span>
                     <span className="spacer" />
-                    <span className="faint" style={{ fontSize: 11 }}>
+                    <span className="faint" style={{ fontSize: "var(--fs-12)"}}>
                       {result.trades.length} 笔
                     </span>
                   </div>
@@ -979,7 +979,7 @@ export default function BacktestPage() {
                   <div className="card-head">
                     <span className="card-title">AI 过滤</span>
                     <span className="spacer" />
-                    <span className="faint" style={{ fontSize: 11 }}>
+                    <span className="faint" style={{ fontSize: "var(--fs-12)"}}>
                       原版 vs 模型复核后
                     </span>
                   </div>
@@ -1150,7 +1150,7 @@ export default function BacktestPage() {
             <div className="card-head">
               <span className="card-title">策略源码</span>
               <span className="spacer" />
-              <span className="faint" style={{ fontSize: 11 }}>
+              <span className="faint" style={{ fontSize: "var(--fs-12)"}}>
                 保存后自动热加载，可直接回测
               </span>
             </div>

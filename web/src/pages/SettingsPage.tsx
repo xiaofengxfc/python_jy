@@ -608,7 +608,7 @@ export default function SettingsPage({ settings, onSaved }: Props) {
           <div className="card-head">
             <span className="card-title">新闻来源</span>
             <span className="spacer" />
-            <span className="faint" style={{ fontSize: 11 }}>
+            <span className="faint" style={{ fontSize: "var(--fs-12)"}}>
               免费公开源 · 无需配置
             </span>
           </div>
@@ -632,7 +632,7 @@ export default function SettingsPage({ settings, onSaved }: Props) {
           <div className="card-head">
             <span className="card-title">AI 助手</span>
             <span className="spacer" />
-            <span className="faint" style={{ fontSize: 11 }}>
+            <span className="faint" style={{ fontSize: "var(--fs-12)"}}>
               {aiStatus?.provider_label ?? "未配置"}
               {aiStatus?.calls_today ? ` · 今日 ${aiStatus.calls_today} 次` : ""}
             </span>
@@ -777,7 +777,7 @@ export default function SettingsPage({ settings, onSaved }: Props) {
 
             {aiStatus && aiStatus.audit.length > 0 && (
               <div style={{ marginTop: 12 }}>
-                <div className="faint" style={{ fontSize: 11, marginBottom: 4 }}>
+                <div className="faint" style={{ fontSize: "var(--fs-12)", marginBottom: 4 }}>
                   最近调用
                 </div>
                 <ul className="ai-audit settings-ai-audit">
@@ -893,7 +893,7 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                   value={draft.proxy}
                   onChange={(event) => patch({ proxy: event.target.value })}
                 />
-                <div className="faint" style={{ fontSize: 12 }}>
+                <div className="faint" style={{ fontSize: "var(--fs-13)"}}>
                   部分网络会污染币安合约域名（fapi.binance.com / dapi.binance.com）的 DNS。
                   填了代理，合约 K 线和下单才能直连币安。留空则不走代理。
                 </div>
@@ -945,7 +945,7 @@ export default function SettingsPage({ settings, onSaved }: Props) {
             <div className="card-head">
               <span className="card-title">企业微信通知</span>
               <span className="spacer" />
-              <span className="faint" style={{ fontSize: 11 }}>
+              <span className="faint" style={{ fontSize: "var(--fs-12)"}}>
                 {notifyStatus
                   ? notifyStatus.available
                     ? `地址已填 · ${notifyStatus.format}`
@@ -1119,7 +1119,7 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                 {riskBusy ? "处理中…" : "解除熔断"}
               </button>
             ) : (
-              <span className="faint" style={{ fontSize: 11 }}>正常</span>
+              <span className="faint" style={{ fontSize: "var(--fs-12)"}}>正常</span>
             )}
           </div>
           <div className="card-body stack">
@@ -1184,7 +1184,7 @@ export default function SettingsPage({ settings, onSaved }: Props) {
           <div className="card-head">
             <span className="card-title">风控参数</span>
             <span className="spacer" />
-            <span className="faint" style={{ fontSize: 11 }}>填 0 表示不限制</span>
+            <span className="faint" style={{ fontSize: "var(--fs-12)"}}>填 0 表示不限制</span>
           </div>
           <div className="card-body stack">
             <div className="form-grid">

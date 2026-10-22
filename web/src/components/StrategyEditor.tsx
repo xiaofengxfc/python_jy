@@ -381,7 +381,7 @@ export default function StrategyEditor({
             >
               取消
             </button>
-            <span className="faint" style={{ fontSize: 11 }}>
+            <span className="faint" style={{ fontSize: "var(--fs-12)"}}>
               自动交易或 AI 交易正在使用这个策略时会被拒绝。
             </span>
           </div>

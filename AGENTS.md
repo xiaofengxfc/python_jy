@@ -45,6 +45,18 @@ Node 不在 PATH 时，先把 Node 目录加进去。
 - 交易页的市场、交易对、周期以设置为初值：用户没在本页手动改过的那一项跟着设置走。
   判断依据是 `picked` 那三个标记，新增可配置项时照这个来，不要写死默认值。
 - K 线一次拉 1000 根（交易所上限），不做成设置项。下单金额由下单框自己记，也不进设置。
+- 界面字号只改 `web/src/styles.css` 里的 `--fs-*` 令牌，组件里不写字面量：
+  CSS 写 `font-size: var(--fs-13)`，JSX 内联写 `style={{ fontSize: "var(--fs-13)" }}`。
+  档位：页面标题 `.page-title` 用 `--fs-14`，正文走 `--font-size`（= `--fs-14`），
+  卡片标题 `.card-title` 和表格 `td` 用 `--fs-13`，表头 `th` 用 `--fs-12`。
+  令牌名就是像素值，整体再抬一档要连名字一起改，别只改数值。窄窗口靠收 `.table` 的内边距，
+  不靠缩字号。图表刻度也跟着令牌走：`chart/theme.ts` 用 `cssPx("--fs-12", 12)` 把令牌换成
+  lightweight-charts 要的数字，令牌改了图表跟着变。
+- 内容列宽上限分两档：默认表单页 1080；资产页 `.stack.portfolio` 和三个 AI 页
+  `.ai-grid` / `.quant-grid` / `.lab-grid` 都是 1400。列靠 `margin: auto` 居中。
+  左右内边距不等：`.main` 左 22、右 12，右边 10px 由 `scrollbar-gutter: stable` 预留给滚动条，
+  视觉上两边都是 22；别把右边改回 22，否则内容会横向跳。页面标题条用负 margin 反向出血铺满整行，
+  `.page-head` 是 `margin: 0 -12px 0 -22px` 配 `padding: 0 12px 0 22px`；加新页照抄这套，别自己另写边距。
 
 ## 4. 账户只有一个来源
 

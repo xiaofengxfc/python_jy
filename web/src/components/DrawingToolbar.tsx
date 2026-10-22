@@ -36,7 +36,7 @@ export default function DrawingToolbar({
 }: Props) {
   return (
     <div className="card-head indicator-bar" role="toolbar" aria-label="图表画线">
-      <span className="faint" style={{ fontSize: 11 }}>
+      <span className="faint" style={{ fontSize: "var(--fs-12)"}}>
         画线
       </span>
       <div className="segmented">
@@ -52,7 +52,7 @@ export default function DrawingToolbar({
           </button>
         ))}
       </div>
-      <span className="faint" style={{ fontSize: 11 }}>
+      <span className="faint" style={{ fontSize: "var(--fs-12)"}}>
         {count > 0 ? `${count} 条` : "无"}
       </span>
       <span className="spacer" />

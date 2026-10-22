@@ -322,7 +322,7 @@ export default function AITradePage({ settings, health }: Props) {
           <div className="card-head">
             <span className="card-title">运行配置</span>
             <span className="spacer" />
-            <span className="faint" style={{ fontSize: 11 }}>
+            <span className="faint" style={{ fontSize: "var(--fs-12)"}}>
               {MARKET_LABELS[market] ?? market}
             </span>
           </div>
@@ -462,7 +462,7 @@ export default function AITradePage({ settings, health }: Props) {
           <div className="card-head">
             <span className="card-title">决策时间线</span>
             <span className="spacer" />
-            <span className="faint" style={{ fontSize: 11 }}>
+            <span className="faint" style={{ fontSize: "var(--fs-12)"}}>
               今日 {counters.decisions_today ?? 0}/{counters.max_decisions_per_day ?? 0} 次决策 ·
               拒绝 {blocked} 次
             </span>
@@ -525,7 +525,7 @@ export default function AITradePage({ settings, health }: Props) {
                           </div>
                         ))}
                         {record.decision_id && (
-                          <div className="faint" style={{ fontSize: 11 }}>
+                          <div className="faint" style={{ fontSize: "var(--fs-12)"}}>
                             决策 {record.decision_id}
                             {record.order_id ? ` · 订单 ${record.order_id}` : ""}
                           </div>
@@ -544,7 +544,7 @@ export default function AITradePage({ settings, health }: Props) {
           <div className="card-head">
             <span className="card-title">账户与风控</span>
             <span className="spacer" />
-            <span className="faint" style={{ fontSize: 11 }}>
+            <span className="faint" style={{ fontSize: "var(--fs-12)"}}>
               {health?.network === "mainnet" ? "主网" : "测试网"}
             </span>
           </div>

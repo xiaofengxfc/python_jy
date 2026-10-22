@@ -398,7 +398,7 @@ export default function StrategyLabPage({ settings, health }: Props) {
         <h1 className="page-title">策略实验室</h1>
         <span className="page-sub">模型写候选，人检查、回测、批准，再调参</span>
         <span className="spacer" />
-        <span className="faint" style={{ fontSize: 11 }}>
+        <span className="faint" style={{ fontSize: "var(--fs-12)"}}>
           {health?.markets.find((item) => item.value === market)?.label ?? market} · {symbol} ·{" "}
           {timeframe}
         </span>
@@ -443,7 +443,7 @@ export default function StrategyLabPage({ settings, health }: Props) {
           ))}
         </select>
         <span className="spacer" />
-        <span className="faint" style={{ fontSize: 11.5 }}>
+        <span className="faint" style={{ fontSize: "var(--fs-12-5)"}}>
           回测和优化都用这一组标的
         </span>
       </div>
@@ -489,12 +489,12 @@ export default function StrategyLabPage({ settings, health }: Props) {
                     {selected.checks?.ok ? "静态检查通过" : "静态检查未通过"}
                   </div>
                   {(selected.checks?.issues ?? []).length === 0 && selected.checks?.ok && (
-                    <div className="faint" style={{ fontSize: 11.5 }}>
+                    <div className="faint" style={{ fontSize: "var(--fs-12-5)"}}>
                       导入白名单内，没有危险调用。
                     </div>
                   )}
                   {(selected.checks?.issues ?? []).map((issue, index) => (
-                    <div key={index} className="faint" style={{ fontSize: 11.5 }}>
+                    <div key={index} className="faint" style={{ fontSize: "var(--fs-12-5)"}}>
                       {issue.line ? `第 ${issue.line} 行：` : ""}
                       {issue.message || issue.code}
                     </div>
@@ -627,7 +627,7 @@ export default function StrategyLabPage({ settings, health }: Props) {
                   />
                 </div>
                 <div className="exec-actions">
-                  <span className="faint" style={{ fontSize: 11.5 }}>
+                  <span className="faint" style={{ fontSize: "var(--fs-12-5)"}}>
                     {symbol} · {timeframe}
                   </span>
                   <span className="spacer" />
@@ -698,7 +698,7 @@ export default function StrategyLabPage({ settings, health }: Props) {
                 </div>
 
                 <div className="exec-actions">
-                  <span className="faint" style={{ fontSize: 11.5 }}>
+                  <span className="faint" style={{ fontSize: "var(--fs-12-5)"}}>
                     {symbol} · {timeframe}
                   </span>
                   <span className="spacer" />
@@ -735,7 +735,7 @@ export default function StrategyLabPage({ settings, health }: Props) {
                       </b>
                     </div>
                     {result?.stopped && (
-                      <div className="faint" style={{ fontSize: 11.5 }}>
+                      <div className="faint" style={{ fontSize: "var(--fs-12-5)"}}>
                         结束原因：{STOPPED_LABEL[result.stopped] ?? result.stopped}
                         {result.calls ? ` · 共 ${result.calls} 次调用` : ""}
                       </div>
@@ -775,7 +775,7 @@ export default function StrategyLabPage({ settings, health }: Props) {
                       <b>{paramsText(result.best)}</b>
                     </div>
                     <div className="exec-actions">
-                      <span className="faint" style={{ fontSize: 11.5 }}>
+                      <span className="faint" style={{ fontSize: "var(--fs-12-5)"}}>
                         {result.best_score === undefined
                           ? ""
                           : `得分 ${fmt(result.best_score, 3)}`}

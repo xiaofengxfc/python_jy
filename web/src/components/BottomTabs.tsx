@@ -268,7 +268,7 @@ export default function BottomTabs({
             </button>
           )}
           {count !== null && (
-            <span className="faint num" style={{ fontSize: 11, alignSelf: "center" }}>
+            <span className="faint num" style={{ fontSize: "var(--fs-12)", alignSelf: "center" }}>
               {count} 条
             </span>
           )}

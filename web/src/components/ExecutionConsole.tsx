@@ -198,7 +198,7 @@ export default function ExecutionConsole({ strategies, market, symbol, timeframe
         </div>
 
         <div className="exec-actions">
-          <span className="faint" style={{ fontSize: 11.5 }}>
+          <span className="faint" style={{ fontSize: "var(--fs-12-5)"}}>
             {symbol} · {TIMEFRAMES.find(([value]) => value === timeframe)?.[1] ?? timeframe}
           </span>
           <span className="spacer" />

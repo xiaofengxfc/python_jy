@@ -41,6 +41,14 @@ export interface Palette {
   entry: string;
 }
 
+/** Reads a px design token and hands lightweight-charts a number, which is what
+ * the library wants for fontSize (it does not parse CSS lengths). Falls back
+ * when the token is missing or the page is not laid out yet. */
+export function cssPx(name: string, fallback: number): number {
+  const value = Number.parseFloat(cssVar(name, ""));
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
 export function chartPalette(): Palette {
   return {
     background: cssVar("--bg", "#ffffff"),
@@ -124,7 +132,7 @@ export function chartOptions(
       background: { type: ColorType.Solid, color: palette.background },
       textColor: palette.axis,
       fontFamily: "Inter, ui-sans-serif, system-ui, sans-serif",
-      fontSize: 11,
+      fontSize: cssPx("--fs-12", 12),
       attributionLogo: false,
     },
     grid: {

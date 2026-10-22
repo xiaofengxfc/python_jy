@@ -109,7 +109,7 @@ export default function LogPanel({ open, onClose, onCounts }: Props) {
             清空
           </button>
           <span className="spacer" />
-          <span className="faint" style={{ fontSize: 11 }}>
+          <span className="faint" style={{ fontSize: "var(--fs-12)"}}>
             自动刷新
           </span>
         </div>

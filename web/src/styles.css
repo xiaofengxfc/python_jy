@@ -43,7 +43,21 @@
 
   --font: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI",
     "Microsoft YaHei", sans-serif;
-  --font-size: 13px;
+  /* 字号阶梯：全站字号只在这里定义，组件一律写 var(--fs-*)，不再写死 px。
+     数值整体比改造前上调一档（旧 10 / 10.5 / 11 / 11.5 / 12 / 12.5 / 13 /
+     14 / 15 / 16 / 19px）。令牌名就是它的像素值，要整体调大小只改这一段。 */
+  --fs-11: 11px; /* 旧 10px：角标、极小注脚 */
+  --fs-11-5: 11.5px; /* 旧 10.5px */
+  --fs-12: 12px; /* 旧 11px：标签、表头、徽标 */
+  --fs-12-5: 12.5px; /* 旧 11.5px */
+  --fs-13: 13px; /* 旧 12px：表体、卡片标题、tab */
+  --fs-13-5: 13.5px; /* 旧 12.5px */
+  --fs-14: 14px; /* 旧 13px：正文基准、按钮、输入框、页面标题 */
+  --fs-15: 15px; /* 旧 14px */
+  --fs-16: 16px; /* 旧 15px */
+  --fs-17: 17px; /* 旧 16px：数字展示 */
+  --fs-20: 20px; /* 旧 19px：大数字 */
+  --font-size: var(--fs-14); /* body 基准 = --fs-14，改它等于改正文 */
   --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
 }
 
@@ -211,7 +225,7 @@ p {
 }
 
 .section-title {
-  font-size: 11px;
+  font-size: var(--fs-12);
   font-weight: 600;
   letter-spacing: 0.04em;
   text-transform: uppercase;
@@ -221,7 +235,7 @@ p {
 
 .hint {
   color: var(--text-3);
-  font-size: 12px;
+  font-size: var(--fs-13);
   line-height: 1.55;
 }
 
@@ -253,7 +267,7 @@ p {
 }
 
 .titlebar-brand {
-  font-size: 12px;
+  font-size: var(--fs-13);
   font-weight: 600;
   letter-spacing: 0.01em;
   color: var(--text-2);
@@ -322,7 +336,7 @@ p {
   border-radius: 8px;
   background: var(--ink);
   color: var(--bg);
-  font-size: 11px;
+  font-size: var(--fs-12);
   font-weight: 700;
   letter-spacing: 0.02em;
 }
@@ -387,7 +401,7 @@ p {
   border-radius: 5px;
   background: var(--ink);
   color: var(--bg);
-  font-size: 12px;
+  font-size: var(--fs-13);
   line-height: 1.4;
   white-space: pre;
   text-align: left;
@@ -442,7 +456,7 @@ p {
   border-radius: 999px;
   background: var(--down);
   color: #fff;
-  font-size: 10px;
+  font-size: var(--fs-11);
   font-weight: 600;
   line-height: 15px;
   text-align: center;
@@ -465,14 +479,18 @@ p {
 }
 
 /* ---------------------------------------------------------- content */
+/* 右边只给 12px：滚动条同样占在右侧，12px 内边距 + 10px 滚动条槽正好等于
+   左边的 22px，内容列左右留白才相等。scrollbar-gutter: stable 让「有没有
+   滚动条」都留同一个槽，否则切到短页面时内容会横向跳 10px。 */
 .main {
   display: flex;
   flex-direction: column;
   gap: var(--gap);
   min-width: 0;
   min-height: 0;
-  padding: 0 22px 20px;
+  padding: 0 12px 20px 22px;
   overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 
 /* Every page except the trading screen is a centred column, so wide monitors
@@ -483,6 +501,16 @@ p {
   max-width: 1080px;
   margin-left: auto;
   margin-right: auto;
+}
+
+/* 资产页和回测页都是结果表 + 图表的数据页，1080 会把右边空掉一大块。
+   跟三个 AI 页同一档（1400），1440 及以下的窗口直接吃满 main 的内容宽度，
+   两侧留白仍由 main 的内边距给（左 22、右 12 + 滚动条槽 10），左右对称。
+   表单页（设置）继续用上面默认的 1080，不要动通用 .stack。 */
+main.main > .stack.portfolio:not(.page-head),
+main.main > .stack.backtest:not(.page-head) {
+  width: 100%;
+  max-width: 1400px;
 }
 
 /* The title row is the one thing that stays put while a long page scrolls.
@@ -498,21 +526,23 @@ p {
   flex: none;
   height: 40px;
   min-height: 40px;
-  margin: 0 -22px;
-  padding: 0 22px;
+  /* 左右按 .main 的内边距反向出血：左边 22、右边 12（10px 滚动条槽在更外面），
+     标题条的边线正好跨到内容区两端，又不会伸进滚动条槽。 */
+  margin: 0 -12px 0 -22px;
+  padding: 0 12px 0 22px;
   background: var(--page);
   border-bottom: 1px solid var(--border);
 }
 
 .page-title {
-  font-size: 13px;
+  font-size: var(--fs-14);
   font-weight: 600;
   letter-spacing: 0;
   line-height: 1.3;
 }
 
 .page-sub {
-  font-size: 12px;
+  font-size: var(--fs-13);
   color: var(--text-3);
 }
 
@@ -565,7 +595,7 @@ p {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  font-size: 11px;
+  font-size: var(--fs-12);
   color: var(--text-2, #5b5b5b);
 }
 
@@ -573,7 +603,7 @@ p {
   width: 58px;
   height: 24px;
   padding: 0 6px;
-  font-size: 11px;
+  font-size: var(--fs-12);
   font-variant-numeric: tabular-nums;
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -582,7 +612,7 @@ p {
 }
 
 .card-title {
-  font-size: 12px;
+  font-size: var(--fs-13);
   font-weight: 600;
   letter-spacing: 0.01em;
 }
@@ -612,7 +642,7 @@ p {
   border-radius: 5px;
   background: transparent;
   color: var(--text-2);
-  font-size: 12px;
+  font-size: var(--fs-13);
   white-space: nowrap;
   transition: background 0.12s ease, color 0.12s ease;
 }
@@ -641,13 +671,13 @@ p {
   align-items: baseline;
   justify-content: space-between;
   gap: 8px;
-  font-size: 12px;
+  font-size: var(--fs-13);
   color: var(--text-2);
 }
 
 .field-label em {
   font-style: normal;
-  font-size: 11px;
+  font-size: var(--fs-12);
   color: var(--text-3);
 }
 
@@ -660,7 +690,7 @@ p {
   border-radius: var(--radius-sm);
   background: var(--bg);
   color: var(--text);
-  font-size: 13px;
+  font-size: var(--fs-14);
   transition: border-color 0.12s ease, box-shadow 0.12s ease;
 }
 
@@ -673,7 +703,7 @@ p {
   width: 96px;
   height: 26px;
   padding: 0 6px;
-  font-size: 12px;
+  font-size: var(--fs-13);
   text-align: right;
 }
 
@@ -718,7 +748,7 @@ input[type="range"].input:focus {
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 12px;
+  font-size: var(--fs-13);
   color: var(--text-2);
   cursor: pointer;
 }
@@ -741,7 +771,7 @@ input[type="range"].input:focus {
   border-radius: var(--radius-sm);
   background: var(--ink);
   color: var(--bg);
-  font-size: 13px;
+  font-size: var(--fs-14);
   font-weight: 500;
   transition: background 0.12s ease, border-color 0.12s ease, opacity 0.12s ease;
 }
@@ -798,7 +828,7 @@ input[type="range"].input:focus {
   border-radius: var(--radius-sm);
   background: var(--bg);
   color: var(--text);
-  font-size: 12px;
+  font-size: var(--fs-13);
   white-space: nowrap;
   transition: background 0.12s ease, border-color 0.12s ease;
 }
@@ -834,7 +864,7 @@ input[type="range"].input:focus {
 .table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 12px;
+  font-size: var(--fs-13);
 }
 
 .table th {
@@ -845,7 +875,7 @@ input[type="range"].input:focus {
   padding: 0 13px;
   background: var(--bg-subtle);
   color: var(--text-3);
-  font-size: 11px;
+  font-size: var(--fs-12);
   font-weight: 500;
   text-align: left;
   white-space: nowrap;
@@ -872,12 +902,23 @@ input[type="range"].input:focus {
   text-align: right;
 }
 
+/* 成交表在面板里，8 列本来刚好卡满面板宽度；字号上调一档后多要 22px 的表宽
+   （实测 609.8px 对 588px 的容器）。窄窗口只收面板内表格的左右内边距，
+   各收 3px 一共让回 48px，字号不动；资产页和 AI 页的表格不受影响。 */
+@media (max-width: 1100px) {
+  .panel-body .table th,
+  .panel-body .table td {
+    padding-left: 10px;
+    padding-right: 10px;
+  }
+}
+
 .empty {
   display: grid;
   place-items: center;
   padding: 40px 16px;
   color: var(--text-3);
-  font-size: 12px;
+  font-size: var(--fs-13);
 }
 
 /* ------------------------------------------------------------ banner */
@@ -890,7 +931,7 @@ input[type="range"].input:focus {
   border-radius: var(--radius-sm);
   background: var(--bg-subtle);
   color: var(--text-2);
-  font-size: 12px;
+  font-size: var(--fs-13);
 }
 
 .banner.error {
@@ -927,7 +968,7 @@ input[type="range"].input:focus {
   border: 1px dashed var(--border-strong);
   border-radius: var(--radius);
   color: var(--text-3);
-  font-size: 12px;
+  font-size: var(--fs-13);
   text-align: center;
 }
 
@@ -935,7 +976,7 @@ input[type="range"].input:focus {
   display: block;
   margin-bottom: 4px;
   color: var(--text-2);
-  font-size: 13px;
+  font-size: var(--fs-14);
   font-weight: 500;
 }
 
@@ -1062,7 +1103,7 @@ input[type="range"].input:focus {
   border-radius: var(--radius-sm);
   background: transparent;
   color: var(--text);
-  font-size: 14px;
+  font-size: var(--fs-15);
   font-weight: 600;
   letter-spacing: -0.01em;
 }
@@ -1115,7 +1156,7 @@ input[type="range"].input:focus {
   border-radius: 999px;
   background: var(--bg-hover);
   color: var(--text-2);
-  font-size: 11px;
+  font-size: var(--fs-12);
 }
 
 .picker-chips button:hover {
@@ -1142,7 +1183,7 @@ input[type="range"].input:focus {
   border-radius: var(--radius-sm);
   background: transparent;
   color: var(--text);
-  font-size: 12px;
+  font-size: var(--fs-13);
   text-align: left;
 }
 
@@ -1158,7 +1199,7 @@ input[type="range"].input:focus {
 .picker-empty {
   padding: 20px 8px;
   color: var(--text-3);
-  font-size: 12px;
+  font-size: var(--fs-13);
   text-align: center;
 }
 
@@ -1169,14 +1210,14 @@ input[type="range"].input:focus {
 }
 
 .price {
-  font-size: 19px;
+  font-size: var(--fs-20);
   font-weight: 600;
   letter-spacing: -0.02em;
   line-height: 1.2;
 }
 
 .change {
-  font-size: 12px;
+  font-size: var(--fs-13);
   font-weight: 500;
 }
 
@@ -1194,11 +1235,11 @@ input[type="range"].input:focus {
 
 .stat-label {
   color: var(--text-3);
-  font-size: 11px;
+  font-size: var(--fs-12);
 }
 
 .stat-value {
-  font-size: 12px;
+  font-size: var(--fs-13);
   color: var(--text-2);
 }
 
@@ -1228,7 +1269,7 @@ input[type="range"].input:focus {
   display: flex;
   gap: 12px;
   color: var(--text-3);
-  font-size: 11px;
+  font-size: var(--fs-12);
   pointer-events: none;
 }
 
@@ -1248,7 +1289,7 @@ input[type="range"].input:focus {
   display: grid;
   place-items: center;
   color: var(--text-3);
-  font-size: 12px;
+  font-size: var(--fs-13);
   pointer-events: none;
 }
 
@@ -1257,7 +1298,7 @@ input[type="range"].input:focus {
   display: flex;
   flex-direction: column;
   padding: 4px 0;
-  font-size: 12px;
+  font-size: var(--fs-13);
 }
 
 .book-side {
@@ -1327,7 +1368,7 @@ input[type="range"].input:focus {
   justify-content: space-between;
   padding: 4px 13px;
   color: var(--text-3);
-  font-size: 11px;
+  font-size: var(--fs-12);
 }
 
 .spread {
@@ -1340,7 +1381,7 @@ input[type="range"].input:focus {
   border-top: 1px solid var(--border);
   border-bottom: 1px solid var(--border);
   color: var(--text-3);
-  font-size: 11px;
+  font-size: var(--fs-12);
 }
 
 /* ------------------------------------------------------------ ticket */
@@ -1364,7 +1405,7 @@ input[type="range"].input:focus {
   border-radius: var(--radius-sm);
   background: var(--bg);
   color: var(--text-3);
-  font-size: 13px;
+  font-size: var(--fs-14);
   font-weight: 500;
   transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
 }
@@ -1441,7 +1482,7 @@ input[type="range"].input:focus {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  font-size: 11px;
+  font-size: var(--fs-12);
   color: var(--text-3);
 }
 
@@ -1465,7 +1506,7 @@ input[type="range"].input:focus {
   border-radius: 5px;
   background: var(--bg);
   color: var(--text-2);
-  font-size: 11px;
+  font-size: var(--fs-12);
   transition: background 0.12s ease, border-color 0.12s ease;
 }
 
@@ -1487,7 +1528,7 @@ input[type="range"].input:focus {
   border-radius: 5px;
   background: var(--bg);
   color: var(--text-3);
-  font-size: 11px;
+  font-size: var(--fs-12);
   font-variant-numeric: tabular-nums;
   transition: border-color 0.12s ease, color 0.12s ease;
 }
@@ -1506,7 +1547,7 @@ input[type="range"].input:focus {
   gap: 6px;
   margin-top: -2px;
   color: var(--text-2);
-  font-size: 12px;
+  font-size: var(--fs-13);
   line-height: 1.4;
 }
 
@@ -1516,7 +1557,7 @@ input[type="range"].input:focus {
 
 .unit {
   color: var(--text-3);
-  font-size: 11px;
+  font-size: var(--fs-12);
 }
 
 .preview {
@@ -1526,7 +1567,7 @@ input[type="range"].input:focus {
   padding: 10px 11px;
   border-radius: var(--radius-sm);
   background: var(--bg-subtle);
-  font-size: 12px;
+  font-size: var(--fs-13);
 }
 
 .preview-row {
@@ -1549,7 +1590,7 @@ input[type="range"].input:focus {
   padding-top: 7px;
   border-top: 1px solid var(--border);
   color: var(--text-3);
-  font-size: 11px;
+  font-size: var(--fs-12);
   line-height: 1.5;
 }
 
@@ -1627,7 +1668,7 @@ input[type="range"].input:focus {
 .ticket-note {
   padding: 0 13px 12px;
   color: var(--text-3);
-  font-size: 11px;
+  font-size: var(--fs-12);
   line-height: 1.5;
 }
 
@@ -1637,7 +1678,7 @@ input[type="range"].input:focus {
   gap: 10px;
   margin-bottom: 5px;
   color: var(--text-3);
-  font-size: 11px;
+  font-size: var(--fs-12);
 }
 
 .ticket-line b {
@@ -1651,7 +1692,7 @@ input[type="range"].input:focus {
   border: 0;
   background: none;
   color: var(--text-3);
-  font-size: 11px;
+  font-size: var(--fs-12);
   text-decoration: underline;
   text-underline-offset: 2px;
 }
@@ -1664,7 +1705,7 @@ input[type="range"].input:focus {
   margin: 0 13px 10px;
   padding: 8px 10px;
   border-radius: var(--radius-sm);
-  font-size: 12px;
+  font-size: var(--fs-13);
 }
 
 .flash.ok {
@@ -1712,7 +1753,7 @@ input[type="range"].input:focus {
   border-radius: 999px;
   background: var(--bg-active);
   color: var(--text-2);
-  font-size: 11px;
+  font-size: var(--fs-12);
 }
 
 .chevron {
@@ -1751,7 +1792,7 @@ input[type="range"].input:focus {
   border-radius: 5px;
   background: transparent;
   color: var(--text-3);
-  font-size: 12px;
+  font-size: var(--fs-13);
   transition: color 0.12s ease, background 0.12s ease;
 }
 
@@ -1775,7 +1816,7 @@ input[type="range"].input:focus {
   border-radius: 5px;
   background: transparent;
   color: var(--text-3);
-  font-size: 12px;
+  font-size: var(--fs-13);
 }
 
 .chart-ai-link:hover,
@@ -1818,10 +1859,30 @@ input[type="range"].input:focus {
   color: var(--text);
 }
 
+/* The body is the height left under the tab strip, and it is a flex column so
+   the tab's content can claim that height. As a plain block the body sized to
+   its content, so a short empty state (98px) left a white band under it. */
 .panel-body {
+  display: flex;
+  flex-direction: column;
   flex: 1 1 auto;
   min-height: 0;
   overflow: auto;
+}
+
+/* display:flex would otherwise win over the [hidden] UA rule, so collapsing the
+   panel would leave the body in the render tree (only clipped by overflow). */
+.panel-body[hidden] {
+  display: none;
+}
+
+/* Table wrapper and empty state stretch to the body height. A long table still
+   scrolls inside its own wrapper, so the sticky header keeps working. */
+.panel-body > .table-wrap,
+.panel-body > .empty,
+.panel-body > .news-wrap {
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 /* The AI tab keeps the same panel height as the tables. Its body scrolls
@@ -1859,18 +1920,18 @@ input[type="range"].input:focus {
 
 .metric-label {
   color: var(--text-3);
-  font-size: 11px;
+  font-size: var(--fs-12);
 }
 
 .metric-value {
-  font-size: 16px;
+  font-size: var(--fs-17);
   font-weight: 600;
   letter-spacing: -0.01em;
   line-height: 1.25;
 }
 
 .metric-value.small {
-  font-size: 13px;
+  font-size: var(--fs-14);
 }
 
 /* ---------------------------------------------------- legend / alloc */
@@ -1878,7 +1939,7 @@ input[type="range"].input:focus {
   display: flex;
   flex-wrap: wrap;
   gap: 14px;
-  font-size: 11px;
+  font-size: var(--fs-12);
   color: var(--text-2);
 }
 
@@ -1905,7 +1966,7 @@ input[type="range"].input:focus {
   grid-template-columns: 84px minmax(0, 1fr) 52px;
   align-items: center;
   gap: 10px;
-  font-size: 12px;
+  font-size: var(--fs-13);
 }
 
 .alloc-bar {
@@ -1934,7 +1995,7 @@ input[type="range"].input:focus {
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
-  font-size: 12px;
+  font-size: var(--fs-13);
 }
 
 .feed-row {
@@ -1953,12 +2014,12 @@ input[type="range"].input:focus {
 
 .feed-when {
   color: var(--text-3);
-  font-size: 11px;
+  font-size: var(--fs-12);
 }
 
 .feed-kind {
   color: var(--text-3);
-  font-size: 11px;
+  font-size: var(--fs-12);
 }
 
 .feed-kind.signal {
@@ -1982,7 +2043,7 @@ input[type="range"].input:focus {
   border: 1px solid var(--border);
   border-radius: 999px;
   color: var(--text-2);
-  font-size: 11px;
+  font-size: var(--fs-12);
 }
 
 .live-badge.idle {
@@ -1998,7 +2059,7 @@ input[type="range"].input:focus {
   border: 1px solid var(--border);
   border-radius: 999px;
   color: var(--text-2);
-  font-size: 11px;
+  font-size: var(--fs-12);
   white-space: nowrap;
 }
 
@@ -2028,7 +2089,7 @@ input[type="range"].input:focus {
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 12px;
+  font-size: var(--fs-13);
   color: var(--text-2);
 }
 
@@ -2041,7 +2102,7 @@ input[type="range"].input:focus {
   padding: 2px 8px;
   border: 1px solid var(--border);
   border-radius: 999px;
-  font-size: 11px;
+  font-size: var(--fs-12);
   color: var(--text-3);
 }
 
@@ -2060,7 +2121,7 @@ input[type="range"].input:focus {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  font-size: 12px;
+  font-size: var(--fs-13);
   color: var(--text-2);
 }
 
@@ -2077,7 +2138,7 @@ input[type="range"].input:focus {
   flex-wrap: wrap;
   padding-top: 10px;
   border-top: 1px solid var(--border);
-  font-size: 11.5px;
+  font-size: var(--fs-12-5);
   color: var(--text-3);
 }
 
@@ -2122,7 +2183,7 @@ input[type="range"].input:focus {
 }
 
 .log-head strong {
-  font-size: 13px;
+  font-size: var(--fs-14);
   font-weight: 600;
 }
 
@@ -2145,7 +2206,7 @@ input[type="range"].input:focus {
 .log-empty {
   padding: 32px 12px;
   color: var(--text-3);
-  font-size: 12px;
+  font-size: var(--fs-13);
   text-align: center;
 }
 
@@ -2159,11 +2220,11 @@ input[type="range"].input:focus {
   align-items: center;
   gap: 8px;
   margin-bottom: 3px;
-  font-size: 11px;
+  font-size: var(--fs-12);
 }
 
 .log-level {
-  font-size: 10px;
+  font-size: var(--fs-11);
   font-weight: 600;
   letter-spacing: 0.03em;
 }
@@ -2177,7 +2238,7 @@ input[type="range"].input:focus {
 }
 
 .log-message {
-  font-size: 12px;
+  font-size: var(--fs-13);
   line-height: 1.5;
   word-break: break-word;
 }
@@ -2189,7 +2250,7 @@ input[type="range"].input:focus {
   background: var(--bg-subtle);
   color: var(--text-2);
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: var(--fs-12);
   line-height: 1.45;
   white-space: pre-wrap;
   word-break: break-word;
@@ -2222,7 +2283,7 @@ input[type="range"].input:focus {
   border-radius: var(--radius-sm);
   background: var(--warn-weak);
   color: var(--warn);
-  font-size: 12px;
+  font-size: var(--fs-13);
 }
 
 .modal-mask {
@@ -2245,14 +2306,14 @@ input[type="range"].input:focus {
 }
 
 .modal-title {
-  font-size: 15px;
+  font-size: var(--fs-16);
   font-weight: 600;
   margin-bottom: 10px;
 }
 
 .modal-text {
   margin: 0 0 10px;
-  font-size: 12px;
+  font-size: var(--fs-13);
   line-height: 1.7;
   color: var(--text-2);
 }
@@ -2277,7 +2338,7 @@ input[type="range"].input:focus {
   align-items: baseline;
   gap: 7px 16px;
   margin-bottom: 14px;
-  font-size: 12px;
+  font-size: var(--fs-13);
 }
 
 .detail-grid > span {
@@ -2296,7 +2357,7 @@ input[type="range"].input:focus {
   align-items: center;
   gap: 6px;
   margin-top: 6px;
-  font-size: 11px;
+  font-size: var(--fs-12);
 }
 
 .chip-row .spacer {
@@ -2309,7 +2370,7 @@ input[type="range"].input:focus {
   border-radius: 999px;
   background: var(--bg);
   color: var(--text-2);
-  font-size: 11px;
+  font-size: var(--fs-12);
   cursor: pointer;
 }
 
@@ -2357,7 +2418,7 @@ input[type="range"].input:focus {
 .news-title {
   display: block;
   color: var(--text);
-  font-size: 12px;
+  font-size: var(--fs-13);
   line-height: 1.5;
   text-decoration: none;
 }
@@ -2374,7 +2435,7 @@ input[type="range"].input:focus {
   gap: 8px;
   margin-top: 3px;
   color: var(--text-3);
-  font-size: 11px;
+  font-size: var(--fs-12);
 }
 
 .news-tag {
@@ -2383,7 +2444,7 @@ input[type="range"].input:focus {
   background: var(--bg-hover);
   color: var(--text-2);
   font-family: var(--mono);
-  font-size: 10px;
+  font-size: var(--fs-11);
 }
 
 .news-tag.hot {
@@ -2401,14 +2462,14 @@ input[type="range"].input:focus {
   min-height: 120px;
   padding: 16px;
   color: var(--text-3);
-  font-size: 12px;
+  font-size: var(--fs-13);
   text-align: center;
 }
 
 .news-foot {
   padding: 6px 12px 8px;
   border-top: 1px solid var(--border);
-  font-size: 11px;
+  font-size: var(--fs-12);
 }
 
 .news-token-row {
@@ -2432,18 +2493,18 @@ input[type="range"].input:focus {
 .ai-actions .btn {
   flex: 1 1 auto;
   min-width: 96px;
-  font-size: 12px;
+  font-size: var(--fs-13);
   padding: 6px 10px;
 }
 
 .ai-meta {
   padding: 0 12px 6px;
-  font-size: 11px;
+  font-size: var(--fs-12);
 }
 
 .ai-text {
   padding: 0 12px 10px;
-  font-size: 12px;
+  font-size: var(--fs-13);
   line-height: 1.65;
   color: var(--text-2);
   max-height: 240px;
@@ -2478,7 +2539,7 @@ input[type="range"].input:focus {
 .ai-text h3,
 .ai-text h4 {
   margin: 10px 0 5px;
-  font-size: 13px;
+  font-size: var(--fs-14);
   font-weight: 600;
   color: var(--text);
 }
@@ -2488,7 +2549,7 @@ input[type="range"].input:focus {
   border-radius: 4px;
   background: var(--bg-hover);
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: var(--fs-12);
 }
 
 .ai-text pre {
@@ -2509,7 +2570,7 @@ input[type="range"].input:focus {
   width: 100%;
   margin: 6px 0 8px;
   border-collapse: collapse;
-  font-size: 11px;
+  font-size: var(--fs-12);
 }
 
 .ai-text th,
@@ -2550,7 +2611,7 @@ input[type="range"].input:focus {
   display: flex;
   align-items: baseline;
   gap: 8px;
-  font-size: 12px;
+  font-size: var(--fs-13);
   padding: 2px 6px;
   border-left: 2px solid transparent;
   border-radius: 3px;
@@ -2571,13 +2632,13 @@ input[type="range"].input:focus {
 
 .ai-level-kind {
   min-width: 28px;
-  font-size: 11px;
+  font-size: var(--fs-12);
   color: var(--text-3);
 }
 
 .ai-level-note {
   margin-left: auto;
-  font-size: 11px;
+  font-size: var(--fs-12);
   max-width: 40%;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2593,7 +2654,7 @@ input[type="range"].input:focus {
   align-items: center;
   gap: 8px;
   padding: 8px 12px 4px;
-  font-size: 12px;
+  font-size: var(--fs-13);
   font-weight: 600;
   color: var(--text-1);
 }
@@ -2601,7 +2662,7 @@ input[type="range"].input:focus {
 .ai-score {
   margin-left: auto;
   font-family: var(--font-num, monospace);
-  font-size: 12px;
+  font-size: var(--fs-13);
 }
 
 .ai-score.up {
@@ -2621,7 +2682,7 @@ input[type="range"].input:focus {
   display: flex;
   flex-direction: column;
   gap: 3px;
-  font-size: 11px;
+  font-size: var(--fs-12);
 }
 
 .ai-audit-row {
@@ -2685,7 +2746,7 @@ input[type="range"].input:focus {
 .settings-ai-audit .ai-audit-err {
   flex: 1 1 auto;
   max-width: 42%;
-  font-size: 11px;
+  font-size: var(--fs-12);
 }
 
 /* "描述想法 → 匹配策略" row under the parameter editor. */
@@ -2716,7 +2777,7 @@ input[type="range"].input:focus {
 .ai-prejudge-text {
   padding: 0;
   max-height: 140px;
-  font-size: 11.5px;
+  font-size: var(--fs-12-5);
 }
 
 /* AI 量化页下方的执行引擎：配置在左、日志在右，窄屏落成一列。 */
@@ -2728,8 +2789,6 @@ main.main > .auto-head:not(.page-head) {
   margin-right: 0;
 }
 
-@media (max-width: 1100px) {
-}
 
 main.main > .auto-section,
 main.main > .ai-section {
@@ -2779,14 +2838,14 @@ main.main > .ai-workspace .ai-col {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 12px;
+  font-size: var(--fs-13);
 }
 
 .ai-quant-checks {
   display: flex;
   flex-wrap: wrap;
   gap: 14px;
-  font-size: 12px;
+  font-size: var(--fs-13);
 }
 
 .ai-quant-code {
@@ -2797,7 +2856,7 @@ main.main > .ai-workspace .ai-col {
   border-radius: 6px;
   background: var(--bg-subtle);
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: var(--fs-12);
   line-height: 1.5;
   white-space: pre-wrap;
 }
@@ -2818,7 +2877,7 @@ main.main > .ai-workspace .ai-col {
   display: flex;
   flex-direction: column;
   gap: 3px;
-  font-size: 12px;
+  font-size: var(--fs-13);
 }
 
 .ai-quant-steps b {
@@ -2833,7 +2892,7 @@ main.main > .ai-workspace .ai-col {
   width: 150px;
   height: 28px;
   padding: 0 8px;
-  font-size: 12px;
+  font-size: var(--fs-13);
 }
 
 .ai-head-actions {
@@ -2889,19 +2948,19 @@ main.main > .ai-workspace .ai-col {
 
 .ai-stat-label {
   color: var(--text-3);
-  font-size: 11px;
+  font-size: var(--fs-12);
 }
 
 .ai-stat-value {
   color: var(--text);
-  font-size: 16px;
+  font-size: var(--fs-17);
   font-weight: 600;
   font-variant-numeric: tabular-nums;
 }
 
 .ai-stat-value em {
   color: var(--text-3);
-  font-size: 11px;
+  font-size: var(--fs-12);
   font-style: normal;
   font-weight: 400;
 }
@@ -2937,7 +2996,7 @@ main.main > .ai-workspace .ai-col {
 
 .ai-reason {
   color: var(--text-3);
-  font-size: 11px;
+  font-size: var(--fs-12);
 }
 
 /* 审计抽屉：右侧滑出的整高面板，点遮罩或按 Esc 关闭。 */
@@ -2997,47 +3056,32 @@ main.main > .ai-workspace .ai-col {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
-  font-size: 12px;
+  font-size: var(--fs-13);
 }
 
 .ai-audit-time {
   color: var(--text-3);
-  font-size: 11px;
+  font-size: var(--fs-12);
 }
 
 .ai-audit-meta {
   color: var(--text-3);
-  font-size: 11px;
+  font-size: var(--fs-12);
   font-variant-numeric: tabular-nums;
 }
 
 .ai-audit-text {
   color: var(--text-2);
-  font-size: 12px;
+  font-size: var(--fs-13);
   line-height: 1.5;
   overflow-wrap: anywhere;
 }
 
-@media (max-width: 1100px) {
-}
 
 /* ============================================================
    策略实验室（Phase 4-B）
    左列：候选列表 + 代码预览；右列：多轮优化 + 轮次结果。
    ============================================================ */
-/* Slightly wider than the 1080px form pages: the code block and the rounds
-   table both need horizontal room. */
-main.main > .lab-page:not(.page-head) {
-  max-width: 1440px;
-}
-
-.lab-page {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  min-width: 0;
-}
-
 /* --------------------------------------------------------- candidates */
 .lab-list {
   display: flex;
@@ -3049,7 +3093,7 @@ main.main > .lab-page:not(.page-head) {
 
 .lab-check {
   grid-column: 1 / 3;
-  font-size: 11px;
+  font-size: var(--fs-12);
 }
 
 .lab-check.ok {
@@ -3070,7 +3114,7 @@ main.main > .lab-page:not(.page-head) {
   background: var(--bg-subtle);
   color: var(--text);
   font-family: var(--mono);
-  font-size: 11.5px;
+  font-size: var(--fs-12-5);
   line-height: 1.55;
   white-space: pre;
   tab-size: 4;
@@ -3083,7 +3127,7 @@ main.main > .lab-page:not(.page-head) {
   padding: 8px 10px;
   border-radius: var(--radius-sm);
   background: var(--down-weak);
-  font-size: 11.5px;
+  font-size: var(--fs-12-5);
   color: var(--down);
 }
 
@@ -3113,7 +3157,7 @@ main.main > .lab-page:not(.page-head) {
 }
 
 .lab-progress-meta {
-  font-size: 11px;
+  font-size: var(--fs-12);
 }
 
 .lab-table-wrap {
@@ -3121,13 +3165,13 @@ main.main > .lab-page:not(.page-head) {
 }
 
 .lab-table-wrap .table {
-  font-size: 11.5px;
+  font-size: var(--fs-12-5);
 }
 
 .lab-reason {
   max-width: 260px;
   color: var(--text-2);
-  font-size: 11px;
+  font-size: var(--fs-12);
   line-height: 1.5;
 }
 
@@ -3155,7 +3199,7 @@ main.main > .lab-page:not(.page-head) {
   border-radius: var(--radius-sm);
   background: var(--bg-subtle);
   font-family: var(--mono);
-  font-size: 11.5px;
+  font-size: var(--fs-12-5);
   line-height: 1.55;
   white-space: pre;
 }
@@ -3170,7 +3214,7 @@ main.main > .lab-page:not(.page-head) {
   display: inline-flex;
   align-items: baseline;
   gap: 5px;
-  font-size: 11px;
+  font-size: var(--fs-12);
 }
 
 .lab-metric strong {
@@ -3223,7 +3267,7 @@ main.main > .lab-page:not(.page-head) {
   justify-content: space-between;
   gap: 8px;
   margin-top: 6px;
-  font-size: 11px;
+  font-size: var(--fs-12);
 }
 
 .strategy-editor-code {
@@ -3234,7 +3278,7 @@ main.main > .lab-page:not(.page-head) {
 }
 
 .strategy-editor-code .cm-editor {
-  font-size: 12px;
+  font-size: var(--fs-13);
   line-height: 1.55;
 }
 
@@ -3247,7 +3291,7 @@ main.main > .lab-page:not(.page-head) {
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--bg-subtle);
-  font-size: 12px;
+  font-size: var(--fs-13);
   line-height: 1.6;
 }
 
@@ -3278,7 +3322,7 @@ main.main > .lab-page:not(.page-head) {
 }
 
 .strategy-editor-foot {
-  font-size: 11px;
+  font-size: var(--fs-12);
   line-height: 1.5;
 }
 
@@ -3288,7 +3332,7 @@ main.main > .lab-page:not(.page-head) {
   color: var(--text);
   border-radius: 7px;
   padding: 8px 10px;
-  font-size: 12px;
+  font-size: var(--fs-13);
 }
 
 .strategy-editor-modal {
@@ -3319,7 +3363,7 @@ main.main > .lab-page:not(.page-head) {
   border-radius: var(--radius-sm);
   cursor: pointer;
   text-align: left;
-  font-size: 12px;
+  font-size: var(--fs-13);
   color: var(--text-1);
 }
 
@@ -3345,7 +3389,7 @@ main.main > .lab-page:not(.page-head) {
   padding: 3px 10px;
   border: 1px solid var(--border);
   border-radius: 999px;
-  font-size: 11.5px;
+  font-size: var(--fs-12-5);
   color: var(--text-2);
 }
 
@@ -3380,7 +3424,7 @@ main.main > .lab-page:not(.page-head) {
   align-items: center;
   gap: 8px;
   padding: 6px 14px 6px 10px;
-  font-size: 12px;
+  font-size: var(--fs-13);
   color: var(--text-3);
   border-top: 1px solid var(--border);
   border-bottom: 1px solid var(--border);
@@ -3425,7 +3469,7 @@ main.main > .lab-page:not(.page-head) {
   height: 18px;
   border-radius: 999px;
   border: 1px solid currentColor;
-  font-size: 10.5px;
+  font-size: var(--fs-11-5);
   line-height: 1;
 }
 
@@ -3452,13 +3496,13 @@ main.main > .lab-page:not(.page-head) {
 }
 
 .metric-cell-label {
-  font-size: 11px;
+  font-size: var(--fs-12);
   color: var(--text-3);
 }
 
 .metric-cell-value {
   font-family: var(--mono);
-  font-size: 14px;
+  font-size: var(--fs-15);
   font-variant-numeric: tabular-nums;
 }
 
@@ -3543,7 +3587,7 @@ main.main > .stage-bar:not(.page-head) {
 }
 
 .page-toolbar-label {
-  font-size: 11.5px;
+  font-size: var(--fs-12-5);
   color: var(--text-3);
 }
 
@@ -3597,7 +3641,7 @@ main.main > .stage-bar:not(.page-head) {
   min-height: 96px;
   padding: 18px 14px;
   text-align: center;
-  font-size: 12px;
+  font-size: var(--fs-13);
   line-height: 1.7;
   color: var(--text-3);
 }
@@ -3674,12 +3718,12 @@ main.main > .stage-bar:not(.page-head) {
 }
 
 .depth-pick b {
-  font-size: 12px;
+  font-size: var(--fs-13);
   font-weight: 500;
 }
 
 .depth-pick span {
-  font-size: 11px;
+  font-size: var(--fs-12);
   color: var(--text-3);
 }
 
@@ -3706,7 +3750,7 @@ main.main > .stage-bar:not(.page-head) {
   border-radius: var(--radius-sm);
   cursor: pointer;
   text-align: left;
-  font-size: 12px;
+  font-size: var(--fs-13);
   color: var(--text-2);
 }
 
@@ -3725,7 +3769,7 @@ main.main > .stage-bar:not(.page-head) {
 
 .timeline-time {
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: var(--fs-12);
   color: var(--text-3);
 }
 
@@ -3769,12 +3813,12 @@ main.main > .stage-bar:not(.page-head) {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  font-size: 11.5px;
+  font-size: var(--fs-12-5);
 }
 
 .stage-text {
   margin-top: 4px;
-  font-size: 12px;
+  font-size: var(--fs-13);
   line-height: 1.6;
   color: var(--text-1);
   white-space: pre-wrap;
@@ -3793,7 +3837,7 @@ main.main > .stage-bar:not(.page-head) {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  font-size: 12px;
+  font-size: var(--fs-13);
   color: var(--text-3);
 }
 
@@ -3814,7 +3858,7 @@ main.main > .stage-bar:not(.page-head) {
   display: grid;
   grid-template-columns: 1.4fr 0.6fr 1fr 0.8fr;
   gap: 8px;
-  font-size: 11px;
+  font-size: var(--fs-12);
   color: var(--text-3);
   padding-bottom: 4px;
   border-bottom: 1px solid var(--border);
@@ -3824,7 +3868,7 @@ main.main > .stage-bar:not(.page-head) {
   display: grid;
   grid-template-columns: 1.4fr 0.6fr 1fr 0.8fr;
   gap: 8px;
-  font-size: 11.5px;
+  font-size: var(--fs-12-5);
   color: var(--text-2);
 }
 
@@ -3843,7 +3887,7 @@ main.main > .stage-bar:not(.page-head) {
   margin-top: 10px;
   max-height: 260px;
   overflow-y: auto;
-  font-size: 11.5px;
+  font-size: var(--fs-12-5);
 }
 
 .exec-log-row {
@@ -3873,7 +3917,7 @@ main.main > .stage-bar:not(.page-head) {
 
 .exec-log-time {
   font-family: var(--mono);
-  font-size: 10.5px;
+  font-size: var(--fs-11-5);
 }
 
 .checks {
@@ -3932,7 +3976,7 @@ main.main > .stage-bar:not(.page-head) {
   align-items: baseline;
   justify-content: space-between;
   gap: 8px;
-  font-size: 12.5px;
+  font-size: var(--fs-13-5);
 }
 
 .cand-top b {
@@ -3941,13 +3985,13 @@ main.main > .stage-bar:not(.page-head) {
 }
 
 .cand-meta {
-  font-size: 11px;
+  font-size: var(--fs-12);
 }
 
 .cand-metrics {
   display: flex;
   gap: 10px;
-  font-size: 11px;
+  font-size: var(--fs-12);
   font-family: var(--mono);
   color: var(--text-2);
 }
@@ -3964,7 +4008,7 @@ main.main > .stage-bar:not(.page-head) {
   padding: 1px 7px;
   border-radius: 999px;
   border: 1px solid var(--border);
-  font-size: 10.5px;
+  font-size: var(--fs-11-5);
   color: var(--text-3);
 }
 
@@ -3985,5 +4029,5 @@ main.main > .stage-bar:not(.page-head) {
 
 .cand-empty {
   padding: 12px 0;
-  font-size: 12px;
+  font-size: var(--fs-13);
 }

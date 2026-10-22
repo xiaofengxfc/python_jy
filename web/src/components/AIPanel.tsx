@@ -136,7 +136,7 @@ export default function AIPanel({
         <div className="card-head">
           <span className="card-title">AI 分析</span>
         </div>
-        <div className="faint" style={{ fontSize: 12, lineHeight: 1.6 }}>
+        <div className="faint" style={{ fontSize: "var(--fs-13)", lineHeight: 1.6 }}>
           未启用。到「设置 → AI 助手」选供应商，填入 API Key。
           之后可以在图上标支撑、阻力、止损，也能让模型读多周期 K 线。
         </div>
@@ -149,7 +149,7 @@ export default function AIPanel({
       <div className="card-head">
         <span className="card-title">AI 分析</span>
         <span className="spacer" />
-        <span className="faint" style={{ fontSize: 11 }}>
+        <span className="faint" style={{ fontSize: "var(--fs-12)"}}>
           {status.model}
           {status.calls_today > 0 ? ` · 今日 ${status.calls_today} 次` : ""}
         </span>
@@ -203,7 +203,7 @@ export default function AIPanel({
           {levels.length > 0 && (
             <div className="ai-levels">
               <div className="ai-levels-head">
-                <span className="faint" style={{ fontSize: 11 }}>
+                <span className="faint" style={{ fontSize: "var(--fs-12)"}}>
                   图上已画 {levels.length} 条线
                 </span>
                 <span className="spacer" />

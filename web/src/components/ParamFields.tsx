@@ -17,7 +17,7 @@ function kindOf(spec: ParamSpec): "choice" | "bool" | "number" | "text" {
  * layout so switching strategies never reshuffles the panel. */
 export function ParamFields({ specs, values, onChange }: Props) {
   if (!specs.length) {
-    return <div className="faint" style={{ fontSize: 12 }}>该策略没有可调参数。</div>;
+    return <div className="faint" style={{ fontSize: "var(--fs-13)"}}>该策略没有可调参数。</div>;
   }
 
   return (

@@ -609,7 +609,7 @@ export default function TradingPage({
               onToggleVisible={() => setDrawingsVisible((value) => !value)}
             />
             <div className="card-head indicator-bar">
-              <span className="faint" style={{ fontSize: 11 }}>
+              <span className="faint" style={{ fontSize: "var(--fs-12)"}}>
                 指标
               </span>
               {INDICATORS.map(({ group, items }) => (
@@ -657,7 +657,7 @@ export default function TradingPage({
             </div>
             {editing && indicators.some((item) => item.name === editing) && (
               <div className="card-head indicator-params">
-                <span className="faint" style={{ fontSize: 11 }}>
+                <span className="faint" style={{ fontSize: "var(--fs-12)"}}>
                   {INDICATOR_SPECS[editing].label} 参数
                 </span>
                 {INDICATOR_SPECS[editing].params.map((param) => {
@@ -773,7 +773,7 @@ export default function TradingPage({
             <div className="card-head">
               <span className="card-title">盘口</span>
               <span className="spacer" />
-              <span className="faint num" style={{ fontSize: 11 }}>
+              <span className="faint num" style={{ fontSize: "var(--fs-12)"}}>
                 {ticker?.bid && ticker?.ask
                   ? `${fmtPrice(ticker.bid)} / ${fmtPrice(ticker.ask)}`
                   : "—"}

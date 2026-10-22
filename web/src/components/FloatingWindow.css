@@ -57,7 +57,7 @@
 .fw-title {
   min-width: 0;
   overflow: hidden;
-  font-size: 12px;
+  font-size: var(--fs-13);
   font-weight: 600;
   letter-spacing: 0.01em;
   white-space: nowrap;

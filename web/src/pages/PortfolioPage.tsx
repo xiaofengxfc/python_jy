@@ -85,13 +85,13 @@ export default function PortfolioPage({ onEquity }: Props) {
 
       {error && <div className="banner error">{error}</div>}
 
-      <div className="stack">
+      <div className="stack portfolio">
         <div className="metrics">
           <div className="metric">
             <span className="metric-label">总权益</span>
             <span className="metric-value num">
               {fmt(data?.equity ?? 0, 2)}
-              <span className="faint" style={{ fontSize: 11, marginLeft: 4 }}>{quote}</span>
+              <span className="faint" style={{ fontSize: "var(--fs-12)", marginLeft: 4 }}>{quote}</span>
             </span>
           </div>
           <div className="metric">
@@ -128,7 +128,7 @@ export default function PortfolioPage({ onEquity }: Props) {
             <div className="card-head">
               <span className="card-title">权益曲线</span>
               <span className="spacer" />
-              <span className="faint" style={{ fontSize: 11 }}>
+              <span className="faint" style={{ fontSize: "var(--fs-12)"}}>
                 初始 {fmt(data?.starting_balance ?? 0, 2)}
               </span>
             </div>
@@ -171,7 +171,7 @@ export default function PortfolioPage({ onEquity }: Props) {
           <div className="card-head">
             <span className="card-title">当前持仓</span>
             <span className="spacer" />
-            <span className="faint" style={{ fontSize: 11 }}>{positions.length} 个</span>
+            <span className="faint" style={{ fontSize: "var(--fs-12)"}}>{positions.length} 个</span>
           </div>
           <Table
             headers={["交易对", "方向", "数量", "开仓价", "最新价", "浮动盈亏", "市值"]}
