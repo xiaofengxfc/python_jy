@@ -19,6 +19,8 @@ export default function StrategiesPage({ focus }: Props) {
   const [selected, setSelected] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  /** 删除成功那一句：refresh() 会把编辑器里的通知清掉，所以放在页面这一层。 */
+  const [notice, setNotice] = useState("");
   const editor = useRef<StrategyEditorHandle>(null);
 
   const refresh = useCallback(async (selectKey?: string) => {
@@ -62,6 +64,7 @@ export default function StrategiesPage({ focus }: Props) {
 
   const pick = (key: string) => {
     if (key === selected) return;
+    setNotice("");
     if (!confirmDiscard(`切到「${key}」`)) return;
     setSelected(key);
   };
@@ -132,6 +135,7 @@ export default function StrategiesPage({ focus }: Props) {
       </div>
 
       {error && <div className="banner error">{error}</div>}
+      {notice && <div className="banner ok">{notice}</div>}
 
       <div className="strategy-page">
         <section className="card">
@@ -183,6 +187,7 @@ export default function StrategiesPage({ focus }: Props) {
               value={selected}
               onSelect={(key) => setSelected(key)}
               onSaved={(key) => void refresh(key)}
+              onDeleted={(key) => setNotice(`已删除「${key}」，文件已从数据目录移除。`)}
             />
           </div>
         </section>

@@ -69,6 +69,8 @@ interface Props {
   value: string;
   onSelect: (key: string) => void;
   onSaved?: (key: string) => void;
+  /** 删掉一条用户策略之后通知页面：列表要重拉，选中项也得让开。 */
+  onDeleted?: (key: string) => void;
   onClose?: () => void;
   /** page：独立策略页里用，代码区撑满卡片、内部不再渲染策略下拉。 */
   layout?: "modal" | "page";
@@ -83,6 +85,7 @@ export default function StrategyEditor({
   value,
   onSelect,
   onSaved,
+  onDeleted,
   onClose,
   layout = "modal",
   ref,
@@ -94,7 +97,7 @@ export default function StrategyEditor({
   const [original, setOriginal] = useState("");
   const [isNew, setIsNew] = useState(false);
   const [newKey, setNewKey] = useState("my_strategy");
-  const [busy, setBusy] = useState<"" | "load" | "save" | "validate" | "restore">("");
+  const [busy, setBusy] = useState<"" | "load" | "save" | "validate" | "restore" | "remove">("");
   const [renaming, setRenaming] = useState(false);
   const [renameKey, setRenameKey] = useState("");
   const [renameName, setRenameName] = useState("");
@@ -198,6 +201,32 @@ export default function StrategyEditor({
       await api(`/api/strategies/${encodeURIComponent(key)}/restore`, { method: "POST" });
       await load(key);
       setNotice("已还原内置原版，覆盖文件已删除。");
+      onSaved?.(key);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  /** 删掉这条用户策略。只给纯自定义策略：覆盖版本删除等于还原，那条路是「还原内置」，
+   *  纯内置后端会 400 并指向 restore。删除会真删数据目录里的文件，所以先问一句。 */
+  const remove = async () => {
+    if (!detail) return;
+    const key = detail.key;
+    const file = detail.filename || `${key}.py`;
+    if (!window.confirm(`删除「${detail.name || key}」会从数据目录删掉 ${file}，删了就找不回来。继续？`)) {
+      return;
+    }
+    setBusy("remove");
+    setError("");
+    setNotice("");
+    try {
+      await api(`/api/strategies/${encodeURIComponent(key)}`, { method: "DELETE" });
+      setDetail(null);
+      setCode("");
+      setOriginal("");
+      onDeleted?.(key);
       onSaved?.(key);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -395,6 +424,17 @@ export default function StrategyEditor({
               title="删掉你的覆盖文件，回到内置原版"
             >
               {busy === "restore" ? "还原中…" : "还原内置"}
+            </button>
+          )}
+          {detail && !isNew && !detail.builtin && (
+            <button
+              type="button"
+              className="btn-sm"
+              onClick={() => void remove()}
+              disabled={busy !== ""}
+              title="从数据目录删掉这个策略文件，删了就找不回来"
+            >
+              {busy === "remove" ? "删除中…" : "删除"}
             </button>
           )}
           <button

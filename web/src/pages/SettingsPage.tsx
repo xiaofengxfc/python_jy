@@ -14,6 +14,8 @@ import type {
 
 interface Props {
   settings: AppSettings | null;
+  /** 读设置失败的原因（后端没起来、正在重启）。空串表示还在读或者读到了。 */
+  settingsError?: string;
   onSaved: (settings: AppSettings) => void;
 }
 
@@ -45,7 +47,7 @@ const PCT_FIELDS: [keyof AppSettings["risk"], string, string][] = [
   ["max_order_pct", "单笔上限比例", "% 本金"],
 ];
 
-export default function SettingsPage({ settings, onSaved }: Props) {
+export default function SettingsPage({ settings, settingsError = "", onSaved }: Props) {
   const [draft, setDraft] = useState<AppSettings | null>(settings);
   // 保存时只提交改过的字段：整份回传会把别处刚改的值盖回旧值。
   const baseline = useRef<AppSettings | null>(settings);
@@ -427,9 +429,13 @@ export default function SettingsPage({ settings, onSaved }: Props) {
       <>
         <div className="page-head">
           <h1 className="page-title">设置</h1>
-          <span className="page-sub">正在读取设置…</span>
+          <span className="page-sub">{settingsError ? "读不到设置" : "正在读取设置…"}</span>
         </div>
-        <div className="placeholder">正在读取设置…</div>
+        <div className="placeholder">
+          {settingsError
+            ? `读取设置失败：${settingsError}。后端起来后会自动重试，也可以刷新页面。`
+            : "正在读取设置…"}
+        </div>
       </>
     );
   }

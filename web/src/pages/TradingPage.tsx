@@ -302,7 +302,12 @@ export default function TradingPage({
 
   /* ------------------------------------------------------------ klines */
   const loadKlines = useCallback(async () => {
-    if (!symbol) return;
+    // 没有交易对（市场列表没读回来、或后端没起来）就别装作在加载：
+    // 以前这里直接 return，chartLoading 停在 true，图表永远显示「加载中…」。
+    if (!symbol) {
+      setChartLoading(false);
+      return;
+    }
     const id = ++requestId.current;
     setChartLoading(true);
     try {
@@ -479,6 +484,8 @@ export default function TradingPage({
   const high = ticker?.high || restTicker?.high || 0;
   const low = ticker?.low || restTicker?.low || 0;
   const volume = ticker?.quote_volume ?? ticker?.base_volume ?? 0;
+  /** 行情还没到（或后端读不到）时这些位留空显示「—」，不拿 0 冒充数据。 */
+  const hasQuote = Boolean(ticker) || lastPrice > 0;
 
   const positionQty = useMemo(() => {
     const held = account?.positions.find((position) => position.symbol === symbol);
@@ -555,26 +562,36 @@ export default function TradingPage({
             />
 
             <div className="price-line">
-              <span className="price num">{fmtPrice(lastPrice)}</span>
-              <span className={`change num ${changePct >= 0 ? "up" : "down"}`}>
-                {changePct >= 0 ? "+" : ""}
-                {changePct.toFixed(2)}%
-              </span>
+              <span className="price num">{hasQuote ? fmtPrice(lastPrice) : "—"}</span>
+              {hasQuote ? (
+                <span className={`change num ${changePct >= 0 ? "up" : "down"}`}>
+                  {changePct >= 0 ? "+" : ""}
+                  {changePct.toFixed(2)}%
+                </span>
+              ) : (
+                <span className="change num faint">—</span>
+              )}
             </div>
 
             <div className="stats">
               <div className="stat">
                 <span className="stat-label">24h 高</span>
-                <span className="stat-value num">{fmtPrice(high)}</span>
+                <span className="stat-value num">{high > 0 ? fmtPrice(high) : "—"}</span>
               </div>
               <div className="stat">
                 <span className="stat-label">24h 低</span>
-                <span className="stat-value num">{fmtPrice(low)}</span>
+                <span className="stat-value num">{low > 0 ? fmtPrice(low) : "—"}</span>
               </div>
               <div className="stat">
                 <span className="stat-label">24h 量</span>
                 <span className="stat-value num">
-                  {fmtCompact(volume)} <span className="unit">{quote}</span>
+                  {volume > 0 ? (
+                    <>
+                      {fmtCompact(volume)} <span className="unit">{quote}</span>
+                    </>
+                  ) : (
+                    "—"
+                  )}
                 </span>
               </div>
             </div>

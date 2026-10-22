@@ -335,3 +335,45 @@ def test_switching_strategy_asks_before_dropping_unsaved_edits() -> None:
     assert "if (!confirmDiscard(`切到" in page
     assert 'onClick={() => pick(item.key)}' in page
     assert "onClick={startNew}" in page and "onClick={fork}" in page
+
+def test_custom_strategies_can_be_deleted_from_the_page() -> None:
+    """自定义策略要能从界面上删掉（DELETE /api/strategies/{key}）。
+
+    以前只有新建/复制，删不掉自己造出来的文件，只能去数据目录手删。删除会真删文件，
+    所以先 confirm；覆盖版本删除等于还原，那条路是「还原内置」，纯内置后端 400 指向 restore。
+    """
+    editor = (UI_DIR / "components" / "StrategyEditor.tsx").read_text(encoding="utf-8")
+    page = (UI_DIR / "pages" / "StrategiesPage.tsx").read_text(encoding="utf-8")
+
+    assert 'method: "DELETE"' in editor
+    assert "onDeleted?.(key)" in editor
+    assert "{detail && !isNew && !detail.builtin && (" in editor, "纯自定义策略才出删除按钮"
+    assert "window.confirm(" in editor
+    assert '"remove"' in editor
+    # 删除后的反馈在页面这一层（refresh 会清掉编辑器里的通知）
+    assert "已删除「" in page
+
+
+def test_pages_do_not_spin_forever_when_the_backend_is_down() -> None:
+    """后端没起来时：设置页要说读不到并自己重试，交易页别拿 0 冒充行情。
+
+    实测（网络层全拒绝）三处都是错的：设置页永远「正在读取设置…」，交易页图表永远
+    「加载中…」，24h 高低量/最新价印成 0.000000。
+    """
+    app = (UI_DIR / "App.tsx").read_text(encoding="utf-8")
+    page = (UI_DIR / "pages" / "TradingPage.tsx").read_text(encoding="utf-8")
+    settings = (UI_DIR / "pages" / "SettingsPage.tsx").read_text(encoding="utf-8")
+
+    # 设置读取失败：留错误、并排一次重试
+    assert "setSettingsError(" in app
+    assert "window.setTimeout(() => void load(), 5000)" in app
+    assert 'settingsError ? "读不到设置" : "正在读取设置…"' in settings
+    assert "读取设置失败：" in settings
+
+    # 没有交易对时不要停在加载态
+    assert "if (!symbol) {" in page and "setChartLoading(false);" in page
+    # 没有行情时显示「—」，不是 0
+    assert "const hasQuote = Boolean(ticker) || lastPrice > 0;" in page
+    assert '{high > 0 ? fmtPrice(high) : "—"}' in page
+    assert '{low > 0 ? fmtPrice(low) : "—"}' in page
+    assert "{volume > 0 ? (" in page

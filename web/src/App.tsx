@@ -31,6 +31,8 @@ export default function App() {
   const [market, setMarket] = useState("spot");
   const [equity, setEquity] = useState<number | null>(null);
   const [settings, setSettings] = useState<AppSettings | null>(null);
+  /** 读设置失败的原因。后端正在重启时读不到，界面不该一直停在「正在读取设置…」。 */
+  const [settingsError, setSettingsError] = useState("");
   const [logOpen, setLogOpen] = useState(false);
   /** 跳到策略页时要预选的 key（回测页「编辑源码」、实验室「在策略页编辑」）。 */
   const [strategyFocus, setStrategyFocus] = useState<string | null>(null);
@@ -66,9 +68,27 @@ export default function App() {
   }, [settings?.theme]);
 
   useEffect(() => {
-    api<{ settings: AppSettings }>("/api/settings")
-      .then((data) => setSettings(data.settings))
-      .catch(() => undefined);
+    let cancelled = false;
+    let timer = 0;
+    // 后端还没起来、或正在重启时读不到设置：隔 5 秒自己再试一次，
+    // 用户不用刷新页面（设置页那张「正在读取设置…」就是卡在这里）。
+    const load = async () => {
+      try {
+        const data = await api<{ settings: AppSettings }>("/api/settings");
+        if (cancelled) return;
+        setSettings(data.settings);
+        setSettingsError("");
+      } catch (error) {
+        if (cancelled) return;
+        setSettingsError(error instanceof Error ? error.message : String(error));
+        timer = window.setTimeout(() => void load(), 5000);
+      }
+    };
+    void load();
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
   }, []);
 
   const handleAccountChange = useCallback((value: number) => setEquity(value), []);
@@ -133,7 +153,11 @@ export default function App() {
           />
         )}
         {page === "settings" && (
-          <SettingsPage settings={settings} onSaved={setSettings} />
+          <SettingsPage
+            settings={settings}
+            settingsError={settingsError}
+            onSaved={setSettings}
+          />
         )}
       </main>
 
