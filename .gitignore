@@ -31,3 +31,6 @@ dist-electron/
 .zcf/
 .taste-skill/
 .agent-teams/
+
+# vite/tsc 增量构建缓存
+web/tsconfig.tsbuildinfo
