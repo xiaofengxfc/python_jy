@@ -289,6 +289,155 @@ export interface AIAnalysis {
   model: string;
 }
 
+/* ------------------------------------------------------- AI 交易与候选策略 */
+/* 三个页面（AI 交易、AI 量化、策略实验室）共用这几份形状。字段一律可选：
+   后端升级前后互不匹配时，界面要能降级显示，而不是白屏。 */
+
+/** AI 交易自己的运行配置，存在设置的 ai_auto 里。 */
+export interface AIAutoSettings {
+  enabled: boolean;
+  live_enabled: boolean;
+  symbol: string;
+  timeframe: string;
+  leverage: number;
+  max_order_quote: number;
+  max_position_quote: number;
+  max_decisions_per_day: number;
+  max_orders_per_hour: number;
+  min_confidence: number;
+  decision_ttl_sec: number;
+  max_price_drift_pct: number;
+  cooldown_sec: number;
+  poll_sec: number;
+  require_stop: boolean;
+  /** 决策深度：quick 一次调用，standard 四段，deep 六段。 */
+  depth: string;
+  strategy_params?: Record<string, Record<string, unknown>>;
+}
+
+/** 流水线里的一段。败了也留着，界面据此标灰。 */
+export interface PipelineStage {
+  stage: string;
+  title: string;
+  ok: boolean;
+  skipped?: boolean;
+  text: string;
+  model?: string;
+  tokens?: number;
+  elapsed?: number;
+}
+
+/** 一条决策记录。trace 是整条流水线的输出。 */
+export interface AIDecisionRecord {
+  at?: number;
+  seq?: number;
+  kind?: string;
+  event?: string;
+  outcome?: string;
+  reason?: string;
+  decision_id?: string;
+  action?: string;
+  symbol?: string;
+  quote?: number;
+  price?: number | null;
+  confidence?: number;
+  signal_target?: number | null;
+  stop_loss?: number | null;
+  rationale?: string;
+  order_id?: string | null;
+  network?: string;
+  state?: string;
+  depth?: string;
+  trace?: PipelineStage[];
+}
+
+export interface AITraderStatus {
+  state?: string;
+  paused?: boolean;
+  halted_reason?: string;
+  config?: {
+    network?: string;
+    symbol?: string;
+    strategy?: string;
+    market_type?: string;
+    timeframe?: string;
+    live_enabled?: boolean;
+    depth?: string;
+    max_order_quote?: number;
+    max_position_quote?: number;
+  };
+  counters?: {
+    decisions_today?: number;
+    orders_last_hour?: number;
+    max_decisions_per_day?: number;
+    max_orders_per_hour?: number;
+  };
+  last_decision?: AIDecisionRecord | null;
+  events?: AIDecisionRecord[];
+  seq?: number;
+}
+
+/** 一条 AI 生成的候选策略。 */
+export interface CandidateIssue {
+  code?: string;
+  message?: string;
+  line?: number;
+}
+
+export interface CandidateChecks {
+  ok?: boolean;
+  issues?: CandidateIssue[];
+  imports?: string[];
+  classes?: string[];
+}
+
+export interface Candidate {
+  id: string;
+  created_at?: number;
+  strategy_key?: string;
+  name?: string;
+  base_key?: string;
+  model?: string;
+  status?: string;
+  checks?: CandidateChecks;
+  backtest?: Record<string, unknown>;
+  note?: string;
+  reviewer?: string;
+  registered_key?: string;
+  strategy_path?: string;
+}
+
+export interface OptimizeRound {
+  round?: number;
+  params?: Record<string, unknown>;
+  metrics?: Record<string, number>;
+  score?: number;
+  accepted?: boolean;
+  reason?: string;
+  reflection?: string;
+  tokens?: number;
+  elapsed?: number;
+  error?: string;
+}
+
+export interface OptimizeResult {
+  rounds?: OptimizeRound[];
+  best?: Record<string, unknown>;
+  best_metrics?: Record<string, number>;
+  best_score?: number;
+  calls?: number;
+  stopped?: string;
+}
+
+export interface OptimizeJob {
+  id?: string;
+  status?: string;
+  progress?: number;
+  started?: number;
+  result?: OptimizeResult | null;
+  error?: string | null;
+}
+
 export interface AppSettings {
   /** 交易所。现在只有币安接了完整链路。 */
   platform: string;
@@ -312,6 +461,8 @@ export interface AppSettings {
   theme: string;
   notify: NotifySettings;
   ai: AISettings;
+  /** AI 交易的运行配置。默认关闭，实盘另有显式开关。 */
+  ai_auto?: AIAutoSettings;
 }
 
 /** 凭证区顶部的交易所下拉项。enabled=false 的只占位，选了也下不了单。 */

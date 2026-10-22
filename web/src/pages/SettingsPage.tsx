@@ -57,6 +57,8 @@ export default function SettingsPage({ settings, onSaved }: Props) {
   const [flash, setFlash] = useState<{ tone: "ok" | "err"; text: string } | null>(null);
   const [network, setNetwork] = useState(settings?.network ?? "testnet");
   const [credDrafts, setCredDrafts] = useState<Record<string, Draft>>({});
+  /** 凭据卡片当前看哪个市场：一次只显示一个，三份表单挤在一起没法对齐。 */
+  const [credMarket, setCredMarket] = useState("");
   const [credBusy, setCredBusy] = useState<string>("");
   const [risk, setRisk] = useState<RiskState | null>(null);
   const [riskBusy, setRiskBusy] = useState(false);
@@ -404,6 +406,13 @@ export default function SettingsPage({ settings, onSaved }: Props) {
   // The one bound recipient, if there is exactly one. Narrowed here because
   // the array index is optional and the card below reads it several times.
 
+  /* ---------------------------------------------------------- 凭据 */
+  // 选中的市场不在列表里（第一次加载、或换了网络）就退到第一个。
+  const credCurrent =
+    credentials.find((item) => item.market === credMarket) ?? credentials[0] ?? null;
+  const activeMarket = credCurrent?.market ?? "";
+  const credEntry = credDrafts[activeMarket] ?? EMPTY_DRAFT;
+
   return (
     <>
       <div className="page-head">
@@ -436,104 +445,128 @@ export default function SettingsPage({ settings, onSaved }: Props) {
             </div>
           </div>
           {credentialsError && <div className="banner error">{credentialsError}</div>}
-          <div className="cred-row">
-            <div className="cred-name">
-              <span>平台</span>
-              <span className="cred-state">
-                {platforms.find((item) => item.key === platform)?.label ?? "币安"}
+          <div className="cred-card">
+            <div className="cred-top">
+              <label className="cred-platform">
+                <span>平台</span>
+                <select
+                  className="select"
+                  value={platform}
+                  disabled={platformBusy}
+                  onChange={(event) => void switchPlatform(event.target.value)}
+                >
+                  {(platforms.length
+                    ? platforms
+                    : [{ key: "binance", label: "币安", enabled: true }]
+                  ).map((item) => (
+                    <option key={item.key} value={item.key} disabled={!item.enabled}>
+                      {item.enabled ? item.label : `${item.label}（暂未开放）`}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div className="segmented" role="group" aria-label="市场">
+                {credentials.map((item) => (
+                  <button
+                    key={item.market}
+                    type="button"
+                    aria-pressed={credCurrent?.market === item.market}
+                    onClick={() => setCredMarket(item.market)}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+              <span className={`cred-state${credCurrent?.configured ? " on" : ""}`}>
+                {credCurrent
+                  ? credCurrent.configured
+                    ? `已配置 · ${credCurrent.masked}`
+                    : "未配置"
+                  : "读取中…"}
               </span>
             </div>
-            <select
-              className="input"
-              value={platform}
-              disabled={platformBusy}
-              onChange={(event) => void switchPlatform(event.target.value)}
-            >
-              {(platforms.length ? platforms : [{ key: "binance", label: "币安", enabled: true }]).map(
-                (item) => (
-                  <option key={item.key} value={item.key} disabled={!item.enabled}>
-                    {item.enabled ? item.label : `${item.label}（暂未开放）`}
-                  </option>
-                ),
+
+            <div className="cred-grid">
+              <label className="cred-field">
+                <span>API Key</span>
+                <input
+                  className="input"
+                  type="password"
+                  autoComplete="off"
+                  placeholder={credCurrent?.configured ? "已保存，留空表示不改" : "粘贴 API Key"}
+                  value={credEntry.apiKey}
+                  onChange={(event) =>
+                    setCredDrafts((current) => ({
+                      ...current,
+                      [activeMarket]: { ...credEntry, apiKey: event.target.value },
+                    }))
+                  }
+                />
+              </label>
+              <label className="cred-field">
+                <span>API Secret</span>
+                <input
+                  className="input"
+                  type="password"
+                  autoComplete="off"
+                  placeholder={credCurrent?.configured ? "已保存，留空表示不改" : "粘贴 API Secret"}
+                  value={credEntry.apiSecret}
+                  onChange={(event) =>
+                    setCredDrafts((current) => ({
+                      ...current,
+                      [activeMarket]: { ...credEntry, apiSecret: event.target.value },
+                    }))
+                  }
+                />
+              </label>
+            </div>
+
+            <div className="cred-actions">
+              <label className="check">
+                <input
+                  type="checkbox"
+                  checked={credEntry.verify}
+                  onChange={(event) =>
+                    setCredDrafts((current) => ({
+                      ...current,
+                      [activeMarket]: { ...credEntry, verify: event.target.checked },
+                    }))
+                  }
+                />
+                先做连接测试
+              </label>
+              <span className="spacer" />
+              <button
+                type="button"
+                className="btn-sm primary"
+                disabled={!activeMarket || credBusy === activeMarket || !credEntry.apiKey || !credEntry.apiSecret}
+                onClick={() => saveCredential(activeMarket)}
+              >
+                {credBusy === activeMarket ? "处理中…" : "保存"}
+              </button>
+              {credCurrent?.configured && (
+                <button
+                  type="button"
+                  className="btn-sm"
+                  disabled={credBusy === activeMarket}
+                  onClick={() => deleteCredential(activeMarket)}
+                >
+                  清除
+                </button>
               )}
-            </select>
-          </div>
-          {credentials.map((item) => {
-            const entry = credDrafts[item.market] ?? EMPTY_DRAFT;
-            const busy = credBusy === item.market;
-            return (
-              <div key={item.market} className="cred-row">
-                <div className="cred-name">
-                  <span>{item.label}</span>
-                  <span className="cred-state">
-                    {item.configured ? `已配置 · ${item.masked}` : "未配置"}
+            </div>
+
+            <div className="cred-others">
+              <span>其它市场</span>
+              {credentials
+                .filter((item) => item.market !== activeMarket)
+                .map((item) => (
+                  <span key={item.market} className={item.configured ? "on" : ""}>
+                    {item.label} {item.configured ? item.masked : "未配置"}
                   </span>
-                </div>
-                <div className="cred-fields">
-                  <input
-                    className="input"
-                    type="password"
-                    autoComplete="off"
-                    placeholder="API Key"
-                    value={entry.apiKey}
-                    onChange={(event) =>
-                      setCredDrafts((current) => ({
-                        ...current,
-                        [item.market]: { ...entry, apiKey: event.target.value },
-                      }))
-                    }
-                  />
-                  <input
-                    className="input"
-                    type="password"
-                    autoComplete="off"
-                    placeholder="API Secret"
-                    value={entry.apiSecret}
-                    onChange={(event) =>
-                      setCredDrafts((current) => ({
-                        ...current,
-                        [item.market]: { ...entry, apiSecret: event.target.value },
-                      }))
-                    }
-                  />
-                  <div className="cred-actions">
-                    <label className="check">
-                      <input
-                        type="checkbox"
-                        checked={entry.verify}
-                        onChange={(event) =>
-                          setCredDrafts((current) => ({
-                            ...current,
-                            [item.market]: { ...entry, verify: event.target.checked },
-                          }))
-                        }
-                      />
-                      保存前做连接测试
-                    </label>
-                    <span className="spacer" />
-                    <button
-                      type="button"
-                      className="btn-sm primary"
-                      disabled={busy || !entry.apiKey || !entry.apiSecret}
-                      onClick={() => saveCredential(item.market)}
-                    >
-                      {busy ? "处理中…" : "保存"}
-                    </button>
-                    {item.configured && (
-                      <button
-                        type="button"
-                        className="btn-sm"
-                        disabled={busy}
-                        onClick={() => deleteCredential(item.market)}
-                      >
-                        删除
-                      </button>
-                    )}
-                  </div>
-                </div>
-              </div>
-            );
-          })}
+                ))}
+            </div>
+          </div>
           <div className="card-body hint">
             密钥保存在系统凭据库（Windows 凭据管理器 / macOS 钥匙串），不会写入配置文件。
             建议在币安只勾选「读取」和「交易」权限，关闭「提现」，并绑定 IP 白名单。

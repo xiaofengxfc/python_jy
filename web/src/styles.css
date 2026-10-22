@@ -2010,41 +2010,59 @@ input[type="range"].input:focus {
 }
 
 /* ------------------------------------------------------- credentials */
-.cred-row {
+/* 一次只显示一个市场：平台一行、市场分段、下面两列输入。 */
+.cred-card {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding: 13px 0;
-  border-bottom: 1px solid var(--border);
+  gap: 12px;
+  padding: 4px 0 0;
 }
 
-.cred-row:first-child {
-  padding-top: 0;
+.cred-top {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
 }
 
-.cred-row:last-child {
-  padding-bottom: 0;
-  border-bottom: 0;
-}
-
-.cred-name {
+.cred-platform {
   display: flex;
   align-items: center;
   gap: 8px;
   font-size: 12px;
-  font-weight: 500;
+  color: var(--text-2);
+}
+
+.cred-platform .select {
+  min-width: 120px;
 }
 
 .cred-state {
-  color: var(--text-3);
+  margin-left: auto;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
   font-size: 11px;
-  font-weight: 400;
+  color: var(--text-3);
 }
 
-.cred-fields {
+.cred-state.on {
+  border-color: color-mix(in srgb, var(--up) 35%, var(--border));
+  color: var(--up);
+}
+
+.cred-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
+  gap: 12px;
+}
+
+.cred-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-2);
 }
 
 .cred-actions {
@@ -2052,6 +2070,26 @@ input[type="range"].input:focus {
   align-items: center;
   gap: 12px;
 }
+
+.cred-others {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+.cred-others > span:first-child {
+  color: var(--text-2);
+}
+
+.cred-others > span.on {
+  color: var(--up);
+}
+
 
 /* ------------------------------------------------------- log panel */
 .log-mask {
@@ -3120,7 +3158,7 @@ main.main > .lab-page:not(.page-head) {
 
 .lab-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.35fr) minmax(0, 1fr);
   gap: 12px;
   align-items: start;
 }
@@ -3534,4 +3572,512 @@ main.main > .lab-page:not(.page-head) {
   margin-left: auto;
   font-weight: 500;
   color: var(--text-2);
+}
+
+/* --------------------------------------------- AI 交易 / AI 量化 / 实验室 */
+/* 三个页面共用同一套骨架：页头、阶段条、三列网格。 */
+
+.state-chip {
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+
+.state-chip.running {
+  border-color: color-mix(in srgb, var(--up) 40%, var(--border));
+  background: var(--up-weak);
+  color: var(--up);
+}
+
+.state-chip.paused {
+  border-color: color-mix(in srgb, var(--warn) 40%, var(--border));
+  color: var(--warn);
+}
+
+.state-chip.halted {
+  border-color: color-mix(in srgb, var(--down) 45%, var(--border));
+  background: var(--down-weak);
+  color: var(--down);
+}
+
+.stage-bar {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  margin: 4px 0 12px;
+  padding: 0;
+  list-style: none;
+}
+
+.stage-bar li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 14px 6px 10px;
+  font-size: 12px;
+  color: var(--text-3);
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-subtle);
+}
+
+.stage-bar li:first-child {
+  border-left: 1px solid var(--border);
+  border-radius: var(--radius-sm) 0 0 var(--radius-sm);
+  padding-left: 12px;
+}
+
+.stage-bar li:last-child {
+  border-right: 1px solid var(--border);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+}
+
+.stage-bar li + li::before {
+  content: "";
+  width: 18px;
+  height: 1px;
+  margin-left: -18px;
+  background: var(--border);
+}
+
+.stage-bar li[data-state="done"] {
+  color: var(--text-2);
+}
+
+.stage-bar li[data-state="active"] {
+  color: var(--ink);
+  background: var(--bg);
+  border-color: var(--border-strong);
+  font-weight: 500;
+}
+
+.stage-index {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  font-size: 10.5px;
+  line-height: 1;
+}
+
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
+  gap: 8px;
+  margin: 10px 0;
+}
+
+.metric-grid.dense {
+  grid-template-columns: repeat(auto-fit, minmax(76px, 1fr));
+  margin: 6px 0;
+}
+
+.metric-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle);
+}
+
+.metric-cell-label {
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.metric-cell-value {
+  font-family: var(--mono);
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+}
+
+.metric-cell-value.up {
+  color: var(--up);
+}
+
+.metric-cell-value.down {
+  color: var(--down);
+}
+
+.metric-cell-value.muted {
+  color: var(--text-2);
+}
+
+.ai-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 0.95fr) minmax(0, 1.5fr) minmax(0, 0.95fr);
+  gap: 12px;
+  align-items: start;
+}
+
+.quant-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.4fr) minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+
+@media (max-width: 1180px) {
+  .ai-grid,
+  .quant-grid,
+  .lab-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* 深度选择：三个按钮横排，各带一句说明。 */
+.depth-pick {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.depth-pick button {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 10px;
+  text-align: left;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  color: var(--text-2);
+}
+
+.depth-pick button:hover {
+  background: var(--bg-hover);
+}
+
+.depth-pick button[aria-pressed="true"] {
+  border-color: var(--border-strong);
+  background: var(--bg);
+  color: var(--ink);
+}
+
+.depth-pick button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.depth-pick b {
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.depth-pick span {
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+/* 决策时间线：一条一行，点开看各段。 */
+.timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: 620px;
+  overflow-y: auto;
+}
+
+.timeline-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 9px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  text-align: left;
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.timeline-head:hover {
+  background: var(--bg-hover);
+}
+
+.timeline-item.order .timeline-head {
+  border-left: 2px solid var(--up);
+}
+
+.timeline-item.reject .timeline-head,
+.timeline-item.error .timeline-head {
+  border-left: 2px solid var(--down);
+}
+
+.timeline-time {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.timeline-action {
+  font-weight: 500;
+  color: var(--text-1);
+}
+
+.timeline-reason {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 40%;
+}
+
+.stage-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 0 4px 12px;
+}
+
+.stage-card {
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+}
+
+.stage-card.bad {
+  border-left-color: var(--warn);
+}
+
+.stage-card.skipped {
+  opacity: 0.65;
+}
+
+.stage-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 11.5px;
+}
+
+.stage-text {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-1);
+  white-space: pre-wrap;
+}
+
+/* 闸门与账户信息：一行一项，左右对齐。 */
+.gate-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 10px 0;
+}
+
+.gate-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+.gate-row b {
+  font-weight: 500;
+  color: var(--text-1);
+  text-align: right;
+}
+
+.mini-table {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 10px;
+}
+
+.mini-head {
+  display: grid;
+  grid-template-columns: 1.4fr 0.6fr 1fr 0.8fr;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-3);
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border);
+}
+
+.mini-row {
+  display: grid;
+  grid-template-columns: 1.4fr 0.6fr 1fr 0.8fr;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+
+/* 执行台动作行与日志。 */
+.exec-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 10px 0;
+}
+
+.exec-log {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 10px;
+  max-height: 260px;
+  overflow-y: auto;
+  font-size: 11.5px;
+}
+
+.exec-log-row {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr) auto;
+  gap: 8px;
+  padding: 3px 6px;
+  border-radius: var(--radius-sm);
+}
+
+.exec-log-row.error {
+  background: var(--down-weak);
+}
+
+.exec-log-row.warn {
+  background: var(--warn-weak);
+}
+
+.exec-log-kind {
+  color: var(--text-3);
+}
+
+.exec-log-text {
+  color: var(--text-1);
+  overflow-wrap: anywhere;
+}
+
+.exec-log-time {
+  font-family: var(--mono);
+  font-size: 10.5px;
+}
+
+.checks {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 8px 0;
+}
+
+.optimize-progress,
+.optimize-best {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+/* 候选策略列表：一条一张小卡，指标压在同一行。 */
+.cand-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+  max-height: 620px;
+  overflow-y: auto;
+}
+
+.cand-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  padding: 8px 10px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  text-align: left;
+  cursor: pointer;
+}
+
+.cand-item:hover {
+  background: var(--bg-hover);
+}
+
+.cand-item.active {
+  border-color: var(--border-strong);
+  background: var(--bg);
+}
+
+.cand-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12.5px;
+}
+
+.cand-top b {
+  font-weight: 500;
+  color: var(--ink);
+}
+
+.cand-meta {
+  font-size: 11px;
+}
+
+.cand-metrics {
+  display: flex;
+  gap: 10px;
+  font-size: 11px;
+  font-family: var(--mono);
+  color: var(--text-2);
+}
+
+.cand-metrics .up {
+  color: var(--up);
+}
+
+.cand-metrics .down {
+  color: var(--down);
+}
+
+.cand-state {
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+
+.cand-state.pending {
+  border-color: color-mix(in srgb, var(--warn) 40%, var(--border));
+  color: var(--warn);
+}
+
+.cand-state.approved {
+  border-color: color-mix(in srgb, var(--up) 40%, var(--border));
+  color: var(--up);
+}
+
+.cand-state.rejected {
+  border-color: color-mix(in srgb, var(--down) 40%, var(--border));
+  color: var(--down);
+}
+
+.cand-empty {
+  padding: 12px 0;
+  font-size: 12px;
 }

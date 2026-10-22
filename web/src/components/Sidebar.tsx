@@ -23,6 +23,20 @@ const ICONS: Record<PageKey, ReactNode> = {
       strokeLinejoin="round"
     />
   ),
+  "ai-trade": (
+    <path
+      d="M8 2.2 9.6 6l3.8 1.6-3.8 1.6L8 13l-1.6-3.8L2.6 7.6 6.4 6 8 2.2"
+      stroke="currentColor"
+      strokeWidth="1.3"
+      strokeLinejoin="round"
+    />
+  ),
+  "ai-quant": (
+    <>
+      <path d="M2.6 12.4V7.2M6.1 12.4V3.6M9.6 12.4V8.8M13.1 12.4V5.4" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+      <path d="M2 13.8h12" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+    </>
+  ),
   portfolio: (
     <>
       <rect
@@ -72,6 +86,8 @@ const ICONS: Record<PageKey, ReactNode> = {
 
 const LABELS: [PageKey, string][] = [
   ["trading", "交易"],
+  ["ai-trade", "AI 交易"],
+  ["ai-quant", "AI 量化"],
   ["portfolio", "资产"],
   ["backtest", "回测"],
   ["lab", "实验室"],

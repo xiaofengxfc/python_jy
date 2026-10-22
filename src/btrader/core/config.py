@@ -63,6 +63,8 @@ class AIAutoSettings:
     cooldown_sec: float = 30.0
     poll_sec: float = 60.0
     require_stop: bool = True
+    # 决策深度：quick 一次调用，standard 四段，deep 六段。
+    depth: str = "standard"
     # Best parameter sets explicitly applied from the strategy lab, keyed by
     # strategy. They never change without a human clicking “apply”.
     strategy_params: dict[str, dict[str, Any]] = field(default_factory=dict)

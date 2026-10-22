@@ -8,10 +8,19 @@ import PortfolioPage from "./pages/PortfolioPage";
 import SettingsPage from "./pages/SettingsPage";
 import BacktestPage from "./pages/BacktestPage";
 import StrategyLabPage from "./pages/StrategyLabPage";
+import AITradePage from "./pages/AITradePage";
+import AIQuantPage from "./pages/AIQuantPage";
 import type { AppSettings, Health } from "./types";
 
-/** 「自动交易」在交易页里，是 AI 量化执行引擎面板，没有单独的页面。 */
-export type PageKey = "trading" | "portfolio" | "backtest" | "lab" | "settings";
+/** 五个页面各自独立：AI 交易和 AI 量化都是一整页，不再挤在交易页底下。 */
+export type PageKey =
+  | "trading"
+  | "ai-trade"
+  | "ai-quant"
+  | "portfolio"
+  | "backtest"
+  | "lab"
+  | "settings";
 
 export default function App() {
   const [page, setPage] = useState<PageKey>("trading");
@@ -89,12 +98,19 @@ export default function App() {
             settings={settings}
             onMarketChange={setMarket}
             onAccountChange={handleAccountChange}
-            onNavigate={setPage}
+          />
+        )}
+        {page === "ai-trade" && <AITradePage settings={settings} health={health} />}
+        {page === "ai-quant" && (
+          <AIQuantPage
+            settings={settings}
+            health={health}
+            onNavigate={(next) => setPage(next)}
           />
         )}
         {page === "portfolio" && <PortfolioPage onEquity={handleAccountChange} />}
         {page === "backtest" && <BacktestPage />}
-        {page === "lab" && <StrategyLabPage />}
+        {page === "lab" && <StrategyLabPage settings={settings} health={health} />}
         {page === "settings" && (
           <SettingsPage settings={settings} onSaved={setSettings} />
         )}

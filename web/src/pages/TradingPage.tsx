@@ -5,7 +5,6 @@ import { foldTick } from "../liveCandle";
 import { useMarketStream } from "../hooks/useMarketStream";
 import type { Account, AILevel, AppSettings, Candle, Health, SymbolInfo } from "../types";
 import AIPanel from "../components/AIPanel";
-import AITradingPanel from "../components/AITradingPanel";
 import BottomTabs, { type BottomTab } from "../components/BottomTabs";
 import TradingViewChart from "../chart/TradingViewChart";
 import {
@@ -111,7 +110,6 @@ export default function TradingPage({
   settings,
   onMarketChange,
   onAccountChange,
-  onNavigate,
 }: Props) {
   const [market, setMarket] = useState(settings?.market_type || "spot");
   const [symbol, setSymbol] = useState("");
@@ -808,13 +806,7 @@ export default function TradingPage({
       </div>
 
 
-      {/* AI 交易（模型逐根 K 线决策）/ AI 量化（策略生命周期），两个独立流程。 */}
-      <AITradingPanel
-        market={market}
-        symbol={symbol}
-        timeframe={timeframe}
-        onNavigate={onNavigate}
-      />
+      {/* AI 交易和 AI 量化各自有整页，左侧栏进；交易页只管看图、下单、持仓。 */}
     </>
   );
 }

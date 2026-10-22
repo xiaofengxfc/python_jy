@@ -32,6 +32,7 @@ from ..core.types import (
     Network,
     timeframe_seconds,
 )
+from ..ai_pipeline import DEPTHS
 from ..engine.ai_trader import AITrader, AITraderConfig, TradeLease
 from ..engine.auto import AutoTrader, AutoTraderConfig
 from ..exchange import mirror
@@ -203,6 +204,8 @@ class AITraderStartPayload(BaseModel):
     confirm_live: bool = False
     max_order_quote: float | None = Field(default=None, ge=0)
     max_position_quote: float | None = Field(default=None, ge=0)
+    # 决策深度：quick / standard / deep。空表示用设置里的值。
+    depth: str = ""
 
 
 class AITraderPausePayload(BaseModel):
@@ -666,6 +669,9 @@ class AITraderController:
                 status_code=400, detail="主网 AI 交易需要显式确认（confirm_live=true）"
             )
 
+        depth = (payload.depth or cfg.depth or "standard").strip()
+        if depth not in DEPTHS:
+            raise HTTPException(status_code=400, detail=f"未知的决策深度：{depth}")
         config = AITraderConfig(
             enabled=True,
             live_enabled=cfg.live_enabled,
@@ -692,6 +698,7 @@ class AITraderController:
             cooldown_sec=cfg.cooldown_sec,
             poll_sec=cfg.poll_sec,
             require_stop=cfg.require_stop,
+            depth=depth,
         )
         trader = AITrader(
             config,
@@ -712,6 +719,8 @@ class AITraderController:
                 signal_strategy,
                 signal_strategy.validate_params(payload.params or {}),
             ),
+            # 新闻只喂给流水线当参考，拉不到就当没有，不影响决策。
+            news_provider=lambda: _news_block(ctx, symbol),
         )
         return trader
 
@@ -1659,6 +1668,28 @@ def _apply_ai_auto(target: AIAutoSettings, values: dict[str, Any]) -> None:
             raise HTTPException(status_code=400, detail=f"ai_auto.{name} 不能为负")
     if not (0.0 <= target.min_confidence <= 1.0):
         raise HTTPException(status_code=400, detail="ai_auto.min_confidence 必须在 0 到 1 之间")
+
+
+def _news_block(ctx: Any, symbol: str, limit: int = 8) -> str:
+    """把最近的新闻标题拼成一段，喂给 AI 交易流水线。
+
+    只给标题和时间，正文太长会把上下文挤满。拉不到就当没有新闻，
+    流水线自己会跳过消息面那一段。
+    """
+    try:
+        data = ctx.news.snapshot(symbol=symbol, limit=limit)
+    except Exception as exc:
+        log.debug("读取新闻失败：%s", exc)
+        return ""
+    lines = []
+    for item in data.get("items") or []:
+        title = str(item.get("title") or "").strip()
+        if not title:
+            continue
+        stamp = str(item.get("published_at") or "")[:16].replace("T", " ")
+        source = str(item.get("source") or "").strip()
+        lines.append(f"- {stamp} {source}｜{title}".strip())
+    return "\n".join(lines)
 
 
 def _ai_portfolio(state, symbol: str) -> dict[str, Any]:

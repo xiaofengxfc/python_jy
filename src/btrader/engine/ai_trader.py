@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from .. import ai, paths
+from .. import ai, ai_pipeline, paths
 from ..core.types import MarketType, OrderSide, OrderType
 from .trading import OrderRequest, OrderResult
 
@@ -35,14 +35,8 @@ STATE_RUNNING = "running"
 STATE_PAUSED = "paused"
 STATE_HALTED = "halted"
 
-DECISION_PROMPT = (
-    "你是量化交易员。只输出一个 JSON 对象，不要解释。字段：\n"
-    '{"action":"open_long|open_short|close_long|close_short|hold",'
-    '"symbol":"交易对","quote":下单金额USDT,"price":参考价,"stop_loss":止损价或null,'
-    '"take_profit":止盈价或null,"confidence":0到1,"ttl_sec":决策有效期秒,"rationale":"一句话理由"}\n'
-    "约束：没有把握就输出 hold。quote 不得超过账户可用资金。不要给出杠杆。"
-    "止损必须在方向上合理，多单止损低于参考价，空单高于参考价。"
-)
+# 裁决段的输出格式在 ai_pipeline 里，解析和提示词必须同源。
+DECISION_PROMPT = ai_pipeline.DECISION_PROMPT
 
 
 # --------------------------------------------------------------- data types
@@ -95,6 +89,8 @@ class AITraderConfig:
     cooldown_sec: float = 30.0
     poll_sec: float = 60.0
     require_stop: bool = True
+    # 决策深度：quick 一次调用，standard 四段，deep 六段。引擎默认最省。
+    depth: str = "quick"
 
 
 @dataclass
@@ -265,6 +261,7 @@ class AITrader:
         frame_provider: Callable[[], Any] | None = None,
         portfolio_provider: Callable[[], dict[str, Any]] | None = None,
         signal_provider: Callable[[], float] | None = None,
+        news_provider: Callable[[], str] | None = None,
         audit_path: Path | None = None,
         clock: Callable[[], float] = time.time,
         lease: TradeLease | None = None,
@@ -276,6 +273,7 @@ class AITrader:
         self.frame_provider = frame_provider
         self.portfolio_provider = portfolio_provider
         self.signal_provider = signal_provider
+        self.news_provider = news_provider
         self._last_signal: float | None = None
         self.audit_path = audit_path or (paths.logs_dir() / "ai-trade-audit.jsonl")
         self.clock = clock
@@ -453,20 +451,27 @@ class AITrader:
                 "skip", reason="已达 AI 当日决策次数上限", decision=None, now=now
             )
 
-        prompt = self._build_prompt(frame, portfolio, signal_target)
-        answer = self.llm.ask(prompt, system="", cache_key="", kind="ai_trader") or {}
-        if not answer.get("ok"):
+        pipeline = self._decide(frame, portfolio, signal_target)
+        if not pipeline.ok:
             return self._record(
-                "skip", reason=f"模型调用失败：{answer.get('error') or '未知错误'}",
-                decision=None, now=now,
+                "skip",
+                reason=f"模型调用失败：{pipeline.error or '未知错误'}",
+                decision=None,
+                now=now,
+                trace=pipeline.trace,
             )
         self._decisions_today += 1
-        decision, error = parse_decision(str(answer.get("text") or ""), now=now)
+        decision, error = parse_decision(pipeline.decision_text, now=now)
         if decision is None:
-            return self._record("skip", reason=error, decision=None, now=now)
+            return self._record(
+                "skip", reason=error, decision=None, now=now, trace=pipeline.trace
+            )
         errors = validate_decision(decision, self.config)
         if errors:
-            return self._record("reject", reason="；".join(errors), decision=decision, now=now)
+            return self._record(
+                "reject", reason="；".join(errors), decision=decision, now=now,
+                trace=pipeline.trace,
+            )
         if signal_target is not None:
             if signal_target > 0 and decision.action == "open_short":
                 return self._record(
@@ -474,6 +479,7 @@ class AITrader:
                     reason="策略信号为多，AI 不得反向开空",
                     decision=decision,
                     now=now,
+                    trace=pipeline.trace,
                 )
             if signal_target < 0 and decision.action == "open_long":
                 return self._record(
@@ -481,6 +487,7 @@ class AITrader:
                     reason="策略信号为空，AI 不得反向开多",
                     decision=decision,
                     now=now,
+                    trace=pipeline.trace,
                 )
             if decision.is_entry and signal_target == 0:
                 return self._record(
@@ -488,6 +495,7 @@ class AITrader:
                     reason="策略无信号，AI 不得开仓",
                     decision=decision,
                     now=now,
+                    trace=pipeline.trace,
                 )
 
         guard = self.guard.check(
@@ -503,20 +511,27 @@ class AITrader:
             halted_reason=self._halted_reason or str(portfolio.get("halted_reason") or ""),
         )
         if not guard.ok:
-            return self._record("reject", reason=guard.reason, decision=decision, now=now)
+            return self._record(
+                "reject", reason=guard.reason, decision=decision, now=now, trace=pipeline.trace
+            )
 
         if decision.action == "hold":
-            return self._record("skip", reason="观望", decision=decision, now=now)
+            return self._record(
+                "skip", reason="观望", decision=decision, now=now, trace=pipeline.trace
+            )
 
         try:
             order = self._submit(decision, market_price)
         except Exception as exc:
             return self._record(
-                "error", reason=f"下单失败：{exc}", decision=decision, now=now
+                "error", reason=f"下单失败：{exc}", decision=decision, now=now,
+                trace=pipeline.trace,
             )
         self._order_times.append(now)
         self._last_order_at = now
-        return self._record("order", reason="", decision=decision, now=now, order=order)
+        return self._record(
+            "order", reason="", decision=decision, now=now, order=order, trace=pipeline.trace
+        )
 
     def _submit(self, decision: AIDecision, market_price: float | None) -> OrderResult:
         c = self.config
@@ -564,6 +579,43 @@ class AITrader:
             log.warning("读取 AI 组合视图失败", exc_info=True)
             return {}
 
+    def _decide(
+        self,
+        frame: Any,
+        portfolio: dict[str, Any],
+        signal_target: float | None,
+    ) -> ai_pipeline.PipelineResult:
+        """跑一遍流水线。深度、账户和限额都在这里翻译成流水线的输入。"""
+        ctx = ai_pipeline.PipelineContext(
+            symbol=self.config.symbol,
+            timeframe=self.config.timeframe,
+            digest=self._digest(frame),
+            equity=float(portfolio.get("equity") or 0.0),
+            position_quote=float(portfolio.get("position_quote") or 0.0),
+            price=portfolio.get("price"),
+            signal_target=signal_target,
+            max_order_quote=self.config.max_order_quote,
+            max_position_quote=self.config.max_position_quote,
+            min_confidence=self.config.min_confidence,
+            news=self._news(),
+        )
+        return ai_pipeline.run(self.llm, ctx, depth=self.config.depth)
+
+    def _digest(self, frame: Any) -> str:
+        try:
+            return ai.digest(frame, timeframe=self.config.timeframe, label=self.config.symbol)
+        except Exception:  # pragma: no cover - digest is best effort
+            return ""
+
+    def _news(self) -> str:
+        """新闻标题由外部注入；没有就返回空串，流水线会跳过那一段。"""
+        if self.news_provider is None:
+            return ""
+        try:
+            return str(self.news_provider() or "")
+        except Exception:  # pragma: no cover - 新闻拉不到不影响决策
+            return ""
+
     def _build_prompt(
         self,
         frame: Any,
@@ -603,6 +655,7 @@ class AITrader:
         decision: AIDecision | None,
         now: float,
         order: OrderResult | None = None,
+        trace: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         self._seq += 1
         order_row = None
@@ -629,6 +682,8 @@ class AITrader:
             "order_id": (order_row or {}).get("id") if isinstance(order_row, dict) else None,
             "network": self.config.network,
             "state": self.state,
+            "depth": self.config.depth,
+            "trace": list(trace or []),
         }
         self.last_decision = record
         with self._lock:
@@ -660,6 +715,7 @@ class AITrader:
                 "market_type": self.config.market_type,
                 "timeframe": self.config.timeframe,
                 "live_enabled": self.config.live_enabled,
+                "depth": self.config.depth,
                 "max_order_quote": self.config.max_order_quote,
                 "max_position_quote": self.config.max_position_quote,
             },

@@ -1,107 +1,42 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import type { ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, query } from "../api";
 import { TIMEFRAMES, fmt } from "../format";
-import type { Strategy, SymbolInfo } from "../types";
+import type {
+  AppSettings,
+  BacktestJob,
+  Candidate,
+  Health,
+  OptimizeJob,
+  Strategy,
+  SymbolInfo,
+} from "../types";
+import CandidateList, { CANDIDATE_STATE } from "../components/CandidateList";
+import MetricGrid from "../components/MetricGrid";
+import StageBar from "../components/StageBar";
 
-/* --------------------------------------------------------------- types */
-/* The lab endpoints live outside `types.ts` because they are still new: only
-   this page consumes them, and every field is optional so an older backend
-   (or a partially written record) cannot break the screen. */
+/** 策略实验室：让模型写候选，人检查、回测、批准，再拿参数去优化。
+ *
+ * 后端接口没变，只是把三件事摆成三列：左边挑候选，中间看候选，右边干活
+ * （生成和调参）。批准之后候选才进策略库，AI 量化页才拿得到它。
+ */
 
-interface CandidateIssue {
-  code?: string;
-  message?: string;
-  line?: number;
+interface Props {
+  settings: AppSettings | null;
+  health: Health | null;
 }
 
-interface CandidateChecks {
-  ok?: boolean;
-  issues?: CandidateIssue[];
-  imports?: string[];
-  classes?: string[];
-}
-
-interface Candidate {
-  id: string;
-  created_at?: number;
-  strategy_key?: string;
-  name?: string;
-  base_key?: string;
-  model?: string;
-  status?: string;
-  checks?: CandidateChecks;
-  backtest?: Record<string, unknown>;
-  note?: string;
-  reviewer?: string;
-  registered_key?: string;
-  strategy_path?: string;
-}
-
-interface OptimizeRound {
-  round?: number;
-  params?: Record<string, unknown>;
-  metrics?: Record<string, number>;
-  score?: number;
-  accepted?: boolean;
-  reason?: string;
-  reflection?: string;
-  tokens?: number;
-  elapsed?: number;
-  error?: string;
-}
-
-interface OptimizeResult {
-  rounds?: OptimizeRound[];
-  best?: Record<string, unknown>;
-  best_metrics?: Record<string, number>;
-  best_score?: number;
-  calls?: number;
-  stopped?: string;
-}
-
-interface BacktestJob {
-  status?: string;
-  progress?: number;
-  error?: string;
-  result?: { metrics?: Record<string, number> };
-}
-
-interface OptimizeJob {
-  id?: string;
-  status?: string;
-  progress?: number;
-  started?: number;
-  result?: OptimizeResult | null;
-  error?: string | null;
-}
-
-/* ------------------------------------------------------------- constants */
-const CANDIDATE_STATE: Record<string, [string, string]> = {
-  pending: ["待审", "pending"],
-  approved: ["已批准", "approved"],
-  rejected: ["已拒绝", "rejected"],
-};
-
-const JOB_STATE: Record<string, string> = {
-  running: "运行中",
-  cancelling: "取消中",
-  done: "已完成",
-  failed: "失败",
-  cancelled: "已取消",
-};
+const STAGES = [
+  { key: "generate", label: "生成" },
+  { key: "check", label: "检查" },
+  { key: "backtest", label: "回测" },
+  { key: "approve", label: "批准" },
+];
 
 const METRICS: [string, string][] = [
   ["sharpe", "夏普"],
   ["total_return", "总收益"],
   ["win_rate", "胜率"],
   ["profit_factor", "盈亏比"],
-];
-
-const MARKETS: [string, string][] = [
-  ["spot", "现货"],
-  ["usdm", "U 本位"],
-  ["coinm", "币本位"],
 ];
 
 const STOPPED_LABEL: Record<string, string> = {
@@ -112,80 +47,53 @@ const STOPPED_LABEL: Record<string, string> = {
   no_improvement: "连续未改善",
 };
 
-function pad(value: number): string {
-  return String(value).padStart(2, "0");
-}
-
-function stampOf(seconds: number | undefined): string {
-  if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds <= 0) return "—";
-  const date = new Date(seconds * 1000);
-  return (
-    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
-    `${pad(date.getHours())}:${pad(date.getMinutes())}`
-  );
+function stageOf(candidate: Candidate | null): string {
+  if (!candidate) return "generate";
+  if (candidate.status === "approved") return "approve";
+  if (candidate.backtest && Object.keys(candidate.backtest).length) return "backtest";
+  return candidate.checks ? "check" : "generate";
 }
 
 function paramsText(params: Record<string, unknown> | undefined): string {
-  if (!params) return "—";
-  const entries = Object.entries(params);
-  if (!entries.length) return "—";
-  return entries
-    .map(([key, value]) => `${key}=${typeof value === "number" ? fmt(value, 2) : String(value)}`)
-    .join(" · ");
+  if (!params) return "";
+  return Object.entries(params)
+    .map(([key, value]) => `${key}=${String(value)}`)
+    .join(" ");
 }
 
-/** One candidate row. Clicking it loads the source below. */
-function statusChip(candidate: Candidate): ReactNode {
-  const [label, kind] = CANDIDATE_STATE[candidate.status ?? ""] ?? [candidate.status ?? "未知", ""];
-  return <span className={`lab-chip ${kind}`}>{label}</span>;
-}
-
-/* ----------------------------------------------------------------- page */
-export default function StrategyLabPage() {
-  /* candidates */
+export default function StrategyLabPage({ settings, health }: Props) {
   const [candidates, setCandidates] = useState<Candidate[]>([]);
-  const [candidateError, setCandidateError] = useState("");
-  const [candidateLoading, setCandidateLoading] = useState(true);
   const [selected, setSelected] = useState<Candidate | null>(null);
   const [code, setCode] = useState("");
-  const [codeError, setCodeError] = useState("");
-  const [codeLoading, setCodeLoading] = useState(false);
-  const [reviewNote, setReviewNote] = useState("");
-  const [backtestBusy, setBacktestBusy] = useState(false);
+  const [codeOpen, setCodeOpen] = useState(false);
 
-  /* generation */
-  const [instruction, setInstruction] = useState("");
-  const [genBase, setGenBase] = useState("");
-  const [generateBusy, setGenerateBusy] = useState(false);
-
-  /* shared strategy / symbol catalogues */
   const [strategies, setStrategies] = useState<Strategy[]>([]);
   const [symbols, setSymbols] = useState<SymbolInfo[]>([]);
+  const [market, setMarket] = useState(settings?.market_type ?? "spot");
+  const [symbol, setSymbol] = useState(settings?.last_symbol ?? "BTC/USDT");
+  const [timeframe, setTimeframe] = useState(settings?.timeframe ?? "1h");
 
-  /* optimisation */
-  const [market, setMarket] = useState("spot");
-  const [symbol, setSymbol] = useState("BTC/USDT");
-  const [timeframe, setTimeframe] = useState("1h");
+  const [tab, setTab] = useState<"generate" | "optimize">("generate");
+  const [instruction, setInstruction] = useState("");
+  const [genBase, setGenBase] = useState("");
+  const [reviewNote, setReviewNote] = useState("");
+
   const [baseKey, setBaseKey] = useState("");
   const [rounds, setRounds] = useState(3);
   const [metric, setMetric] = useState("sharpe");
-  const [optimizeBusy, setOptimizeBusy] = useState(false);
-  const [applyBusy, setApplyBusy] = useState(false);
-  const [jobId, setJobId] = useState("");
   const [job, setJob] = useState<OptimizeJob | null>(null);
+  const [jobId, setJobId] = useState("");
 
+  const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const pollRef = useRef<number | undefined>(undefined);
-  const handoffApplied = useRef(false);
+  const poll = useRef<number | undefined>(undefined);
+  const handoff = useRef(false);
 
-  useEffect(() => () => window.clearInterval(pollRef.current), []);
-
-  // "优化策略" from AI 交易 carries the signal strategy and chart context.
-  // It is one-shot: remove it after reading so a later sidebar visit is clean.
+  /* ------------------------------------------------------------- 进入带参 */
   useEffect(() => {
-    if (handoffApplied.current) return;
-    handoffApplied.current = true;
+    if (handoff.current) return;
+    handoff.current = true;
     const raw = window.sessionStorage.getItem("bitrader.lab.handoff");
     if (!raw) return;
     window.sessionStorage.removeItem("bitrader.lab.handoff");
@@ -200,25 +108,21 @@ export default function StrategyLabPage() {
       if (data.symbol) setSymbol(data.symbol);
       if (data.timeframe) setTimeframe(data.timeframe);
       if (data.market) setMarket(data.market);
-      setNotice(
-        `已带入 ${data.strategy ?? "策略"} · ${data.symbol ?? ""} ${data.timeframe ?? ""}，可直接启动优化。`,
-      );
+      setTab("optimize");
     } catch {
-      /* malformed handoff is ignored */
+      // 带参坏了就当没带。
     }
   }, []);
 
-  /* ------------------------------------------------------------- loading */
+  /* ---------------------------------------------------------------- 数据 */
   const loadCandidates = useCallback(async () => {
-    setCandidateLoading(true);
     try {
       const data = await api<{ items: Candidate[] }>("/api/ai/strategies/candidates");
-      setCandidates(data.items ?? []);
-      setCandidateError("");
+      const items = data.items ?? [];
+      setCandidates(items);
+      setSelected((current) => items.find((item) => item.id === current?.id) ?? items[0] ?? null);
     } catch (caught) {
-      setCandidateError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setCandidateLoading(false);
+      setError(caught instanceof Error ? caught.message : String(caught));
     }
   }, []);
 
@@ -229,129 +133,122 @@ export default function StrategyLabPage() {
   useEffect(() => {
     api<{ items: Strategy[] }>("/api/strategies")
       .then((data) => {
-        setStrategies(data.items ?? []);
-        const first = data.items?.[0];
-        if (first) {
-          setGenBase((current) => current || first.key);
-          setBaseKey((current) => current || first.key);
+        const items = data.items ?? [];
+        setStrategies(items);
+        if (items[0]) {
+          setGenBase((current) => current || items[0]!.key);
+          setBaseKey((current) => current || items[0]!.key);
         }
       })
       .catch(() => setStrategies([]));
   }, []);
 
   useEffect(() => {
+    if (!market) return;
     api<{ items: SymbolInfo[] }>(`/api/symbols?${query({ market })}`)
       .then((data) => {
-        setSymbols(data.items ?? []);
+        const items = data.items ?? [];
+        setSymbols(items);
         setSymbol((current) =>
-          (data.items ?? []).some((item) => item.symbol === current)
+          items.some((item) => item.symbol === current)
             ? current
-            : ((data.items ?? [])[0]?.symbol ?? current),
+            : (items.find((item) => item.symbol === "BTC/USDT") ?? items[0])?.symbol ?? "",
         );
       })
       .catch(() => setSymbols([]));
   }, [market]);
 
-  useEffect(() => {
-    if (!strategies.length) return;
-    setBaseKey((current) =>
-      strategies.some((item) => item.key === current) ? current : strategies[0]!.key,
-    );
-  }, [strategies]);
-
-  /* ------------------------------------------------------------ actions */
   const pickCandidate = useCallback(async (candidate: Candidate) => {
     setSelected(candidate);
     setCode("");
-    setCodeError("");
-    setCodeLoading(true);
-    setReviewNote("");
+    setCodeOpen(false);
     try {
       const data = await api<{ candidate: Candidate; code: string }>(
         `/api/ai/strategies/candidates/${encodeURIComponent(candidate.id)}`,
       );
-      setSelected(data.candidate ?? candidate);
+      setSelected(data.candidate);
       setCode(data.code ?? "");
-    } catch (caught) {
-      setCodeError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setCodeLoading(false);
+    } catch {
+      // 源码读不到不影响后面的动作。
     }
   }, []);
 
-  const generate = useCallback(
-    async (baseOverride?: string) => {
-      if (generateBusy) return;
-      setGenerateBusy(true);
-      setError("");
-      setNotice("");
-      try {
-        const data = await api<{ ok: boolean; candidate: Candidate }>(
-          "/api/ai/strategies/candidates/generate",
-          {
-            method: "POST",
-            body: JSON.stringify({
-              base_key: baseOverride ?? genBase,
-              instruction: instruction.trim(),
-              market,
-              symbol,
-              timeframe,
-            }),
-          },
-        );
-        const created = data.candidate;
-        setCandidates((current) => [created, ...current.filter((item) => item.id !== created.id)]);
-        setNotice(`已生成候选 ${created.strategy_key ?? created.id}。`);
-        await pickCandidate(created);
-      } catch (caught) {
-        setError(caught instanceof Error ? caught.message : String(caught));
-      } finally {
-        setGenerateBusy(false);
-      }
-    },
-    [generateBusy, genBase, instruction, market, symbol, timeframe, pickCandidate],
-  );
+  useEffect(() => {
+    if (selected) void pickCandidate(selected);
+    // 只在换候选时读源码。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selected?.id]);
 
-  const review = useCallback(
-    async (approve: boolean) => {
-      if (!selected) return;
-      setError("");
-      setNotice("");
-      try {
-        const data = await api<{ ok: boolean; candidate: Candidate }>(
-          `/api/ai/strategies/candidates/${encodeURIComponent(selected.id)}/review`,
-          {
-            method: "POST",
-            body: JSON.stringify({ approve, note: reviewNote.trim() }),
-          },
-        );
-        const updated = data.candidate;
-        setSelected(updated);
-        setCandidates((current) =>
-          current.map((item) => (item.id === updated.id ? updated : item)),
-        );
-        setNotice(
-          approve
-            ? updated.registered_key
-              ? `已批准并生成本地策略：${updated.registered_key}.py`
-              : "已批准该候选。"
-            : "已拒绝该候选。",
-        );
-      } catch (caught) {
-        setError(caught instanceof Error ? caught.message : String(caught));
-      }
-    },
-    [selected, reviewNote],
-  );
+  const visible = useMemo(() => candidates, [candidates]);
 
-  /** Backtest the candidate *before* it is approved.
-   * The backend loads it into a throwaway registry (`cand:<id>`), so the
-   * strategy list never gains a file the user did not approve. */
-  const backtestCandidate = useCallback(async () => {
-    if (!selected) return;
-    setBacktestBusy(true);
+  /* ---------------------------------------------------------------- 动作 */
+  const generate = async () => {
+    if (busy || !genBase) return;
+    setBusy("generate");
     setError("");
     setNotice("");
+    try {
+      const data = await api<{ ok: boolean; candidate: Candidate }>(
+        "/api/ai/strategies/candidates/generate",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            base_key: genBase,
+            instruction: instruction.trim(),
+            market,
+            symbol,
+            timeframe,
+          }),
+        },
+      );
+      setCandidates((current) => [
+        data.candidate,
+        ...current.filter((item) => item.id !== data.candidate.id),
+      ]);
+      setSelected(data.candidate);
+      setNotice(`已生成候选 ${data.candidate.strategy_key ?? data.candidate.id}。`);
+      setTab("generate");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const review = async (approve: boolean) => {
+    if (!selected || busy) return;
+    setBusy("review");
+    setError("");
+    setNotice("");
+    try {
+      const data = await api<{ ok: boolean; candidate: Candidate }>(
+        `/api/ai/strategies/candidates/${encodeURIComponent(selected.id)}/review`,
+        { method: "POST", body: JSON.stringify({ approve, note: reviewNote.trim() }) },
+      );
+      setSelected(data.candidate);
+      setCandidates((current) =>
+        current.map((item) => (item.id === data.candidate.id ? data.candidate : item)),
+      );
+      setNotice(
+        approve
+          ? data.candidate.registered_key
+            ? `已批准，策略库多了 ${data.candidate.registered_key}。`
+            : "已批准该候选。"
+          : "已拒绝该候选。",
+      );
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  /** 批准之前也能回测：后端把它装进一次性的 cand:<id> 注册表。 */
+  const backtestCandidate = async () => {
+    if (!selected || busy) return;
+    setBusy("backtest");
+    setError("");
+    setNotice("回测已启动，等一会儿。");
     try {
       const started = await api<{ job_id: string }>("/api/backtest/run", {
         method: "POST",
@@ -366,24 +263,23 @@ export default function StrategyLabPage() {
           save: false,
         }),
       });
-      setNotice(
-        "候选回测已启动：" + (selected.name ?? selected.strategy_key) + " · " + symbol + " " + timeframe,
-      );
       let outcome: BacktestJob | null = null;
       for (let attempt = 0; attempt < 180; attempt += 1) {
         await new Promise((resolve) => window.setTimeout(resolve, 1000));
-        const job = await api<BacktestJob>(
-          "/api/backtest/jobs/" + encodeURIComponent(started.job_id),
+        const current = await api<BacktestJob>(
+          `/api/backtest/jobs/${encodeURIComponent(started.job_id)}`,
         );
-        if (job.status === "running") continue;
-        outcome = job;
+        if (current.status === "running") continue;
+        outcome = current;
         break;
       }
-      if (!outcome) throw new Error("回测超时，请稍后用回测页重试");
+      if (!outcome) throw new Error("回测超时，稍后到回测页重试");
       if (outcome.status !== "done") throw new Error(outcome.error || "回测失败");
-      const metrics = outcome.result?.metrics ?? {};
+      const payload = outcome.result;
+      const metrics =
+        payload && "metrics" in payload ? (payload.metrics as Record<string, number>) : {};
       const refreshed = await api<{ candidate: Candidate; code: string }>(
-        "/api/ai/strategies/candidates/" + encodeURIComponent(selected.id),
+        `/api/ai/strategies/candidates/${encodeURIComponent(selected.id)}`,
       );
       setSelected(refreshed.candidate);
       setCandidates((current) =>
@@ -391,384 +287,363 @@ export default function StrategyLabPage() {
           item.id === refreshed.candidate.id ? refreshed.candidate : item,
         ),
       );
-      const trades = Number(metrics.trades ?? 0);
-      const total = fmt(Number(metrics.total_return ?? 0) * 100, 2);
-      setNotice("回测完成：" + trades + " 笔成交，总收益 " + total + "%。");
+      setNotice(
+        `回测完成：${Number(metrics.trades ?? 0)} 笔成交，总收益 ` +
+          `${fmt(Number(metrics.total_return ?? 0) * 100, 2)}%。`,
+      );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
-      setBacktestBusy(false);
+      setBusy("");
     }
-  }, [selected, market, symbol, timeframe]);
+  };
 
-  /* -------------------------------------------------------- optimisation */
   const stopPolling = useCallback(() => {
-    window.clearInterval(pollRef.current);
-    pollRef.current = undefined;
+    if (poll.current) {
+      window.clearInterval(poll.current);
+      poll.current = undefined;
+    }
   }, []);
 
-  const poll = useCallback(
-    async (id: string) => {
-      try {
-        const data = await api<OptimizeJob>(`/api/ai/lab/optimize/${encodeURIComponent(id)}`);
-        setJob(data);
-        if (data.status === "done" || data.status === "failed" || data.status === "cancelled") {
-          stopPolling();
-          setOptimizeBusy(false);
-        }
-      } catch (caught) {
-        stopPolling();
-        setOptimizeBusy(false);
-        setError(caught instanceof Error ? caught.message : String(caught));
-      }
-    },
-    [stopPolling],
-  );
+  useEffect(() => stopPolling, [stopPolling]);
 
-  const startOptimize = useCallback(async () => {
-    if (!baseKey) {
-      setError("请先选择要优化的策略。");
-      return;
+  const pollJob = useCallback(async (id: string) => {
+    try {
+      const data = await api<OptimizeJob>(`/api/ai/lab/optimize/${encodeURIComponent(id)}`);
+      setJob(data);
+      if (data.status === "running" || data.status === "cancelling") return;
+      stopPolling();
+      setBusy("");
+      if (data.status === "done") setNotice("优化完成，看下面的轮次表。");
+      if (data.status === "failed") setError(data.error || "优化失败");
+    } catch (caught) {
+      stopPolling();
+      setBusy("");
+      setError(caught instanceof Error ? caught.message : String(caught));
     }
-    setOptimizeBusy(true);
+  }, [stopPolling]);
+
+  const startOptimize = async () => {
+    if (busy || !baseKey) return;
+    setBusy("optimize");
     setError("");
     setNotice("");
     stopPolling();
     try {
       const data = await api<{ ok: boolean; job_id: string }>("/api/ai/lab/optimize", {
         method: "POST",
-        body: JSON.stringify({
-          market,
-          symbol,
-          timeframe,
-          base_key: baseKey,
-          rounds,
-          metric,
-        }),
+        body: JSON.stringify({ market, symbol, timeframe, base_key: baseKey, rounds, metric }),
       });
       setJobId(data.job_id);
       setJob({ id: data.job_id, status: "running", progress: 0 });
-      setNotice(`优化任务已启动：${baseKey} · ${symbol} · ${timeframe} · ${rounds} 轮。`);
-      pollRef.current = window.setInterval(() => void poll(data.job_id), 2000);
+      setNotice(`优化已启动：${baseKey} · ${symbol} · ${timeframe} · ${rounds} 轮。`);
+      poll.current = window.setInterval(() => void pollJob(data.job_id), 2000);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
-      setOptimizeBusy(false);
-    }
-  }, [baseKey, market, symbol, timeframe, rounds, metric, poll, stopPolling]);
-
-  const cancelOptimize = useCallback(async () => {
-    if (!jobId) return;
-    setError("");
-    try {
-      await api(`/api/ai/lab/optimize/${encodeURIComponent(jobId)}/cancel`, { method: "POST" });
-      setNotice("已请求取消，等待当前轮结束。");
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-    }
-  }, [jobId]);
-
-  const result = job?.result ?? null;
-  const bestJson = result?.best ? JSON.stringify(result.best, null, 2) : "";
-
-  const copyBest = async () => {
-    if (!bestJson) return;
-    try {
-      await navigator.clipboard.writeText(bestJson);
-      setNotice("已复制 best 参数 JSON，可在「自动交易」的参数字段里粘贴。");
-    } catch (caught) {
-      setError(`复制失败：${caught instanceof Error ? caught.message : String(caught)}`);
+      setBusy("");
     }
   };
 
-  /** Explicit human hand-off: save the optimizer's best params for this
-   * strategy. AI 交易 reads them on its next start; nothing is applied to
-   * a running trader and no code is generated. */
+  const cancelOptimize = async () => {
+    if (!jobId) return;
+    try {
+      await api(`/api/ai/lab/optimize/${encodeURIComponent(jobId)}/cancel`, { method: "POST" });
+      setNotice("已请求取消，等当前这一轮跑完。");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    }
+  };
+
   const applyBest = async () => {
-    if (!baseKey || !result?.best) return;
+    const best = job?.result?.best;
+    if (!baseKey || !best) return;
     const label = strategies.find((item) => item.key === baseKey)?.name ?? baseKey;
     if (
       !window.confirm(
-        `将最优参数应用到「${label}」？\n\n` +
-          "只会写入 AI 交易的参数配置，不会自动启动或修改正在运行的策略。",
+        `把最优参数写进「${label}」？\n\n只写 AI 交易的参数配置，不会启动、也不会改正在跑的实例。`,
       )
     ) {
       return;
     }
-    setApplyBusy(true);
+    setBusy("apply");
     setError("");
-    setNotice("");
     try {
-      const current = await api<{
-        settings: { ai_auto?: { strategy_params?: Record<string, Record<string, unknown>> } };
-      }>("/api/settings");
+      const current = await api<{ settings: AppSettings }>("/api/settings");
       const saved = current.settings.ai_auto?.strategy_params ?? {};
       await api("/api/settings", {
         method: "PUT",
         body: JSON.stringify({
-          ai_auto: {
-            strategy_params: { ...saved, [baseKey]: result.best },
-          },
+          ai_auto: { strategy_params: { ...saved, [baseKey]: best } },
         }),
       });
-      setNotice(`已保存「${label}」的最优参数。下次启动 AI 交易时生效。`);
+      setNotice(`已写入 ${label} 的参数，下一次启动 AI 交易时生效。`);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
-      setApplyBusy(false);
+      setBusy("");
     }
   };
 
-  const jobRunning = job?.status === "running" || job?.status === "cancelling";
+  /* ---------------------------------------------------------------- 渲染 */
+  const stage = stageOf(selected);
+  const [statusLabel, statusTone] = CANDIDATE_STATE[selected?.status ?? "pending"] ?? [
+    "待审",
+    "pending",
+  ];
+  const result = job?.result ?? null;
+  const running = job?.status === "running" || job?.status === "cancelling";
+  const backtest = selected?.backtest ?? {};
 
   return (
     <>
       <div className="page-head">
         <h1 className="page-title">策略实验室</h1>
-        <span className="page-sub">AI 生成候选策略 · 多轮参数优化</span>
+        <span className="page-sub">模型写候选，人检查、回测、批准，再调参</span>
         <span className="spacer" />
-        <span className="faint" style={{ fontSize: 11 }}>
-          {candidates.length} 个候选 · 审核不会自动注册策略
-        </span>
-        <button type="button" className="btn-sm" disabled={candidateLoading} onClick={() => void loadCandidates()}>
-          {candidateLoading ? "刷新中…" : "刷新候选"}
-        </button>
+        <select
+          className="select"
+          aria-label="市场"
+          value={market}
+          onChange={(event) => setMarket(event.target.value)}
+        >
+          {(health?.markets ?? []).map((item) => (
+            <option key={item.value} value={item.value}>
+              {item.label}
+            </option>
+          ))}
+        </select>
+        <select
+          className="select"
+          aria-label="交易对"
+          value={symbol}
+          onChange={(event) => setSymbol(event.target.value)}
+        >
+          {symbols.map((item) => (
+            <option key={item.symbol} value={item.symbol}>
+              {item.display || item.symbol}
+            </option>
+          ))}
+        </select>
+        <select
+          className="select"
+          aria-label="周期"
+          value={timeframe}
+          onChange={(event) => setTimeframe(event.target.value)}
+        >
+          {TIMEFRAMES.map(([value, label]) => (
+            <option key={value} value={value}>
+              {label}
+            </option>
+          ))}
+        </select>
       </div>
 
-      <div className="lab-page">
-        {error && <div className="banner error">{error}</div>}
-        {notice && <div className="banner">{notice}</div>}
-        {candidateError && <div className="banner error">候选列表读取失败：{candidateError}</div>}
+      <StageBar stages={STAGES} current={stage} />
 
-        <div className="lab-grid">
-          {/* ------------------------------------------------ left column */}
-          <div className="stack">
-            <div className="card">
-              <div className="card-head">
-                <span className="card-title">候选策略</span>
-                <span className="spacer" />
-                <span className="faint" style={{ fontSize: 11 }}>
-                  生成一次约 5–20 秒
-                </span>
-              </div>
-              <div className="card-body">
-                <div className="lab-gen">
-                  <div className="field">
-                    <label className="field-label" htmlFor="lab-base">
-                      <span>参考策略</span>
-                      <em>可以留空</em>
-                    </label>
-                    <select
-                      id="lab-base"
-                      className="select"
-                      value={genBase}
-                      disabled={generateBusy}
-                      onChange={(event) => setGenBase(event.target.value)}
-                    >
-                      <option value="">从零生成</option>
-                      {strategies.map((item) => (
-                        <option key={item.key} value={item.key}>
-                          {item.name}
-                        </option>
-                      ))}
-                    </select>
+      {error && <div className="banner error">{error}</div>}
+      {notice && <div className="banner ok">{notice}</div>}
+
+      <div className="lab-grid">
+        <section className="card">
+          <div className="card-head">
+            <span className="card-title">候选策略</span>
+            <span className="spacer" />
+            <button type="button" className="link-btn" onClick={() => void loadCandidates()}>
+              刷新
+            </button>
+          </div>
+          <div className="card-body">
+            <CandidateList
+              items={visible}
+              selectedId={selected?.id ?? ""}
+              onPick={(candidate) => void pickCandidate(candidate)}
+              empty="还没有候选。右边「生成」写一条。"
+            />
+          </div>
+        </section>
+
+        <section className="card">
+          <div className="card-head">
+            <span className="card-title">
+              {selected?.name || selected?.strategy_key || "选一条候选"}
+            </span>
+            <span className="spacer" />
+            {selected && <span className={`cand-state ${statusTone}`}>{statusLabel}</span>}
+          </div>
+          <div className="card-body">
+            {!selected && <div className="faint">左边选一条候选。</div>}
+            {selected && (
+              <>
+                <div className="checks">
+                  <div className={`lab-check ${selected.checks?.ok ? "ok" : "bad"}`}>
+                    {selected.checks?.ok ? "静态检查通过" : "静态检查未通过"}
                   </div>
-                  <div className="field lab-instruction">
-                    <label className="field-label" htmlFor="lab-instruction">
-                      <span>改进要求</span>
-                      <em>一句话，自然语言</em>
-                    </label>
-                    <input
-                      id="lab-instruction"
-                      className="input"
-                      type="text"
-                      placeholder="例：在布林带基础上加入成交量过滤，减少震荡假信号"
-                      value={instruction}
-                      disabled={generateBusy}
-                      onChange={(event) => setInstruction(event.target.value)}
-                    />
-                  </div>
+                  {(selected.checks?.issues ?? []).length === 0 && selected.checks?.ok && (
+                    <div className="faint" style={{ fontSize: 11.5 }}>
+                      导入白名单内，没有危险调用。
+                    </div>
+                  )}
+                  {(selected.checks?.issues ?? []).map((issue, index) => (
+                    <div key={index} className="faint" style={{ fontSize: 11.5 }}>
+                      {issue.line ? `第 ${issue.line} 行：` : ""}
+                      {issue.message || issue.code}
+                    </div>
+                  ))}
+                </div>
+
+                <MetricGrid
+                  items={[
+                    {
+                      label: "总收益",
+                      value:
+                        backtest.total_return === undefined
+                          ? "—"
+                          : `${fmt(Number(backtest.total_return) * 100, 2)}%`,
+                      tone: Number(backtest.total_return ?? 0) > 0 ? "up" : "down",
+                    },
+                    { label: "夏普", value: backtest.sharpe === undefined ? "—" : fmt(Number(backtest.sharpe), 2) },
+                    { label: "成交", value: backtest.trades === undefined ? "—" : String(backtest.trades) },
+                  ]}
+                />
+
+                <div className="field">
+                  <label className="field-label" htmlFor="lab-note">
+                    <span>审查意见</span>
+                    <em>可选</em>
+                  </label>
+                  <input
+                    id="lab-note"
+                    className="input"
+                    value={reviewNote}
+                    placeholder="写一句为什么批或拒"
+                    onChange={(event) => setReviewNote(event.target.value)}
+                  />
+                </div>
+
+                <div className="exec-actions">
                   <button
                     type="button"
-                    className="btn-sm primary lab-generate"
-                    disabled={generateBusy}
-                    onClick={() => void generate()}
+                    className="btn-sm"
+                    disabled={busy !== "" || !selected.checks?.ok || selected.status === "approved"}
+                    onClick={() => void review(true)}
                   >
-                    {generateBusy ? "生成中…" : "AI 生成候选"}
+                    批准
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-sm"
+                    disabled={busy !== "" || selected.status === "rejected"}
+                    onClick={() => void review(false)}
+                  >
+                    拒绝
+                  </button>
+                  <span className="spacer" />
+                  <button
+                    type="button"
+                    className="btn-sm"
+                    disabled={busy !== ""}
+                    onClick={() => void backtestCandidate()}
+                  >
+                    {busy === "backtest" ? "回测中…" : "跑回测"}
                   </button>
                 </div>
 
-                <div className="lab-list">
-                  {candidateLoading ? (
-                    <div className="empty">读取候选…</div>
-                  ) : candidates.length === 0 ? (
-                    <div className="empty">还没有候选。写一句改进要求后点「AI 生成候选」。</div>
-                  ) : (
-                    candidates.map((item) => {
-                      const issues = item.checks?.issues ?? [];
-                      const ok = Boolean(item.checks?.ok);
-                      return (
-                        <button
-                          key={item.id}
-                          type="button"
-                          className={`lab-candidate ${selected?.id === item.id ? "active" : ""}`}
-                          onClick={() => void pickCandidate(item)}
-                        >
-                          <span className="lab-candidate-key num">{item.strategy_key ?? item.id}</span>
-                          <span className="lab-candidate-name">{item.name ?? "—"}</span>
-                          {statusChip(item)}
-                          <span className={`lab-check ${ok ? "ok" : "bad"}`}>
-                            {ok ? "检查通过" : `检查未通过 · ${issues.length} 个问题`}
-                          </span>
-                          <span className="lab-candidate-meta faint">
-                            {stampOf(item.created_at)}
-                            {item.base_key ? ` · 基于 ${item.base_key}` : ""}
-                            {item.model ? ` · ${item.model}` : ""}
-                          </span>
-                        </button>
-                      );
-                    })
-                  )}
-                </div>
-              </div>
-            </div>
-
-            <div className="card">
-              <div className="card-head">
-                <span className="card-title">代码预览</span>
-                <span className="spacer" />
-                {selected && (
-                  <>
-                    <input
-                      className="input input-xs lab-note"
-                      placeholder="审核备注（可选）"
-                      value={reviewNote}
-                      onChange={(event) => setReviewNote(event.target.value)}
-                    />
-                    <button
-                      type="button"
-                      className="btn-sm primary"
-                      disabled={
-                        !selected.checks?.ok ||
-                        (selected.status === "approved" && !!selected.registered_key)
-                      }
-                      title={
-                        selected.checks?.ok
-                          ? "批准并生成本地策略文件（会触发热加载）"
-                          : "静态检查未通过，不能批准"
-                      }
-                      onClick={() => void review(true)}
-                    >
-                      {selected.status === "approved" && !selected.registered_key
-                        ? "生成本地策略"
-                        : "批准"}
-                    </button>
-                    <button
-                      type="button"
-                      className="btn-sm"
-                      disabled={selected.status === "rejected"}
-                      onClick={() => void review(false)}
-                    >
-                      拒绝
-                    </button>
-                    <button
-                      type="button"
-                      className="btn-sm"
-                      disabled={backtestBusy || !selected.checks?.ok}
-                      title="用源码默认参数跑一次回测。不会注册为正式策略"
-                      onClick={() => void backtestCandidate()}
-                    >
-                      {backtestBusy ? "回测中…" : "回测候选"}
-                    </button>
-                  </>
-                )}
                 <button
                   type="button"
-                  className="btn-sm"
-                  disabled={generateBusy}
-                  onClick={() => void generate(selected?.base_key || genBase)}
+                  className="link-btn"
+                  onClick={() => setCodeOpen((open) => !open)}
                 >
-                  {generateBusy ? "生成中…" : "重新生成"}
+                  {codeOpen ? "收起源码" : "看源码"}
                 </button>
-              </div>
-              <div className="card-body">
-                {!selected ? (
-                  <div className="empty">在左侧选择一个候选，查看它生成的源码。</div>
-                ) : codeLoading ? (
-                  <div className="empty">读取源码…</div>
-                ) : codeError ? (
-                  <div className="banner error">{codeError}</div>
-                ) : (
-                  <>
-                    <div className="lab-code-meta faint">
-                      {selected.strategy_key} · {selected.id}
-                      {selected.checks?.classes?.length
-                        ? ` · 类 ${selected.checks.classes.join(", ")}`
-                        : ""}
-                    </div>
-                    {selected.backtest && Object.keys(selected.backtest).length > 0 && (
-                      <div className="lab-code-meta faint">
-                        上次回测：收益
-                        {fmt(Number(selected.backtest.total_return ?? 0) * 100, 2)}%
-                        {", 夏普 " + fmt(Number(selected.backtest.sharpe ?? 0), 2)}
-                        {", 回撤 " + fmt(Number(selected.backtest.max_drawdown ?? 0) * 100, 2)}%
-                        {", " + String(Number(selected.backtest.trades ?? 0)) + " 笔"}
-                        {selected.backtest.symbol ? " · " + String(selected.backtest.symbol) : ""}
-                        {selected.backtest.timeframe ? " " + String(selected.backtest.timeframe) : ""}
-                      </div>
-                    )}
-                    {selected.registered_key && (
-                      <div className="lab-code-meta faint">
-                        已生成本地策略：
-                        <code>{selected.registered_key}.py</code>
-                        {selected.strategy_path ? ` · ${selected.strategy_path}` : ""}
-                      </div>
-                    )}
-                    {selected.checks?.imports?.length ? (
-                      <div className="lab-code-meta faint">
-                        导入：{selected.checks.imports.join(", ")}
-                      </div>
-                    ) : null}
-                    {(selected.checks?.issues ?? []).length > 0 && (
-                      <div className="lab-issues">
-                        {(selected.checks?.issues ?? []).map((issue, index) => (
-                          <div className="lab-issue" key={`${issue.code ?? "issue"}-${index}`}>
-                            <span className="lab-chip rejected">{issue.code ?? "问题"}</span>
-                            <span>
-                              {issue.message ?? ""}
-                              {typeof issue.line === "number" ? `（第 ${issue.line} 行）` : ""}
-                            </span>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                    <pre className="lab-code">{code || "# 空文件"}</pre>
-                  </>
-                )}
-              </div>
+                {codeOpen && <pre className="lab-code">{code || "没有读到源码。"}</pre>}
+              </>
+            )}
+          </div>
+        </section>
+
+        <section className="card">
+          <div className="card-head">
+            <span className="card-title">工作区</span>
+            <span className="spacer" />
+            <div className="segmented" role="group" aria-label="工作区">
+              <button
+                type="button"
+                aria-pressed={tab === "generate"}
+                onClick={() => setTab("generate")}
+              >
+                生成
+              </button>
+              <button
+                type="button"
+                aria-pressed={tab === "optimize"}
+                onClick={() => setTab("optimize")}
+              >
+                优化
+              </button>
             </div>
           </div>
+          <div className="card-body">
+            {tab === "generate" && (
+              <>
+                <div className="field">
+                  <label className="field-label" htmlFor="lab-base">
+                    <span>以哪个策略为基础</span>
+                  </label>
+                  <select
+                    id="lab-base"
+                    className="select"
+                    value={genBase}
+                    onChange={(event) => setGenBase(event.target.value)}
+                  >
+                    {strategies.map((item) => (
+                      <option key={item.key} value={item.key}>
+                        {item.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="field">
+                  <label className="field-label" htmlFor="lab-instruction">
+                    <span>想要什么</span>
+                    <em>留空就让模型自由发挥</em>
+                  </label>
+                  <textarea
+                    id="lab-instruction"
+                    className="input"
+                    rows={4}
+                    value={instruction}
+                    placeholder="例如：只在放量突破时开仓，震荡时不开"
+                    onChange={(event) => setInstruction(event.target.value)}
+                  />
+                </div>
+                <div className="exec-actions">
+                  <span className="faint" style={{ fontSize: 11.5 }}>
+                    {symbol} · {timeframe}
+                  </span>
+                  <span className="spacer" />
+                  <button
+                    type="button"
+                    className="btn-sm primary"
+                    disabled={busy !== "" || !genBase}
+                    onClick={() => void generate()}
+                  >
+                    {busy === "generate" ? "生成中…" : "生成候选"}
+                  </button>
+                </div>
+              </>
+            )}
 
-          {/* ----------------------------------------------- right column */}
-          <div className="stack">
-            <div className="card">
-              <div className="card-head">
-                <span className="card-title">多轮参数优化</span>
-                <span className="spacer" />
-                <span className={`lab-chip ${jobRunning ? "pending" : job?.status === "done" ? "approved" : ""}`}>
-                  {JOB_STATE[job?.status ?? ""] ?? "未开始"}
-                </span>
-              </div>
-              <div className="card-body">
+            {tab === "optimize" && (
+              <>
                 <div className="form-grid">
                   <div className="field">
-                    <label className="field-label" htmlFor="lab-opt-strategy">
+                    <label className="field-label" htmlFor="lab-opt-key">
                       <span>策略</span>
                     </label>
                     <select
-                      id="lab-opt-strategy"
+                      id="lab-opt-key"
                       className="select"
                       value={baseKey}
-                      disabled={jobRunning}
                       onChange={(event) => setBaseKey(event.target.value)}
                     >
                       {strategies.map((item) => (
@@ -779,88 +654,13 @@ export default function StrategyLabPage() {
                     </select>
                   </div>
                   <div className="field">
-                    <label className="field-label" htmlFor="lab-opt-market">
-                      <span>市场</span>
-                    </label>
-                    <select
-                      id="lab-opt-market"
-                      className="select"
-                      value={market}
-                      disabled={jobRunning}
-                      onChange={(event) => setMarket(event.target.value)}
-                    >
-                      {MARKETS.map(([value, label]) => (
-                        <option key={value} value={value}>
-                          {label}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                  <div className="field">
-                    <label className="field-label" htmlFor="lab-opt-symbol">
-                      <span>交易对</span>
-                    </label>
-                    <select
-                      id="lab-opt-symbol"
-                      className="select"
-                      value={symbol}
-                      disabled={jobRunning}
-                      onChange={(event) => setSymbol(event.target.value)}
-                    >
-                      {symbols.map((item) => (
-                        <option key={item.symbol} value={item.symbol}>
-                          {item.display}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                  <div className="field">
-                    <label className="field-label" htmlFor="lab-opt-timeframe">
-                      <span>周期</span>
-                    </label>
-                    <select
-                      id="lab-opt-timeframe"
-                      className="select"
-                      value={timeframe}
-                      disabled={jobRunning}
-                      onChange={(event) => setTimeframe(event.target.value)}
-                    >
-                      {TIMEFRAMES.map(([value, label]) => (
-                        <option key={value} value={value}>
-                          {label}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                  <div className="field">
-                    <label className="field-label" htmlFor="lab-opt-rounds">
-                      <span>轮次</span>
-                      <em>1–5</em>
-                    </label>
-                    <input
-                      id="lab-opt-rounds"
-                      className="input"
-                      type="number"
-                      min={1}
-                      max={5}
-                      step={1}
-                      disabled={jobRunning}
-                      value={rounds}
-                      onChange={(event) => {
-                        const next = Number(event.target.value);
-                        if (Number.isFinite(next)) setRounds(Math.max(1, Math.min(5, next)));
-                      }}
-                    />
-                  </div>
-                  <div className="field">
                     <label className="field-label" htmlFor="lab-opt-metric">
-                      <span>优化指标</span>
+                      <span>目标指标</span>
                     </label>
                     <select
                       id="lab-opt-metric"
                       className="select"
                       value={metric}
-                      disabled={jobRunning}
                       onChange={(event) => setMetric(event.target.value)}
                     >
                       {METRICS.map(([value, label]) => (
@@ -870,141 +670,122 @@ export default function StrategyLabPage() {
                       ))}
                     </select>
                   </div>
+                  <div className="field">
+                    <label className="field-label" htmlFor="lab-opt-rounds">
+                      <span>轮次</span>
+                      <em>一轮一次模型调用</em>
+                    </label>
+                    <input
+                      id="lab-opt-rounds"
+                      className="input"
+                      type="number"
+                      min={1}
+                      max={10}
+                      value={rounds}
+                      onChange={(event) => setRounds(Number(event.target.value))}
+                    />
+                  </div>
                 </div>
 
-                <div className="lab-opt-actions">
-                  <button
-                    type="button"
-                    className="btn-sm primary"
-                    disabled={optimizeBusy || !baseKey}
-                    onClick={() => void startOptimize()}
-                  >
-                    {jobRunning ? "优化中…" : "启动优化"}
-                  </button>
-                  <button
-                    type="button"
-                    className="btn-sm"
-                    disabled={!jobRunning}
-                    onClick={() => void cancelOptimize()}
-                  >
-                    取消
-                  </button>
-                  <span className="spacer" />
-                  <span className="faint" style={{ fontSize: 11 }}>
-                    每 2 秒刷新 · 最多 10 次模型调用
+                <div className="exec-actions">
+                  <span className="faint" style={{ fontSize: 11.5 }}>
+                    {symbol} · {timeframe}
                   </span>
+                  <span className="spacer" />
+                  {running ? (
+                    <button type="button" className="btn-sm" onClick={() => void cancelOptimize()}>
+                      取消
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      className="btn-sm primary"
+                      disabled={busy !== "" || !baseKey}
+                      onClick={() => void startOptimize()}
+                    >
+                      {busy === "optimize" ? "启动中…" : "开始优化"}
+                    </button>
+                  )}
                 </div>
 
                 {job && (
-                  <div className="lab-progress">
-                    <div className="progress">
-                      <div style={{ width: `${Math.round((job.progress ?? 0) * 100)}%` }} />
+                  <div className="optimize-progress">
+                    <div className="gate-row">
+                      <span>状态</span>
+                      <b>
+                        {job.status === "running"
+                          ? `运行中 ${Math.round(Number(job.progress ?? 0) * 100)}%`
+                          : job.status === "done"
+                            ? "已完成"
+                            : job.status === "failed"
+                              ? job.error || "失败"
+                              : job.status === "cancelled"
+                                ? "已取消"
+                                : job.status}
+                      </b>
                     </div>
-                    <div className="lab-progress-meta faint">
-                      {JOB_STATE[job.status ?? ""] ?? job.status ?? "—"} ·{" "}
-                      {Math.round((job.progress ?? 0) * 100)}%
-                      {job.result?.stopped
-                        ? ` · ${STOPPED_LABEL[job.result.stopped] ?? job.result.stopped}`
-                        : ""}
-                      {typeof job.result?.calls === "number" ? ` · 调用 ${job.result.calls} 次` : ""}
-                    </div>
+                    {result?.stopped && (
+                      <div className="faint" style={{ fontSize: 11.5 }}>
+                        结束原因：{STOPPED_LABEL[result.stopped] ?? result.stopped}
+                        {result.calls ? ` · 共 ${result.calls} 次调用` : ""}
+                      </div>
+                    )}
                   </div>
                 )}
 
-                {job?.error && <div className="banner error">优化失败：{job.error}</div>}
-                {!job && (
-                  <div className="hint">
-                    选一个已注册策略，模型会按轮次给出新参数并回测，只有指标改善且回撤不变差才接受。
-                  </div>
-                )}
-              </div>
-            </div>
-
-            <div className="card">
-              <div className="card-head">
-                <span className="card-title">轮次结果</span>
-                <span className="spacer" />
-                <span className="faint" style={{ fontSize: 11 }}>
-                  {result?.rounds?.length ?? 0} 轮
-                </span>
-              </div>
-              <div className="card-body">
-                {!result || (result.rounds ?? []).length === 0 ? (
-                  <div className="empty">
-                    {jobRunning ? "第一轮还在回测…" : "还没有结果。启动优化后这里会逐轮显示。"}
-                  </div>
-                ) : (
-                  <div className="lab-table-wrap">
-                    <table className="table">
-                      <thead>
-                        <tr>
-                          <th>轮次</th>
-                          <th>参数</th>
-                          <th className="right">评分</th>
-                          <th>结果</th>
-                          <th>理由 / 反思</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {(result.rounds ?? []).map((row) => (
-                          <tr key={row.round ?? JSON.stringify(row.params)}>
-                            <td className="num">{row.round ?? "—"}</td>
-                            <td className="num">{paramsText(row.params)}</td>
-                            <td className="right num">{fmt(row.score, 4)}</td>
-                            <td>
-                              <span className={`lab-chip ${row.accepted ? "approved" : "rejected"}`}>
-                                {row.accepted ? "接受" : "保留"}
-                              </span>
-                            </td>
-                            <td className="lab-reason">
-                              {row.reason || row.error || "—"}
-                              {row.reflection ? ` · ${row.reflection}` : ""}
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-
-                {result && (
-                  <div className="lab-best">
-                    <div className="lab-best-head">
-                      <span className="card-title">最优参数</span>
-                      <span className="lab-chip approved">评分 {fmt(result.best_score, 4)}</span>
-                      <span className="spacer" />
-                       <button type="button" className="link-btn" disabled={!bestJson} onClick={() => void copyBest()}>
-                         复制 JSON
-                       </button>
-                       <button
-                         type="button"
-                         className="btn-sm primary"
-                         disabled={applyBusy || !result?.best}
-                         onClick={() => void applyBest()}
-                       >
-                         {applyBusy ? "保存中…" : "应用到 AI 交易"}
-                       </button>
+                {!!result?.rounds?.length && (
+                  <div className="mini-table">
+                    <div className="mini-head">
+                      <span>轮次</span>
+                      <span>得分</span>
+                      <span>收益</span>
+                      <span>参数</span>
                     </div>
-                    <pre className="lab-best-json">{bestJson || "{}"}</pre>
-                    <div className="lab-best-metrics">
-                      {Object.entries(result.best_metrics ?? {}).map(([key, value]) => (
-                        <span className="lab-metric" key={key}>
-                          <span className="faint">{key}</span>
-                          <strong className="num">{typeof value === "number" ? fmt(value, 4) : String(value)}</strong>
+                    {result.rounds.map((round) => (
+                      <div key={round.round} className="mini-row">
+                        <span>{round.round}</span>
+                        <span className={round.accepted ? "up" : ""}>
+                          {round.score === undefined ? "—" : fmt(round.score, 3)}
                         </span>
-                      ))}
+                        <span>
+                          {round.metrics?.total_return === undefined
+                            ? "—"
+                            : `${fmt(Number(round.metrics.total_return) * 100, 2)}%`}
+                        </span>
+                        <span className="faint">{paramsText(round.params) || round.reason || "—"}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {result?.best && (
+                  <div className="optimize-best">
+                    <div className="gate-row">
+                      <span>最优参数</span>
+                      <b>{paramsText(result.best)}</b>
                     </div>
-                    <div className="hint">
-                      参数不会写进正在运行的交易。点「应用到 AI 交易」后，下次启动 AI 交易时才用。
-                      也可以复制 JSON 手动填写。
+                    <div className="exec-actions">
+                      <span className="faint" style={{ fontSize: 11.5 }}>
+                        {result.best_score === undefined
+                          ? ""
+                          : `得分 ${fmt(result.best_score, 3)}`}
+                      </span>
+                      <span className="spacer" />
+                      <button
+                        type="button"
+                        className="btn-sm primary"
+                        disabled={busy !== ""}
+                        onClick={() => void applyBest()}
+                      >
+                        写进 AI 交易
+                      </button>
                     </div>
                   </div>
                 )}
-              </div>
-            </div>
+              </>
+            )}
           </div>
-        </div>
-
+        </section>
       </div>
     </>
   );
