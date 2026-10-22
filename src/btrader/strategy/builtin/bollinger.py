@@ -30,10 +30,14 @@ class BollingerStrategy(Strategy):
             if pd.isna(mi[i]):
                 positions[i] = 0.0
                 continue
+            # 横盘时标准差为 0，上下轨和中轨挤成同一个价位：这一根上「跌破下轨」
+            # 和「回到中轨」同时成立，于是每根都开一次仓、下一根就平掉，只交手续费。
+            # 带宽为 0 的通道没有信息，不开新仓；已有的仓位照常按中轨离场。
+            width = up[i] - lo[i]
             if state == 0.0:
-                if close[i] <= lo[i]:
+                if width > 0 and close[i] <= lo[i]:
                     state = 1.0
-                elif close[i] >= up[i] and self.allow_short:
+                elif width > 0 and close[i] >= up[i] and self.allow_short:
                     state = -1.0
             elif state > 0 and close[i] >= mi[i]:
                 state = 0.0
