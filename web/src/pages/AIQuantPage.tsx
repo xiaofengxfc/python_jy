@@ -324,7 +324,7 @@ export default function AIQuantPage({ settings, health, onNavigate }: Props) {
             <span className={`cand-state ${statusTone}`}>{statusLabel}</span>
           </div>
           <div className="card-body">
-            {!selected && <div className="faint">左边选一条候选。</div>}
+            {!selected && <div className="empty-note">左边选一条候选。</div>}
             {selected && (
               <>
                 <div className="form-grid">

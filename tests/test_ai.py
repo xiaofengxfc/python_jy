@@ -469,24 +469,11 @@ def test_missing_key_is_reported_before_the_request(tmp_path, monkeypatch) -> No
     assert "API Key" in result["error"]
 
 
-def test_daily_limit_stops_calls(tmp_path, monkeypatch) -> None:
-    monkeypatch.setenv("BITRADER_DATA_DIR", str(tmp_path))
-    monkeypatch.setattr(llm, "load_key", lambda: "sk-test")
-    llm.reset_cache()
-    store = llm.cache()
-    for _ in range(3):
-        store.count_call()
-    service = LLMService(AISettings(enabled=True, daily_limit=3))
-    result = service.ask("hi")
-    assert result["ok"] is False
-    assert "上限" in result["error"]
-
-
 def test_cache_returns_the_same_answer_without_a_second_call(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("BITRADER_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(llm, "load_key", lambda: "sk-test")
     llm.reset_cache()
-    service = LLMService(AISettings(enabled=True, cache_seconds=600))
+    service = LLMService(AISettings(enabled=True))
     calls: list[str] = []
 
     def fake_request(spec, settings, key, system, prompt, **kwargs):
@@ -700,7 +687,7 @@ def test_openai_request_has_the_documented_url_headers_and_payload(
     assert payload["model"] == "gpt-4o-mini"
     assert payload["stream"] is False
     assert payload["temperature"] == pytest.approx(0.2)
-    assert payload["max_tokens"] == 3000
+    assert payload["max_tokens"] == llm.OUTPUT_TOKENS
     assert payload["messages"][0] == {"role": "system", "content": "你是分析师"}
     assert payload["messages"][-1] == {"role": "user", "content": "问题"}
 
@@ -743,7 +730,7 @@ def test_anthropic_request_uses_its_own_headers_and_a_system_field(
     # Anthropic takes the system prompt as a top-level field, not a message.
     assert payload["system"] == "你是分析师"
     assert payload["messages"] == [{"role": "user", "content": "问题"}]
-    assert payload["max_tokens"] == 3000
+    assert payload["max_tokens"] == llm.OUTPUT_TOKENS
 
 
 def test_ollama_request_is_local_and_sends_no_credentials(tmp_path, monkeypatch) -> None:
@@ -765,7 +752,7 @@ def test_ollama_request_is_local_and_sends_no_credentials(tmp_path, monkeypatch)
     payload = json.loads(request.data.decode("utf-8"))
     assert payload["stream"] is False
     assert payload["options"]["temperature"] == pytest.approx(0.2)
-    assert payload["options"]["num_predict"] == 3000
+    assert payload["options"]["num_predict"] == llm.OUTPUT_TOKENS
     assert payload["messages"][0] == {"role": "system", "content": "你是分析师"}
 
 

@@ -144,10 +144,6 @@ class ConfigStore:
         )
         ai_known = {f for f in AISettings.__dataclass_fields__}
         settings.ai = AISettings(**{k: v for k, v in ai_raw.items() if k in ai_known})
-        # 旧默认输出上限是 1200，推理模型会把整份额度花在思考上，正文成了空串。
-        # 只迁移还停在旧默认值的配置，用户自己调过的不动。
-        if settings.ai.max_tokens == 1200:
-            settings.ai.max_tokens = 3000
         ai_auto_known = {f for f in AIAutoSettings.__dataclass_fields__}
         settings.ai_auto = AIAutoSettings(
             **{k: v for k, v in ai_auto_raw.items() if k in ai_auto_known}

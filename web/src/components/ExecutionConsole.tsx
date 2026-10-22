@@ -225,7 +225,7 @@ export default function ExecutionConsole({ strategies, market, symbol, timeframe
         </div>
 
         <div className="exec-log">
-          {!events.length && <div className="faint">没有日志。</div>}
+          {!events.length && <div className="empty-note">没有日志。</div>}
           {events.map((item) => (
             <div key={item.seq} className={`exec-log-row ${item.level}`}>
               <span className="exec-log-kind">{STATE_LABEL[item.kind] ?? item.kind}</span>

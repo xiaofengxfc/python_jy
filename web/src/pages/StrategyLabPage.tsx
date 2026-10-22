@@ -398,6 +398,14 @@ export default function StrategyLabPage({ settings, health }: Props) {
         <h1 className="page-title">策略实验室</h1>
         <span className="page-sub">模型写候选，人检查、回测、批准，再调参</span>
         <span className="spacer" />
+        <span className="faint" style={{ fontSize: 11 }}>
+          {health?.markets.find((item) => item.value === market)?.label ?? market} · {symbol} ·{" "}
+          {timeframe}
+        </span>
+      </div>
+
+      <div className="page-toolbar">
+        <span className="page-toolbar-label">标的</span>
         <select
           className="select"
           aria-label="市场"
@@ -434,6 +442,10 @@ export default function StrategyLabPage({ settings, health }: Props) {
             </option>
           ))}
         </select>
+        <span className="spacer" />
+        <span className="faint" style={{ fontSize: 11.5 }}>
+          回测和优化都用这一组标的
+        </span>
       </div>
 
       <StageBar stages={STAGES} current={stage} />
@@ -469,7 +481,7 @@ export default function StrategyLabPage({ settings, health }: Props) {
             {selected && <span className={`cand-state ${statusTone}`}>{statusLabel}</span>}
           </div>
           <div className="card-body">
-            {!selected && <div className="faint">左边选一条候选。</div>}
+            {!selected && <div className="empty-note">左边选一条候选。</div>}
             {selected && (
               <>
                 <div className="checks">

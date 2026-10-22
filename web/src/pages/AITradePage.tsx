@@ -468,7 +468,10 @@ export default function AITradePage({ settings, health }: Props) {
             </span>
           </div>
           <div className="card-body">
-            {!events.length && <div className="faint">还没有决策。启动后每根 K 线记一条。</div>}
+            {!events.length && (
+              <div className="empty-note">还没有决策。启动后每根 K 线记一条。</div>
+            )}
+            {!!events.length && (
             <ul className="timeline">
               {events.map((record) => {
                 const key = record.seq ?? 0;
@@ -533,6 +536,7 @@ export default function AITradePage({ settings, health }: Props) {
                 );
               })}
             </ul>
+            )}
           </div>
         </section>
 

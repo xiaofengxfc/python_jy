@@ -1627,8 +1627,6 @@ def _apply_ai(target: Any, values: dict[str, Any]) -> None:
             setattr(target, key, type(current)(value))
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail=f"AI 字段 {key} 的值无效") from None
-    if target.daily_limit < 0:
-        raise HTTPException(status_code=400, detail="每日调用上限不能为负")
 
 
 def _apply_ai_auto(target: AIAutoSettings, values: dict[str, Any]) -> None:

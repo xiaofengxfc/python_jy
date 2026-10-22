@@ -221,11 +221,7 @@ export interface AISettings {
   model: string;
   base_url: string;
   temperature: number;
-  max_tokens: number;
   timeout: number;
-  /** 0 disables the per-day budget. */
-  daily_limit: number;
-  cache_seconds: number;
   /** Positions and P/L are private; sending them to a model is opt-in. */
   share_position: boolean;
   /** Write a briefing after every closed candle in the auto-trader. */

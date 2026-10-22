@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api } from "../api";
+import { api, query } from "../api";
 import { TIMEFRAMES } from "../format";
 import type {
   AISettings,
@@ -9,6 +9,7 @@ import type {
   NotifyStatus,
   PlatformOption,
   RiskState,
+  SymbolInfo,
 } from "../types";
 
 interface Props {
@@ -236,6 +237,36 @@ export default function SettingsPage({ settings, onSaved }: Props) {
   useEffect(() => {
     void loadCredentials();
   }, [loadCredentials, network]);
+
+  /** 默认交易对的选项来自交易页同一个接口，两个页面永远同一份列表。 */
+  const [symbols, setSymbols] = useState<SymbolInfo[]>([]);
+  const symbolMarket = draft?.market_type ?? "";
+  useEffect(() => {
+    if (!symbolMarket) return;
+    let cancelled = false;
+    api<{ items: SymbolInfo[] }>(`/api/symbols?${query({ market: symbolMarket })}`)
+      .then((data) => {
+        if (cancelled) return;
+        const items = data.items ?? [];
+        setSymbols(items);
+        // 老配置里可能存着这个市场没有的交易对（以前是自由输入框）。
+        // 落到列表里，否则下拉会显示空白。
+        setDraft((current) => {
+          if (!current) return current;
+          if (!items.length || items.some((item) => item.symbol === current.last_symbol)) {
+            return current;
+          }
+          const fallback = items.find((item) => item.symbol === "BTC/USDT") ?? items[0];
+          return fallback ? { ...current, last_symbol: fallback.symbol } : current;
+        });
+      })
+      .catch(() => {
+        if (!cancelled) setSymbols([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [symbolMarket]);
 
   const patch = (values: Partial<AppSettings>) => {
     setDraft((current) => (current ? { ...current, ...values } : current));
@@ -673,55 +704,6 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                 />
               </div>
 
-              <div className="field">
-                <label className="field-label" htmlFor="set-ai-limit">
-                  <span>每日调用上限</span>
-                </label>
-                <input
-                  id="set-ai-limit"
-                  className="input"
-                  type="number"
-                  min={0}
-                  step={10}
-                  value={draft.ai.daily_limit}
-                  onChange={(event) => patchAI({ daily_limit: Number(event.target.value) })}
-                />
-                <span className="field-hint">填 0 表示不限制。超额后调用直接失败，不会继续计费。</span>
-              </div>
-
-              <div className="field">
-                <label className="field-label" htmlFor="set-ai-max-tokens">
-                  <span>输出上限</span>
-                </label>
-                <input
-                  id="set-ai-max-tokens"
-                  className="input"
-                  type="number"
-                  min={200}
-                  step={100}
-                  value={draft.ai.max_tokens}
-                  onChange={(event) => patchAI({ max_tokens: Number(event.target.value) })}
-                />
-                <span className="field-hint">
-                  一次回答最多花多少 token。推理模型先想再答，想的部分也占这个额度，填 2000 以上。
-                </span>
-              </div>
-
-              <div className="field">
-                <label className="field-label" htmlFor="set-ai-cache">
-                  <span>结果缓存</span>
-                </label>
-                <input
-                  id="set-ai-cache"
-                  className="input"
-                  type="number"
-                  min={0}
-                  step={60}
-                  value={draft.ai.cache_seconds}
-                  onChange={(event) => patchAI({ cache_seconds: Number(event.target.value) })}
-                />
-                <span className="field-hint">秒。同一根已收盘 K 线在缓存期内重复问，不再计费。</span>
-              </div>
             </div>
 
             <div className="field" style={{ marginTop: 12 }}>
@@ -861,12 +843,24 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                   <label className="field-label" htmlFor="set-symbol">
                     <span>默认交易对</span>
                   </label>
-                  <input
+                  <select
                     id="set-symbol"
-                    className="input"
+                    className="select"
                     value={draft.last_symbol}
                     onChange={(event) => patch({ last_symbol: event.target.value })}
-                  />
+                  >
+                    {!symbols.some((item) => item.symbol === draft.last_symbol) && (
+                      <option value={draft.last_symbol}>{draft.last_symbol || "先选市场"}</option>
+                    )}
+                    {symbols.map((item) => (
+                      <option key={item.symbol} value={item.symbol}>
+                        {item.display || item.symbol}
+                      </option>
+                    ))}
+                  </select>
+                  <span className="field-hint">
+                    选项跟着「默认市场」走，和交易页的下拉是同一份。
+                  </span>
                 </div>
                 <div className="field">
                   <label className="field-label" htmlFor="set-timeframe">

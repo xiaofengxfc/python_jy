@@ -122,7 +122,8 @@ class LabController:
             # A whole strategy module is 3-6k characters; the default 1200
             # output tokens truncate the JSON mid-string and the candidate is
             # then rejected for reasons the user cannot see.
-            max_tokens=max(2400, int(getattr(ctx.ai.settings, "max_tokens", 1200) or 1200)),
+            # 写代码比问答长，一次给够，别让 JSON 从中间断掉。
+                max_tokens=2400,
         )
         if not answer.get("ok"):
             raise HTTPException(

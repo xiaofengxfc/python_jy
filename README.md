@@ -147,8 +147,8 @@ Key 存系统密钥环，不写进 `config.json`。
 - 回测过滤只看开仓点之前的 K 线。调用失败或回答读不懂时保留该笔交易，
   避免出现「因为超时所以策略变好」。
 - 持仓和盈亏默认不外发。要打开「允许把持仓和盈亏发给模型」开关才会出现在请求里。
-- 每日调用上限默认 300 次。结果按 K 线缓存，调用记录写到 `logs/ai-audit.jsonl`。
-  上限用完后调用直接失败。
+- 调用额度不开放配置：一次回答 4000 token，同一根 K 线重复提问走缓存（5 分钟内不重复计费）。
+  调用记录写到 `logs/ai-audit.jsonl`，设置页只显示今日次数。
 - 请求带客户端标识。部分 OpenAI 兼容中转站和 Cloudflare 防火墙会拦 Python `urllib` 的默认
   User-Agent，返回 HTTP 403 和 `error code: 1010`。`llm.py` 统一发送 `biTrader` 的
   User-Agent 和 `Accept: application/json`。遇到这个错误会提示是防火墙拦截。

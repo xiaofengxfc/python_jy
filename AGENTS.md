@@ -78,7 +78,7 @@ Node 不在 PATH 时，先把 Node 目录加进去。
 改 `btrader/llm.py` 和 `btrader/ai.py` 之前，先读 README 的「AI 助手」一节。
 
 - 密钥在系统密钥环，service 叫 `biTrader-ai`，不进 `config.json`。
-  `AISettings` 只存供应商、模型、上限和开关。
+  `AISettings` 只存供应商、模型、接口地址、温度、开关。
 - `llm.py` 只管收发：多供应商、缓存、审计、限额。
   `ai.py` 只管提示词和解析。两个模块都不碰交易。改提示词只动 `ai.py`。
 - 以下五条不要破坏：
@@ -91,6 +91,8 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   它和 `/api/klines` 一样会回落到 Gate 永续行情。
   不要在 AI 路由里直接调 `ctx.klines.fetch`，否则图表能用，分析接口报 500。
 - AI 测试在 `tests/test_ai.py`，全部离线：`FakeLLM` 替身加 `monkeypatch` 密钥环。
+- 输出额度、缓存窗口、每日调用次数都不进设置，固定在 `llm.py` 的 `OUTPUT_TOKENS` 和 `CACHE_SECONDS`。
+  设置页只留开关、供应商、模型、接口地址、Key。
 
 ## 7. AI 交易与 AI 量化
 
@@ -100,6 +102,9 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   `AITraderConfig.depth` 默认 quick（测试和「决策一次」用），界面默认 standard。
 - 裁决段的提示词只有一份，在 `ai_pipeline.DECISION_PROMPT`，`engine/ai_trader` 直接引用。
   改格式要同时改 `parse_decision`。
+- 三个页面共用 `main.main > .ai-grid / .quant-grid / .lab-grid` 这套三列骨架：1400 起三列，
+  1360 起两列，1024 以下单列交回页面滚动。列内卡片等高靠网格 stretch，卡内列表自己滚，
+  空数据用 `.empty-note` / `.cand-empty` 的虚线框，不要再退回 1080 的单列。
 - 三个页面各自独立，侧栏进：`AITradePage`（全自动交易）、`AIQuantPage`（候选 → 部署）、
   `StrategyLabPage`（生成与调参）。`StageBar`、`CandidateList`、`MetricGrid`、`ExecutionConsole`
   是共用件，别再各写一份。

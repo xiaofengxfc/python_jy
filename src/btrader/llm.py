@@ -85,11 +85,11 @@ DEFAULT_PROVIDER = "deepseek"
 USER_AGENT = "biTrader/0.5 (+desktop)"
 ACCEPT = "application/json"
 
-# A briefing per closed candle is the intended frequency; more than a few
-# hundred calls a day means a loop is misconfigured and is about to cost money.
-DEFAULT_DAILY_LIMIT = 300
-# Identical questions (same candle, same symbol) must not be paid for twice.
-DEFAULT_CACHE_SECONDS = 600.0
+# 输出额度不开放给用户调。推理模型先把额度花在思考上：3000 时正文偶尔被截成空，
+# 4000 留够余量。写策略那种长回答由调用方显式传更大的值。
+OUTPUT_TOKENS = 4000
+# 同一根已收盘 K 线重复提问不该计费两次。缓存窗口固定，不给调。
+CACHE_SECONDS = 300.0
 CACHE_LIMIT = 500
 AUDIT_LIMIT_BYTES = 2 * 1024 * 1024
 
@@ -103,15 +103,7 @@ class AISettings:
     model: str = ""
     base_url: str = ""
     temperature: float = 0.2
-    # Reasoning models (deepseek-v4.1-flash and friends) spend this budget on
-    # thinking before writing a single word of the answer. At 1200 the whole
-    # allowance went on the hidden reasoning and the visible answer came back
-    # empty, which read as "模型返回了空内容" for a request that was fine.
-    max_tokens: int = 3000
     timeout: float = 60.0
-    # 0 disables the budget. Counted per local day, from the audit trail.
-    daily_limit: int = DEFAULT_DAILY_LIMIT
-    cache_seconds: float = DEFAULT_CACHE_SECONDS
     # Positions, balances and P/L are private. Sending them to a third-party
     # API is opt-in, and the settings page says so next to the switch.
     share_position: bool = False
@@ -363,7 +355,6 @@ class LLMService:
                 for name, item in PROVIDERS.items()
             ],
             "calls_today": cache().calls_today(),
-            "daily_limit": self.settings.daily_limit,
             "audit": audit_tail(20),
         }
 
@@ -401,7 +392,7 @@ class LLMService:
             return result
 
         if cache_key:
-            hit = cache().get(cache_key, self.settings.cache_seconds)
+            hit = cache().get(cache_key, CACHE_SECONDS)
             if hit:
                 result.update(
                     ok=True,
@@ -417,11 +408,6 @@ class LLMService:
         if spec["needs_key"] and not key:
             result["error"] = "还没有填写 API Key。"
             return result
-        limit = int(self.settings.daily_limit or 0)
-        if limit > 0 and cache().calls_today() >= limit:
-            result["error"] = f"今日调用已达上限 {limit} 次，明天再试或调高上限。"
-            return result
-
         try:
             text, tokens = self._request(
                 spec, settings, key, system, prompt, max_tokens=max_tokens
@@ -448,7 +434,7 @@ class LLMService:
             return result
 
         cache().count_call()
-        if cache_key and self.settings.cache_seconds > 0:
+        if cache_key:
             cache().put(cache_key, text, tokens)
         result.update(
             ok=True,
@@ -487,7 +473,7 @@ class LLMService:
     ) -> tuple[str, int]:
         style = spec["style"]
         base = settings.base_url.rstrip("/")
-        output_limit = int(max_tokens or settings.max_tokens)
+        output_limit = int(max_tokens or OUTPUT_TOKENS)
         if style == "anthropic":
             url = f"{base}/v1/messages"
             payload = {
