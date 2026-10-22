@@ -529,3 +529,96 @@ def test_start_refuses_while_the_previous_poller_is_still_exiting(tmp_path):
     trader._thread = StuckThread()
     ok, message = trader.start()
     assert not ok and "仍在退出" in message
+
+
+def test_a_nan_quote_never_reaches_the_order(tmp_path):
+    """NaN 和任何数比大小都是假：金额、单笔上限、持仓上限三道检查全都判不出来。
+
+    一条 quote=NaN 的决策会一路走到下单，提交 amount=NaN，还把 NaN 写进审计 JSONL——
+    那不是合法 JSON，前端 JSON.parse 整块表格都会失败。
+    """
+    answer = json.dumps(
+        {
+            "action": "open_long",
+            "symbol": "BTC/USDT",
+            "quote": float("nan"),
+            "price": 100.0,
+            "stop_loss": 98.0,
+            "confidence": 0.8,
+        }
+    )
+    trader, _llm, trading, _risk = make_trader(tmp_path, answer=answer)
+
+    record = trader.decide_once()
+
+    assert record is not None and record["outcome"] == "reject"
+    assert "有限数值" in record["reason"]
+    assert trading.requests == []
+
+    def no_constants(token: str) -> float:
+        raise ValueError(f"非法 JSON 常量：{token}")
+
+    for line in (tmp_path / "audit.jsonl").read_text(encoding="utf-8").splitlines():
+        # 审计行必须是标准 JSON：NaN 会让前端 JSON.parse 整块表格失败
+        json.loads(line, parse_constant=no_constants)
+
+
+def test_a_take_profit_on_the_wrong_side_is_rejected(tmp_path):
+    """止损方向查了，止盈没查：多单止盈放在现价下方会被立刻触发。
+
+    交易所要么拒单（止盈挂不上，持仓裸奔），要么当场按市价了结。
+    """
+    trader, _llm, trading, _risk = make_trader(
+        tmp_path, answer=decision_json(take_profit=96.0)
+    )
+
+    record = trader.decide_once()
+
+    assert record is not None and record["outcome"] == "reject"
+    assert "止盈" in record["reason"]
+    assert trading.requests == []
+
+
+def test_a_stop_on_the_wrong_side_is_caught_without_a_model_price(tmp_path):
+    """模型不给 price 时方向校验曾经整段跳过：多单止损 102、行情 100，挂上就成交。
+
+    下单时 _submit 就是拿行情价当参考价的，校验得用同一个价。
+    """
+    answer = json.dumps(
+        {
+            "action": "open_long",
+            "symbol": "BTC/USDT",
+            "quote": 25.0,
+            "stop_loss": 102.0,
+            "take_profit": 110.0,
+            "confidence": 0.9,
+        }
+    )
+    trader, _llm, trading, _risk = make_trader(
+        tmp_path, answer=answer, require_stop=True
+    )
+
+    record = trader.decide_once()
+
+    assert record is not None and record["outcome"] == "reject"
+    assert "多单止损" in record["reason"]
+    assert trading.requests == []
+
+
+def test_a_close_without_a_positive_quote_is_not_sent_as_an_empty_order(tmp_path):
+    """平仓没查金额：quote=0/负数会变成 amount=0 / amount<0 的平仓单。
+
+    交易所一拒，仓还在，审计里却写着 order。
+    """
+    for quote in (0.0, -25.0):
+        trader, _llm, trading, _risk = make_trader(
+            tmp_path,
+            answer=decision_json(action="close_long", quote=quote, stop_loss=None),
+            portfolio={"equity": 1000.0, "position_quote": 400.0, "price": 100.0},
+        )
+
+        record = trader.decide_once()
+
+        assert record is not None and record["outcome"] == "reject", quote
+        assert "平仓金额" in record["reason"]
+        assert trading.requests == []

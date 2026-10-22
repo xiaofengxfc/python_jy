@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import threading
 import time
 import uuid
@@ -156,9 +157,38 @@ def parse_decision(text: str, *, now: float | None = None) -> tuple[AIDecision |
     return decision, ""
 
 
-def validate_decision(decision: AIDecision, config: AITraderConfig) -> list[str]:
-    """结构校验。任何一条不过都不允许下单。"""
+def validate_decision(
+    decision: AIDecision,
+    config: AITraderConfig,
+    *,
+    reference_price: float | None = None,
+) -> list[str]:
+    """结构校验。任何一条不过都不允许下单。
+
+    reference_price 是下单那一刻的行情价。模型没给参考价（price 为 null）时，
+    止损止盈的方向只能靠它判，否则这两条检查会被整段跳过。
+    """
     errors: list[str] = []
+    # NaN/inf 和任何数比大小都是假：quote=NaN 时「必须大于 0」「不许超过单笔上限」
+    # 「持仓不会超限」全都判不出来，一路走到下单，提交 amount=NaN，还把 NaN 写进
+    # 审计 JSONL（不是合法 JSON，前端 JSON.parse 整块都会失败）。
+    for label, value in (
+        ("下单金额", decision.quote),
+        ("参考价", decision.price),
+        ("止损价", decision.stop_loss),
+        ("止盈价", decision.take_profit),
+        ("置信度", decision.confidence),
+        ("有效期", decision.ttl_sec),
+    ):
+        if value is None:
+            continue
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            errors.append(f"{label}不是数值")
+            continue
+        if not math.isfinite(numeric):
+            errors.append(f"{label}必须是有限数值")
     if decision.action not in ACTIONS:
         errors.append("动作非法")
     if decision.symbol != config.symbol.upper():
@@ -177,11 +207,25 @@ def validate_decision(decision: AIDecision, config: AITraderConfig) -> list[str]
             errors.append("缺少止损价")
         if decision.price is not None and decision.price <= 0:
             errors.append("参考价必须大于 0")
-        if decision.stop_loss is not None and decision.price:
-            if decision.action == "open_long" and decision.stop_loss >= decision.price:
+        # 模型不给 price 时用行情价当参考价：下单时 _submit 就是这么取价的，
+        # 校验也得用同一个价，否则「多单止损在现价上方」这种会直接漏过去。
+        reference = decision.price if decision.price else reference_price
+        if decision.stop_loss is not None and reference:
+            if decision.action == "open_long" and decision.stop_loss >= reference:
                 errors.append("多单止损价必须低于参考价")
-            if decision.action == "open_short" and decision.stop_loss <= decision.price:
+            if decision.action == "open_short" and decision.stop_loss <= reference:
                 errors.append("空单止损价必须高于参考价")
+        # 止盈和止损是对称的两条：多单止盈放在现价下方（空单在上方）会被交易所
+        # 立刻触发，要么拒单要么当场按市价了结。止损查了，止盈不能漏。
+        if decision.take_profit is not None and reference:
+            if decision.action == "open_long" and decision.take_profit <= reference:
+                errors.append("多单止盈价必须高于参考价")
+            if decision.action == "open_short" and decision.take_profit >= reference:
+                errors.append("空单止盈价必须低于参考价")
+    if decision.is_close and decision.quote <= 0:
+        # 平仓不查金额时，quote=0/负数会变成 amount=0 / amount<0 的平仓单：
+        # 交易所一拒，仓还在，审计里却写着 order。
+        errors.append("平仓金额必须大于 0")
     if decision.ttl_sec < 0:
         errors.append("有效期不能为负")
     return errors
@@ -481,7 +525,7 @@ class AITrader:
             return self._record(
                 "skip", reason=error, decision=None, now=now, trace=pipeline.trace
             )
-        errors = validate_decision(decision, self.config)
+        errors = validate_decision(decision, self.config, reference_price=market_price)
         if errors:
             return self._record(
                 "reject", reason="；".join(errors), decision=decision, now=now,
@@ -668,6 +712,13 @@ class AITrader:
             "state": self.state,
             "depth": self.config.depth,
             "trace": list(trace or []),
+        }
+        # NaN/inf 不是合法 JSON：写进审计文件会让那一行解析不了，塞进 status 的
+        # 事件流还会让前端 JSON.parse 整块失败（一条坏记录毁掉整张表）。
+        # 模型回 NaN 时决策本身已经被 validate_decision 拒了，这里只保证记录干净。
+        record = {
+            key: (None if isinstance(value, float) and not math.isfinite(value) else value)
+            for key, value in record.items()
         }
         self.last_decision = record
         with self._lock:
