@@ -502,12 +502,17 @@ class AutoController:
 
     def status(self, since: int = 0) -> dict[str, Any]:
         items, seq = self.events.since(since)
+        with self._lock:
+            trader = self._trader
         return {
             "running": self.running,
             "config": self.config,
             "last_signal": self.last_signal,
             "seq": seq,
             "events": items,
+            # 新增字段，既有字段一个没动：K 线供给情况。预热不够时引擎在跑却
+            # 什么都不做，界面要能看见「不足 N 根」，不能只看见 running=true。
+            "data": trader.data_status() if trader is not None else None,
         }
 
     # ------------------------------------------------------------- notifications

@@ -27,6 +27,13 @@ from .trading import OrderRejected, OrderRequest, TradingService
 
 log = logging.getLogger(__name__)
 
+# 交易所一次能给的 K 线上限。AGENTS 里定了「K 线一次拉 1000 根，不做成设置项」，
+# 所以这里是常量，不是 AutoTraderConfig 上的一个可调项。
+MAX_KLINES = 1000
+# 预热除了策略要的根数，还要多两根：一根留给「丢掉尚未收盘的那根」，
+# 一根让最后一个指标的数值落定。少这两根策略会在指标还没值的时候空转。
+WARMUP_EXTRA = 2
+
 LogListener = Callable[[str, str], None]
 SignalListener = Callable[[float, str], None]
 StateListener = Callable[[bool], None]
@@ -75,6 +82,18 @@ class AutoTrader:
         # Unknown until the venue answers. A made-up starting figure would size
         # the first order against money the account may not have.
         self._equity: float | None = None
+        # K 线供给情况，界面通过 status 读它。预热不够时引擎在跑却什么都不做，
+        # 不把这个状态说出来，用户只能看见 running=true。
+        self._data_lock = threading.RLock()
+        self._data_status: dict[str, Any] = {
+            "required_bars": 0,
+            "fetched_bars": 0,
+            "max_bars": MAX_KLINES,
+            "short": False,
+            "message": "",
+        }
+        # 同一句「K 线不足」只报一次：每 10 秒一条会把日志和事件面板刷满。
+        self._warned_shortfall = ""
 
         self._listener_lock = threading.RLock()
         self._log_listeners: list[LogListener] = []
@@ -162,12 +181,33 @@ class AutoTrader:
         # 预热根数要按实际参数算：慢线填 200 就得 201 根，按默认值算的 22 根
         # 会让策略在指标还没有值的时候空转（目标恒为 0）。
         min_bars = self.strategy.min_bars(cfg.params)
+        # 以前这里固定拉 cfg.kline_limit 根（默认 500）：慢线一填到 500 就需要
+        # 503 根，永远不够，于是每轮静默 return——界面显示在跑却什么都不做，
+        # 日志里一个字都没有。现在按需要的根数拉，够用了就正常出信号。
+        required = min_bars + WARMUP_EXTRA
+        if required > MAX_KLINES:
+            # 拉也拉不到，别每 10 秒白跑一次 1000 根的请求，直接说清楚。
+            self._report_shortfall(
+                f"K 线不足 {required} 根（交易所单次最多 {MAX_KLINES} 根），"
+                f"请把周期改小或把慢线参数调小",
+                required=required,
+                fetched=0,
+            )
+            return
+        limit = self._warmup_limit(required)
         # Live runs always hit the API: the cache may be a full bar behind.
         df = self.klines.fetch(
             cfg.market_type, cfg.symbol, cfg.timeframe,
-            limit=cfg.kline_limit, use_cache=False,
+            limit=limit, use_cache=False,
         )
-        if df is None or len(df) < min_bars + 2:
+        bars = 0 if df is None else len(df)
+        if bars < required:
+            self._report_shortfall(
+                f"K 线不足：只拿到 {bars} 根，需要 {required} 根，这一轮跳过"
+                f"（交易对上市时间太短，或周期太长）",
+                required=required,
+                fetched=bars,
+            )
             return
 
         # Drop the still-forming candle: signals use closed bars only.
@@ -177,7 +217,14 @@ class AutoTrader:
         closed = df if last_open + step <= now else df.iloc[:-1]
         closed = closed.reset_index(drop=True)
         if len(closed) < min_bars + 1:
+            self._report_shortfall(
+                f"K 线不足：收盘后只剩 {len(closed)} 根，需要 {min_bars + 1} 根，"
+                f"这一轮跳过",
+                required=min_bars + 1,
+                fetched=len(closed),
+            )
             return
+        self._clear_shortfall(required, bars)
         last_ts = int(closed["timestamp"].iloc[-1])
         if last_ts == self._last_candle_ts:
             return
@@ -206,6 +253,50 @@ class AutoTrader:
         self._emit_signal(target, f"收盘价 {price:,.4f}")
 
         self._rebalance(target, price)
+
+    # ------------------------------------------------------------------ warmup
+    def _warmup_limit(self, required: int) -> int:
+        """这一轮拉多少根 K 线：照旧起步，参数要得更多就多拉，封顶 1000。"""
+        return max(1, min(MAX_KLINES, max(int(self.config.kline_limit), int(required))))
+
+    def data_status(self) -> dict[str, Any]:
+        """K 线供给：这一轮要几根、拿到几根、够不够。
+
+        给界面看的。引擎在跑不等于在决策，预热不够时它只是每轮空转，这个字段
+        是唯一能把「为什么没有信号」说出来的地方。
+        """
+        with self._data_lock:
+            return dict(self._data_status)
+
+    def _set_data_status(
+        self, *, required: int, fetched: int, short: bool, message: str
+    ) -> None:
+        with self._data_lock:
+            self._data_status = {
+                "required_bars": int(required),
+                "fetched_bars": int(fetched),
+                "max_bars": MAX_KLINES,
+                "short": bool(short),
+                "message": message,
+            }
+
+    def _report_shortfall(self, message: str, *, required: int, fetched: int) -> None:
+        """记下「数据不够」，并且只报一次。
+
+        轮询每 10 秒一轮，同一句话重复进日志和事件面板就没人看得见了；
+        参数一改、或者数据重新够用，这句话才算翻篇。
+        """
+        self._set_data_status(required=required, fetched=fetched, short=True, message=message)
+        if message == self._warned_shortfall:
+            return
+        self._warned_shortfall = message
+        log.warning("%s", message)
+        self._emit_log("WARN", message)
+
+    def _clear_shortfall(self, required: int, fetched: int) -> None:
+        self._set_data_status(required=required, fetched=fetched, short=False, message="")
+        # 恢复之后再出现同样的不足，要能再报一次。
+        self._warned_shortfall = ""
 
     def _refresh_equity(self, price: float) -> None:
         """Read the wallet straight from the venue before sizing an order.
