@@ -23,6 +23,24 @@ from .risk import RiskDecision, RiskManager
 
 log = logging.getLogger(__name__)
 
+# 交易所拒单的英文原文对用户没有指导意义，能认出来的换成一句能照做的中文。
+HEDGE_MODE_HINT = (
+    "交易所账户开着「双向持仓」（hedge mode），本程序只支持单向持仓："
+    "请到币安合约的持仓模式里改成「单向持仓」再下单。"
+)
+
+
+def venue_rejection_message(exc: Exception) -> str:
+    """把交易所的拒单翻成一句用户能照着做的中文。
+
+    -4061 / "position side" 是双向持仓账户在不带 positionSide 时的拒绝，
+    这条以前直接 500 抛出去，用户只能看到一段英文错误码。
+    """
+    text = str(exc)
+    if "-4061" in text or "position side" in text.lower():
+        return HEDGE_MODE_HINT
+    return f"交易所拒绝下单：{text}"
+
 # Live fills already folded into the risk manager, plus the per-symbol cost
 # ledger derives closing PnL. It lives in SQLite so a restart does not
 # charge the same exit twice.
@@ -378,20 +396,25 @@ class TradingService:
                     log.info("平仓前撤销 %s 的 %d 笔挂单", req.symbol, canceled)
             except ExchangeError as exc:
                 log.warning("平仓前撤单失败 %s：%s", req.symbol, exc)
-        if req.order_type == OrderType.MARKET.value:
-            order = rest.create_order(
-                req.market_type, req.symbol, "market", req.side, exchange_amount, None, params
-            )
-        else:
-            order = rest.create_order(
-                req.market_type,
-                req.symbol,
-                "limit",
-                req.side,
-                exchange_amount,
-                rest.price_to_precision(req.market_type, req.symbol, price),
-                params,
-            )
+        try:
+            if req.order_type == OrderType.MARKET.value:
+                order = rest.create_order(
+                    req.market_type, req.symbol, "market", req.side, exchange_amount, None, params
+                )
+            else:
+                order = rest.create_order(
+                    req.market_type,
+                    req.symbol,
+                    "limit",
+                    req.side,
+                    exchange_amount,
+                    rest.price_to_precision(req.market_type, req.symbol, price),
+                    params,
+                )
+        except ExchangeError as exc:
+            # 交易所的拒单以前原样抛到路由，变成 500 + 一段英文（"binanceusdm {"code":-4061..."）。
+            # 用户看不出该改什么；换成 400 加一句能照做的中文。
+            raise OrderRejected(venue_rejection_message(exc)) from exc
         quote = abs(base_qty) * price
         self.risk.record_order()
         try:
@@ -877,11 +900,21 @@ class TradingService:
         key = (market_type, symbol)
         if abs(self._leverage_applied.get(key, 0.0) - leverage) < 1e-9:
             return
+        # 交易所的杠杆是整数。ccxt 把 1.0 序列化成 "1.0"，币安回
+        # -1102 "leverage ... malformed"，于是每张合约单都 400「设置杠杆 1x 失败」，
+        # 面板上一张单都发不出去。整数值就按整数发，非整数直接说清楚。
+        if abs(leverage - round(leverage)) > 1e-9:
+            raise OrderRejected(
+                f"合约杠杆只能是整数：现在是 {leverage:g}x，请改成整数再下单。"
+            )
+        venue_leverage = int(round(leverage))
+        if venue_leverage < 1:
+            raise OrderRejected("合约杠杆至少 1x。")
         try:
-            self.rest_for(market_type).set_leverage(symbol, leverage, market_type)
+            self.rest_for(market_type).set_leverage(symbol, venue_leverage, market_type)
         except ExchangeError as exc:
-            raise OrderRejected(f"设置杠杆 {leverage:g}x 失败：{exc}") from exc
-        self._leverage_applied[key] = leverage
+            raise OrderRejected(f"设置杠杆 {venue_leverage}x 失败：{exc}") from exc
+        self._leverage_applied[key] = float(venue_leverage)
 
     def change_network(self, network: Network, credentials) -> None:
         self.network = network
