@@ -2070,12 +2070,14 @@ input[type="range"].input:focus {
 }
 
 /* ------------------------------------------------------- credentials */
-/* 一次只显示一个市场：平台一行、市场分段、下面两列输入。 */
+/* 一次只显示一个市场：平台一行、市场分段、下面两列输入。
+   它不是 .card-body，所以左右内边距要自己补：跟 .card-head 的 13px 对齐，
+   底部 14px 跟 .card-body 一致，否则输入框会贴到卡片边缘。 */
 .cred-card {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  padding: 4px 0 0;
+  padding: 4px 13px 14px;
 }
 
 .cred-top {
@@ -2093,7 +2095,16 @@ input[type="range"].input:focus {
   color: var(--text-2);
 }
 
+/* 全局 .select 是 width:100%，放进 flex 行里会把「平台」两个字挤成竖排。
+   这里让 select 自己弹性铺开，label 保持一行。 */
+.cred-platform > span {
+  flex: none;
+  white-space: nowrap;
+}
+
 .cred-platform .select {
+  flex: 1 1 auto;
+  width: auto;
   min-width: 120px;
 }
 
@@ -3335,18 +3346,6 @@ main.main > .ai-workspace .ai-col {
   font-size: var(--fs-13);
 }
 
-.strategy-editor-modal {
-  width: min(980px, 94vw);
-  max-height: 90vh;
-  overflow: auto;
-}
-
-.strategy-editor-modal .card-head {
-  position: sticky;
-  top: 0;
-  z-index: 2;
-  background: var(--bg);
-}
 /* 持仓表把「买来的」和「钱包里本来就有的」分开：后者折成一行，点开才展开。 */
 .wallet-group {
   margin-top: 8px;
@@ -3525,6 +3524,7 @@ main.main > .ai-workspace .ai-col {
 main.main > .ai-grid:not(.page-head),
 main.main > .quant-grid:not(.page-head),
 main.main > .lab-grid:not(.page-head),
+main.main > .strategy-page:not(.page-head),
 main.main > .page-toolbar:not(.page-head),
 main.main > .stage-bar:not(.page-head) {
   width: 100%;
@@ -3679,6 +3679,100 @@ main.main > .stage-bar:not(.page-head) {
   .quant-grid > .card:nth-child(3),
   .lab-grid > .card:nth-child(3) {
     grid-column: auto;
+  }
+}
+
+/* ------------------------------------------------------- strategy page */
+/* 策略页跟着三个 AI 页同一套骨架：1400 档、卡片拉平、列内自己滚。
+   只是两列、左边固定 300px —— 列表放 key 和参数个数，宽度要够；右边编辑器吃剩下的。 */
+.strategy-page {
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr);
+  gap: 12px;
+  align-items: stretch;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.strategy-page > .card {
+  min-height: 0;
+}
+
+.strategy-page > .card > .card-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* 整张卡就是滚动容器，列表自身不再限高。 */
+.strategy-page .cand-list {
+  margin-top: 0;
+  max-height: none;
+}
+
+/* 分组标题：只是把「自定义」「内置」分开，不抢行的视觉重量。 */
+.strategy-group {
+  margin: 2px 0 0;
+  padding: 0 2px;
+  font-size: var(--fs-12);
+  color: var(--text-3);
+}
+
+.strategy-group:first-child {
+  margin-top: 0;
+}
+
+/* 页面模式：编辑器撑满卡片，代码区吃掉剩下的高度（弹窗里还是固定 440px）。
+   CodeMirror 外面套了一层 .cm-theme-*，高度要一层层传下去，否则内层回到 auto。 */
+.strategy-editor.page {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.strategy-editor.page .strategy-editor-code {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 220px;
+}
+
+.strategy-editor.page .strategy-editor-code > [class*="cm-theme"] {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.strategy-editor.page .strategy-editor-code .cm-editor {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+@media (max-width: 1024px) {
+  /* 单列时不再撑屏：代码区改成确定高度，自己内部滚，页面只滚一次。
+     只写 min-height 不够——CodeMirror 外层 .cm-theme 是 auto 高度，
+     .cm-editor 的 height:100% 会退回内容高度，整页跟着被撑到源码那么长。 */
+  .strategy-page {
+    grid-template-columns: minmax(0, 1fr);
+    flex: none;
+  }
+
+  .strategy-page > .card > .card-body {
+    overflow: visible;
+  }
+
+  .strategy-editor.page .strategy-editor-code {
+    flex: none;
+    height: 460px;
+    min-height: 0;
+  }
+
+  /* .cm-theme 是 flex 子项，靠 flex 拿到确定高度；.cm-editor 再吃掉它。 */
+  .strategy-editor.page .strategy-editor-code > [class*="cm-theme"] {
+    height: 100%;
+  }
+
+  .strategy-editor.page .strategy-editor-code .cm-editor {
+    height: 100%;
   }
 }
 

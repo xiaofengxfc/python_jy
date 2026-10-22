@@ -7,18 +7,20 @@ import TradingPage from "./pages/TradingPage";
 import PortfolioPage from "./pages/PortfolioPage";
 import SettingsPage from "./pages/SettingsPage";
 import BacktestPage from "./pages/BacktestPage";
+import StrategiesPage from "./pages/StrategiesPage";
 import StrategyLabPage from "./pages/StrategyLabPage";
 import AITradePage from "./pages/AITradePage";
 import AIQuantPage from "./pages/AIQuantPage";
 import type { AppSettings, Health } from "./types";
 
-/** 五个页面各自独立：AI 交易和 AI 量化都是一整页，不再挤在交易页底下。 */
+/** 每个页面各自独立：AI 交易和 AI 量化都是一整页，不再挤在交易页底下。 */
 export type PageKey =
   | "trading"
   | "ai-trade"
   | "ai-quant"
   | "portfolio"
   | "backtest"
+  | "strategy"
   | "lab"
   | "settings";
 
@@ -30,6 +32,8 @@ export default function App() {
   const [equity, setEquity] = useState<number | null>(null);
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [logOpen, setLogOpen] = useState(false);
+  /** 跳到策略页时要预选的 key（回测页「编辑源码」、实验室「在策略页编辑」）。 */
+  const [strategyFocus, setStrategyFocus] = useState<string | null>(null);
   const [logErrors, setLogErrors] = useState(0);
 
   useEffect(() => {
@@ -109,8 +113,25 @@ export default function App() {
           />
         )}
         {page === "portfolio" && <PortfolioPage onEquity={handleAccountChange} />}
-        {page === "backtest" && <BacktestPage />}
-        {page === "lab" && <StrategyLabPage settings={settings} health={health} />}
+        {page === "backtest" && (
+          <BacktestPage
+            onEditStrategy={(key) => {
+              setStrategyFocus(key);
+              setPage("strategy");
+            }}
+          />
+        )}
+        {page === "strategy" && <StrategiesPage focus={strategyFocus} />}
+        {page === "lab" && (
+          <StrategyLabPage
+            settings={settings}
+            health={health}
+            onNavigate={(next, key) => {
+              if (key) setStrategyFocus(key);
+              setPage(next);
+            }}
+          />
+        )}
         {page === "settings" && (
           <SettingsPage settings={settings} onSaved={setSettings} />
         )}

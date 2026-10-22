@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useImperativeHandle, useMemo, useState } from "react";
+import type { Ref } from "react";
 import CodeMirror from "@uiw/react-codemirror";
 import { python } from "@codemirror/lang-python";
 import { api } from "../api";
@@ -37,6 +38,8 @@ interface SourceDetail {
   filename: string;
   editable: boolean;
   builtin: boolean;
+  /** 当前生效的是用户目录里的覆盖文件（存在同名内置原版）。 */
+  overridden: boolean;
 }
 
 interface Issue {
@@ -52,6 +55,12 @@ interface ValidationReport {
   imports?: string[];
 }
 
+/** 「新建」「复制为新策略」两个动作的状态在编辑器里，策略页的工具条要能远程触发。 */
+export interface StrategyEditorHandle {
+  startNew: () => void;
+  fork: () => void;
+}
+
 interface Props {
   strategies: Strategy[];
   /** Currently selected strategy key in the page. */
@@ -59,24 +68,31 @@ interface Props {
   onSelect: (key: string) => void;
   onSaved?: (key: string) => void;
   onClose?: () => void;
+  /** page：独立策略页里用，代码区撑满卡片、内部不再渲染策略下拉。 */
+  layout?: "modal" | "page";
+  ref?: Ref<StrategyEditorHandle>;
 }
 
 /** Inline strategy source editor: read, validate, save and hot-reload a user
- * plugin. Built-ins are read-only and can be copied into a new plugin. */
+ * plugin. Built-ins open editable; saving one writes a same-key override into
+ * the user directory, and 「还原内置」 deletes that file again. */
 export default function StrategyEditor({
   strategies,
   value,
   onSelect,
   onSaved,
   onClose,
+  layout = "modal",
+  ref,
 }: Props) {
+  const page = layout === "page";
   const [selected, setSelected] = useState(value);
   const [detail, setDetail] = useState<SourceDetail | null>(null);
   const [code, setCode] = useState("");
   const [original, setOriginal] = useState("");
   const [isNew, setIsNew] = useState(false);
   const [newKey, setNewKey] = useState("my_strategy");
-  const [busy, setBusy] = useState<"" | "load" | "save" | "validate">("");
+  const [busy, setBusy] = useState<"" | "load" | "save" | "validate" | "restore">("");
   const [renaming, setRenaming] = useState(false);
   const [renameKey, setRenameKey] = useState("");
   const [renameName, setRenameName] = useState("");
@@ -122,7 +138,14 @@ export default function StrategyEditor({
   }, [value, load]);
 
   const dirty = code !== original;
-  const readOnly = Boolean(detail?.builtin) && !isNew;
+  /** 内置也带 editable:true（保存会写成覆盖文件），所以只看后端给的这一位。 */
+  const readOnly = !isNew && detail !== null && !detail.editable;
+  /** 状态行：内置看有没有被覆盖，自定义看文件名。 */
+  const sourceLabel = detail?.builtin
+    ? detail.overridden
+      ? `内置 · 已覆盖 · ${detail.filename}`
+      : "内置 · 未覆盖"
+    : detail?.filename || "未保存";
 
   const startNew = () => {
     setIsNew(true);
@@ -143,13 +166,42 @@ export default function StrategyEditor({
       `$1key = "${key}"`,
     );
     setIsNew(true);
-    setDetail({ ...detail, key, builtin: false, editable: true, filename: "" });
+    setDetail({
+      ...detail,
+      key,
+      builtin: false,
+      overridden: false,
+      editable: true,
+      filename: "",
+    });
     setCode(next);
     setOriginal("");
     setNewKey(key);
     setReport(null);
     setError("");
     setNotice(`已复制为「${key}」，保存后会生成新文件，原策略不变。`);
+  };
+
+  useImperativeHandle(ref, () => ({ startNew, fork }));
+
+  /** Drop the override file and go back to the package copy. Only offered when
+   * the current source is an override, which the detail payload tells us. */
+  const restore = async () => {
+    if (!detail) return;
+    const key = detail.key;
+    setBusy("restore");
+    setError("");
+    setNotice("");
+    try {
+      await api(`/api/strategies/${encodeURIComponent(key)}/restore`, { method: "POST" });
+      await load(key);
+      setNotice("已还原内置原版，覆盖文件已删除。");
+      onSaved?.(key);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusy("");
+    }
   };
 
   /** Rename the plugin: new key (and file name) plus an optional display name.
@@ -223,25 +275,44 @@ export default function StrategyEditor({
     setNotice("");
     try {
       const key = isNew ? newKey.trim() : selected;
+      let result: { filename?: string; builtin?: boolean; overridden?: boolean } = {};
       if (isNew) {
         await api("/api/strategies", {
           method: "POST",
           body: JSON.stringify({ key, code, create: true }),
         });
       } else {
-        await api(`/api/strategies/${encodeURIComponent(selected)}/source`, {
-          method: "PUT",
-          body: JSON.stringify({ code }),
-        });
+        result =
+          (await api<{ filename?: string; builtin?: boolean; overridden?: boolean }>(
+            `/api/strategies/${encodeURIComponent(selected)}/source`,
+            {
+              method: "PUT",
+              body: JSON.stringify({ code }),
+            },
+          )) ?? {};
       }
+      const filename = result.filename || `${key}.py`;
+      const overridesBuiltin = Boolean(result.builtin);
       setOriginal(code);
       setIsNew(false);
       setDetail((current) =>
         current
-          ? { ...current, key, code, editable: true, builtin: false, filename: `${key}.py` }
+          ? {
+              ...current,
+              key,
+              code,
+              editable: true,
+              filename,
+              builtin: overridesBuiltin,
+              overridden: Boolean(result.overridden) || overridesBuiltin,
+            }
           : current,
       );
-      setNotice(`已保存并热加载：${key}.py`);
+      setNotice(
+        overridesBuiltin
+          ? `已保存并热加载：${filename} · 覆盖内置原版，可点「还原内置」退回`
+          : `已保存并热加载：${filename}`,
+      );
       onSelect(key);
       onSaved?.(key);
     } catch (caught) {
@@ -252,41 +323,53 @@ export default function StrategyEditor({
   };
 
   return (
-    <div className="strategy-editor">
+    <div className={page ? "strategy-editor page" : "strategy-editor"}>
       <div className="strategy-editor-bar">
         <div className="strategy-editor-pick">
-          <label className="field-label" htmlFor="strategy-editor-select">
-            <span>策略文件</span>
-            <em>{detail?.builtin ? "内置 · 只读" : detail?.filename || "未保存"}</em>
-          </label>
-          <select
-            id="strategy-editor-select"
-            className="select"
-            value={isNew ? "" : selected}
-            onChange={(event) => {
-              if (event.target.value) {
-                setIsNew(false);
-                setSelected(event.target.value);
-                onSelect(event.target.value);
-              }
-            }}
-          >
-            {isNew && <option value="">新策略（未保存）</option>}
-            {strategies.map((item) => (
-              <option key={item.key} value={item.key}>
-                {item.name} · {item.key}
-              </option>
-            ))}
-          </select>
+          {page ? (
+            /* 页面模式由左边的列表负责挑策略，这里只报一下当前是哪个文件。 */
+            <div className="field-label">
+              <span>{detail?.name || (isNew ? "新策略（未保存）" : selected)}</span>
+              <em>{isNew ? "未保存" : sourceLabel}</em>
+            </div>
+          ) : (
+            <>
+              <label className="field-label" htmlFor="strategy-editor-select">
+                <span>策略文件</span>
+                <em>{sourceLabel}</em>
+              </label>
+              <select
+                id="strategy-editor-select"
+                className="select"
+                value={isNew ? "" : selected}
+                onChange={(event) => {
+                  if (event.target.value) {
+                    setIsNew(false);
+                    setSelected(event.target.value);
+                    onSelect(event.target.value);
+                  }
+                }}
+              >
+                {isNew && <option value="">新策略（未保存）</option>}
+                {strategies.map((item) => (
+                  <option key={item.key} value={item.key}>
+                    {item.name} · {item.key}
+                  </option>
+                ))}
+              </select>
+            </>
+          )}
         </div>
         <div className="strategy-editor-actions">
-          <button type="button" className="btn-sm" onClick={startNew} disabled={busy !== ""}>
-            新建
-          </button>
-          {readOnly && (
-            <button type="button" className="btn-sm" onClick={fork} disabled={busy !== ""}>
-              复制为新策略
-            </button>
+          {!page && (
+            <>
+              <button type="button" className="btn-sm" onClick={startNew} disabled={busy !== ""}>
+                新建
+              </button>
+              <button type="button" className="btn-sm" onClick={fork} disabled={busy !== "" || !detail}>
+                复制为新策略
+              </button>
+            </>
           )}
           <button
             type="button"
@@ -295,12 +378,23 @@ export default function StrategyEditor({
             disabled={busy !== "" || isNew || !detail?.editable || detail?.builtin}
             title={
               detail?.builtin
-                ? "内置策略只读。先「复制为新策略」再改名"
+                ? "内置策略不能改名，先还原或另存为新策略"
                 : "改文件名和 key，引用会自动跟上"
             }
           >
             重命名
           </button>
+          {detail?.overridden && !isNew && (
+            <button
+              type="button"
+              className="btn-sm"
+              onClick={() => void restore()}
+              disabled={busy !== ""}
+              title="删掉你的覆盖文件，回到内置原版"
+            >
+              {busy === "restore" ? "还原中…" : "还原内置"}
+            </button>
+          )}
           <button
             type="button"
             className="btn-sm"
@@ -399,7 +493,7 @@ export default function StrategyEditor({
         ) : (
           <CodeMirror
             value={code}
-            height="440px"
+            height={page ? "100%" : "440px"}
             theme="light"
             readOnly={readOnly}
             extensions={[python()]}

@@ -59,6 +59,18 @@ const ICONS: Record<PageKey, ReactNode> = {
       strokeLinecap="round"
     />
   ),
+  strategy: (
+    <>
+      <path
+        d="M5.6 5 2.6 8l3 3M10.4 5l3 3-3 3"
+        stroke="currentColor"
+        strokeWidth="1.4"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path d="M9.1 3.4 6.9 12.6" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
+    </>
+  ),
   lab: (
     <>
       <path
@@ -90,6 +102,7 @@ const LABELS: [PageKey, string][] = [
   ["ai-quant", "AI 量化"],
   ["portfolio", "资产"],
   ["backtest", "回测"],
+  ["strategy", "策略"],
   ["lab", "实验室"],
   ["settings", "设置"],
 ];

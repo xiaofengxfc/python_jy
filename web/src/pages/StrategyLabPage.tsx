@@ -23,6 +23,8 @@ import StageBar from "../components/StageBar";
 interface Props {
   settings: AppSettings | null;
   health: Health | null;
+  /** 已注册的候选要能跳到策略页改源码，带上它注册后的 key。 */
+  onNavigate?: (page: "strategy", focusKey?: string) => void;
 }
 
 const STAGES = [
@@ -61,7 +63,7 @@ function paramsText(params: Record<string, unknown> | undefined): string {
     .join(" ");
 }
 
-export default function StrategyLabPage({ settings, health }: Props) {
+export default function StrategyLabPage({ settings, health, onNavigate }: Props) {
   const [candidates, setCandidates] = useState<Candidate[]>([]);
   const [selected, setSelected] = useState<Candidate | null>(null);
   const [code, setCode] = useState("");
@@ -558,13 +560,27 @@ export default function StrategyLabPage({ settings, health }: Props) {
                   </button>
                 </div>
 
-                <button
-                  type="button"
-                  className="link-btn"
-                  onClick={() => setCodeOpen((open) => !open)}
-                >
-                  {codeOpen ? "收起源码" : "看源码"}
-                </button>
+                {/* .link-btn 自带 margin-left:auto，一行放两个会各自右顶、中间撑开一大段；
+                    spacer 吃掉空余量，两个链接就挨着排在右边，和原来单个链接的位置一致。 */}
+                <div className="row">
+                  <span className="spacer" />
+                  <button
+                    type="button"
+                    className="link-btn"
+                    onClick={() => setCodeOpen((open) => !open)}
+                  >
+                    {codeOpen ? "收起源码" : "看源码"}
+                  </button>
+                  {selected.registered_key && onNavigate && (
+                    <button
+                      type="button"
+                      className="link-btn"
+                      onClick={() => onNavigate("strategy", selected.registered_key)}
+                    >
+                      在策略页编辑
+                    </button>
+                  )}
+                </div>
                 {codeOpen && <pre className="lab-code">{code || "没有读到源码。"}</pre>}
               </>
             )}

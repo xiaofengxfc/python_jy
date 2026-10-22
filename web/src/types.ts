@@ -174,10 +174,14 @@ export interface Strategy {
   allow_short: boolean;
   params: ParamSpec[];
   defaults: Record<string, unknown>;
-  /** User-plugin filename; empty for built-ins. */
+  /** User-plugin filename in the per-user directory; empty for a plain built-in. */
   source_name?: string;
-  /** True only for files in the per-user strategy directory. */
+  /** The source can be saved. True for built-ins too: saving writes an override file. */
   editable?: boolean;
+  /** A package implementation of this key exists, overridden or not. */
+  builtin?: boolean;
+  /** The user file for this key wins over the package original. */
+  overridden?: boolean;
 }
 
 export interface Portfolio {

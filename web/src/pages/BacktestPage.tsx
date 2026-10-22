@@ -10,7 +10,6 @@ import type {
   SymbolInfo,
 } from "../types";
 import { ParamFields } from "../components/ParamFields";
-import StrategyEditor from "../components/StrategyEditor";
 import LineChart, { Legend, type Series } from "../components/LineChart";
 import Table from "../components/Table";
 
@@ -68,7 +67,12 @@ interface Candidate {
   checks?: { ok?: boolean };
 }
 
-export default function BacktestPage() {
+/** 源码编辑搬到独立的「策略」页了，这里只负责跳过去并带上当前策略 key。 */
+interface Props {
+  onEditStrategy?: (key: string) => void;
+}
+
+export default function BacktestPage({ onEditStrategy }: Props) {
   const [tab, setTab] = useState<Tab>("single");
   const [strategies, setStrategies] = useState<Strategy[]>([]);
   const [candidates, setCandidates] = useState<Candidate[]>([]);
@@ -107,7 +111,6 @@ export default function BacktestPage() {
   const [aiLimit, setAiLimit] = useState(40);
   const [aiDescribe, setAiDescribe] = useState("");
   const [aiBusy, setAiBusy] = useState<"filter" | "describe" | "suggest" | "">("");
-  const [editorOpen, setEditorOpen] = useState(false);
   const handoffApplied = useRef(false);
   /** Plain-language strategy picking: the model may only choose one of the
    * strategies that already exist and fill its params — never write code. */
@@ -143,28 +146,14 @@ export default function BacktestPage() {
 
   const isCandidate = config.strategy.startsWith("cand:");
 
-  /** Re-read the registry after the source editor saves. Selecting the new key
-   * also refreshes the parameter form; built-ins keep their current params. */
-  const reloadStrategies = (selectKey?: string) => {
-    api<{ items: Strategy[] }>("/api/strategies")
-      .then((data) => {
-        setStrategies(data.items);
-        const target = data.items.find((item) => item.key === (selectKey ?? config.strategy));
-        if (target) {
-          setConfig((current) => ({
-            ...current,
-            strategy: target.key,
-            params:
-              selectKey && selectKey !== current.strategy
-                ? { ...target.defaults }
-                : current.params,
-          }));
-        }
-      })
-      .catch((caught) =>
-        setError(caught instanceof Error ? caught.message : String(caught)),
-      );
-  };
+  /** 策略来源三态：内置未覆盖 / 内置已覆盖 / 纯自定义。内置被覆盖时别再自称自定义。 */
+  const strategyOrigin = !strategy
+    ? ""
+    : strategy.builtin
+      ? strategy.overridden
+        ? `内置策略 · 已被你的版本覆盖 · ${strategy.source_name || `${strategy.key}.py`}`
+        : "内置策略 · 改了会存成你的覆盖版本"
+      : `自定义策略 · ${strategy.source_name || `${strategy.key}.py`}`;
 
   const pollRef = useRef<number | undefined>(undefined);
   useEffect(() => () => window.clearInterval(pollRef.current), []);
@@ -588,15 +577,13 @@ export default function BacktestPage() {
                   <span className="faint">
                     {isCandidate
                       ? "候选策略 · 用源码里的默认参数回测，不会注册为正式策略"
-                      : strategy?.editable
-                        ? `自定义策略 · ${strategy.source_name || `${strategy.key}.py`}`
-                        : "内置策略 · 只读"}
+                      : strategyOrigin}
                   </span>
                   <button
                     type="button"
                     className="btn-sm"
-                    disabled={isCandidate}
-                    onClick={() => setEditorOpen(true)}
+                    disabled={isCandidate || !onEditStrategy}
+                    onClick={() => onEditStrategy?.(config.strategy)}
                   >
                     编辑源码
                   </button>
@@ -1138,41 +1125,6 @@ export default function BacktestPage() {
           </div>
         </div>
       </div>
-
-      {editorOpen && (
-        <div
-          className="modal-mask"
-          onMouseDown={(event) => {
-            if (event.target === event.currentTarget) setEditorOpen(false);
-          }}
-        >
-          <div className="card strategy-editor-modal" onMouseDown={(event) => event.stopPropagation()}>
-            <div className="card-head">
-              <span className="card-title">策略源码</span>
-              <span className="spacer" />
-              <span className="faint" style={{ fontSize: "var(--fs-12)"}}>
-                保存后自动热加载，可直接回测
-              </span>
-            </div>
-            <div style={{ padding: 14 }}>
-              <StrategyEditor
-                strategies={strategies}
-                value={config.strategy}
-                onSelect={(key) => {
-                  const found = strategies.find((item) => item.key === key);
-                  setConfig((current) => ({
-                    ...current,
-                    strategy: key,
-                    params: found ? { ...found.defaults } : current.params,
-                  }));
-                }}
-                onSaved={(key) => reloadStrategies(key)}
-                onClose={() => setEditorOpen(false)}
-              />
-            </div>
-          </div>
-        </div>
-      )}
     </>
   );
 }
