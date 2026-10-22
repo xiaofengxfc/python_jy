@@ -45,6 +45,11 @@ Node 不在 PATH 时，先把 Node 目录加进去。
 - 交易页的市场、交易对、周期以设置为初值：用户没在本页手动改过的那一项跟着设置走。
   判断依据是 `picked` 那三个标记，新增可配置项时照这个来，不要写死默认值。
 - K 线一次拉 1000 根（交易所上限），不做成设置项。下单金额由下单框自己记，也不进设置。
+  自动交易按实际参数的 `min_bars + 2` 决定这一轮拉多少根：`kline_limit`（默认 500）只是下限，
+  上限仍是 1000。真不够（要的比 1000 多、或者交易所只有那么长历史）时不发请求，只报一次
+  「K 线不足 N 根，请把周期改小」，状态在 `GET /api/auto/status` 的 `data` 字段里。
+  以前固定拉 `kline_limit` 根，慢线填到 500 就每轮静默 return——界面显示在跑，实际什么都不做，
+  日志一个字都没有。
 - 界面字号只改 `web/src/styles.css` 里的 `--fs-*` 令牌，组件里不写字面量：
   CSS 写 `font-size: var(--fs-13)`，JSX 内联写 `style={{ fontSize: "var(--fs-13)" }}`。
   档位：页面标题 `.page-title` 用 `--fs-14`，正文走 `--font-size`（= `--fs-14`），
@@ -72,6 +77,9 @@ Node 不在 PATH 时，先把 Node 目录加进去。
 - 回测也按市场类型收死：现货不许借杠杆、不许做空（`leverage=1`、`allow_short=False`），
   合约照常。`_validate_backtest` 原样透传 `leverage` / `allow_short` 的时候，直调接口能给现货
   跑出「做空 10 倍杠杆」的收益曲线，那条曲线在真实市场里根本不存在。
+  策略实验室的优化打分（`routes_lab.start_optimize`）同一口径：`allow_short=market.is_futures`、
+  杠杆恒 1。以前它用 `BacktestConfig` 的默认值 `allow_short=True`，现货优化把「靠做空吃到的收益」
+  当成绩顶上排名，和合约的打分逐位相同。
 - 现货没有 reduce-only 触发单。止损、止盈、条件单只在合约市场挂到交易所侧。
   现货请求会返回明确文案：`PUT /api/positions/protection` 和
   `POST /api/orders/conditional`。
@@ -165,6 +173,11 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   当日决策次数、每小时订单数、冷却时间。轮询和「立即决策」点一次 new 一个 `AITrader`，
   计数要是留在实例里，点第二下就从零开始数，96 次/日、12 单/时、30 秒冷却等于不存在。
   控制器把同一份 budget 传给每一个实例（`AITrader(budget=)`），别在实例里另起一份。
+- 提交前复核：模型调用那几十秒里行情、持仓、策略信号都可能变了。`_recheck_before_submit`
+  在 AIGuard 之前重读一遍——策略信号反向或掉成空仓就拒、持仓数量变了就拒（不自己改数量重算）、
+  读不到持仓也拒。拒单文案一律以「提交前复核：」开头。只拦新开仓，平仓和观望放行：拦减仓比
+  漏减仓更糟，和 RiskManager「只在 entry 上判熔断」同一条理由。复核过之后 AIGuard 与 submit
+  用的是最新的持仓与价格，漂移闸、持仓上限、急停看到的都是提交前的数。
 - 决策有效期是真闸，不是文档里的承诺：`created_at` 打在「模型返回、解析出决策」那一刻
   （不是这一轮开始），`AIGuard.check` 的「现在」取提交前那一刻，有效期取
   `min(模型给的 ttl_sec, 配置的 decision_ttl_sec)`——配置是上限，模型顶不开。超龄就拒并落审计。
