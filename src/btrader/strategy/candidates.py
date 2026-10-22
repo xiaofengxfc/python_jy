@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import shutil
 import tempfile
@@ -59,6 +60,27 @@ class Candidate:
 
 class CandidateError(RuntimeError):
     pass
+
+
+def json_safe(metrics: dict[str, Any]) -> dict[str, Any]:
+    """只留能写进 JSON 的指标值。
+
+    ``json.dumps`` 默认把 NaN / inf 写成 ``NaN`` / ``Infinity``：文件写得下去，
+    ``json.loads`` 也读得回来，但接口响应用的序列化不接受这两个字面量，于是
+    一条坏指标能让整个 ``/api/ai/strategies/candidates`` 从此 500，用户只能去数据
+    目录手改 JSON。坏值在这里丢掉，界面读到的就是「—」。
+    """
+    clean: dict[str, Any] = {}
+    for name, value in dict(metrics).items():
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            clean[str(name)] = value  # 交易对、周期这类文本原样保留
+            continue
+        if not math.isfinite(number):
+            continue
+        clean[str(name)] = value
+    return clean
 
 
 class CandidateStore:
@@ -216,7 +238,7 @@ class CandidateStore:
 
     def record_backtest(self, candidate_id: str, metrics: dict[str, Any]) -> Candidate:
         candidate = self.get(candidate_id)
-        candidate.backtest = dict(metrics)
+        candidate.backtest = json_safe(metrics)
         self._write(candidate)
         return candidate
 

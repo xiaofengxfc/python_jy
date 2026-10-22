@@ -7,6 +7,7 @@ The controller is a plain class so the logic can be tested without HTTP.
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import threading
@@ -108,6 +109,54 @@ def _market(value: str) -> MarketType:
         return MarketType(value)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"未知市场：{value}") from exc
+
+
+def _char_offset(line: str, byte_offset: int) -> int:
+    """ast 的列号是 UTF-8 字节数，切片要的是字符数。"""
+    return len(line.encode("utf-8")[:byte_offset].decode("utf-8", "ignore"))
+
+
+def _rewrite_class_key(code: str, key: str) -> tuple[str, bool]:
+    r"""把「第一个声明了 key 的策略类」的 key 字面量改成 ``key``。
+
+    判据必须和 ``source._class_key`` / ``ai_candidate.class_meta`` 是同一次 AST
+    走法：候选列表上写的 key、最终注册用的 key、编辑器认识的 key 只能是同一处。
+    以前这里是一条 ``^\s*key\s*=\s*["']`` 正则取第一个匹配，撞上模块级的
+    ``key = "..."`` 常量（或类前面某个函数里的同名局部变量）时改的是那一行，类里
+    的 key 一个字节都没动，于是 save_source 报「类里的 key='x' 与文件名
+    key='y' 不一致」——而这两个 key 用户一个都没写过，候选从此批准不了。
+
+    返回 ``(code, found)``：源码里根本没有类属性 key 字面量时 found 为 False。
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:  # 静态检查已经拦过语法错误，这里只求不炸
+        return code, False
+    lines = code.splitlines(keepends=True)
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for stmt in node.body:
+            if not isinstance(stmt, ast.Assign):
+                continue
+            named = [t for t in stmt.targets if isinstance(t, ast.Name) and t.id == "key"]
+            if not named:
+                continue
+            value = stmt.value
+            if not (isinstance(value, ast.Constant) and isinstance(value.value, str)):
+                continue
+            literal = ast.get_source_segment(code, value) or ""
+            if not literal:
+                return code, False
+            offset = len("".join(lines[: value.lineno - 1])) + _char_offset(
+                lines[value.lineno - 1], value.col_offset
+            )
+            quote = literal[0] if literal[0] in "\"'" else '"'
+            return (
+                code[:offset] + f"{quote}{key}{quote}" + code[offset + len(literal) :],
+                True,
+            )
+    return code, False
 
 
 class LabController:
@@ -256,13 +305,8 @@ class LabController:
             key = f"{base[:48]}_{suffix}"
 
         code = self.candidates.read_code(candidate_id)
-        rewritten, count = re.subn(
-            r'(?m)^(\s*key\s*=\s*)["\'][^"\']*["\']',
-            lambda match: f'{match.group(1)}"{key}"',
-            code,
-            count=1,
-        )
-        if not count:
+        rewritten, found = _rewrite_class_key(code, key)
+        if not found:
             raise CandidateError("候选源码缺少类属性 key，无法注册为策略")
         result = save_source(
             ctx.strategies,
