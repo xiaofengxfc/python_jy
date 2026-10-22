@@ -423,10 +423,35 @@ class AITrader:
         with self._lock:
             return self._state
 
+    def _assistant_blocked(self) -> str:
+        """AI 助手能不能真的调用模型；不能就返回一句拒启动的理由。
+
+        以前这里只看交易所凭据：AI 的 Key 没配时启动照样成功，界面显示「运行中」，
+        每一轮决策只在审计里写一条「模型调用失败：还没有填写 API Key。」，人以为它在干活。
+        没有 Key 就和没启动一样，不如当场说清楚。
+
+        查不到状态就放行（测试替身、离线调用没有 status()），别为了这一道闸把替身全拦了。
+        """
+        reader = getattr(self.llm, "status", None)
+        if reader is None:
+            return ""
+        try:
+            info = reader()
+        except Exception:
+            return ""
+        if not isinstance(info, dict):
+            return ""
+        if info.get("configured"):
+            return ""
+        return "AI 助手还没有配 API Key，先在设置里填写后再启动 AI 交易"
+
     def start(self) -> tuple[bool, str]:
         c = self.config
         if not c.enabled:
             return False, "AI 交易未启用"
+        blocked = self._assistant_blocked()
+        if blocked:
+            return False, blocked
         # The testnet has fake money: rehearsing must not cost an extra click.
         if c.network == "mainnet" and not c.confirm_live:
             return False, "缺少二次确认"

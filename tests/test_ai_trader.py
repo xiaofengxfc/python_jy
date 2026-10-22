@@ -1028,3 +1028,50 @@ def test_a_close_still_goes_through_when_the_recheck_cannot_read(tmp_path):
 
     assert record is not None and record["outcome"] == "order", record
     assert trading.requests[-1].reduce_only is True
+
+
+# ------------------------------------- 启动前的助手可用性（实测：没 Key 也能启起来）
+def test_start_refuses_when_the_assistant_has_no_api_key(tmp_path):
+    """没配 API Key 时启动要当场拒，不能跑一个永远不会决策的引擎。
+
+    实测：POST /api/ai/trader/start 在 has_key=false 下返回 200 state=running，
+    之后每一轮只剩审计里一条「模型调用失败：还没有填写 API Key。」，
+    界面显示「运行中」而实际什么都不会发生。
+    """
+    trader, *_rest = make_trader(tmp_path, market_type="usdm")
+
+    class NoKeyLLM:
+        def status(self) -> dict:
+            return {"provider": "openai", "configured": False, "needs_key": True}
+
+        def ask(self, *_args, **_kwargs):
+            raise AssertionError("没 Key 时不该真去调模型")
+
+    trader.llm = NoKeyLLM()
+
+    ok, message = trader.start()
+
+    assert ok is False
+    assert "API Key" in message
+    assert trader.state == "stopped"
+
+
+def test_start_goes_through_when_the_assistant_is_configured(tmp_path):
+    """配置好了就别多拦一道：这条防的是把启动一刀切掉。"""
+    trader, *_rest = make_trader(tmp_path, market_type="usdm")
+
+    class ReadyLLM:
+        def status(self) -> dict:
+            return {"provider": "ollama", "configured": True, "needs_key": False}
+
+        def ask(self, *_args, **_kwargs):
+            raise AssertionError("这一轮不该走到模型")
+
+    trader.llm = ReadyLLM()
+
+    ok, message = trader.start()
+    try:
+        assert ok is True, message
+        assert trader.state == "running"
+    finally:
+        trader.stop()
