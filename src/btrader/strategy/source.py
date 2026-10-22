@@ -404,6 +404,47 @@ def restore_builtin(
     }
 
 
+def delete_source(
+    registry: StrategyRegistry, key: str, directory: Path | None = None
+) -> dict[str, Any]:
+    """Delete a user strategy file, then hot-reload the registry.
+
+    Deleting an override *is* restoring: the file in the user directory is what
+    shadows the built-in, so removing it brings the package copy back. A plain
+    built-in has no file to delete, and there the answer is the restore route,
+    not a deletion that would come back with the next upgrade.
+
+    The file is deleted, never rewritten: one file may define several
+    strategies, and cutting a single class out of it would be guesswork about
+    how the author laid it out. Same rule as :func:`restore_builtin`.
+    """
+    directory = _user_dir(directory)
+    if key not in registry:
+        raise StrategySourceError(f"未知策略：{key}", status=404)
+    path = registry.source_path(key)
+    if path is None:
+        # 包里那份：没有可删的文件，删掉也会跟着安装包回来。
+        raise StrategySourceError(
+            f"内置策略不能删：它是程序自带的那份，删掉也会随安装包回来。"
+            f"要撤掉自己改过的内容请用 POST /api/strategies/{key}/restore。"
+        )
+    path = path.resolve()
+    if path.parent != directory:
+        raise StrategySourceError("只能删除自己策略目录里的文件", status=403)
+    shared = sorted(
+        other for other in registry.keys if other != key and registry.source_path(other) == path
+    )
+    if shared:
+        raise StrategySourceError(f"该文件还定义了 {', '.join(shared)}，先拆开再删除")
+    was_builtin = registry.is_builtin(key)
+    path.unlink(missing_ok=True)
+    registry.discover([directory])
+    if was_builtin and key not in registry:
+        detail = "\n".join(registry.errors[-3:]) or "内置策略没有被注册"
+        raise StrategySourceError(f"删除后内置策略没有回来：{detail}", status=422)
+    return {"ok": True, "key": key}
+
+
 def rename_source(
     registry: StrategyRegistry,
     *,

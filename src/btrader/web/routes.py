@@ -48,6 +48,7 @@ from ..strategy.candidates import CandidateError, default_store
 from ..strategy.source import (
     StrategySourceError,
     rename_source,
+    delete_source,
     restore_builtin,
     save_source,
 )
@@ -1503,6 +1504,22 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
             raise HTTPException(status_code=409, detail=blocked)
         try:
             return restore_builtin(ctx.strategies, key)
+        except StrategySourceError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+    @router.delete("/api/strategies/{key}")
+    def strategy_delete(key: str) -> dict[str, Any]:
+        """删掉一条用户策略。删覆盖版本等于还原，纯内置不删。
+
+        删除会动用户目录里的文件，所以和保存 / 还原一样，引擎正在跑这条策略时
+        返回 409：引擎握着自己的实例，删了文件它还在跑，界面上却已经没有这条策略。
+        """
+        ctx = get_state().ctx
+        blocked = _strategy_in_use(auto, ai_ctl, key, "删除")
+        if blocked:
+            raise HTTPException(status_code=409, detail=blocked)
+        try:
+            return delete_source(ctx.strategies, key)
         except StrategySourceError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
 
