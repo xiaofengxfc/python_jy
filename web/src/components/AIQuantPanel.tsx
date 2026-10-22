@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
 import { fmt } from "../format";
+import ExecutionPanel from "./ExecutionPanel";
 
 interface Candidate {
   id: string;
@@ -396,6 +397,10 @@ export default function AIQuantPanel({ market, symbol, timeframe, onNavigate }: 
           </div>
         </div>
       </div>
+
+      {/* 部署之后的执行引擎：策略信号 → 自动下单。市场、交易对、周期都用上面这一套，
+          不再让用户选第二遍。与 AI 交易互斥运行（共用交易权租约）。 */}
+      <ExecutionPanel market={market} symbol={symbol} timeframe={timeframe} />
     </div>
   );
 }

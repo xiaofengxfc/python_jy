@@ -7,7 +7,6 @@ import type { Account, AILevel, AppSettings, Candle, Health, SymbolInfo } from "
 import AIPanel from "../components/AIPanel";
 import AITradingPanel from "../components/AITradingPanel";
 import BottomTabs, { type BottomTab } from "../components/BottomTabs";
-import AutoPage from "./AutoPage";
 import TradingViewChart from "../chart/TradingViewChart";
 import {
   INDICATOR_SPECS,
@@ -794,9 +793,6 @@ export default function TradingPage({
         </div>
       </div>
 
-      {/* AI 量化的执行引擎：策略信号 → 自动下单。跟随图表的交易对与周期，
-          与下面的 AI 交易互斥运行（共用交易权租约）。 */}
-      <AutoPage embedded market={market} symbol={symbol} timeframe={timeframe} />
 
       {/* AI 交易（模型逐根 K 线决策）/ AI 量化（策略生命周期），两个独立流程。 */}
       <AITradingPanel
