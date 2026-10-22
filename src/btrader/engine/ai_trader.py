@@ -44,7 +44,11 @@ DECISION_PROMPT = ai_pipeline.DECISION_PROMPT
 # --------------------------------------------------------------- data types
 @dataclass(frozen=True)
 class AIDecision:
-    """模型给出的一条决策。schema 里没有 leverage（INV-6）。"""
+    """模型给出的一条决策。schema 里没有 leverage（INV-6）。
+
+    ``created_at`` 是解析出这条决策的时刻，有效期（ttl_sec / decision_ttl_sec）从
+    这一刻算到提交为止。
+    """
 
     decision_id: str
     action: str
@@ -100,12 +104,71 @@ class GuardVerdict:
     reason: str = ""
 
 
+class TradeBudget:
+    """轮询和「立即决策」共用的一份下单预算：当日决策次数、每小时订单数、冷却。
+
+    两个入口各自 new 一个 AITrader（「立即决策」点一次就 new 一次）。计数留在实例里，
+    点第二下就从零开始数，96 次/日、12 单/时、30 秒冷却对这条路径等于不存在。挪到这里，
+    谁从哪个入口进来都数同一份。读它的是 poller 和接口两处线程，所以全走锁。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._day = ""
+        self._decisions = 0
+        self._order_times: deque[float] = deque(maxlen=200)
+        self._last_order_at = 0.0
+
+    def roll(self, now: float) -> None:
+        """跨天清零。"""
+        day = time.strftime("%Y-%m-%d", time.localtime(now))
+        with self._lock:
+            if day == self._day:
+                return
+            self._day = day
+            self._decisions = 0
+            self._order_times.clear()
+            self._last_order_at = 0.0
+
+    @property
+    def decisions_today(self) -> int:
+        with self._lock:
+            return self._decisions
+
+    def note_decision(self) -> None:
+        """记一次真的花出去的模型调用。"""
+        with self._lock:
+            self._decisions += 1
+
+    def orders_last_hour(self, now: float) -> int:
+        with self._lock:
+            while self._order_times and now - self._order_times[0] > 3600:
+                self._order_times.popleft()
+            return len(self._order_times)
+
+    @property
+    def last_order_at(self) -> float:
+        with self._lock:
+            return self._last_order_at
+
+    def note_order(self, now: float) -> None:
+        with self._lock:
+            self._order_times.append(now)
+            self._last_order_at = now
+
+
 class TradeLease:
-    """最小互斥租约：auto / ai / quant 同一时刻只有一个能操作资金（INV-14）。"""
+    """最小互斥租约：auto / ai / quant 同一时刻只有一个能操作资金（INV-14）。
+
+    预算跟着租约走：拿到同一把租约的引擎，数的是同一份当日决策次数、每小时订单数
+    和冷却。控制器给轮询和「立即决策」的本来就是同一把租约，所以两条路径共用一份；
+    没接控制器、自己 new 一个 AITrader 的地方（测试、脚本）各自一把，互不干扰。
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._owner = ""
+        self.budget = TradeBudget()
 
     @property
     def owner(self) -> str:
@@ -127,7 +190,11 @@ class TradeLease:
 
 # ------------------------------------------------------------------ parsing
 def parse_decision(text: str, *, now: float | None = None) -> tuple[AIDecision | None, str]:
-    """把模型文本解析成决策。解析不出来就是失败，调用方必须不下单。"""
+    """把模型文本解析成决策。解析不出来就是失败，调用方必须不下单。
+
+    ``now`` 是「解析出这条决策」的时刻（AIGuard 拿它算有效期），别把这一轮开始的
+    时刻传进来——那会让决策凭空变老，也会让有效期闸永远算不出间隔。
+    """
     found = ai._find_json_object(text or "")
     if found is None:
         return None, "模型没有返回可解析的 JSON 决策"
@@ -263,8 +330,17 @@ class AIGuard:
             return GuardVerdict(False, "动作不支持")
         if decision.confidence < c.min_confidence:
             return GuardVerdict(False, f"置信度 {decision.confidence:.2f} 低于门槛 {c.min_confidence:.2f}")
-        if decision.ttl_sec and now - decision.created_at > decision.ttl_sec:
-            return GuardVerdict(False, "决策已过期")
+        # 有效期：模型给的 ttl_sec 和配置里的 decision_ttl_sec 取更紧的那个，配置是上限。
+        # created_at 是解析出决策的时刻，now 是此刻（提交前）——以前 created_at 就是
+        # now，这条判断永远不成立，decision_ttl_sec 全库没人读（B1）。
+        limits = [value for value in (decision.ttl_sec, c.decision_ttl_sec) if value and value > 0]
+        if limits and decision.created_at:
+            age = now - decision.created_at
+            ttl = min(limits)
+            if age > ttl:
+                return GuardVerdict(
+                    False, f"决策已过期（已过 {age:.0f} 秒，有效期 {ttl:.0f} 秒）"
+                )
         if market_price and decision.price:
             drift = abs(market_price - decision.price) / max(decision.price, 1e-9)
             if drift > c.max_price_drift_pct:
@@ -310,6 +386,7 @@ class AITrader:
         clock: Callable[[], float] = time.time,
         lease: TradeLease | None = None,
         risk: Any | None = None,
+        budget: TradeBudget | None = None,
     ) -> None:
         self.config = config
         self.trading = trading
@@ -322,6 +399,10 @@ class AITrader:
         self.audit_path = audit_path or (paths.logs_dir() / "ai-trade-audit.jsonl")
         self.clock = clock
         self.lease = lease or TradeLease()
+        # 计数要和别的实例共用：「立即决策」每点一次就是一个新实例（B2）。控制器给
+        # 每个实例的是同一把租约，预算挂在租约上，所以两条路径数的是同一份；显式传
+        # budget 的（将来控制器自己持有一份也行）优先。
+        self.budget = budget if budget is not None else self.lease.budget
         self.guard = AIGuard(config, risk)
         # Unique lease identity: two AITrader instances must not both think
         # they hold the single "ai" slot.
@@ -334,10 +415,6 @@ class AITrader:
         self._stop_event = threading.Event()
         self._seq = 0
         self._events: deque[dict[str, Any]] = deque(maxlen=200)
-        self._counters_day = ""
-        self._decisions_today = 0
-        self._order_times: deque[float] = deque(maxlen=200)
-        self._last_order_at = 0.0
         self.last_decision: dict[str, Any] | None = None
 
     # ------------------------------------------------------------- lifecycle
@@ -446,19 +523,6 @@ class AITrader:
                 log.warning("AI 自主交易轮询失败", exc_info=True)
             self._stop_event.wait(max(1.0, self.config.poll_sec))
 
-    def _roll_counters(self, now: float) -> None:
-        day = time.strftime("%Y-%m-%d", time.localtime(now))
-        if day != self._counters_day:
-            self._counters_day = day
-            self._decisions_today = 0
-            self._order_times.clear()
-            self._last_order_at = 0.0
-
-    def _orders_last_hour(self, now: float) -> int:
-        while self._order_times and now - self._order_times[0] > 3600:
-            self._order_times.popleft()
-        return len(self._order_times)
-
     # ------------------------------------------------------------------ step
     def step(self) -> dict[str, Any] | None:
         """poller 的一轮：只有运行中且未暂停才真正决策。"""
@@ -473,7 +537,7 @@ class AITrader:
         与状态机解耦，供测试、``/preview`` 和人工「立即决策」复用。
         """
         now = self.clock()
-        self._roll_counters(now)
+        self.budget.roll(now)
         portfolio = self._portfolio()
         market_price = portfolio.get("price")
         frame = None
@@ -505,7 +569,10 @@ class AITrader:
         self._last_signal = signal_target
 
         # 决策次数是模型调用预算：先判上限，避免为一个注定被拒的请求付钱。
-        if self.config.max_decisions_per_day and self._decisions_today >= self.config.max_decisions_per_day:
+        if (
+            self.config.max_decisions_per_day
+            and self.budget.decisions_today >= self.config.max_decisions_per_day
+        ):
             return self._record(
                 "skip", reason="已达 AI 当日决策次数上限", decision=None, now=now
             )
@@ -519,8 +586,10 @@ class AITrader:
                 now=now,
                 trace=pipeline.trace,
             )
-        self._decisions_today += 1
-        decision, error = parse_decision(pipeline.decision_text, now=now)
+        self.budget.note_decision()
+        # 时间戳打在「模型返回、解析出决策」这一刻：有效期从决策出生算起，
+        # 不是从这一轮开始时算起。
+        decision, error = parse_decision(pipeline.decision_text, now=self.clock())
         if decision is None:
             return self._record(
                 "skip", reason=error, decision=None, now=now, trace=pipeline.trace
@@ -559,12 +628,13 @@ class AITrader:
 
         guard = self.guard.check(
             decision,
-            now=now,
+            # 闸门看的「现在」也用此刻：有效期判的是「决策出生 → 提交」之间的间隔。
+            now=self.clock(),
             position_quote=float(portfolio.get("position_quote") or 0.0),
             equity=float(portfolio.get("equity") or 0.0),
-            decisions_today=max(0, self._decisions_today - 1),
-            orders_last_hour=self._orders_last_hour(now),
-            last_order_at=self._last_order_at,
+            decisions_today=max(0, self.budget.decisions_today - 1),
+            orders_last_hour=self.budget.orders_last_hour(now),
+            last_order_at=self.budget.last_order_at,
             market_price=market_price,
             kill_switch=bool(portfolio.get("kill_switch")),
             halted_reason=self._halted_reason or str(portfolio.get("halted_reason") or ""),
@@ -586,8 +656,7 @@ class AITrader:
                 "error", reason=f"下单失败：{exc}", decision=decision, now=now,
                 trace=pipeline.trace,
             )
-        self._order_times.append(now)
-        self._last_order_at = now
+        self.budget.note_order(now)
         return self._record(
             "order", reason="", decision=decision, now=now, order=order, trace=pipeline.trace
         )
@@ -737,7 +806,7 @@ class AITrader:
 
     def status(self, since: int = 0) -> dict[str, Any]:
         now = self.clock()
-        self._roll_counters(now)
+        self.budget.roll(now)
         events = [item for item in list(self._events) if int(item.get("seq") or 0) > since]
         return {
             "state": self.state,
@@ -754,8 +823,8 @@ class AITrader:
                 "max_position_quote": self.config.max_position_quote,
             },
             "counters": {
-                "decisions_today": self._decisions_today,
-                "orders_last_hour": self._orders_last_hour(now),
+                "decisions_today": self.budget.decisions_today,
+                "orders_last_hour": self.budget.orders_last_hour(now),
                 "max_decisions_per_day": self.config.max_decisions_per_day,
                 "max_orders_per_hour": self.config.max_orders_per_hour,
             },

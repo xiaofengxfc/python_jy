@@ -17,6 +17,7 @@ from btrader.engine.ai_trader import (
     AIGuard,
     AITrader,
     AITraderConfig,
+    TradeBudget,
     TradeLease,
     parse_decision,
     validate_decision,
@@ -110,6 +111,9 @@ def make_trader(
     llm_ok: bool = True,
     portfolio: dict | None = None,
     signal_target: float | None = None,
+    clock=None,
+    budget: TradeBudget | None = None,
+    lease: TradeLease | None = None,
     **cfg,
 ) -> tuple[AITrader, FakeLLM, FakeTrading, FakeRisk]:
     cfg.setdefault("enabled", True)
@@ -133,8 +137,10 @@ def make_trader(
         portfolio_provider=lambda: dict(view),
         signal_provider=(lambda: signal_target) if signal_target is not None else None,
         audit_path=tmp_path / "audit.jsonl",
-        clock=lambda: 1_800_000_000.0,
+        clock=clock or (lambda: 1_800_000_000.0),
         risk=risk,
+        budget=budget,
+        lease=lease,
     )
     return trader, llm, trading, risk
 
@@ -622,3 +628,197 @@ def test_a_close_without_a_positive_quote_is_not_sent_as_an_empty_order(tmp_path
         assert record is not None and record["outcome"] == "reject", quote
         assert "平仓金额" in record["reason"]
         assert trading.requests == []
+
+
+# ------------------------------------------- 有效期：从决策出生算到提交
+def test_a_stale_decision_is_not_submitted(tmp_path):
+    """有效期闸以前是死的：created_at 就是 now，now - created_at 恒为 0。
+
+    这里让时钟每读一次往前走 2 秒（决策出来到提交这一步已经过去 2 秒），配置里
+    的有效期是 1.5 秒；模型自己写 ttl_sec=3600 也顶不开它，配置是上限。
+    """
+    ticks = [1_800_000_000.0]
+
+    def clock() -> float:
+        ticks[0] += 2.0
+        return ticks[0]
+
+    trader, _llm, trading, _risk = make_trader(
+        tmp_path,
+        answer=decision_json(ttl_sec=3600),
+        clock=clock,
+        decision_ttl_sec=1.5,
+    )
+
+    record = trader.decide_once()
+
+    assert record is not None and record["outcome"] == "reject"
+    assert "过期" in record["reason"]
+    assert trading.requests == []
+
+
+def test_a_slow_model_does_not_age_the_decision_it_just_produced(tmp_path):
+    """created_at 打的是「模型返回、解析出决策」那一刻，不是这一轮开始那一刻。
+
+    模型想了十分钟，决策是刚出生的；拿这一轮的开始时点去判有效期，等于凭空
+    给每一单加上模型耗时。
+    """
+    ticks = [1_800_000_000.0]
+    trader, llm, trading, _risk = make_trader(
+        tmp_path, clock=lambda: ticks[0], decision_ttl_sec=120.0
+    )
+    answer = llm.ask
+
+    def slow(prompt, **kwargs):
+        ticks[0] += 600.0  # 模型思考了十分钟
+        return answer(prompt, **kwargs)
+
+    llm.ask = slow
+
+    record = trader.decide_once()
+
+    assert record is not None and record["outcome"] == "order", record
+    assert len(trading.requests) == 1
+
+
+# ------------------------------------------- 计数：轮询和「立即决策」共用一份
+def test_a_second_instance_keeps_counting_the_daily_decisions(tmp_path):
+    """「立即决策」每点一次就是一个新实例；计数留在实例里，每日上限等于没有。"""
+    budget = TradeBudget()
+    first, _llm, trading, _risk = make_trader(
+        tmp_path, budget=budget, max_decisions_per_day=1
+    )
+    assert first.decide_once()["outcome"] == "order"
+    assert len(trading.requests) == 1
+
+    second, llm_second, trading_second, _risk_second = make_trader(
+        tmp_path, budget=budget, max_decisions_per_day=1
+    )
+    record = second.decide_once()
+
+    assert record is not None and record["outcome"] == "skip"
+    assert "当日决策次数" in record["reason"]
+    assert llm_second.calls == [], "次数用完了不该再去问模型"
+    assert trading_second.requests == []
+
+
+def test_a_second_instance_keeps_counting_the_hourly_orders(tmp_path):
+    """每小时下单上限同理：换一个实例就重新数，等于没有上限。"""
+    budget = TradeBudget()
+    first, _llm, trading, _risk = make_trader(
+        tmp_path, budget=budget, max_orders_per_hour=1, cooldown_sec=0.0
+    )
+    assert first.decide_once()["outcome"] == "order"
+    assert len(trading.requests) == 1
+
+    second, _llm2, trading_second, _risk2 = make_trader(
+        tmp_path, budget=budget, max_orders_per_hour=1, cooldown_sec=0.0
+    )
+    record = second.decide_once()
+
+    assert record is not None and record["outcome"] == "reject"
+    assert "每小时下单次数上限" in record["reason"]
+    assert trading_second.requests == []
+
+
+def test_a_second_instance_respects_the_cooldown(tmp_path):
+    """冷却同理：刚下过单的 30 秒里，另一个实例不能接着下。"""
+    budget = TradeBudget()
+    first, _llm, trading, _risk = make_trader(tmp_path, budget=budget, cooldown_sec=30.0)
+    assert first.decide_once()["outcome"] == "order"
+    assert len(trading.requests) == 1
+
+    second, _llm2, trading_second, _risk2 = make_trader(
+        tmp_path, budget=budget, cooldown_sec=30.0
+    )
+    record = second.decide_once()
+
+    assert record is not None and record["outcome"] == "reject"
+    assert "冷却" in record["reason"]
+    assert trading_second.requests == []
+
+
+class _StubStrategy:
+    def validate_params(self, params):
+        return dict(params or {})
+
+
+class _StubRegistry:
+    keys = ["ma_cross"]
+
+    def get(self, key):  # noqa: ARG002 - 接口形状而已
+        return _StubStrategy()
+
+
+class _StubRest:
+    has_credentials = True
+
+
+def _build_state():
+    """只满足 AITraderController._build 入参检查的一副骨架，不联网。"""
+    from types import SimpleNamespace
+
+    from btrader.core.config import AppSettings
+    from btrader.core.types import MarketType, Network
+
+    settings = AppSettings()
+    settings.ai.enabled = True
+    return SimpleNamespace(
+        ctx=SimpleNamespace(
+            settings=settings,
+            market_type=MarketType.USDM,
+            network=Network.TESTNET,
+            strategies=_StubRegistry(),
+            rest_for=lambda market: _StubRest(),
+            trading=SimpleNamespace(risk=SimpleNamespace()),
+            ai=SimpleNamespace(),
+        )
+    )
+
+
+def test_instances_built_on_the_same_lease_count_the_same_budget(tmp_path):
+    """控制器给轮询和「立即决策」的是同一把租约；预算挂在租约上，所以数同一份。"""
+    lease = TradeLease()
+    assert isinstance(lease.budget, TradeBudget)
+
+    first, _llm, trading, _risk = make_trader(
+        tmp_path, lease=lease, max_decisions_per_day=1
+    )
+    assert first.budget is lease.budget
+    assert first.decide_once()["outcome"] == "order"
+    assert len(trading.requests) == 1
+
+    # 「立即决策」点第二下：新实例、同一个 lease（控制器就是这么建的）
+    second, llm_second, trading_second, _risk2 = make_trader(
+        tmp_path, lease=lease, max_decisions_per_day=1
+    )
+    assert second.budget is lease.budget
+    record = second.decide_once()
+
+    assert record is not None and record["outcome"] == "skip"
+    assert "当日决策次数" in record["reason"]
+    assert llm_second.calls == []
+    assert trading_second.requests == []
+
+
+def test_the_controller_builds_every_trader_on_one_lease(tmp_path, monkeypatch):
+    """控制器那一侧只保证「同一把租约」——预算跟着租约走，接线不用再加一行。"""
+    from btrader.web import routes
+
+    built: list[dict] = []
+
+    class StubTrader:
+        def __init__(self, config, **kwargs):
+            built.append(kwargs)
+
+    monkeypatch.setattr(routes, "AITrader", StubTrader)
+    controller = routes.AITraderController()
+    payload = routes.AITraderStartPayload(symbol="BTC/USDT", strategy="ma_cross")
+
+    controller._build(_build_state(), payload)  # 轮询
+    controller._build(_build_state(), payload)  # 「立即决策」
+
+    assert len(built) == 2
+    assert built[0]["lease"] is controller.lease
+    assert built[1]["lease"] is controller.lease, "两个入口必须拿到同一把租约"
+    assert isinstance(controller.lease.budget, TradeBudget)
