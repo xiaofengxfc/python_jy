@@ -69,6 +69,9 @@ Node 不在 PATH 时，先把 Node 目录加进去。
 - 权益基线存在 `account.baseline.v1:<network>:<market>`，只有全钱包读会写。
   单交易对读只继承。如果让单交易对读也写，第一次读的那一对会把偏小的金额
   冻成「起始资金」。
+- 回测也按市场类型收死：现货不许借杠杆、不许做空（`leverage=1`、`allow_short=False`），
+  合约照常。`_validate_backtest` 原样透传 `leverage` / `allow_short` 的时候，直调接口能给现货
+  跑出「做空 10 倍杠杆」的收益曲线，那条曲线在真实市场里根本不存在。
 - 现货没有 reduce-only 触发单。止损、止盈、条件单只在合约市场挂到交易所侧。
   现货请求会返回明确文案：`PUT /api/positions/protection` 和
   `POST /api/orders/conditional`。
@@ -126,6 +129,10 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   - `sanitize_key`：`key` 撞上已有策略或已有候选就加 `_ai` / `_ai2` 后缀，原名写进候选的 note。
     提示词里也念一遍现有 key，那只是减少重试；真正兜底的是这个函数。
   - 解析只负责把代码捞出来。候选代码仍然要过 `sandbox.check_code`，那是唯一闸门；
+    `check_code` 除了结构，还盯三件会让代码根本加载不了的事：相对导入（`from ..base` 在候选
+    这种独立模块里解析不了，直接判不通过并给出绝对写法）、基类名必须在模块顶层可见（类继承了
+    `Strategy` 却通篇没 import，是最常见的模型错误）、参数构造器同样要可见（用了 `IntParam`
+    没导入）。只用 `from x import *` 的写法名字不可知，那种放过。
     批准时 `_register_candidate` 再改写一次类属性 `key = "..."`，所以候选列表上的 key 和最终
     注册的 key 可能差一个后缀。
 
@@ -154,6 +161,14 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   回测 / 策略 / 实验室 / 设置。`StageBar`、`CandidateList`、`MetricGrid`、`ExecutionConsole`
   是共用件，别再各写一份。
 - 执行台和 AI 交易共用同一个账户，同时只能开一个，撞上了返回 409。
+- 下单预算跟着 `TradeLease` 走（`TradeLease.budget` 是本进程唯一的一份 `TradeBudget`）：
+  当日决策次数、每小时订单数、冷却时间。轮询和「立即决策」点一次 new 一个 `AITrader`，
+  计数要是留在实例里，点第二下就从零开始数，96 次/日、12 单/时、30 秒冷却等于不存在。
+  控制器把同一份 budget 传给每一个实例（`AITrader(budget=)`），别在实例里另起一份。
+- 决策有效期是真闸，不是文档里的承诺：`created_at` 打在「模型返回、解析出决策」那一刻
+  （不是这一轮开始），`AIGuard.check` 的「现在」取提交前那一刻，有效期取
+  `min(模型给的 ttl_sec, 配置的 decision_ttl_sec)`——配置是上限，模型顶不开。超龄就拒并落审计。
+  别把它改回「用构造时刻当 created_at」，那等于 now - created_at 恒为 0，闸门永远是开的。
 - 熔断就是当场把交易权还回去：`halt()` 之后 `TradeLease` 立刻释放。熔断的实例本来就不
   会再下单（`step()` 看 state、`_submit()` 看 `_stop_event`、`AIGuard` 看 halted_reason），
   拦住「熔断期间新开仓」的是 `STATE_HALTED` 和 AIGuard，不是租约。别为了拦开仓把整个账户
