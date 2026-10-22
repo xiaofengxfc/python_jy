@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import threading
 import time
 from contextlib import asynccontextmanager, suppress
@@ -32,11 +31,19 @@ from ..core.types import (
     MarketType,
     Network,
     market_for_symbol,
+    split_symbol,
+    symbol_is_contract,
 )
 from ..engine.trading import OrderRejected, OrderRequest
 from ..exchange.symbols import format_amount, load_symbols
 from ..exchange import mirror
-from ..exchange.rest import ExchangeError, ticker_bid_ask
+from ..exchange.rest import (
+    DEFAULT_DEPTH,
+    SYMBOL_MISSING_MARKERS,
+    ExchangeError,
+    looks_unknown_symbol,
+    ticker_bid_ask,
+)
 from ..logging_setup import error_buffer
 from .routes import build_router
 from .routes_lab import build_lab_router
@@ -446,18 +453,14 @@ def _venue_symbol(state: _State, market: MarketType, symbol: str) -> str:
     已经把它翻成 400 加原因，不会变成「没有持仓」这种误导。
     """
     text = (symbol or "").strip()
-    if not text or not market.is_futures or ":" in text:
+    base, quote, settle = split_symbol(text)
+    if not text or not market.is_futures or settle:
         return text
-    base, _, tail = text.partition("/")
-    quote = tail.split(":")[0].upper()
+    pair = f"{base}/{quote}"
     if market is MarketType.COINM:
-        return f"{text}:{base.upper()}"
-    settle = quote if quote in ("USDT", "USDC") else "USDT"
-    return f"{text}:{settle}"
-
-
-# 交割合约的符号在结算币后面还挂一段到期日，例如 BTC/USDT:USDT-250328。
-_SYMBOL_EXPIRY = re.compile(r"-\d{6}$")
+        return f"{pair}:{base.upper()}"
+    tail = quote.upper() if quote.upper() in ("USDT", "USDC") else "USDT"
+    return f"{pair}:{tail}"
 
 
 def _check_symbol_shape(market: MarketType, symbol: str) -> str:
@@ -475,14 +478,14 @@ def _check_symbol_shape(market: MarketType, symbol: str) -> str:
     text = (symbol or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="缺少交易对。")
-    base, slash, rest = text.partition("/")
-    quote = rest.split(":")[0]
+    base, quote, _settle = split_symbol(text)
+    _, slash, rest = text.partition("/")
     if not slash or not base or not quote or "/" in rest:
         raise HTTPException(
             status_code=400,
             detail=f"交易对写法不对：「{text}」要写成「币/计价」，例如 BTC/USDT。",
         )
-    contract_shape = ":" in text or bool(_SYMBOL_EXPIRY.search(text))
+    contract_shape = symbol_is_contract(text)
     if contract_shape and not market.is_futures:
         raise HTTPException(
             status_code=400,
@@ -529,6 +532,31 @@ def _live_held(state: _State, symbol: str, market: MarketType) -> float | None:
                 return contracts
             return 0.0
         return _live_spot_available(state, symbol, market)
+
+
+def _minimum_order(spec: Any, price: float) -> tuple[float | None, float | None]:
+    """这一对的最小下单量（基础币）与最小名义额（计价币）。
+
+    取交易所自己公布的申报值：``min_amount`` 是最小数量（现货与本位合约是币，
+    币本位是张），``min_cost`` 是最小名义额（币安现货的 NOTIONAL、合约的
+    MIN_NOTIONAL）。张要按现价折成币，没有价格就报 null。
+
+    拿不到就报 null：不发一个猜出来的数字让用户照着改。这只是**报数**，不是新闸门——
+    真正的门仍然是交易所那一道和 RiskManager。
+    """
+    if spec is None:
+        return None, None
+    min_amount: float | None = None
+    units = float(getattr(spec, "min_amount", 0.0) or 0.0) * float(
+        getattr(spec, "contract_size", 1.0) or 1.0
+    )
+    if units > 0:
+        if getattr(spec, "inverse", False):
+            min_amount = units / price if price > 0 else None
+        else:
+            min_amount = units
+    min_cost = float(getattr(spec, "min_cost", 0.0) or 0.0)
+    return min_amount, (min_cost if min_cost > 0 else None)
 
 
 def _is_reducing(
@@ -603,23 +631,11 @@ def _check_protection_levels(
 
 
 # ----------------------------------------------------------------------- app
-_SYMBOL_MISSING_MARKERS: tuple[str, ...] = (
-    "does not have market symbol",
-    "invalid symbol",
-    "market symbol not found",
-    "invalid market",
-)
-
-def _unknown_symbol(exc: BaseException) -> bool:
-    """True when the venue says this pair does not exist.
-
-    ccxt raises BadSymbol for a typo'd pair, but the exchange layer flattens
-    every failure into ExchangeError, so by the time a route sees it only the
-    message is left. It matters: a 503 tells the caller to try again later,
-    and this answer will never change until the symbol does.
-    """
-    text = str(exc).lower()
-    return any(marker in text for marker in _SYMBOL_MISSING_MARKERS)
+# 词根表与判定都在 exchange.rest（下层的作业线程也要用同一套），这里只留名字。
+_SYMBOL_MISSING_MARKERS = SYMBOL_MISSING_MARKERS
+# True when the venue says this pair does not exist: a 503 would tell the caller
+# to try again later, and this answer will never change until the symbol does.
+_unknown_symbol = looks_unknown_symbol
 
 
 def _venue_http_error(
@@ -814,8 +830,11 @@ def create_app() -> FastAPI:
 
     @app.get("/api/orderbook")
     def api_orderbook(
-        market: str = "spot", symbol: str = "BTC/USDT", limit: int = 12
+        market: str = "spot", symbol: str = "BTC/USDT", limit: int = DEFAULT_DEPTH
     ) -> dict[str, Any]:
+        """limit 是「想要几档」：交易所只认 5/10/20/50/100/500/1000，发别的数
+        （默认值曾经是 12）会被币安回 -4021，整条请求变成 503。
+        rest.fetch_order_book 会把档位向上换成交所认的那一档。"""
         state = get_state()
         mt = _market(market)
         limit = max(5, min(int(limit), 50))
@@ -831,7 +850,11 @@ def create_app() -> FastAPI:
 
     # --------------------------------------------------------------- account
     @app.get("/api/account")
-    def api_account(market: str = "spot", symbol: str | None = None) -> dict[str, Any]:
+    def api_account(
+        market: str = "spot",
+        symbol: str | None = None,
+        refresh: bool = False,
+    ) -> dict[str, Any]:
         """Balances, positions, open orders and the fill ledger for one market.
 
         Everything here comes from the venue. There is no simulated account any
@@ -843,11 +866,26 @@ def create_app() -> FastAPI:
         signing balance + positions + open orders per poll would burn the
         request weight budget for nothing.
 
+        ``refresh=1`` skips that cache for **one pair** (``live_snapshot``): right
+        after a fill the cached row is still the wallet row, so the panel shows a
+        「卖出」button and prefills the whole balance for what the program just
+        bought. Without a symbol there is nothing to scope the read to — a whole
+        wallet re-pricing is what ``/api/portfolio`` already does on its own
+        schedule, and letting a panel trigger it would be the expensive read we
+        just avoided — so that case keeps serving the cached snapshot. The read
+        does not take ``account_lock``: reading an account must not queue behind
+        an order.
+
         A missing key is not an error: the page still renders, and "尚未配置
         API Key" is a message, not a blank screen.
         """
         state = get_state()
-        snapshot = state.ctx.account.snapshot(_market(market), symbol)
+        account = state.ctx.account
+        pair = (symbol or "").strip() or None
+        if refresh and pair:
+            snapshot = account.live_snapshot(_market(market), pair)
+        else:
+            snapshot = account.snapshot(_market(market), pair)
         return snapshot.as_payload()
 
     @app.post("/api/orders/preview")
@@ -892,6 +930,14 @@ def create_app() -> FastAPI:
 
         trading = state.ctx.trading
         notional = abs(amount) * reference
+        # 这一对能下多小：太小的单打到交易所才被 NOTIONAL 拒掉（实测 4.77 USDT
+        # 那次），所以预览就把交易所的最小数量与最小名义额一起报出来，界面据此
+        # 提示，而不是让用户先撞一次墙。规格读不到就 null。
+        try:
+            spec = state.ctx.trading.rest_for(mt).contract_spec(mt, payload.symbol)
+        except Exception:
+            spec = None
+        min_amount, min_notional = _minimum_order(spec, reference)
         base = {
             "symbol": payload.symbol,
             "market": mt.value,
@@ -902,6 +948,8 @@ def create_app() -> FastAPI:
             "quote_notional": notional,
             "fee_rate": TAKER_FEE_RATE,
             "slippage_bps": SLIPPAGE_BPS,
+            "min_amount": min_amount,
+            "min_notional": min_notional,
         }
 
         try:
@@ -1178,6 +1226,13 @@ def create_app() -> FastAPI:
             # 现货的「持仓」是币余额，里面混着用户自己充进来的钱：不带 size 时只平
             # 本程序成交账本记着的数量。以前这里拿钱包余额当全部持仓，一次不带
             # size 的平仓把钱包里本来就有的币一起卖了（t33 实测：1 BTC 全没了）。
+            # 账本是 5 秒一轮的成交同步填的：刚买完就点平仓，算的是上一轮的数字
+            # （账本还空着的时候甚至直接报「没有这一对」）。先单独把这一对的成交
+            # 同步一次，平的就是刚买进来的那些。
+            try:
+                state.ctx.trading.sync_symbol_fills(mt, symbol)
+            except Exception:  # 读不到也不能挡住平仓的其它判据
+                log.debug("平仓前同步成交失败 %s", symbol, exc_info=True)
             booked = _booked_held(state, symbol)
             if booked is None or abs(booked) <= 1e-12:
                 raise HTTPException(

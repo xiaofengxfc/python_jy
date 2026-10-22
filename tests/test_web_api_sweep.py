@@ -32,6 +32,42 @@ def test_unknown_symbol_markers_are_recognised():
     assert not _unknown_symbol(VenueError("Connection refused"))
 
 
+def test_an_unknown_strategy_message_has_no_python_quotes():
+    """KeyError 的 str() 会给消息套一层引号：界面曾经显示 '未知策略: nope'。"""
+    from btrader.web.routes import _key_error_text
+
+    assert _key_error_text(KeyError("未知策略：nope")) == "未知策略：nope"
+    assert _key_error_text(KeyError()) == "KeyError"
+
+
+def test_a_failed_job_says_no_such_symbol_in_chinese():
+    """作业线程里没有状态码，只剩一句话给界面看：别把 ccxt 的英文整句摊出去。
+
+    实测：POST /api/backtest/run 传一个不存在的交易对，接口回 200 + job_id，
+    作业随后报「binance does not have market symbol NOPE/USDT」。
+    """
+    from btrader.web.routes import _job_error_text
+
+    assert (
+        _job_error_text(
+            VenueError("binance does not have market symbol NOPE/USDT"), "NOPE/USDT"
+        )
+        == "没有这个交易对：NOPE/USDT"
+    )
+    # 别的失败原样透出：那是真的故障，堆栈在日志里。
+    assert _job_error_text(VenueError("Connection refused"), "BTC/USDT") == "Connection refused"
+    assert _job_error_text(RuntimeError(), "") == "RuntimeError"
+
+
+def test_the_app_alias_and_the_rest_helper_agree():
+    """词根表挪到 exchange.rest 之后，app 里那两个名字仍是同一套判定。"""
+    from btrader.exchange import rest as rest_mod
+    from btrader.web import app as web_app
+
+    assert web_app._SYMBOL_MISSING_MARKERS == rest_mod.SYMBOL_MISSING_MARKERS
+    assert web_app._unknown_symbol is rest_mod.looks_unknown_symbol
+
+
 def test_unknown_symbol_is_a_400_not_a_503():
     error = _venue_http_error(
         VenueError("binanceusdm does not have market symbol FAKE/USDT"),

@@ -42,7 +42,12 @@ from ..engine.ai_trader import (
 )
 from ..engine.auto import AutoTrader, AutoTraderConfig
 from ..exchange import mirror
-from ..exchange.rest import PLATFORMS, SUPPORTED_PLATFORMS, BinanceREST
+from ..exchange.rest import (
+    PLATFORMS,
+    SUPPORTED_PLATFORMS,
+    BinanceREST,
+    looks_unknown_symbol,
+)
 from ..notify import FORMATS, Notifier, NotifyError, check_webhook_url
 from ..strategy.candidates import CandidateError, default_store
 from ..strategy.source import (
@@ -136,7 +141,7 @@ def _strategy_for(state, key: str):
         try:
             return state.ctx.strategies.get(key)
         except KeyError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise HTTPException(status_code=400, detail=_key_error_text(exc)) from exc
     try:
         return default_store().load_strategy(candidate_id)
     except CandidateError as exc:
@@ -470,7 +475,7 @@ class AutoController:
         try:
             strategy = ctx.strategies.get(payload.strategy)
         except KeyError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise HTTPException(status_code=400, detail=_key_error_text(exc)) from exc
         params = _strategy_params(strategy, payload.params)
 
         with self._lock:
@@ -743,7 +748,7 @@ class AITraderController:
         try:
             signal_strategy = ctx.strategies.get(strategy_key)
         except KeyError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise HTTPException(status_code=400, detail=_key_error_text(exc)) from exc
         # 这里没有「允许实盘」总闸：配了凭据就是能签名下单，没凭据下面就拦住。
         # 主网多要一句 confirm_live，让调用方把「这是真钱」说出口；测试网的钱是假的，
         # 排练一次不该多花一次点击。
@@ -1234,7 +1239,7 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
         try:
             strategy = ctx.strategies.get(payload.strategy)
         except KeyError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise HTTPException(status_code=400, detail=_key_error_text(exc)) from exc
         params = _strategy_params(strategy, payload.params)
         source = _strategy_source(strategy)
         result = ai.describe_strategy(
@@ -1943,7 +1948,16 @@ def _ai_portfolio(state, symbol: str) -> dict[str, Any]:
     for item in snapshot.positions:
         if item.get("symbol") != symbol:
             continue
-        position_quote = abs(float(item.get("quote_value") or 0.0))
+        if market.is_futures:
+            position_quote = abs(float(item.get("quote_value") or 0.0))
+        else:
+            # 现货行的 quote_value 是**钱包估值**，里面混着用户自己充提的币。
+            # AI 的仓位上限量的是「本程序买了多少」，所以按账本数量 × 现价算：
+            # 钱包里有 1 BTC（用户自己的）而账本只有 0.00042 时，以前的 position_quote
+            # 是 81000，AIGuard 直接回「持仓金额将超过 AI 上限」，现货 AI 交易开不了仓。
+            held = abs(float(item.get("ledger_size") or 0.0))
+            mark = float(item.get("last") or 0.0) or float(price or 0.0)
+            position_quote = held * mark
         break
     equity = snapshot.equity
     risk = ctx.trading.risk
@@ -2078,6 +2092,28 @@ def _validate_backtest(state, payload: BacktestPayload):
     return market, strategy, params, config
 
 
+def _key_error_text(exc: KeyError) -> str:
+    """把 KeyError 的消息还原成一句话。
+
+    KeyError 的 str() 会给消息套一层引号，界面于是显示 '未知策略: nope'——
+    看着像把 Python 异常摊给用户了。真正要显示的那句在 args[0] 里。
+    """
+    text = exc.args[0] if exc.args else ""
+    return str(text) or exc.__class__.__name__
+
+
+def _job_error_text(exc: BaseException, symbol: str = "") -> str:
+    """作业线程里没有 HTTP 状态码，只剩一句话要显示给用户。
+
+    交易所说「没有这个交易对」时照实说中文：以前把 ccxt 的英文整句
+    （binance does not have market symbol NOPE/USDT）原样摊在界面上。
+    其余失败保持原样，堆栈在日志里。
+    """
+    if looks_unknown_symbol(exc):
+        return f"没有这个交易对：{symbol}" if symbol else "这条市场没有这个交易对"
+    return str(exc) or exc.__class__.__name__
+
+
 def _start_backtest(state, jobs: JobStore, payload: BacktestPayload) -> dict[str, Any]:
     market, strategy, params, config = _validate_backtest(state, payload)
     job_id = jobs.create("backtest")
@@ -2138,11 +2174,14 @@ def _start_backtest(state, jobs: JobStore, payload: BacktestPayload) -> dict[str
             )
         except Exception as exc:
             log.warning("回测失败: %s", exc, exc_info=True)
-            jobs.update(job_id, status="error", error=str(exc) or exc.__class__.__name__)
+            jobs.update(job_id, status="error", error=_job_error_text(exc, payload.symbol))
             _notify_task(
                 state.ctx,
                 "回测失败",
-                [f"{payload.symbol} {payload.timeframe} · {payload.strategy}", str(exc)],
+                [
+                    f"{payload.symbol} {payload.timeframe} · {payload.strategy}",
+                    _job_error_text(exc, payload.symbol),
+                ],
             )
 
     threading.Thread(target=work, name=f"backtest-{job_id}", daemon=True).start()
@@ -2196,11 +2235,14 @@ def _start_optimize(state, jobs: JobStore, payload: OptimizePayload) -> dict[str
             )
         except Exception as exc:
             log.warning("参数优化失败: %s", exc, exc_info=True)
-            jobs.update(job_id, status="error", error=str(exc) or exc.__class__.__name__)
+            jobs.update(job_id, status="error", error=_job_error_text(exc, payload.symbol))
             _notify_task(
                 state.ctx,
                 "参数优化失败",
-                [f"{payload.symbol} {payload.timeframe} · {payload.strategy}", str(exc)],
+                [
+                    f"{payload.symbol} {payload.timeframe} · {payload.strategy}",
+                    _job_error_text(exc, payload.symbol),
+                ],
             )
 
     threading.Thread(target=work, name=f"optimize-{job_id}", daemon=True).start()
@@ -2310,11 +2352,14 @@ def _start_ai_filter(state, jobs: JobStore, payload: AIFilterPayload) -> dict[st
             )
         except Exception as exc:
             log.warning("AI 过滤回测失败: %s", exc, exc_info=True)
-            jobs.update(job_id, status="error", error=str(exc) or exc.__class__.__name__)
+            jobs.update(job_id, status="error", error=_job_error_text(exc, payload.symbol))
             _notify_task(
                 ctx,
                 "AI 过滤回测失败",
-                [f"{payload.symbol} {payload.timeframe} · {payload.strategy}", str(exc)],
+                [
+                    f"{payload.symbol} {payload.timeframe} · {payload.strategy}",
+                    _job_error_text(exc, payload.symbol),
+                ],
             )
 
     threading.Thread(target=work, name=f"ai-filter-{job_id}", daemon=True).start()

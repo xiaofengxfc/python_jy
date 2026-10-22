@@ -26,6 +26,10 @@ class ContractSpec:
     quote: str = ""
     settle: str = ""
     min_amount: float = 0.0
+    # 名义额下限（计价币）：币安现货的 NOTIONAL、合约的 MIN_NOTIONAL，ccxt 把它
+    # 映射到 ``limits.cost.min``。0 表示交易所没公布——下单预览如实报 null，不拿
+    # min_amount × 价格去凑一个数（那是另一个口径，凑出来的值会骗人）。
+    min_cost: float = 0.0
 
     @property
     def is_inverse(self) -> bool:

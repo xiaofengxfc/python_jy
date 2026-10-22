@@ -124,7 +124,7 @@ class StrategyRegistry:
         try:
             return self._strategies[key]()
         except KeyError as exc:
-            raise KeyError(f"未知策略: {key}") from exc
+            raise KeyError(f"未知策略：{key}") from exc
 
     def source_path(self, key: str) -> Path | None:
         """The user-plugin file in effect for ``key``, or ``None`` for a built-in.
