@@ -940,22 +940,22 @@ export default function BacktestPage({ onEditStrategy }: Props) {
                     </span>
                   </div>
                   <Table
-                    headers={["时间", "方向", "价格", "数量", "盈亏"]}
-                    rightFrom={2}
+                    headers={["开仓时间", "平仓时间", "方向", "开仓价", "平仓价", "数量", "盈亏"]}
+                    rightFrom={3}
                     rows={result.trades.slice(-60).reverse().map((trade) => {
-                      const pnl = Number(trade.pnl ?? 0);
+                      const at = (value: number) =>
+                        value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "—";
                       return [
-                        trade.timestamp
-                          ? new Date(Number(trade.timestamp)).toLocaleString("zh-CN", {
-                              hour12: false,
-                            })
-                          : "—",
-                        <span className={String(trade.side) === "buy" ? "up" : "down"}>
-                          {String(trade.side) === "buy" ? "买入" : "卖出"}
+                        at(trade.entry_time),
+                        at(trade.exit_time),
+                        <span className={trade.side === "short" ? "down" : "up"}>
+                          {trade.side === "short" ? "空头" : "多头"}
                         </span>,
-                        fmtPrice(Number(trade.price ?? 0)),
-                        fmt(Number(trade.amount ?? 0), 6),
-                        <span className={pnl >= 0 ? "up" : "down"}>{fmt(pnl, 2)}</span>,
+                        fmtPrice(trade.entry_price),
+                        fmtPrice(trade.exit_price),
+                        // qty 带符号，做空是负数，表里显示绝对值。
+                        fmt(Math.abs(trade.qty), 6),
+                        <span className={trade.pnl >= 0 ? "up" : "down"}>{fmt(trade.pnl, 2)}</span>,
                       ];
                     })}
                     empty="策略在这段时间内没有成交"

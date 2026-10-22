@@ -630,11 +630,33 @@ export interface EquityPoint {
   close: number;
 }
 
+/** 一笔回测成交：一次完整的开平仓往返，字段与后端 TradeRecord.as_dict() 一一对应。 */
+export interface BacktestTrade {
+  /** 开仓那根 K 线的收盘时间，毫秒。 */
+  entry_time: number;
+  /** 平仓那根 K 线的收盘时间，毫秒。 */
+  exit_time: number;
+  side: "long" | "short";
+  entry_price: number;
+  exit_price: number;
+  /** 带符号的数量：做空是负数，显示时取绝对值。 */
+  qty: number;
+  /** 已扣手续费的盈亏，计价货币。 */
+  pnl: number;
+  /** 相对开仓名义金额的收益率。 */
+  pnl_pct: number;
+  /** 持仓根数。 */
+  bars: number;
+  /** 平仓原因：signal / stop_loss / take_profit / end。 */
+  exit_reason: string;
+  fee: number;
+}
+
 export interface BacktestResult {
   metrics: Record<string, number>;
   params: Record<string, unknown>;
   equity: EquityPoint[];
-  trades: Record<string, unknown>[];
+  trades: BacktestTrade[];
   /** Where the run came from: "btrader" for a normal run, "cand:<id>" for a candidate. */
   source?: string;
 }

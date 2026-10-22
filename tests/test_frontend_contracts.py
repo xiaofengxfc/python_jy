@@ -123,3 +123,62 @@ def test_numeric_inputs_never_send_a_blank_or_half_typed_value() -> None:
         handler = ai_trade[max(0, commit - 520) : commit]
         assert 'if (raw === "") return;' in handler, f"{field} 没拦住空串"
         assert "Number.isFinite(next)" in handler, f"{field} 没拦住 NaN"
+
+BACKTEST_ENGINE = ROOT / "src" / "btrader" / "backtest" / "engine.py"
+
+
+def _trade_record_keys() -> set[str]:
+    """后端 TradeRecord.as_dict() 现在吐哪些键。"""
+    source = BACKTEST_ENGINE.read_text(encoding="utf-8")
+    block = source.split("def as_dict", 1)[1].split("}", 1)[0]
+    return set(re.findall(r'"([a-z_]+)":', block))
+
+
+def _typescript_fields(name: str) -> set[str]:
+    """types.ts 里某个 interface 声明的字段名（注释先剥掉）。"""
+    source = (UI_DIR / "types.ts").read_text(encoding="utf-8")
+    body = source.split(f"export interface {name} {{", 1)[1].split("}", 1)[0]
+    body = re.sub(r"/\*.*?\*/", "", body, flags=re.S)
+    body = re.sub(r"//[^\n]*", "", body)
+    return set(re.findall(r"^\s*([a-z_]+)\??\s*:", body, flags=re.M))
+
+
+def test_backtest_trade_rows_read_the_fields_the_backend_sends() -> None:
+    """成交明细曾经读 timestamp / price / amount，后端一个都不发。
+
+    后端发的是 TradeRecord.as_dict()：entry_time / exit_time / side /
+    entry_price / exit_price / qty / pnl / pnl_pct / bars / exit_reason / fee，
+    而且 side 是 long / short，不是 buy / sell。
+    """
+    backend = _trade_record_keys()
+    assert backend == {
+        "entry_time",
+        "exit_time",
+        "side",
+        "entry_price",
+        "exit_price",
+        "qty",
+        "pnl",
+        "pnl_pct",
+        "bars",
+        "exit_reason",
+        "fee",
+    }, f"后端 TradeRecord 的字段变了，types.ts 要跟着改：{sorted(backend)}"
+
+    declared = _typescript_fields("BacktestTrade")
+    assert declared == backend, f"types.ts 的 BacktestTrade 和后端对不上：{declared ^ backend}"
+    types_source = (UI_DIR / "types.ts").read_text(encoding="utf-8")
+    assert "trades: BacktestTrade[];" in types_source, "BacktestResult.trades 还挂在模糊类型上"
+
+    page = (UI_DIR / "pages" / "BacktestPage.tsx").read_text(encoding="utf-8")
+    for stale in ("trade.timestamp", "trade.price", "trade.amount"):
+        assert stale not in page, f"成交明细还在读后端不返回的 {stale}"
+    for used in (
+        "trade.entry_time",
+        "trade.exit_time",
+        "trade.entry_price",
+        "trade.exit_price",
+        "trade.qty",
+    ):
+        assert used in page, f"成交明细没有读 {used}"
+    assert 'trade.side === "short"' in page, "side 是 long / short，不是 buy / sell"
