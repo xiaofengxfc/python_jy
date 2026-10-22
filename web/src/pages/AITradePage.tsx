@@ -428,7 +428,16 @@ export default function AITradePage({ settings, health }: Props) {
                 min={0}
                 step={10}
                 value={auto.max_order_quote}
-                onChange={(event) => patch({ max_order_quote: Number(event.target.value) })}
+                onChange={(event) => {
+                  // 清空输入框时 value 是空串，Number("") 是 0，而后端的
+                  // 0 等于「不限制」——一清空就把单笔上限关了。半截数字是 NaN，
+                  // JSON 会变成 null。两种都不该写进配置。
+                  const raw = event.target.value.trim();
+                  if (raw === "") return;
+                  const next = Number(raw);
+                  if (!Number.isFinite(next) || next < 0) return;
+                  patch({ max_order_quote: next });
+                }}
               />
             </div>
             <div className="field">
@@ -443,7 +452,13 @@ export default function AITradePage({ settings, health }: Props) {
                 min={0}
                 step={10}
                 value={auto.max_position_quote}
-                onChange={(event) => patch({ max_position_quote: Number(event.target.value) })}
+                onChange={(event) => {
+                  const raw = event.target.value.trim();
+                  if (raw === "") return;
+                  const next = Number(raw);
+                  if (!Number.isFinite(next) || next < 0) return;
+                  patch({ max_position_quote: next });
+                }}
               />
             </div>
             <div className="hint" style={{ gridColumn: "1 / -1" }}>

@@ -104,7 +104,7 @@ export default function BottomTabs({
   const cancel = (order: OrderRow) =>
     run(`cancel:${order.id}`, () =>
       api(
-        `T/api/orders/${encodeURIComponent(order.id)}?${query({
+        `/api/orders/${encodeURIComponent(order.id)}?${query({
           symbol: order.symbol,
           market: order.market,
         })}`,

@@ -66,7 +66,17 @@ export function ParamFields({ specs, values, onChange }: Props) {
                 max={spec.maximum ?? undefined}
                 step={spec.step ?? "any"}
                 value={String(value)}
-                onChange={(event) => onChange(spec.name, Number(event.target.value))}
+                onChange={(event) => {
+                  // 输入框被清空时 value 是空串，Number("") 是 0：直接提交等于把
+                  // 参数悄悄改成最小值（后端按 minimum 夹）。半截数字（"-"、"1e"）
+                  // 是 NaN，JSON 会变成 null，后端 int(None) 直接崩。
+                  // 两种都不是用户想表达的值，宁可不改。
+                  const raw = event.target.value.trim();
+                  if (raw === "") return;
+                  const next = Number(raw);
+                  if (!Number.isFinite(next)) return;
+                  onChange(spec.name, next);
+                }}
               />
             )}
           </div>
