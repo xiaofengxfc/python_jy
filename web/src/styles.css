@@ -1210,10 +1210,15 @@ input[type="range"].input:focus {
   padding: 4px 6px 2px;
 }
 
+/* TradingView（lightweight-charts）自己管理画布尺寸，这里只给容器定位。 */
+.chart-host {
+  position: absolute;
+  inset: 4px 6px 2px;
+  overflow: hidden;
+}
+
 .chart-wrap canvas {
   display: block;
-  width: 100%;
-  height: 100%;
 }
 
 .chart-legend {
@@ -1230,6 +1235,11 @@ input[type="range"].input:focus {
 .chart-legend b {
   color: var(--text-2);
   font-weight: 500;
+}
+
+/* 图例整体不吃鼠标事件（避免挡住图表的十字光标），但「回到最新」要能点。 */
+.chart-legend .link-btn {
+  pointer-events: auto;
 }
 
 .chart-empty {

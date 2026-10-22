@@ -11,6 +11,7 @@
   "dependencies": {
     "@codemirror/lang-python": "^6.2.1",
     "@uiw/react-codemirror": "^4.25.12",
+    "lightweight-charts": "^5.2.1",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
     "react-markdown": "^10.1.0",

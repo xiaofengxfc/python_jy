@@ -36,6 +36,9 @@ Node 不在 PATH 时：`$env:Path = "D:\tool\node;" + $env:Path`。
 
 ## 3. 代码/编辑注意事项
 
+- 图表用 TradingView lightweight-charts，代码在 `web/src/chart/`（指标算法在
+  `indicators.ts`，画线图元在 `primitives.ts`）。指标算法是从旧手绘 canvas 版原样搬过来的，
+  不要在搬迁/重构里"顺手优化"，数值一变图上和历史截图就对不上了。
 - 含中文的源文件只用编辑器工具改，**不要**用 `Set-Content`/`Out-File`
   （会用 GBK 写成乱码，导致 SyntaxError）。
 - `cmd` 脚本必须 CRLF + 纯 ASCII，否则 `rem` 行会被当命令执行。

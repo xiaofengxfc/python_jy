@@ -8,14 +8,15 @@ import AIPanel from "../components/AIPanel";
 import AITradingPanel from "../components/AITradingPanel";
 import BottomTabs, { type BottomTab } from "../components/BottomTabs";
 import AutoPage from "./AutoPage";
-import Chart, {
+import TradingViewChart from "../chart/TradingViewChart";
+import {
   INDICATOR_SPECS,
   clampParam,
   defaultParams,
   type Indicator,
   type IndicatorConfig,
   type IndicatorParams,
-} from "../components/Chart";
+} from "../chart/specs";
 import DrawingToolbar from "../components/DrawingToolbar";
 import type { Drawing, DrawingTool } from "../components/drawings";
 import { levelsToDrawings, loadDrawings, saveDrawings } from "../components/drawingsStore";
@@ -255,6 +256,35 @@ export default function TradingPage({
     // BTC fallback.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [market, settings?.last_symbol]);
+
+  /* ------------------------------------------- 图上标注（成交/持仓） */
+  /** 当前交易对的价格小数位：交易所给几位就显示几位，和下单页一致。 */
+  const pricePrecision = useMemo(
+    () => symbols.find((item) => item.symbol === symbol)?.price_precision ?? 2,
+    [symbols, symbol],
+  );
+
+  /** 成交买卖点：账本里属于当前交易对的成交，标到对应的 K 线上。
+   * 只取最近 60 笔，免得几百个箭头糊满整张图。 */
+  const chartMarkers = useMemo(() => {
+    const trades = account?.trades ?? [];
+    return trades
+      .filter((trade) => trade.symbol === symbol && trade.timestamp > 0)
+      .slice(-60)
+      .map((trade) => ({
+        time: trade.timestamp,
+        side: trade.side === "buy" ? ("buy" as const) : ("sell" as const),
+        label: (trade.side === "buy" ? "买 " : "卖 ") + fmtCompact(trade.amount),
+      }));
+  }, [account?.trades, symbol]);
+
+  /** 当前交易对的持仓均价，画一条虚线标在图上。 */
+  const entryPrice = useMemo(() => {
+    const held = (account?.positions ?? []).find(
+      (item) => item.symbol === symbol && Math.abs(item.contracts) > 0,
+    );
+    return held?.entry_price ?? null;
+  }, [account?.positions, symbol]);
 
   /* ------------------------------------------------------------ klines */
   const loadKlines = useCallback(async () => {
@@ -750,7 +780,7 @@ export default function TradingPage({
                 价格与币安存在价差，下单仍走币安）
               </div>
             )}
-            <Chart
+            <TradingViewChart
               candles={candles}
               seriesKey={`${market}:${symbol}`}
               dataKey={`${market}:${symbol}:${candlesFor || timeframe}`}
@@ -768,6 +798,9 @@ export default function TradingPage({
               onSelect={setSelectedDrawing}
               onToolDone={() => setDrawingTool("select")}
               drawingsVisible={drawingsVisible}
+              markers={chartMarkers}
+              entryPrice={entryPrice}
+              pricePrecision={pricePrecision}
             />
           </div>
 
