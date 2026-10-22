@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import pandas as pd
@@ -17,9 +18,11 @@ from btrader.engine.ai_trader import (
     AIGuard,
     AITrader,
     AITraderConfig,
+    AuditLog,
     TradeBudget,
     TradeLease,
     parse_decision,
+    read_audit_rows,
     validate_decision,
 )
 
@@ -1075,3 +1078,114 @@ def test_start_goes_through_when_the_assistant_is_configured(tmp_path):
         assert trader.state == "running"
     finally:
         trader.stop()
+
+
+# ------------------------------------------- 审计 seq：整份文件单调、跨实例唯一
+def test_audit_seq_keeps_counting_across_instances(tmp_path):
+    """seq 是「这份审计文件」的序号，不是实例的序号。
+
+    轮询和「立即决策」各 new 一个 AITrader：以前每个实例都从 1 数，同一个文件里
+    三行全是 seq=1，按 seq 增量取就会漏掉后两行。
+    """
+    for _ in range(3):
+        trader, _llm, _trading, _risk = make_trader(tmp_path)
+        assert trader.decide_once()["outcome"] == "order"
+
+    rows = audit_rows(tmp_path / "audit.jsonl")
+    assert [row["seq"] for row in rows] == [1, 2, 3], [row.get("seq") for row in rows]
+
+
+def test_lifecycle_rows_carry_a_seq_too(tmp_path):
+    """起停这类行以前 seq 是 null：任何按 seq 增量取的地方都会永远跳过它们。"""
+    trader, _llm, _trading, _risk = make_trader(tmp_path, market_type="usdm")
+    ok, message = trader.start()
+    assert ok, message
+    trader.pause(True)
+    trader.pause(False)
+    trader.stop()
+
+    rows = audit_rows(tmp_path / "audit.jsonl")
+    # 起停那几行必须都有 seq；轮询线程可能顺手写一条 decision 行，不碍事。
+    lifecycle = [row for row in rows if row["kind"] == "lifecycle"]
+    assert [row["event"] for row in lifecycle] == ["start", "pause", "resume", "stop"], lifecycle
+    assert all(isinstance(row.get("seq"), int) for row in rows), [row.get("seq") for row in rows]
+    assert [row["seq"] for row in rows] == list(range(1, len(rows) + 1))
+
+
+def test_a_fresh_log_instance_continues_the_numbering(tmp_path, monkeypatch):
+    """重启后端 = 新进程：进程内计数器没了，得从文件里的最大号接着数。
+
+    页面可能带着上次的 since 来取，seq 倒退会让它永远看不到重启后的新行。
+    """
+    import btrader.engine.ai_trader as module
+
+    path = tmp_path / "audit.jsonl"
+    before = AuditLog(path)
+    assert before.append({"kind": "lifecycle", "event": "start"})["seq"] == 1
+    assert before.append({"kind": "lifecycle", "event": "stop"})["seq"] == 2
+
+    # 模拟重启：进程内的状态（锁和计数器）全部丢掉，只剩磁盘上那份文件。
+    monkeypatch.setattr(module, "_AUDIT_STATE", {})
+
+    after = AuditLog(path)
+    assert after.append({"kind": "lifecycle", "event": "start"})["seq"] == 3
+    assert [row["seq"] for row in audit_rows(path)] == [1, 2, 3]
+
+    # 没有文件时从 1 开始另外数一份。
+    fresh = AuditLog(tmp_path / "other.jsonl")
+    assert fresh.append({"kind": "decision"})["seq"] == 1
+
+
+def test_legacy_rows_without_a_seq_do_not_send_the_counter_backwards(tmp_path):
+    """老文件里的 lifecycle 行没有 seq：接着数的时候不能被它们带回 1。"""
+    path = tmp_path / "audit.jsonl"
+    path.write_text(
+        '{"kind": "lifecycle", "event": "start"}\n'
+        '{"kind": "decision", "seq": 7}\n',
+        encoding="utf-8",
+    )
+
+    assert AuditLog(path).append({"kind": "decision"})["seq"] == 8
+
+
+def test_two_writers_at_once_never_repeat_a_seq_or_tear_a_line(tmp_path):
+    """两个实例同时写同一份文件：不能撞号，也不能把行切半。"""
+    path = tmp_path / "audit.jsonl"
+    logs = [AuditLog(path), AuditLog(path)]
+
+    def worker(writer: AuditLog, tag: str) -> None:
+        for index in range(25):
+            writer.append(
+                {"kind": "decision", "tag": tag, "index": index, "filler": "x" * 200}
+            )
+
+    threads = [
+        threading.Thread(target=worker, args=(writer, tag))
+        for writer in logs
+        for tag in ("a", "b")
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    rows = audit_rows(path)  # 有一行被切半，这里就会 json 解析失败
+    assert len(rows) == 100
+    assert [row["seq"] for row in rows] == list(range(1, 101))
+
+
+def test_read_audit_rows_filters_by_since(tmp_path):
+    """端点用这个读：since 之后的新行。老行没有 seq，只在 since=0 时算新行。"""
+    path = tmp_path / "audit.jsonl"
+    path.write_text(
+        '{"kind": "lifecycle", "event": "start"}\n'
+        '{"kind": "decision", "seq": 1}\n'
+        '{"kind": "decision", "seq": 2}\n',
+        encoding="utf-8",
+    )
+
+    assert [row.get("seq") for row in read_audit_rows(path)] == [None, 1, 2]
+    assert [row["seq"] for row in read_audit_rows(path, since=1)] == [2]
+    assert read_audit_rows(path, since=2) == []
+    assert len(read_audit_rows(path, limit=2)) == 2
+    assert read_audit_rows(tmp_path / "missing.jsonl") == []

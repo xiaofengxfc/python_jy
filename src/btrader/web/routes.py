@@ -33,7 +33,13 @@ from ..core.types import (
     timeframe_seconds,
 )
 from ..ai_pipeline import DEPTHS
-from ..engine.ai_trader import AITrader, AITraderConfig, TradeBudget, TradeLease
+from ..engine.ai_trader import (
+    AITrader,
+    AITraderConfig,
+    TradeBudget,
+    TradeLease,
+    read_audit_rows,
+)
 from ..engine.auto import AutoTrader, AutoTraderConfig
 from ..exchange import mirror
 from ..exchange.rest import PLATFORMS, SUPPORTED_PLATFORMS, BinanceREST
@@ -1570,20 +1576,16 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
         return {"ok": True, "ai_trader": result, "risk": ctx.trading.risk.snapshot()}
 
     @router.get("/api/ai/trader/audit")
-    def ai_trader_audit(limit: int = 100) -> dict[str, Any]:
+    def ai_trader_audit(limit: int = 100, since: int = 0) -> dict[str, Any]:
+        """审计记录。``since`` 是「只要 seq 大于它的行」，0 表示全量（页面一直这么取）。"""
         path = paths.logs_dir() / "ai-trade-audit.jsonl"
         if not path.exists():
             return {"items": []}
         count = max(1, min(limit, 500))
         rows: deque[dict[str, Any]] = deque(maxlen=count)
         try:
-            for line in path.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
-                try:
-                    rows.append(json.loads(line))
-                except ValueError:
-                    continue
+            for row in read_audit_rows(path, since=max(0, since), limit=count):
+                rows.append(row)
         except OSError as exc:
             raise HTTPException(status_code=500, detail=f"读取审计日志失败：{exc}") from exc
         return {"items": list(rows)}

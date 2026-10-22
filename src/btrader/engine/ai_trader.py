@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import threading
 import time
 import uuid
@@ -187,6 +188,152 @@ class TradeLease:
             if self._owner == owner:
                 self._owner = ""
 
+
+# ---------------------------------------------------------------- audit log
+class _AuditState:
+    """一份审计文件在进程内共享的状态：一把锁 + 数到哪儿了。
+
+    锁和计数器按「文件」放，不按「实例」放：轮询和「立即决策」各 new 一个
+    AITrader，两个实例一起写同一份文件时必须排同一队、数同一个号。
+    """
+
+    __slots__ = ("lock", "last")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.last: int | None = None
+
+
+_AUDIT_STATE: dict[str, _AuditState] = {}
+_AUDIT_STATE_GUARD = threading.Lock()
+
+
+def _audit_state(path: Path) -> _AuditState:
+    key = str(Path(path).resolve()).lower()
+    with _AUDIT_STATE_GUARD:
+        state = _AUDIT_STATE.get(key)
+        if state is None:
+            state = _AuditState()
+            _AUDIT_STATE[key] = state
+        return state
+
+
+def _last_seq_in(path: Path) -> int:
+    """文件里最大的 seq；没有就是 0。只读尾部——文件是追加写的，最大号在最后。"""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return 0
+    if size <= 0:
+        return 0
+    chunk = 64 * 1024
+    try:
+        with path.open("rb") as handle:
+            if size > chunk:
+                handle.seek(size - chunk)
+            text = handle.read().decode("utf-8", errors="ignore")
+    except OSError:
+        return 0
+    best = 0
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue  # 尾部半行、老坏行：都跳过
+        if not isinstance(row, dict):
+            continue
+        try:
+            value = int(row.get("seq") or 0)
+        except (TypeError, ValueError):
+            continue
+        best = max(best, value)
+    return best
+
+
+class AuditLog:
+    """一份共享审计文件的写入器：seq 在这份文件里单调，跨实例不重号。
+
+    以前 seq 是实例内自增（每个新建的 AITrader 从 1 开始数），于是同一个文件里
+    decision 行全是 1、lifecycle 行干脆没有 seq。页面固定 since=0 全量取看不出
+    问题，但任何按 seq 增量取的地方都会漏行。
+
+    重启后端 = 新进程：计数器第一次用到时从文件尾部读回最大号接着数，所以 seq
+    不会倒退——页面带着上次的 since 来取也不会漏掉重启后的新行。
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self._state = _audit_state(self.path)
+
+    @property
+    def last_seq(self) -> int:
+        with self._state.lock:
+            self._seed()
+            return int(self._state.last or 0)
+
+    def _seed(self) -> None:
+        if self._state.last is None:
+            self._state.last = _last_seq_in(self.path)
+
+    def append(self, record: dict[str, Any]) -> dict[str, Any]:
+        """补一个 seq 并整行写下去，返回真正写出去的那行。"""
+        with self._state.lock:
+            self._seed()
+            self._state.last = int(self._state.last or 0) + 1
+            row = dict(record)
+            row["seq"] = self._state.last
+            line = json.dumps(row, ensure_ascii=False) + "\n"
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                # 一次 os.write 落一整行：O_APPEND 加上单次写，别的线程插不进
+                # 半行。用 open("a") 的缓冲写，一行可能分两次落盘，读的人会
+                # 看到半行（那一行 JSON 就废了，整张事件表跟着解析失败）。
+                handle = os.open(
+                    self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644
+                )
+                try:
+                    os.write(handle, line.encode("utf-8"))
+                finally:
+                    os.close(handle)
+            except OSError:  # pragma: no cover - 磁盘满等
+                log.warning("写入 AI 交易审计失败", exc_info=True)
+            return row
+
+
+def read_audit_rows(
+    path: Path, *, since: int = 0, limit: int = 100
+) -> list[dict[str, Any]]:
+    """读审计文件：seq > since 的最后 limit 行。
+
+    ``since=0`` 就是「全都要」——页面一直这么取，行为不变。老版本写的行没有
+    seq（lifecycle 行），它们只在 since=0 时算新行；否则按 seq 增量取的人会
+    永远重复拿到同一批老行。
+    """
+    target = Path(path)
+    if not target.exists():
+        return []
+    count = max(1, int(limit))
+    rows: deque[dict[str, Any]] = deque(maxlen=count)
+    with target.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue  # 坏行跳过，不毁整张表
+            if not isinstance(row, dict):
+                continue
+            try:
+                seq = int(row.get("seq") or 0)
+            except (TypeError, ValueError):
+                seq = 0
+            if since > 0 and seq <= since:
+                continue
+            rows.append(row)
+    return list(rows)
 
 # ------------------------------------------------------------------ parsing
 def parse_decision(text: str, *, now: float | None = None) -> tuple[AIDecision | None, str]:
@@ -397,6 +544,8 @@ class AITrader:
         self.news_provider = news_provider
         self._last_signal: float | None = None
         self.audit_path = audit_path or (paths.logs_dir() / "ai-trade-audit.jsonl")
+        # seq 归这份文件所有，不归实例：见 AuditLog 的说明。
+        self._audit_log = AuditLog(self.audit_path)
         self.clock = clock
         self.lease = lease or TradeLease()
         # 计数要和别的实例共用：「立即决策」每点一次就是一个新实例（B2）。控制器给
@@ -898,7 +1047,6 @@ class AITrader:
         order: OrderResult | None = None,
         trace: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        self._seq += 1
         order_row = None
         if order is not None:
             try:
@@ -907,7 +1055,6 @@ class AITrader:
                 order_row = None
         record = {
             "at": now,
-            "seq": self._seq,
             "kind": "decision",
             "outcome": outcome,
             "reason": reason,
@@ -933,20 +1080,22 @@ class AITrader:
             key: (None if isinstance(value, float) and not math.isfinite(value) else value)
             for key, value in record.items()
         }
-        self.last_decision = record
+        # seq 在落盘那一下才发出来（跨实例单调），事件流里拿的是写出去的那一行。
+        written = self._audit(record)
+        self.last_decision = written
         with self._lock:
-            self._events.append(record)
-        self._audit(record)
-        return record
+            self._events.append(written)
+        return written
 
-    def _audit(self, record: dict[str, Any]) -> None:
-        """每笔决策或状态变更追加一行。写失败绝不能打断交易（INV-15）。"""
-        try:
-            self.audit_path.parent.mkdir(parents=True, exist_ok=True)
-            with self.audit_path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-        except Exception:  # pragma: no cover - disk full etc.
-            log.warning("写入 AI 交易审计失败", exc_info=True)
+    def _audit(self, record: dict[str, Any]) -> dict[str, Any]:
+        """每笔决策或状态变更追加一行，返回补好 seq 的那行。
+
+        写失败绝不能打断交易（INV-15）：seq 已经发出去，缺的那行就是缺了，
+        但交易照走。
+        """
+        written = self._audit_log.append(record)
+        self._seq = max(self._seq, int(written.get("seq") or 0))
+        return written
 
     def status(self, since: int = 0) -> dict[str, Any]:
         now = self.clock()
