@@ -72,7 +72,9 @@ class AutoTrader:
         self._current_target = 0.0
         self._last_candle_ts = 0
         self._position_quote = 0.0
-        self._equity = 10_000.0
+        # Unknown until the venue answers. A made-up starting figure would size
+        # the first order against money the account may not have.
+        self._equity: float | None = None
 
         self._listener_lock = threading.RLock()
         self._log_listeners: list[LogListener] = []
@@ -218,16 +220,23 @@ class AutoTrader:
                 # Coin-M wallets hold the margin coin (BTC for BTCUSD), so the
                 # wallet balance has to be marked to USD before sizing.
                 asset = spec.settle or spec.base or "BTC"
-                self._equity = float(totals.get(asset) or 0.0) * price
+                value = totals.get(asset)
+                self._equity = None if value is None else float(value) * price
             else:
-                self._equity = float(totals.get("USDT") or 0.0)
+                value = totals.get("USDT")
+                # A wallet shape without the key is not a 0 balance: sizing 0
+                # would sell a position the engine never meant to touch.
+                self._equity = None if value is None else float(value)
         except Exception:
             pass
 
     def _rebalance(self, target: float, price: float) -> None:
-        if price <= 0:
+        equity = self._equity
+        if price <= 0 or equity is None:
+            # Never read the wallet yet: sizing an order against an assumed
+            # balance is the same mistake as assuming a flat position.
             return
-        notional = self._equity * self.config.position_pct * self.config.leverage
+        notional = equity * self.config.position_pct * self.config.leverage
         # ``desired_qty`` is always expressed in base coins; TradingService
         # converts it to contracts for coin-margined markets.
         desired_qty = target * notional / price
@@ -243,7 +252,11 @@ class AutoTrader:
             return
 
         side = "buy" if delta > 0 else "sell"
-        reduce_only = abs(desired_qty) < abs(current_qty) and (desired_qty == 0 or desired_qty * current_qty < 0)
+        # Only a move to flat is a pure reduction. A flip (long -> short) also
+        # has to open the other side: marking it reduce-only makes the venue
+        # drop that half — or reject the whole order — and the target was
+        # already recorded as reached, so the engine never retries it.
+        reduce_only = desired_qty == 0 and abs(current_qty) > 1e-12
         request = OrderRequest(
             symbol=self.config.symbol,
             side=side,

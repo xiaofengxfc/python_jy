@@ -279,9 +279,12 @@ class AccountService:
         snap.trades = self._recent_trades()
         # Only a whole-wallet read may set the reference point: a pair read
         # prices one coin and would freeze a partial equity as "the start".
+        # A read that already reported an error is just as partial — the
+        # positions it failed to fetch are missing from that equity — so it
+        # inherits too instead of freezing it.
         snap.baseline = (
             self._baseline(market, snap.equity)
-            if symbol is None
+            if symbol is None and not snap.error
             else self._stored_baseline(market)
         )
         return snap

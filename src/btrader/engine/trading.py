@@ -345,7 +345,14 @@ class TradingService:
             )
         quote = abs(base_qty) * price
         self.risk.record_order()
-        self.db.save_order(self._account_id(), req.market_type.value, order, RunMode.LIVE.value)
+        try:
+            self.db.save_order(
+                self._account_id(), req.market_type.value, order, RunMode.LIVE.value
+            )
+        except Exception:
+            # The order is already at the venue. Reporting a history write
+            # failure as a failed order invites a retry and a second position.
+            log.warning("订单写库失败", exc_info=True)
 
         protection: list[dict] = []
         warnings: list[str] = []
@@ -391,6 +398,16 @@ class TradingService:
             return [], ["挂单尚未成交，成交后可再次设置止损/止盈。"]
 
         exit_side = "sell" if req.side == OrderSide.BUY.value else "buy"
+        # Size the guard by what actually filled. A stop larger than the
+        # position is rejected by the venue as reduce-only, which left the
+        # filled part unprotected while the entry itself looked successful.
+        size = exchange_amount
+        try:
+            filled = float(order.get("filled") or 0.0)
+        except (TypeError, ValueError):
+            filled = 0.0
+        if 0 < filled < exchange_amount:
+            size = filled
         placed: list[dict] = []
         warnings: list[str] = []
         for price, take_profit, label in (
@@ -403,13 +420,13 @@ class TradingService:
                 if take_profit:
                     placed.append(
                         self.rest.create_take_profit_market(
-                            req.market_type, req.symbol, exit_side, exchange_amount, price
+                            req.market_type, req.symbol, exit_side, size, price
                         )
                     )
                 else:
                     placed.append(
                         self.rest.create_stop_market(
-                            req.market_type, req.symbol, exit_side, exchange_amount, price
+                            req.market_type, req.symbol, exit_side, size, price
                         )
                     )
             except ExchangeError as exc:
@@ -773,11 +790,17 @@ class TradingService:
             books.pop(symbol, None)
         elif old == 0 or (old > 0) != (new > 0):
             books[symbol] = {"contracts": new, "entry": price}
-        else:
+        elif (old > 0) == (signed > 0):
+            # A fill that adds to the leg re-averages its cost.
             books[symbol] = {
                 "contracts": new,
                 "entry": (entry * old + price * signed) / new,
             }
+        else:
+            # A fill that only reduces the leg leaves the cost of what is still
+            # held alone. Re-averaging it with the exit price shrank the basis,
+            # so the next exit reported a profit that never happened.
+            books[symbol] = {"contracts": new, "entry": entry}
 
         if closed <= 0:
             return None

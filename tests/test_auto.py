@@ -211,3 +211,115 @@ def test_live_entry_refused_when_position_unknown(tmp_path):
         assert venue.fills == []
     finally:
         db.close()
+
+def test_auto_flip_to_short_is_not_marked_reduce_only(service):
+    """A long->short flip has to open the short half.
+
+    Marking the whole flip reduce-only makes the venue drop (or reject) that
+    half while _current_target already says short, so the engine sits flat and
+    never retries the position it believes it holds.
+    """
+    trading, venue = service
+    symbol = "BTC/USDT:USDT"
+    trader = _trader(trading, MarketType.USDM, 1.0, symbol=symbol)
+    trader._tick()
+    assert venue.position_base(symbol) > 0
+
+    trader.strategy = FixedTarget(-0.5)
+    trader._last_candle_ts = 0  # force re-evaluation
+    trader._tick()
+
+    assert not venue.fills[-1]["info"].get("reduceOnly"), "翻转不是减仓"
+    assert venue.position_base(symbol) < 0
+
+
+class NoBalanceVenue(FakeVenue):
+    """Wallet reads fail while the position endpoint still answers."""
+
+    def fetch_balance(self, market_type):
+        raise RuntimeError("network down")
+
+
+def test_auto_never_sizes_an_order_against_an_unknown_equity(tmp_path):
+    """A failed wallet read used to fall back to a hardcoded 10,000."""
+    settings = _settings()
+    venue = NoBalanceVenue()
+    db = Database(tmp_path / "nobalance.db")
+    try:
+        trading = TradingService(settings, venue, RiskManager(settings.risk), db)
+        trader = _trader(trading, MarketType.USDM, 1.0, symbol="BTC/USDT:USDT")
+        trader._tick()
+        assert trader._equity is None
+        assert venue.fills == [], "权益未知时不能按假余额下单"
+    finally:
+        db.close()
+
+
+class HalfFilledVenue(FakeVenue):
+    """Answers a market order with a half fill, as a thin book does."""
+
+    def create_order(
+        self, market, symbol, order_type, side, amount, price=None, params=None
+    ):
+        order = super().create_order(
+            market, symbol, order_type, side, amount, price, params
+        )
+        order["filled"] = amount / 2.0
+        order["status"] = "partially_filled"
+        return order
+
+
+def test_stop_covers_the_filled_size_not_the_requested_one(tmp_path):
+    """A reduce-only stop larger than the position is rejected by the venue.
+
+    That left the filled half unprotected and the entry looking successful.
+    """
+    settings = _settings()
+    venue = HalfFilledVenue()
+    db = Database(tmp_path / "partial.db")
+    try:
+        trading = TradingService(settings, venue, RiskManager(settings.risk), db)
+        result = trading.submit(
+            OrderRequest(
+                symbol="BTC/USDT:USDT",
+                side="buy",
+                order_type="market",
+                amount=1.0,
+                price=100.0,
+                market_type=MarketType.USDM,
+                stop_loss=95.0,
+            )
+        )
+        assert result.order["filled"] == pytest.approx(0.5)
+        kind, _symbol, side, size, trigger = venue.stop_orders[0]
+        assert (kind, side, trigger) == ("stop", "sell", 95.0)
+        assert size == pytest.approx(0.5)
+    finally:
+        db.close()
+
+
+def test_history_write_failure_is_not_reported_as_a_failed_order(tmp_path):
+    """The order is already at the venue; a raised error invites a second one."""
+    class BrokenHistory(Database):
+        def save_order(self, *args, **kwargs):
+            raise RuntimeError("disk full")
+
+    settings = _settings()
+    venue = FakeVenue()
+    db = BrokenHistory(tmp_path / "broken.db")
+    try:
+        trading = TradingService(settings, venue, RiskManager(settings.risk), db)
+        result = trading.submit(
+            OrderRequest(
+                symbol="BTC/USDT",
+                side="buy",
+                order_type="market",
+                amount=1.0,
+                price=100.0,
+                market_type=MarketType.SPOT,
+            )
+        )
+        assert result.order.get("status") == "closed"
+        assert venue.position_base("BTC/USDT") == pytest.approx(1.0)
+    finally:
+        db.close()

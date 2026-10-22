@@ -227,3 +227,35 @@ def test_daily_loss_breaker_is_announced_without_a_halt_reason(tmp_path):
     assert service.risk.state.halted_reason == ""
     assert notifier.sent.count("risk") == 1
     db.close()
+
+
+def test_partial_exits_keep_the_average_cost_of_the_open_leg(tmp_path):
+    """Two half exits must book the same result as one full exit.
+
+    Re-averaging the basis with the exit price shrank the cost of the coins
+    still held, so the second exit reported a profit nobody earned and the
+    daily-loss breaker was fed a number that never existed.
+    """
+    from btrader.core.types import MarketType
+
+    rest = FakeREST(
+        {
+            "BTC/USDT": [
+                _trade("1", "buy", 1.0, 100.0),
+                _trade("2", "buy", 1.0, 120.0),
+                _trade("3", "sell", 0.5, 130.0),
+                _trade("4", "sell", 0.5, 130.0),
+            ]
+        }
+    )
+    service, db = _service(tmp_path, rest)
+    booked = service.sync_live_fills([MarketType.SPOT])
+
+    assert [item["realized"] for item in booked] == pytest.approx([10.0, 10.0])
+    # average entry 110 -> the whole 2.0 closed at 130 is +20, not +23.33
+    assert service.risk.state.realized_pnl == pytest.approx(20.0)
+    # The half still open keeps its 110 cost: reducing a leg never re-prices it.
+    book = service._live_ledger()["books"]["BTC/USDT"]
+    assert book["contracts"] == pytest.approx(1.0)
+    assert book["entry"] == pytest.approx(110.0)
+    db.close()

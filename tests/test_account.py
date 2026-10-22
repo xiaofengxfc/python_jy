@@ -223,3 +223,36 @@ def test_spot_holdings_are_priced_and_counted_in_equity(tmp_path):
         assert snap.equity == pytest.approx(1_050.0)
     finally:
         db.close()
+
+def test_wallet_read_without_positions_does_not_freeze_the_baseline(tmp_path):
+    """The reference point must come from a complete read.
+
+    A read that already failed to fetch the positions prices only the cash, so
+    writing that figure as 起始资金 leaves 总盈亏 permanently showing a profit
+    that was already in the account before the first order.
+    """
+
+    class BlindPositions(FakeVenue):
+        broken = True
+
+        def fetch_positions(self, market_type, symbols=None):
+            if self.broken:
+                raise RuntimeError("positions endpoint down")
+            return super().fetch_positions(market_type, symbols)
+
+    venue = BlindPositions()
+    venue.create_order(MarketType.USDM, "BTC/USDT:USDT", "market", "buy", 1.0, 100.0)
+    venue._last["BTC/USDT:USDT"] = 200.0  # +100 unrealized
+    service, db = _service(tmp_path, venue)
+    try:
+        degraded = service._load(MarketType.USDM, None)
+        assert degraded.error
+        assert degraded.baseline == 0.0
+        assert service._stored_baseline(MarketType.USDM) == 0.0
+
+        venue.broken = False
+        full = service.snapshot(MarketType.USDM, refresh=True)
+        assert full.equity == pytest.approx(10_100.0)
+        assert full.baseline == pytest.approx(10_100.0)
+    finally:
+        db.close()
