@@ -9,9 +9,8 @@ from btrader.core.config import AppSettings, RiskSettings
 from btrader.core.contracts import ContractSpec
 from btrader.core.credentials import Credentials
 from btrader.core.storage import Database
-from btrader.core.types import MarketType, Network, RunMode
+from btrader.core.types import MarketType, Network
 from btrader.engine.auto import AutoTrader, AutoTraderConfig
-from btrader.engine.paper import PaperBroker
 from btrader.engine.risk import RiskManager
 from btrader.engine.trading import OrderRejected, OrderRequest, TradingService
 from btrader.exchange.rest import BinanceREST
@@ -80,6 +79,15 @@ class InverseStubREST(BinanceREST):
         # "unknown", which now refuses new entries.
         return []
 
+    def fetch_balance(self, market_type):
+        # Coin-M wallet: 0.2 BTC is 10,000 USD at the 50,000 price these tests
+        # use, which is what the position sizing multiplies.
+        if market_type is MarketType.COINM:
+            total = {"BTC": 0.2}
+        else:
+            total = {"USDT": 10_000.0}
+        return {"free": dict(total), "used": {}, "total": total, "info": {}}
+
 
 class FixedTarget(Strategy):
     key = "fixed"
@@ -117,15 +125,14 @@ def service(tmp_path):
         )
     )
     rest = InverseStubREST(Network.MAINNET, Credentials("test-key", "test-secret"))
-    paper = PaperBroker(starting_balance=10_000, fee_rate=0.0, slippage_bps=0.0)
     risk = RiskManager(settings.risk)
     db = Database(tmp_path / "coinm.db")
-    yield TradingService(settings, rest, risk, paper, db), paper, rest
+    yield TradingService(settings, rest, risk, db), rest
     db.close()
 
 
 def test_exchange_amount_converts_base_to_contracts(service):
-    trading, _, _ = service
+    trading, _rest = service
     # 0.05 BTC at 50,000 USD = 2,500 USD = 25 contracts of 100 USD
     exchange_amount, base_qty = trading.exchange_amount(
         MarketType.COINM, "BTC/USD:BTC", 0.05, 50_000.0
@@ -135,7 +142,7 @@ def test_exchange_amount_converts_base_to_contracts(service):
 
 
 def test_exchange_amount_rounds_to_whole_contracts(service):
-    trading, _, _ = service
+    trading, _rest = service
     # 0.0123 BTC at 50,000 USD = 615 USD -> 6.15 contracts -> 6 contracts
     exchange_amount, base_qty = trading.exchange_amount(
         MarketType.COINM, "BTC/USD:BTC", 0.0123, 50_000.0
@@ -145,7 +152,7 @@ def test_exchange_amount_rounds_to_whole_contracts(service):
 
 
 def test_submit_rejects_dust_below_one_contract(service):
-    trading, _, _ = service
+    trading, _rest = service
     with pytest.raises(OrderRejected, match="最小下单量"):
         trading.submit(
             OrderRequest(
@@ -155,13 +162,13 @@ def test_submit_rejects_dust_below_one_contract(service):
                 amount=0.001,  # 50 USD < 100 USD contract
                 price=50_000.0,
                 market_type=MarketType.COINM,
-                mode=RunMode.PAPER,
             )
         )
 
 
-def test_paper_position_is_in_base_coins(service):
-    trading, paper, _ = service
+def test_order_size_is_reported_in_base_coins(service):
+    """The panel speaks base coins even though the venue takes contracts."""
+    trading, rest = service
     result = trading.submit(
         OrderRequest(
             symbol="BTC/USD:BTC",
@@ -170,18 +177,16 @@ def test_paper_position_is_in_base_coins(service):
             amount=0.05,
             price=50_000.0,
             market_type=MarketType.COINM,
-            mode=RunMode.PAPER,
         )
     )
     assert result.amount_exchange == 25.0
     assert result.amount_base == pytest.approx(0.05)
-    position = paper.account.position_for("BTC/USD:BTC")
-    assert position.contracts == pytest.approx(0.05)
     assert result.quote_notional == pytest.approx(2_500.0)
+    assert rest.created[0][3] == 25.0
 
 
 def test_live_submit_sends_contracts_to_exchange(service):
-    trading, _, rest = service
+    trading, rest = service
     result = trading.submit(
         OrderRequest(
             symbol="BTC/USD:BTC",
@@ -190,7 +195,6 @@ def test_live_submit_sends_contracts_to_exchange(service):
             amount=0.05,
             price=50_000.0,
             market_type=MarketType.COINM,
-            mode=RunMode.LIVE,
         )
     )
     assert rest.created, "order never reached the exchange"
@@ -202,7 +206,7 @@ def test_live_submit_sends_contracts_to_exchange(service):
 
 def test_live_entry_arms_venue_side_stop_and_target(service):
     """A live position must be protected at the venue, not only in the app."""
-    trading, _, rest = service
+    trading, rest = service
     result = trading.submit(
         OrderRequest(
             symbol="BTC/USD:BTC",
@@ -213,7 +217,6 @@ def test_live_entry_arms_venue_side_stop_and_target(service):
             stop_loss=55_000.0,
             take_profit=45_000.0,
             market_type=MarketType.COINM,
-            mode=RunMode.LIVE,
         )
     )
     assert [item[0] for item in rest.protection] == ["stop", "target"]
@@ -230,7 +233,7 @@ def test_live_entry_arms_venue_side_stop_and_target(service):
 
 def test_live_exit_cancels_resting_orders_first(service):
     """A leftover reduceOnly stop would otherwise flip the position."""
-    trading, _, rest = service
+    trading, rest = service
     trading.submit(
         OrderRequest(
             symbol="BTC/USD:BTC",
@@ -240,7 +243,6 @@ def test_live_exit_cancels_resting_orders_first(service):
             price=50_000.0,
             reduce_only=True,
             market_type=MarketType.COINM,
-            mode=RunMode.LIVE,
         )
     )
     assert rest.canceled_symbols == [(MarketType.COINM, "BTC/USD:BTC")]
@@ -249,7 +251,7 @@ def test_live_exit_cancels_resting_orders_first(service):
 
 def test_failed_protection_is_reported_not_swallowed(service):
     """The entry already filled; a rejected stop must surface as a warning."""
-    trading, _, rest = service
+    trading, rest = service
     rest.fail_stop = True
     result = trading.submit(
         OrderRequest(
@@ -261,7 +263,6 @@ def test_failed_protection_is_reported_not_swallowed(service):
             stop_loss=45_000.0,
             take_profit=55_000.0,
             market_type=MarketType.COINM,
-            mode=RunMode.LIVE,
         )
     )
     assert result.order["id"] == "live-1"
@@ -271,7 +272,7 @@ def test_failed_protection_is_reported_not_swallowed(service):
 
 def test_live_entry_pushes_leverage_before_ordering(service):
     """The venue sizes with its own leverage; the panel's choice must reach it."""
-    trading, _, rest = service
+    trading, rest = service
     trading.submit(
         OrderRequest(
             symbol="BTC/USD:BTC",
@@ -281,7 +282,6 @@ def test_live_entry_pushes_leverage_before_ordering(service):
             price=50_000.0,
             leverage=5.0,
             market_type=MarketType.COINM,
-            mode=RunMode.LIVE,
         )
     )
     assert rest.leverage_calls == [("BTC/USD:BTC", 5.0, MarketType.COINM)]
@@ -295,7 +295,6 @@ def test_live_entry_pushes_leverage_before_ordering(service):
             price=50_000.0,
             leverage=5.0,
             market_type=MarketType.COINM,
-            mode=RunMode.LIVE,
         )
     )
     assert len(rest.leverage_calls) == 1
@@ -303,7 +302,7 @@ def test_live_entry_pushes_leverage_before_ordering(service):
 
 def test_reduce_only_exit_skips_leverage(service):
     """A close must not be blocked by a leverage call that can fail."""
-    trading, _, rest = service
+    trading, rest = service
     trading.submit(
         OrderRequest(
             symbol="BTC/USD:BTC",
@@ -314,7 +313,6 @@ def test_reduce_only_exit_skips_leverage(service):
             leverage=7.0,
             reduce_only=True,
             market_type=MarketType.COINM,
-            mode=RunMode.LIVE,
         )
     )
     assert rest.leverage_calls == []
@@ -322,8 +320,11 @@ def test_reduce_only_exit_skips_leverage(service):
 
 
 def test_risk_limit_uses_usd_notional_for_inverse(service):
-    trading, _, rest = service
+    trading, rest = service
     trading.settings.risk.max_order_quote = 1_000.0
+    # The percentage rule scales with equity, so it would raise the cap to 25%
+    # of the wallet; disable it to measure the fixed ceiling in USD.
+    trading.settings.risk.max_order_pct = 0.0
     trading.risk.settings = trading.settings.risk
     with pytest.raises(OrderRejected, match="超过上限"):
         trading.submit(
@@ -334,21 +335,20 @@ def test_risk_limit_uses_usd_notional_for_inverse(service):
                 amount=0.05,  # 2,500 USD notional
                 price=50_000.0,
                 market_type=MarketType.COINM,
-                mode=RunMode.LIVE,
             )
         )
     assert not rest.created
 
 
-def test_auto_trader_rebalances_coinm_in_base_units(service):
-    trading, paper, _ = service
+def test_auto_trader_sizes_coinm_in_contracts(service):
+    """The runner speaks base coins; the venue must still receive contracts."""
+    trading, rest = service
     frame = make_candles(120, price=50_000.0, drift=0.0, volatility=0.0)
     trader = AutoTrader(
         AutoTraderConfig(
             symbol="BTC/USD:BTC",
             market_type=MarketType.COINM,
             timeframe="1h",
-            mode=RunMode.PAPER,
             position_pct=0.25,
             leverage=1.0,
         ),
@@ -357,9 +357,12 @@ def test_auto_trader_rebalances_coinm_in_base_units(service):
         StubKlines(frame),
     )
     trader._tick()
-    # 25% of 10,000 USD => 2,500 USD => 0.05 BTC => 25 contracts
-    position = paper.account.position_for("BTC/USD:BTC")
-    assert position.contracts == pytest.approx(0.05, rel=1e-6)
+    # 25% of the 0.2 BTC wallet (10,000 USD at 50,000) => 2,500 USD
+    # => 0.05 BTC => 25 contracts of 100 USD
+    assert rest.created, "the rebalance never reached the exchange"
+    symbol, order_type, side, amount, _price, _params = rest.created[0]
+    assert (symbol, order_type, side) == ("BTC/USD:BTC", "market", "buy")
+    assert amount == pytest.approx(25.0)
 
 
 class ZeroPrecisionStubREST(InverseStubREST):
@@ -378,8 +381,6 @@ def test_unrounded_amount_is_refused_not_degraded(tmp_path):
 
     Before the fix ccxt's "below minimum" error was swallowed and the raw base
     quantity was sent as if it were a contract count, inflating the order.
-    Live orders still round through the exchange; paper orders now round
-    locally, so this guard applies to the live path.
     """
     settings = AppSettings(
         risk=RiskSettings(
@@ -392,10 +393,9 @@ def test_unrounded_amount_is_refused_not_degraded(tmp_path):
         )
     )
     rest = ZeroPrecisionStubREST(Network.MAINNET, Credentials("test-key", "test-secret"))
-    paper = PaperBroker(starting_balance=10_000, fee_rate=0.0, slippage_bps=0.0)
     db = Database(tmp_path / "zero.db")
     try:
-        trading = TradingService(settings, rest, RiskManager(settings.risk), paper, db)
+        trading = TradingService(settings, rest, RiskManager(settings.risk), db)
         with pytest.raises(OrderRejected, match="最小下单单位"):
             trading.submit(
                 OrderRequest(
@@ -405,18 +405,16 @@ def test_unrounded_amount_is_refused_not_degraded(tmp_path):
                     amount=0.05,  # 25 contracts, clears the minimum
                     price=50_000.0,
                     market_type=MarketType.COINM,
-                    mode=RunMode.LIVE,
                 )
             )
         assert not rest.created
-        assert not paper.account.positions.get("BTC/USD:BTC")
     finally:
         db.close()
 
 
 def test_spot_minimum_is_enforced(service):
     """Spot must not accept an order under the exchange minimum either."""
-    trading, _, rest = service
+    trading, rest = service
     with pytest.raises(OrderRejected, match="最小下单量"):
         trading.submit(
             OrderRequest(
@@ -426,7 +424,6 @@ def test_spot_minimum_is_enforced(service):
                 amount=0.000001,  # below 0.00001 BTC
                 price=50_000.0,
                 market_type=MarketType.SPOT,
-                mode=RunMode.LIVE,
             )
         )
     assert not rest.created

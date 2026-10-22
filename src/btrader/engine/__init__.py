@@ -1,6 +1,6 @@
-"""Trading engine: risk management, paper broker and order execution."""
+"""Trading engine: risk management, account snapshots and order execution."""
 
-from .paper import PaperBroker, PaperAccount, PaperPosition
+from .account import AccountService, Snapshot, replay_ledger
 from .risk import RiskDecision, RiskManager
 from .trading import OrderRejected, OrderRequest, OrderResult, TradingService
 
@@ -8,9 +8,9 @@ __all__ = [
     "OrderRejected",
     "OrderRequest",
     "OrderResult",
-    "PaperAccount",
-    "PaperBroker",
-    "PaperPosition",
+    "AccountService",
+    "Snapshot",
+    "replay_ledger",
     "RiskDecision",
     "RiskManager",
     "TradingService",

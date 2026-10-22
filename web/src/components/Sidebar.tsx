@@ -148,7 +148,7 @@ export default function Sidebar({
 
         <span
           className={`tip ${connected ? "dot live" : "dot"}`}
-          data-tip={`${connected ? "行情已连接" : "行情重连中"}\n${netLabel} · ${marketLabel}\n纸面 ${equityText} USDT`}
+          data-tip={`${connected ? "行情已连接" : "行情重连中"}\n${netLabel} · ${marketLabel}\n权益 ${equityText}`}
         />
       </div>
     </aside>

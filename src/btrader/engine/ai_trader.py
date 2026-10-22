@@ -3,12 +3,13 @@
 设计依据：``docs/ai-autonomy-plan.md`` §5.2/§5.4/§5.5/§5.6/§5.9。
 
 这个模块只做三件事：**决策 → 闸门 → 经 TradingService 下单**。它不直接
-import 交易所、纸面 broker 或数据库；唯一下单出口是注入的
-``TradingService.submit()``（INV-1）。风控的权威仍然是 ``RiskManager``，
-本模块的 ``AIGuard`` 只是在其前面再加一层 AI 专属的收紧（INV-2）。
+import 交易所或数据库；唯一下单出口是注入的 ``TradingService.submit()``
+（INV-1）。风控的权威仍然是 ``RiskManager``，本模块的 ``AIGuard`` 只是在其
+前面再加一层 AI 专属的收紧（INV-2）。
 
-默认构造即停止、纸面模式；实盘必须同时满足
-``live_enabled + confirm_live + mainnet + 未急停``（INV-9）。
+默认构造即停止；真下单必须同时满足
+``live_enabled + confirm_live + 未急停``（INV-9）。测试网与主网走同一条
+路径，区别只是 ``network`` 指向哪一个——练习不该需要另一套代码。
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .. import ai, paths
-from ..core.types import MarketType, OrderSide, OrderType, RunMode
+from ..core.types import MarketType, OrderSide, OrderType
 from .trading import OrderRequest, OrderResult
 
 log = logging.getLogger(__name__)
@@ -79,7 +80,6 @@ class AITraderConfig:
     """一份自包含的运行配置；实盘开关默认关闭。"""
 
     enabled: bool = False
-    mode: str = RunMode.PAPER.value
     live_enabled: bool = False
     confirm_live: bool = False
     network: str = "mainnet"
@@ -312,15 +312,14 @@ class AITrader:
         c = self.config
         if not c.enabled:
             return False, "AI 交易未启用"
-        if c.mode == RunMode.LIVE.value:
-            if not c.live_enabled:
-                return False, "实盘未显式开启"
-            if not c.confirm_live:
-                return False, "实盘缺少二次确认"
-            if c.network != "mainnet":
-                return False, "实盘必须使用主网"
-            if c.market_type == MarketType.SPOT.value and c.require_stop:
-                return False, "现货实盘无法挂交易所侧止损，请使用合约或关闭止损要求"
+        if not c.live_enabled:
+            return False, "真下单未显式开启（live_enabled）"
+        # The testnet has fake money: rehearsing must not cost an extra click.
+        if c.network == "mainnet" and not c.confirm_live:
+            return False, "缺少二次确认"
+        if c.market_type == MarketType.SPOT.value and c.require_stop:
+            # 现货没有交易所侧止损，只有合约能挂 reduce-only 保护单。
+            return False, "现货无法挂交易所侧止损，请使用合约或关闭止损要求"
         if self._thread is not None and self._thread.is_alive():
             # 上一轮还在退出（卡在模型调用）。此时清 _stop_event 会让它复活，
             # 变成两个 poller 同时决策。
@@ -335,7 +334,9 @@ class AITrader:
             self._state = STATE_RUNNING
             self._paused = False
             self._stop_event.clear()
-        self._audit({"kind": "lifecycle", "event": "start", "mode": c.mode})
+        self._audit(
+            {"kind": "lifecycle", "event": "start", "network": c.network}
+        )
         self._thread = threading.Thread(target=self._loop, name="ai-trader", daemon=True)
         self._thread.start()
         return True, "AI 交易已启动"
@@ -546,7 +547,6 @@ class AITrader:
             reduce_only=reduce_only,
             leverage=c.leverage,
             market_type=MarketType(c.market_type),
-            mode=RunMode(c.mode),
             stop_loss=decision.stop_loss,
             take_profit=decision.take_profit,
         )
@@ -631,7 +631,7 @@ class AITrader:
             "stop_loss": decision.stop_loss if decision else None,
             "rationale": decision.rationale if decision else "",
             "order_id": (order_row or {}).get("id") if isinstance(order_row, dict) else None,
-            "mode": self.config.mode,
+            "network": self.config.network,
             "state": self.state,
         }
         self.last_decision = record
@@ -658,7 +658,7 @@ class AITrader:
             "paused": self._paused,
             "halted_reason": self._halted_reason,
             "config": {
-                "mode": self.config.mode,
+                "network": self.config.network,
                 "symbol": self.config.symbol,
                 "strategy": self.config.strategy_key,
                 "market_type": self.config.market_type,

@@ -191,6 +191,24 @@ class Database:
             "SELECT * FROM orders ORDER BY created_at DESC LIMIT ?", (limit,)
         )
 
+    def recent_trades(
+        self, limit: int = 100, *, mode: str | None = None
+    ) -> list[sqlite3.Row]:
+        """Stored fills, newest first.
+
+        The mode filter picks the account a fill came from: the venue ledger
+        ("live") is what the app shows now, while rows left over from the
+        removed paper account stay readable for comparison.
+        """
+        if mode:
+            return self.query(
+                "SELECT * FROM trades WHERE mode = ? ORDER BY timestamp DESC LIMIT ?",
+                (mode, limit),
+            )
+        return self.query(
+            "SELECT * FROM trades ORDER BY timestamp DESC LIMIT ?", (limit,)
+        )
+
     def recent_backtests(self, limit: int = 50) -> list[sqlite3.Row]:
         return self.query(
             "SELECT * FROM backtest_runs ORDER BY created_at DESC LIMIT ?", (limit,)

@@ -1,8 +1,8 @@
 """Strategy plugin API.
 
 A strategy is a plain Python class that turns a candle DataFrame into a target
-position column. The same ``generate`` call is used by the backtester, the paper
-trader and live trading, so signals stay consistent across modes.
+position column. The same ``generate`` call is used by the backtester and by
+live trading, so signals stay consistent across modes.
 
 Example::
 

@@ -25,3 +25,7 @@ dist-electron/
 
 # Screenshots
 .shotz/
+
+# 本地工具与计划文件（Agent 工作区，不入库）
+.dsh/
+.zcf/

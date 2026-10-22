@@ -1,9 +1,10 @@
-"""Live fill backfill: exchange trades must reach the risk manager once.
+"""Fill backfill: exchange trades must reach the risk manager once.
 
-The daily-loss and losing-streak breakers were paper-only because nothing ever
-fed live exits into ``RiskManager``. These tests pin down the replacement path:
-the cost book derives a closing PnL from spot fills, and the persisted ledger
-keeps repeated polling (and a restart) from charging the same exit twice.
+The daily-loss and losing-streak breakers can only see an exit that is reported
+to them, and a venue-side stop is never seen by the submitting process. These
+tests pin down that path: the cost book derives a closing PnL from the fills,
+and the persisted ledger keeps repeated polling (and a restart) from charging
+the same exit twice.
 """
 
 from __future__ import annotations
@@ -13,7 +14,6 @@ import pytest
 from btrader.core.config import AppSettings, RiskSettings
 from btrader.core.storage import Database
 from btrader.core.types import MarketType
-from btrader.engine.paper import PaperBroker
 from btrader.engine.risk import RiskManager
 from btrader.engine.trading import TradingService
 from btrader.notify import NotifySettings, WeChatNotifier
@@ -45,7 +45,6 @@ def _service(tmp_path, rest: FakeREST, db: Database | None = None) -> tuple[Trad
         settings,
         rest,
         RiskManager(settings.risk),
-        PaperBroker(starting_balance=1_000),
         db,
     )
     return service, db
@@ -227,82 +226,4 @@ def test_daily_loss_breaker_is_announced_without_a_halt_reason(tmp_path):
 
     assert service.risk.state.halted_reason == ""
     assert notifier.sent.count("risk") == 1
-    db.close()
-
-
-def _recorder() -> "Recording":
-    return Recording(NotifySettings(enabled=True, target="wxid"))
-
-
-class Recording(WeChatNotifier):
-    """Notifier that records instead of shelling out."""
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self.sent: list[tuple[str, str]] = []
-
-    def notify(self, text, *, kind=""):
-        self.sent.append((text, kind))
-        return True
-
-
-def test_conditional_fill_is_booked_and_announced_once(tmp_path):
-    """The reconciler must not re-book what the broker already reported."""
-    from btrader.core.types import MarketType
-
-    rest = FakeREST({})
-    notifier = _recorder()
-    service, db = _service(tmp_path, rest)
-    service.notifier = notifier
-
-    service.paper.place_order("BTC/USDT", "buy", "market", 1.0, 100.0, market="spot")
-    service.paper.place_conditional(
-        "BTC/USDT",
-        "sell",
-        1.0,
-        trigger=105.0,
-        # "below" would wait for a decline; this exit is meant to fire upward.
-        direction="above",
-        order_type="market",
-        market="spot",
-    )
-    assert notifier.sent == []
-
-    # The background loop feeds the last price in; that fires the exit.
-    filled = service.settle_paper_orders("BTC/USDT", 106.0)
-
-    assert len(filled) == 1
-    # one protection-style message for the exit: fill + exit, never twice
-    assert [kind for _text, kind in notifier.sent] == ["fill"]
-    # Slippage and fees are part of the paper fill, so the PnL is close to 6
-    # rather than exactly 6; double-booking would land near 12.
-    booked_once = service.risk.state.realized_pnl
-    assert 5.0 < booked_once < 6.0
-
-    # A second poll returns nothing, and nothing more is booked.
-    assert service.settle_paper_orders("BTC/USDT", 106.0) == []
-    assert service.risk.state.realized_pnl == pytest.approx(booked_once)
-    assert len(notifier.sent) == 1
-    db.close()
-
-
-def test_guard_exit_is_announced_as_a_protection(tmp_path):
-    from btrader.core.types import MarketType  # noqa: F401 - keeps parity with peers
-
-    rest = FakeREST({})
-    notifier = _recorder()
-    service, db = _service(tmp_path, rest)
-    service.notifier = notifier
-
-    service.paper.place_order(
-        "BTC/USDT", "buy", "market", 1.0, 100.0, market="spot", stop_loss=95.0
-    )
-    service.check_protections("BTC/USDT", 90.0)
-
-    assert [kind for _text, kind in notifier.sent] == ["protection"]
-    text = notifier.sent[0][0]
-    # The message quotes the price that actually traded (90 plus slippage),
-    # not the stop level it crossed.
-    assert "止损触发" in text and "95.00" not in text
-    assert "平仓 1 @ 89.99" in text
     db.close()

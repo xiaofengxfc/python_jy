@@ -132,9 +132,6 @@ export default function TradingPage({
   const [chartLoading, setChartLoading] = useState(true);
   const [symbolError, setSymbolError] = useState("");
   const [account, setAccount] = useState<Account | null>(null);
-  /** Paper is the default; live reads balances and routes orders to the venue. */
-  const [mode, setMode] = useState<"paper" | "live">("paper");
-  const [liveConfirmOpen, setLiveConfirmOpen] = useState(false);
   const [liveError, setLiveError] = useState("");
   const [pickedPrice, setPickedPrice] = useState<number | null>(null);
   const [restTicker, setRestTicker] = useState<{ high: number; low: number } | null>(null);
@@ -424,11 +421,7 @@ export default function TradingPage({
   /* ----------------------------------------------------------- account */
   const refreshAccount = useCallback(async () => {
     try {
-      const path =
-        mode === "live"
-          ? `/api/account/live?${query({ market, symbol })}`
-          : "/api/account";
-      const data = await api<Account>(path);
+      const data = await api<Account>(`/api/account?${query({ market, symbol })}`);
       setAccount(data);
       setLiveError("");
       // Server-side equity (cash + marked positions) so the sidebar quotes the
@@ -439,19 +432,17 @@ export default function TradingPage({
         data.cash +
           data.positions.reduce(
             (sum, position) =>
-              sum + Math.abs(position.contracts) * (position.last ?? position.entry_price),
+              sum + Math.abs(position.contracts) * (position.last || position.entry_price),
             0,
           );
       onAccountChange(equity);
     } catch (error) {
-      // A live read failure must be visible: an empty account would look like
-      // the user owns nothing instead of "the key or the network failed".
-      if (mode === "live") {
-        setLiveError(error instanceof Error ? error.message : String(error));
-      }
+      // A read failure must be visible: an empty account would look like the
+      // user owns nothing instead of "the key or the network failed".
+      setLiveError(error instanceof Error ? error.message : String(error));
       /* the sidebar keeps the last known value */
     }
-  }, [mode, market, symbol, onAccountChange]);
+  }, [market, symbol, onAccountChange]);
 
   useEffect(() => {
     void refreshAccount();
@@ -490,18 +481,6 @@ export default function TradingPage({
 
   const banner = actionError || healthError || liveError || symbolError;
 
-  /** Paper is the default; going live is an explicit, acknowledged switch. */
-  const pickMode = (next: "paper" | "live") => {
-    if (next === mode) return;
-    if (next === "live") {
-      setLiveConfirmOpen(true);
-      return;
-    }
-    setMode("paper");
-    setAccount(null);
-    setLiveError("");
-  };
-
   return (
     <>
       <div className="page-head">
@@ -512,22 +491,9 @@ export default function TradingPage({
           <span className={`dot ${connected ? "live" : ""}`} />
           {connected ? "实时" : "重连中"}
         </span>
-        <div className="segmented" role="group" aria-label="交易模式">
-          <button
-            type="button"
-            aria-pressed={mode === "paper"}
-            onClick={() => pickMode("paper")}
-          >
-            纸面
-          </button>
-          <button
-            type="button"
-            aria-pressed={mode === "live"}
-            onClick={() => pickMode("live")}
-          >
-            实盘
-          </button>
-        </div>
+        <span className={`env-badge ${health?.network === "mainnet" ? "live" : ""}`}>
+          {health?.network === "mainnet" ? "主网 · 真实资金" : "测试网 · 模拟资金"}
+        </span>
         <div className="segmented">
           {marketItems.map((item) => (
             <button
@@ -542,47 +508,9 @@ export default function TradingPage({
         </div>
       </div>
 
-      {mode === "live" && (
+      {account && account.has_credentials === false && (
         <div className="mode-flag">
-          实盘模式：委托会真实发送到{health?.network === "mainnet" ? "主网" : "测试网"}
-          （{market === "spot" ? "现货" : market === "usdm" ? "U 本位合约" : "币本位合约"}）。
-        </div>
-      )}
-
-      {liveConfirmOpen && (
-        <div className="modal-mask" role="presentation">
-          <div className="modal" role="dialog" aria-modal="true" aria-label="切换到实盘">
-            <div className="modal-title">切换到实盘交易？</div>
-            <p className="modal-text">
-              之后的委托会真实发送到
-              <b>{health?.network === "mainnet" ? "币安主网" : "币安测试网"}</b>
-              ，成交使用真实资金，盈亏由交易所结算。纸面持仓与实盘互不相通。
-            </p>
-            <p className="modal-text faint">
-              请确认：API Key 只勾选「读取 + 交易」、未开启提现；每笔委托都会经过本地风控校验。
-            </p>
-            <div className="modal-actions">
-              <button
-                type="button"
-                className="btn ghost"
-                onClick={() => setLiveConfirmOpen(false)}
-              >
-                继续纸面
-              </button>
-              <button
-                type="button"
-                className="btn sell"
-                onClick={() => {
-                  setLiveConfirmOpen(false);
-                  setMode("live");
-                  setAccount(null);
-                  setLiveError("");
-                }}
-              >
-                我已确认，切换实盘
-              </button>
-            </div>
-          </div>
+          该市场还没有可用的 API Key，只能看行情不能下单。到设置页填写后再回来。
         </div>
       )}
 
@@ -808,7 +736,6 @@ export default function TradingPage({
             account={account}
             symbol={symbol}
             market={market}
-            mode={mode}
             onChanged={() => {
               setActionError("");
               void refreshAccount();
@@ -859,13 +786,9 @@ export default function TradingPage({
             feeRate={FEE_RATE}
             pickedPrice={pickedPrice}
             protection={account?.protections?.find((item) => item.symbol === symbol) ?? null}
-            mode={mode}
+            network={health?.network ?? "mainnet"}
             onPickedPriceConsumed={() => setPickedPrice(null)}
             onFilled={refreshAccount}
-            onResetPaper={async () => {
-              await api("/api/paper/reset", { method: "POST" });
-              void refreshAccount();
-            }}
           />
         </div>
       </div>

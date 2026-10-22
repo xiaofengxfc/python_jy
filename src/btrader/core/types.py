@@ -106,21 +106,27 @@ class OrderStatus(str, Enum):
 
 
 class RunMode(str, Enum):
+    """What a run is: a backtest, or a real order on the configured network.
+
+    The paper mode is gone on purpose: practice now happens on the exchange
+    testnet, so "simulated" and "real" are the same code path and the only
+    question left is which network it points at.
+    """
+
     BACKTEST = "backtest"
-    PAPER = "paper"
     LIVE = "live"
 
     @property
     def label(self) -> str:
-        return {"backtest": "回测", "paper": "纸面交易", "live": "实盘"}[self.value]
+        return {"backtest": "回测", "live": "实盘"}[self.value]
 
 
 def market_for_symbol(symbol: str) -> MarketType:
     """Infer the market from a ccxt symbol when the caller did not say.
 
     ``BTC/USDT`` -> spot, ``BTC/USDT:USDT`` -> USDT-margined,
-    ``BTC/USD:BTC`` -> coin-margined.  Shared so that pricing a paper
-    position and routing an order can never disagree about its venue.
+    ``BTC/USD:BTC`` -> coin-margined.  Shared so that pricing a position
+    and routing an order can never disagree about its venue.
     """
     if ":" not in symbol:
         return MarketType.SPOT

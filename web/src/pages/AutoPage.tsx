@@ -1,13 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, query } from "../api";
 import { TIMEFRAMES, fmt, fmtPrice } from "../format";
-import type { AutoStatus, SymbolInfo, Strategy } from "../types";
+import type { AutoStatus, Health, SymbolInfo, Strategy } from "../types";
 import { ParamFields } from "../components/ParamFields";
-
-const MODES: [string, string][] = [
-  ["paper", "纸面"],
-  ["live", "实盘"],
-];
 
 interface Props {
   /** Rendered inside the trading page: no page head, and the market / symbol /
@@ -38,7 +33,9 @@ export default function AutoPage({
   const [positionPct, setPositionPct] = useState(1);
   const [leverage, setLeverage] = useState(1);
   const [pollSeconds, setPollSeconds] = useState(10);
-  const [mode, setMode] = useState("paper");
+  /** Which network the server is on: only the mainnet costs a confirmation. */
+  const [network, setNetwork] = useState("mainnet");
+  const [confirmed, setConfirmed] = useState(false);
   const [busy, setBusy] = useState(false);
   const seq = useRef(0);
 
@@ -60,6 +57,12 @@ export default function AutoPage({
       .catch((caught) =>
         setError(caught instanceof Error ? caught.message : String(caught)),
       );
+  }, []);
+
+  useEffect(() => {
+    api<Health>("/api/health")
+      .then((data) => setNetwork(data.network))
+      .catch(() => undefined);
   }, []);
 
   useEffect(() => {
@@ -131,8 +134,9 @@ export default function AutoPage({
           position_pct: positionPct,
           leverage: market === "spot" ? 1 : leverage,
           poll_seconds: pollSeconds,
-          mode,
-          confirm_live: mode === "live",
+          // Testnet runs need no acknowledgement; mainnet does, and the
+          // checkbox above is the acknowledgement.
+          confirm_live: confirmed,
         }),
       });
       setNotice(`量化执行引擎已启动：${strategy?.name ?? strategyKey} · ${symbol}`);
@@ -186,7 +190,7 @@ export default function AutoPage({
             <button
               type="button"
               className="btn-sm primary"
-              disabled={busy || !strategyKey}
+              disabled={busy || !strategyKey || (network === "mainnet" && !confirmed)}
               onClick={start}
             >
               {busy ? "启动中…" : "启动"}
@@ -209,7 +213,7 @@ export default function AutoPage({
             <button
               type="button"
               className="btn-sm primary"
-              disabled={busy || !strategyKey}
+              disabled={busy || !strategyKey || (network === "mainnet" && !confirmed)}
               onClick={start}
             >
               {busy ? "启动中…" : "启动"}
@@ -287,22 +291,26 @@ export default function AutoPage({
                   </>
                 )}
                 <div className="field">
-                  <label className="field-label" htmlFor="auto-mode">
-                    <span>运行模式</span>
+                  <label className="field-label" htmlFor="auto-confirmed">
+                    <span>下单环境</span>
+                    <em>{network === "mainnet" ? "主网 · 真实资金" : "测试网 · 模拟资金"}</em>
                   </label>
-                  <select
-                    id="auto-mode"
-                    className="select"
-                    value={mode}
-                    disabled={running}
-                    onChange={(event) => setMode(event.target.value)}
-                  >
-                    {MODES.map(([value, label]) => (
-                      <option key={value} value={value}>
-                        {label}
-                      </option>
-                    ))}
-                  </select>
+                  {network === "mainnet" ? (
+                    <label className="check" htmlFor="auto-confirmed">
+                      <input
+                        id="auto-confirmed"
+                        type="checkbox"
+                        checked={confirmed}
+                        disabled={running}
+                        onChange={(event) => setConfirmed(event.target.checked)}
+                      />
+                      我确认引擎会在主网自动下单
+                    </label>
+                  ) : (
+                    <span className="faint" style={{ fontSize: 12 }}>
+                      测试网下单不涉及真实资金，无需确认。
+                    </span>
+                  )}
                 </div>
               </div>
 
@@ -394,9 +402,9 @@ export default function AutoPage({
                 )}
               </div>
 
-              {mode === "live" && (
+              {network === "mainnet" && (
                 <div className="banner error">
-                  实盘模式会真实下单。请确认已切换到主网、API Key 已关闭提现权限。
+                  自动交易会真实下单。请确认 API Key 已关闭提现权限，风控上限按资金规模设置。
                 </div>
               )}
 
@@ -416,11 +424,8 @@ export default function AutoPage({
                     </strong>
                   </div>
                   <div className="preview-row">
-                    <span>模式 / 投入</span>
-                    <strong>
-                      {status.config.mode === "live" ? "实盘" : "纸面"} ·{" "}
-                      {(status.config.position_pct * 100).toFixed(0)}%
-                    </strong>
+                    <span>投入</span>
+                    <strong>{(status.config.position_pct * 100).toFixed(0)}%</strong>
                   </div>
                 </div>
               )}

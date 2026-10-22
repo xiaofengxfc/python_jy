@@ -1,4 +1,4 @@
-"""Automated strategy runner (paper + live).
+"""Automated strategy runner.
 
 The runner polls closed candles, evaluates the strategy and rebalances toward
 the target position. It runs in its own thread so the UI stays responsive and
@@ -21,7 +21,7 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from ..core.types import MarketType, RunMode, timeframe_seconds
+from ..core.types import MarketType, timeframe_seconds
 from ..strategy.base import Strategy, clamp_target
 from .trading import OrderRejected, OrderRequest, TradingService
 
@@ -41,7 +41,6 @@ class AutoTraderConfig:
     symbol: str
     market_type: MarketType
     timeframe: str = "15m"
-    mode: RunMode = RunMode.PAPER
     strategy_key: str = ""
     params: dict[str, Any] = field(default_factory=dict)
     position_pct: float = 1.0
@@ -129,7 +128,7 @@ class AutoTrader:
         self._thread = threading.Thread(target=self._loop, name="auto-trader", daemon=True)
         self._thread.start()
         self._emit_state(True)
-        self._emit_log("INFO", f"自动交易已启动（{self.config.mode.label}）")
+        self._emit_log("INFO", f"自动交易已启动（{self.config.market_type.label}）")
 
     def stop(self) -> None:
         if not self.running:
@@ -204,29 +203,26 @@ class AutoTrader:
         self._rebalance(target, price)
 
     def _refresh_equity(self, price: float) -> None:
-        if self.config.mode is RunMode.PAPER:
-            account = self.trading.paper.account
-            position = account.positions.get(self.config.symbol)
-            held = position.contracts if position else 0.0
-            self._position_quote = abs(held) * price
-            # Cash alone understates equity once a position is open.
-            self._equity = account.cash + held * price
-        else:
-            try:
-                balance = self.trading.rest.fetch_balance(self.config.market_type)
-                totals = balance.get("total") or {}
-                spec = self.trading.rest.contract_spec(
-                    self.config.market_type, self.config.symbol
-                )
-                if self.config.market_type is MarketType.COINM:
-                    # Coin-M wallets hold the margin coin (BTC for BTCUSD), so the
-                    # wallet balance has to be marked to USD before sizing.
-                    asset = spec.settle or spec.base or "BTC"
-                    self._equity = float(totals.get(asset) or 0.0) * price
-                else:
-                    self._equity = float(totals.get("USDT") or 0.0)
-            except Exception:
-                pass
+        """Read the wallet straight from the venue before sizing an order.
+
+        A stale equity from the previous candle turns a percentage-of-account
+        rule into guesswork, and a wallet read is one signed call per candle.
+        """
+        try:
+            balance = self.trading.rest.fetch_balance(self.config.market_type)
+            totals = balance.get("total") or {}
+            spec = self.trading.rest.contract_spec(
+                self.config.market_type, self.config.symbol
+            )
+            if self.config.market_type is MarketType.COINM:
+                # Coin-M wallets hold the margin coin (BTC for BTCUSD), so the
+                # wallet balance has to be marked to USD before sizing.
+                asset = spec.settle or spec.base or "BTC"
+                self._equity = float(totals.get(asset) or 0.0) * price
+            else:
+                self._equity = float(totals.get("USDT") or 0.0)
+        except Exception:
+            pass
 
     def _rebalance(self, target: float, price: float) -> None:
         if price <= 0:
@@ -236,15 +232,11 @@ class AutoTrader:
         # converts it to contracts for coin-margined markets.
         desired_qty = target * notional / price
 
-        if self.config.mode is RunMode.PAPER:
-            position = self.trading.paper.account.positions.get(self.config.symbol)
-            current_qty = position.contracts if position else 0.0
-        else:
-            current_qty = self._live_position_qty(price)
-            if current_qty is None:
-                # Unknown exposure: sizing against an assumed flat position is
-                # how a transient read failure turns into a doubled order.
-                return
+        current_qty = self._live_position_qty(price)
+        if current_qty is None:
+            # Unknown exposure: sizing against an assumed flat position is how
+            # a transient read failure turns into a doubled order.
+            return
 
         delta = desired_qty - current_qty
         if abs(delta) * price < 10.0:  # ignore dust
@@ -261,7 +253,6 @@ class AutoTrader:
             reduce_only=reduce_only,
             leverage=self.config.leverage,
             market_type=self.config.market_type,
-            mode=self.config.mode,
         )
         try:
             result = self.trading.submit(request)

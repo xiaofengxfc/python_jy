@@ -79,18 +79,8 @@ export default function PortfolioPage({ onEquity }: Props) {
     <>
       <div className="page-head">
         <h1 className="page-title">资产</h1>
-        <span className="page-sub">纸面账户 · 每 5 秒刷新</span>
+        <span className="page-sub">交易所账户 · 每 5 秒刷新</span>
         <span className="spacer" />
-        <button
-          type="button"
-          className="btn-sm"
-          onClick={async () => {
-            await api("/api/paper/reset", { method: "POST" });
-            void load();
-          }}
-        >
-          重置纸面账户
-        </button>
       </div>
 
       {error && <div className="banner error">{error}</div>}
@@ -192,7 +182,7 @@ export default function PortfolioPage({ onEquity }: Props) {
                 {position.contracts > 0 ? "多头" : "空头"}
               </span>,
               fmt(Math.abs(position.contracts), 6),
-              fmtPrice(position.entry_price),
+              position.entry_price > 0 ? fmtPrice(position.entry_price) : "—",
               fmtPrice(position.last),
               <span className={position.unrealized >= 0 ? "up" : "down"}>
                 {fmt(position.unrealized, 2)}

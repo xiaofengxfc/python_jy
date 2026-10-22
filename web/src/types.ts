@@ -42,21 +42,24 @@ export interface Book {
   asks: [number, number][];
 }
 
-export interface PaperPosition {
+/** A position as the exchange reports it, marked in quote currency. */
+export interface Position {
   symbol: string;
   contracts: number;
   side: "long" | "short" | "flat";
   entry_price: number;
-  /** Booked result of the pair: net of every fee paid, closed rounds included. */
+  /** Result of the pair so far: net of every fee paid, closed rounds included. */
   realized_pnl: number;
   fees?: number;
-  /** Marked fields, present on /api/account and /api/portfolio alike. */
-  last?: number;
-  unrealized?: number;
-  quote_value?: number;
+  /** Marked by the same server call that fills the 资产 page, so both pages
+   * show one number for one position. */
+  last: number;
+  unrealized: number;
+  quote_value: number;
 }
 
-export interface PaperOrder {
+/** One order row: resting on the venue, or already filled. */
+export interface OrderRow {
   id: string;
   symbol: string;
   market?: string;
@@ -64,15 +67,19 @@ export interface PaperOrder {
   type: OrderType;
   amount: number;
   price?: number | null;
+  /** Stop price of a protective order (0 for a plain limit/market order). */
+  trigger?: number;
   filled?: number;
   remaining?: number;
   average?: number;
   status: string;
   timestamp: number;
+  reduce_only?: boolean;
   reduceOnly?: boolean;
 }
 
-export interface PaperTrade {
+/** One fill from the venue's trade history. */
+export interface TradeRow {
   id: string;
   symbol: string;
   /** The order this fill came from, so the detail dialog can trace it. */
@@ -92,45 +99,35 @@ export interface PaperTrade {
   timestamp: number;
 }
 
-/** A stop-loss / take-profit guard currently armed for one symbol. */
-export interface PaperProtection {
+/** The stop / take-profit orders the venue currently holds for one symbol. */
+export interface Protection {
   symbol: string;
-  stopLoss: number;
-  takeProfit: number;
-  createdAt?: number;
-  order?: string;
+  stop_loss: number;
+  take_profit: number;
+  /** Exchange order ids, so a cancel can name them. */
+  orders?: string[];
 }
 
-export interface PaperConditional {
-  id: string;
-  symbol: string;
-  market: string;
-  side: Side;
-  type: OrderType;
-  amount: number;
-  price: number;
-  trigger: number;
-  direction: "below" | "above";
-  status: string;
-  createdAt: number;
-}
-
+/** The venue account: balances, positions, orders and recent fills. */
 export interface Account {
   quote_asset: string;
   cash: number;
+  /** Equity when the account was first connected; the PnL reference point. */
   starting_balance: number;
-  /** Cash plus marked positions: the same figure the 资产 page shows. */
-  equity?: number;
+  /** Wallet plus marked positions: the same figure the 资产 page shows. */
+  equity: number;
   realized_pnl: number;
   /** Realized PnL for each pair, including pairs whose position is closed. */
   realized_pnl_by_symbol?: Record<string, number>;
-  positions: PaperPosition[];
-  orders: PaperOrder[];
-  trades: PaperTrade[];
-  protections?: PaperProtection[];
-  conditional?: PaperConditional[];
-  /** True when the snapshot came from the exchange, not the paper account. */
-  live?: boolean;
+  positions: Position[];
+  orders: OrderRow[];
+  trades: TradeRow[];
+  protections?: Protection[];
+  /** False when this market has no API key configured yet. */
+  has_credentials?: boolean;
+  /** Read failure, already worded for the user; empty when the read worked. */
+  error?: string;
+  updated_at?: number;
 }
 
 export interface OrderPreview {
@@ -185,10 +182,13 @@ export interface Portfolio {
   starting_balance: number;
   equity: number;
   realized_pnl: number;
-  positions: (PaperPosition & { last: number; unrealized: number; quote_value: number; fees: number })[];
-  orders: (PaperOrder & { filled?: number; average?: number; cost?: number })[];
-  trades: PaperTrade[];
+  realized_pnl_by_symbol?: Record<string, number>;
+  positions: Position[];
+  orders: OrderRow[];
+  trades: TradeRow[];
   equity_history: { t: number; equity: number }[];
+  has_credentials?: boolean;
+  error?: string;
 }
 
 export interface NotifySettings {

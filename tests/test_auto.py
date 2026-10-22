@@ -1,4 +1,4 @@
-"""Automation engine behaviour with a stubbed market feed."""
+"""Automation engine behaviour against an in-memory venue."""
 
 from __future__ import annotations
 
@@ -7,17 +7,14 @@ import pandas as pd
 import pytest
 
 from btrader.core.config import AppSettings, RiskSettings
-from btrader.core.credentials import Credentials
 from btrader.core.storage import Database
-from btrader.core.types import MarketType, RunMode
+from btrader.core.types import MarketType
 from btrader.engine.auto import AutoTrader, AutoTraderConfig
-from btrader.engine.paper import PaperBroker
 from btrader.engine.risk import RiskManager
 from btrader.engine.trading import OrderRejected, OrderRequest, TradingService
-from btrader.exchange.rest import BinanceREST
-from btrader.core.types import Network
 from btrader.strategy.base import Strategy
 
+from fakes import FakeVenue
 from helpers import make_candles
 
 
@@ -42,30 +39,8 @@ class StubKlines:
         return self.frame.copy()
 
 
-class StubREST(BinanceREST):
-    """Offline REST double: fixed contract specs, integer contract rounding."""
-
-    def amount_to_precision(self, market_type, symbol, amount):
-        spec = self.contract_spec(market_type, symbol)
-        if spec.inverse:
-            return float(int(amount))  # Binance coin-M trades whole contracts
-        return float(amount)
-
-    def contract_spec(self, market_type, symbol, allow_network=True):
-        from btrader.core.contracts import ContractSpec
-
-        if market_type is MarketType.COINM:
-            return ContractSpec(
-                contract_size=100.0, inverse=True, base="BTC", quote="USD", settle="BTC"
-            )
-        return ContractSpec(contract_size=1.0, inverse=False, base="BTC", quote="USDT")
-
-
-class BlindREST(StubREST):
-    """A venue whose position reads fail, as a dropped connection would."""
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.submitted: list[str] = []
+class BlindVenue(FakeVenue):
+    """A venue whose position and balance reads fail, as a dropped link would."""
 
     def fetch_positions(self, market_type, symbols=None):
         raise RuntimeError("network down")
@@ -73,14 +48,9 @@ class BlindREST(StubREST):
     def fetch_balance(self, market_type):
         raise RuntimeError("network down")
 
-    def create_order(self, *args, **kwargs):
-        self.submitted.append(str(args[:3]))
-        return {"id": "unexpected", "status": "closed"}
 
-
-@pytest.fixture
-def service(tmp_path):
-    settings = AppSettings(
+def _settings() -> AppSettings:
+    return AppSettings(
         risk=RiskSettings(
             max_order_quote=0,
             max_position_quote=0,
@@ -90,23 +60,24 @@ def service(tmp_path):
             max_consecutive_losses=0,
         )
     )
-    rest = StubREST(Network.MAINNET)
-    paper = PaperBroker(starting_balance=10_000, fee_rate=0.0, slippage_bps=0.0)
-    risk = RiskManager(settings.risk)
+
+
+@pytest.fixture
+def service(tmp_path):
+    settings = _settings()
+    venue = FakeVenue()
     db = Database(tmp_path / "test.db")
-    yield TradingService(settings, rest, risk, paper, db), paper
+    yield TradingService(settings, venue, RiskManager(settings.risk), db), venue
     db.close()
 
 
-def _trader(service, market: MarketType, target: float, symbol="BTC/USDT") -> AutoTrader:
-    trading, _ = service
+def _trader(trading, market: MarketType, target: float, symbol="BTC/USDT") -> AutoTrader:
     frame = make_candles(120, price=100.0, drift=0.0, volatility=0.0)
     return AutoTrader(
         AutoTraderConfig(
             symbol=symbol,
             market_type=market,
             timeframe="1h",
-            mode=RunMode.PAPER,
             position_pct=0.5,
             leverage=1.0,
         ),
@@ -117,75 +88,55 @@ def _trader(service, market: MarketType, target: float, symbol="BTC/USDT") -> Au
 
 
 def test_auto_opens_long_on_signal(service):
-    trading, paper = service
-    trader = _trader(service, MarketType.SPOT, 1.0)
+    trading, venue = service
+    trader = _trader(trading, MarketType.SPOT, 1.0)
     trader._tick()
-    position = paper.account.position_for("BTC/USDT")
-    assert position.contracts > 0
-    assert paper.account.cash < 10_000  # capital deployed
+    assert venue.sides() == ["buy"]
+    assert venue.position_base("BTC/USDT") > 0
 
 
 def test_auto_flattens_on_zero_signal(service):
-    trading, paper = service
-    trader = _trader(service, MarketType.SPOT, 1.0)
+    trading, venue = service
+    trader = _trader(trading, MarketType.SPOT, 1.0)
     trader._tick()
-    held = paper.account.position_for("BTC/USDT").contracts
-    assert held > 0
+    assert venue.position_base("BTC/USDT") > 0
 
     trader.strategy = FixedTarget(0.0)
     trader._last_candle_ts = 0  # force re-evaluation
     trader._tick()
-    assert paper.account.position_for("BTC/USDT").contracts == 0
+    assert venue.position_base("BTC/USDT") == pytest.approx(0.0, abs=1e-9)
+    assert venue.sides() == ["buy", "sell"]
 
 
 def test_auto_spot_never_shorts(service):
-    trading, paper = service
-    trader = _trader(service, MarketType.SPOT, -1.0)
+    """Spot cannot go short: a negative target is clamped to flat, no order."""
+    trading, venue = service
+    trader = _trader(trading, MarketType.SPOT, -1.0)
     trader._tick()
-    assert paper.account.position_for("BTC/USDT").contracts == 0
+    assert venue.fills == []
     assert trader._current_target == 0.0
 
 
 def test_auto_futures_can_short(service):
-    trading, paper = service
-    trader = _trader(service, MarketType.USDM, -1.0, symbol="BTC/USDT:USDT")
+    trading, venue = service
+    trader = _trader(trading, MarketType.USDM, -1.0, symbol="BTC/USDT:USDT")
     trader._tick()
-    position = paper.account.position_for("BTC/USDT:USDT")
-    assert position.contracts < 0
+    assert venue.sides() == ["sell"]
+    assert venue.position_base("BTC/USDT:USDT") < 0
 
 
 def test_auto_skips_unchanged_signal(service):
-    trading, paper = service
-    trader = _trader(service, MarketType.SPOT, 1.0)
+    trading, venue = service
+    trader = _trader(trading, MarketType.SPOT, 1.0)
     trader._tick()
-    trades_after_first = len(paper.account.trades)
     trader._tick()
-    assert len(paper.account.trades) == trades_after_first
-
-
-def test_spot_sell_beyond_holding_rejected(service):
-    trading, paper = service
-    with pytest.raises(OrderRejected, match="现货不能做空"):
-        trading.submit(
-            OrderRequest(
-                symbol="ETH/USDT",
-                side="sell",
-                order_type="market",
-                amount=1.0,
-                price=100.0,
-                market_type=MarketType.SPOT,
-                mode=RunMode.PAPER,
-            )
-        )
-    assert paper.account.positions.get("ETH/USDT") is None or paper.account.positions["ETH/USDT"].contracts == 0
+    assert len(venue.fills) == 1
 
 
 def test_live_equity_reads_nested_total():
     """ccxt returns {"total": {"USDT": 5000}}; reading the mapping gave zero."""
 
-    class BalanceREST(StubREST):
-        has_credentials = True
-
+    class BalanceVenue(FakeVenue):
         def fetch_balance(self, market_type):
             return {
                 "free": {"USDT": 4_000.0, "BTC": 0.1},
@@ -193,14 +144,11 @@ def test_live_equity_reads_nested_total():
                 "total": {"USDT": 5_000.0, "BTC": 0.1},
             }
 
-    settings = AppSettings(risk=RiskSettings(max_order_quote=0, max_position_quote=0))
-    from btrader.engine.paper import PaperBroker as Broker
-
+    settings = _settings()
     service = TradingService(
         settings,
-        BalanceREST(Network.MAINNET),
+        BalanceVenue(),
         RiskManager(settings.risk),
-        Broker(starting_balance=1_000),
         Database(":memory:"),
     )
     request = OrderRequest(
@@ -210,41 +158,21 @@ def test_live_equity_reads_nested_total():
         amount=0.01,
         price=100.0,
         market_type=MarketType.SPOT,
-        mode=RunMode.LIVE,
     )
     assert service._equity(request, 100.0) == pytest.approx(5_000.0)
 
 
-def test_paper_broker_rejects_short_when_not_allowed():
-    broker = PaperBroker(starting_balance=1_000)
-    order = broker.place_order(
-        "BTC/USDT", "sell", "market", 1.0, price=100.0, allow_short=False
-    )
-    assert order["status"] == "rejected"
-    assert broker.account.position_for("BTC/USDT").contracts == 0
-
-
 def _blind_service(tmp_path):
-    """A live service whose venue cannot be read at all."""
-    settings = AppSettings(
-        risk=RiskSettings(
-            max_order_quote=0,
-            max_position_quote=0,
-            max_leverage=20,
-            max_daily_trades=0,
-            max_daily_loss=0,
-            max_consecutive_losses=0,
-        )
-    )
-    rest = BlindREST(Network.MAINNET, Credentials("key", "secret"))
-    paper = PaperBroker(starting_balance=10_000, fee_rate=0.0, slippage_bps=0.0)
+    """A service whose venue cannot be read at all."""
+    settings = _settings()
+    venue = BlindVenue()
     db = Database(tmp_path / "blind.db")
-    return TradingService(settings, rest, RiskManager(settings.risk), paper, db), rest, db
+    return TradingService(settings, venue, RiskManager(settings.risk), db), venue, db
 
 
 def test_auto_skips_rebalance_when_live_position_unknown(tmp_path):
     """A failed position read used to look like "flat" and re-buy the target."""
-    trading, rest, db = _blind_service(tmp_path)
+    trading, venue, db = _blind_service(tmp_path)
     try:
         frame = make_candles(120, price=100.0, drift=0.0, volatility=0.0)
         trader = AutoTrader(
@@ -252,7 +180,6 @@ def test_auto_skips_rebalance_when_live_position_unknown(tmp_path):
                 symbol="BTC/USDT",
                 market_type=MarketType.SPOT,
                 timeframe="1h",
-                mode=RunMode.LIVE,
                 position_pct=0.5,
                 leverage=1.0,
             ),
@@ -261,14 +188,14 @@ def test_auto_skips_rebalance_when_live_position_unknown(tmp_path):
             StubKlines(frame),
         )
         trader._tick()
-        assert rest.submitted == [], "unknown exposure must not become an order"
+        assert venue.fills == [], "unknown exposure must not become an order"
     finally:
         db.close()
 
 
 def test_live_entry_refused_when_position_unknown(tmp_path):
     """The position cap cannot be checked without the exposure figure."""
-    trading, rest, db = _blind_service(tmp_path)
+    trading, venue, db = _blind_service(tmp_path)
     try:
         with pytest.raises(OrderRejected, match="无法读取当前持仓"):
             trading.submit(
@@ -279,9 +206,8 @@ def test_live_entry_refused_when_position_unknown(tmp_path):
                     amount=0.1,
                     price=100.0,
                     market_type=MarketType.SPOT,
-                    mode=RunMode.LIVE,
                 )
             )
-        assert rest.submitted == []
+        assert venue.fills == []
     finally:
         db.close()

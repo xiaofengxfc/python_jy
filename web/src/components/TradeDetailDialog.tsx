@@ -1,8 +1,8 @@
 import { fmt, fmtPrice } from "../format";
-import type { PaperTrade } from "../types";
+import type { TradeRow } from "../types";
 
 interface Props {
-  trade: PaperTrade;
+  trade: TradeRow;
   onClose: () => void;
 }
 

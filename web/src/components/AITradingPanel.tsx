@@ -18,7 +18,7 @@ export default function AITradingPanel({ market, symbol, timeframe, onNavigate }
 
   return (
     <div className="ai-workspace">
-      <div className="ai-mode-switch" role="tablist" aria-label="AI 交易模式">
+      <div className="ai-mode-switch" role="tablist" aria-label="AI 工作区">
         <button
           type="button"
           role="tab"

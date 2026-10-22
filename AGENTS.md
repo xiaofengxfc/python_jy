@@ -44,6 +44,18 @@ Node 不在 PATH 时：`$env:Path = "D:\tool\node;" + $env:Path`。
 - `cmd` 脚本必须 CRLF + 纯 ASCII，否则 `rem` 行会被当命令执行。
 - 前端只读磁盘上的静态产物；`index.html` 是 `no-store`，改完刷新页面即可。
 
+## 3.5 账户只有一个来源（已去除纸面交易）
+
+- 没有模拟账户了：`src/btrader/engine/paper.py` 已删除，所有委托直接发到
+  `ctx.network` 指向的交易所（主网/测试网）。界面上也没有「纸面/实盘」开关。
+- 账户数字只来自 `ctx.account`（`engine/account.py` 的 `AccountService`）：
+  `/api/account?market&symbol` 与 `/api/portfolio` 读同一份快照；单交易对读会借用
+  全钱包的权益（`wallet_ttl` 10 秒），所以侧栏和资产页永远是同一个数。
+- 权益基线（`account.baseline.v1:<network>:<market>`）只由**全钱包**读写入，
+  单交易对读只继承；否则第一次读的那一对会把一个偏小的金额冻成「起始资金」。
+- 现货没有 reduce-only 触发单：止损/止盈只在合约市场挂到交易所侧；条件单尚未开放。
+- 历史 SQLite 里 `mode='paper'` 的旧成交仍在库里，界面只显示 `live` 的成交。
+
 ## 4. 已验证的现实约束（别重新踩）
 
 - 推送通道默认是**企业微信智能机器人（API 模式 + 长连接）**：本机 OpenClaw 网关

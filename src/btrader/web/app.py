@@ -25,7 +25,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from ..context import AppContext
-from ..core.types import TIMEFRAME_SECONDS, MarketType, RunMode, market_for_symbol
+from ..core.types import (
+    TIMEFRAME_SECONDS,
+    MarketType,
+    Network,
+    market_for_symbol,
+)
 from ..engine.trading import OrderRejected, OrderRequest
 from ..exchange.symbols import format_amount, load_symbols
 from ..exchange import mirror
@@ -53,6 +58,12 @@ MARKET_LABELS = {
     "usdm": "U 本位合约",
     "coinm": "币本位合约",
 }
+
+# Estimate-only numbers for the order ticket. The venue charges its own
+# commission at fill time; these exist so the ticket can show "约" figures
+# before anything is sent, not to predict the actual fee.
+TAKER_FEE_RATE = 0.0004
+SLIPPAGE_BPS = 1.0
 
 
 # --------------------------------------------------------------------- state
@@ -220,8 +231,7 @@ class OrderPayload(BaseModel):
     # Protective exits for a new entry (absolute prices). Omit to trade bare.
     stop_loss: float | None = Field(default=None, gt=0)
     take_profit: float | None = Field(default=None, gt=0)
-    # Paper is the default; a live order must say so and confirm explicitly.
-    mode: str = "paper"
+    # Mainnet requires an explicit acknowledgement; testnet ignores it.
     confirm_live: bool = False
 
 
@@ -246,71 +256,14 @@ class ClosePayload(BaseModel):
 
     symbol: str
     market: str | None = None
-    mode: str = "paper"
     size: float | None = Field(default=None, gt=0)
     confirm_live: bool = False
-
-
-class ProtectionPayload(BaseModel):
-    """Arm or update the SL/TP guard of an existing position.
-
-    ``0`` (or omitted) clears that leg; sending both as 0 disarms the guard.
-    """
-
-    symbol: str
-    stop_loss: float = Field(default=0.0, ge=0)
-    take_profit: float = Field(default=0.0, ge=0)
-
-
-class ConditionalPayload(BaseModel):
-    """Standalone stop/limit order armed before its trigger is reached.
-
-    Used for "buy when it breaks 90k" and for an exit that has to exist
-    before the entry fills. ``direction`` says which way the price must cross
-    ``trigger``; the resulting order uses ``order_type`` and ``price``.
-    """
-
-    market: str = "spot"
-    symbol: str
-    side: str
-    order_type: str = "market"
-    size_mode: str = "amount"
-    size: float = Field(gt=0)
-    trigger: float = Field(gt=0)
-    direction: str = "below"
-    price: float | None = Field(default=None, gt=0)
-    mode: str = "paper"
-    # An exit that only reduces an existing position (never opens a short).
-    reduce_only: bool = False
 
 
 def _market_for_symbol(symbol: str) -> MarketType:
     """Infer the market from a ccxt symbol (shared with the pricing path)."""
     return market_for_symbol(symbol)
 
-
-def _paper_held(state: _State, symbol: str) -> float:
-    """Base quantity of a paper position, as a positive number."""
-    position = state.ctx.paper.account.positions.get(symbol)
-    return abs(position.contracts) if position else 0.0
-
-
-def _paper_last_price(state: _State, symbol: str) -> float:
-    """Last traded price of a paper symbol, 0.0 when the market is unreachable.
-
-    The trading panel needs the same equity the portfolio page shows, and that
-    page prices every position off the live ticker. Returning 0.0 (instead of
-    raising) lets the caller fall back to the entry price, so an offline
-    exchange shows an honest "no PnL yet" rather than a made-up number.
-    """
-    market = _market_for_symbol(symbol)
-    try:
-        with state.locks[market]:
-            raw = state.ctx.market_rest_for(market).fetch_ticker(market, symbol)
-        return float(raw.get("last") or 0.0)
-    except Exception:
-        log.debug("纸面持仓取价失败 %s", symbol, exc_info=True)
-        return 0.0
 
 def _balance_free(balance: Any, asset: str) -> float:
     """Free balance of one asset from a ccxt balance payload."""
@@ -355,29 +308,34 @@ def _require_live_ready(
     *,
     signed: bool,
     confirm_live: bool,
+    network: Network,
     market: MarketType | None = None,
     stop_loss: float | None = None,
     take_profit: float | None = None,
 ) -> None:
-    """Gate a live order behind credentials and an explicit acknowledgement.
+    """Gate an order behind credentials and, on mainnet, a second confirm.
+
+    Testnet is a real venue with fake funds, so it needs no extra click: the
+    whole point of it is to rehearse without ceremony. Mainnet keeps the
+    acknowledgement because there a typo costs money.
 
     Protective exits used to be refused here because the exchange side could
-    not honour them. They are now placed as ``STOP_MARKET`` /
-    ``TAKE_PROFIT_MARKET`` orders, so a futures order may carry them. Spot
-    still cannot: Binance has no reduce-only stop for spot balances, and
-    pretending to arm one would leave the position unhedged.
+    not honour them. They are now placed as STOP_MARKET / TAKE_PROFIT_MARKET
+    orders, so a futures order may carry them. Spot still cannot: Binance has
+    no reduce-only stop for spot balances, and pretending to arm one would
+    leave the position unhedged.
     """
     if not signed:
-        raise HTTPException(status_code=400, detail="实盘下单需要先配置该市场的 API Key。")
-    if not confirm_live:
+        raise HTTPException(status_code=400, detail="下单需要先配置该市场的 API Key。")
+    if network is Network.MAINNET and not confirm_live:
         raise HTTPException(
             status_code=400,
-            detail="实盘下单需要二次确认（confirm_live=true）。",
+            detail="主网下单需要二次确认（confirm_live=true）；测试网不需要。",
         )
     if (stop_loss or take_profit) and market is not None and not market.is_futures:
         raise HTTPException(
             status_code=400,
-            detail="实盘现货暂不支持交易所侧止损/止盈，请切换到合约市场或手动盯盘。",
+            detail="现货暂无交易所侧止损/止盈，请切换到合约市场或手动盯盘。",
         )
 
 
@@ -407,30 +365,12 @@ def _live_held(state: _State, symbol: str, market: MarketType) -> float:
         return _live_spot_available(state, symbol, market)
 
 
-def _empty_live_account(market: MarketType) -> dict[str, Any]:
-    """Account shape used when the exchange cannot be read."""
-    quote = "USDT" if market is not MarketType.COINM else "BTC"
-    return {
-        "quote_asset": quote,
-        "cash": 0.0,
-        "starting_balance": 0.0,
-        "realized_pnl": 0.0,
-        "positions": [],
-        "orders": [],
-        "trades": [],
-        "protections": [],
-        "conditional": [],
-        "live": True,
-    }
-
-
 def _is_reducing(
     state: _State,
     market: MarketType,
     symbol: str,
     side: str,
     amount: float,
-    mode: RunMode = RunMode.PAPER,
 ) -> bool:
     """Whether an order closes (part of) an existing position.
 
@@ -439,23 +379,14 @@ def _is_reducing(
     refusing it with "单笔金额超过上限" — or with "风控熔断中" — is what made a
     held position impossible to sell.
 
-    Paper reads the simulated book; live reads the venue, because that is
-    where the real position is. Spot sells are always exits: spot cannot
-    short, and the unheld-sell case is rejected earlier with its own message.
+    The position is read from the venue, because that is where the real
+    exposure is. Spot sells are always exits: spot cannot short, and the
+    unheld-sell case is rejected earlier with its own message.
     """
     if market is MarketType.SPOT:
-        if mode is RunMode.LIVE:
-            held = _live_spot_available(state, symbol, market)
-        else:
-            position = state.ctx.paper.account.positions.get(symbol)
-            held = position.contracts if position else 0.0
+        held = _live_spot_available(state, symbol, market)
         return side == "sell" and held > 0 and amount <= held * (1 + 1e-6) + 1e-12
-
-    if mode is RunMode.LIVE:
-        held = _live_held(state, symbol, market)
-    else:
-        position = state.ctx.paper.account.positions.get(symbol)
-        held = position.contracts if position else 0.0
+    held = _live_held(state, symbol, market)
     if side == "sell" and held > 0:
         return amount <= held * (1 + 1e-6) + 1e-12
     if side == "buy" and held < 0:
@@ -516,7 +447,7 @@ def create_app() -> FastAPI:
         ).start()
         state.stop_reconcile.clear()
         threading.Thread(
-            target=_reconcile_paper_orders, args=(state,), name="paper-reconciler", daemon=True
+            target=_reconcile_live_fills, args=(state,), name="live-reconciler", daemon=True
         ).start()
         try:
             yield
@@ -675,175 +606,24 @@ def create_app() -> FastAPI:
 
     # --------------------------------------------------------------- account
     @app.get("/api/account")
-    def api_account() -> dict[str, Any]:
-        state = get_state()
-        # Prices are fetched before the account lock is taken: a slow ticker
-        # must never hold up an order submission.
-        with state.account_lock:
-            symbols = [
-                position.symbol
-                for position in state.ctx.paper.account.positions.values()
-                if abs(position.contracts) > 1e-12
-            ]
-        marks = {symbol: _paper_last_price(state, symbol) for symbol in symbols}
-        with state.account_lock:
-            account = state.ctx.paper.account
-            # The booked result belongs to the pair, not to the position object:
-            # a closed round keeps counting after the position went flat.
-            ledger = account.realized_by_symbol
-            positions = []
-            for position in account.positions.values():
-                if abs(position.contracts) <= 1e-12:
-                    continue
-                last = marks.get(position.symbol) or position.entry_price
-                positions.append(
-                    {
-                        "symbol": position.symbol,
-                        "contracts": position.contracts,
-                        "side": position.side,
-                        "entry_price": position.entry_price,
-                        # The same fields the portfolio page renders, so the two
-                        # pages cannot quote a different equity for one account.
-                        "last": last,
-                        "unrealized": (last - position.entry_price) * position.contracts,
-                        "quote_value": last * position.contracts,
-                        # This position's own booked result: a fresh entry
-                        # reads 0, it never inherits the pair's last round.
-                        # The pair total stays in realized_pnl_by_symbol.
-                        "realized_pnl": position.realized_pnl,
-                    }
-                )
-            realized_by_symbol = dict(ledger)
-            for item in positions:
-                realized_by_symbol.setdefault(item["symbol"], item["realized_pnl"])
-            # Cash plus marked positions: the same figure /api/portfolio
-            # computes, so the sidebar and the 资产 page agree.
-            equity = account.cash + sum(item["quote_value"] for item in positions)
-            orders = [dict(order) for order in account.orders[-50:]][::-1]
-            trades = [dict(trade) for trade in account.trades[-50:]][::-1]
-            return {
-                "quote_asset": account.quote_asset,
-                "cash": account.cash,
-                "starting_balance": account.starting_balance,
-                "equity": equity,
-                "realized_pnl": account.realized_pnl,
-                "realized_pnl_by_symbol": realized_by_symbol,
-                "positions": positions,
-                "orders": orders,
-                "trades": trades,
-                "protections": [
-                    dict(guard) for guard in account.protections.values()
-                ],
-                "conditional": [
-                    {
-                        "id": item.get("id"),
-                        "symbol": item.get("symbol"),
-                        "market": item.get("market") or "spot",
-                        "side": item.get("side"),
-                        "type": item.get("type") or "market",
-                        "amount": item.get("amount") or 0.0,
-                        "price": item.get("price") or 0.0,
-                        "trigger": item.get("trigger") or 0.0,
-                        "direction": item.get("direction") or "below",
-                        "status": item.get("status") or "open",
-                        "createdAt": item.get("createdAt") or 0,
-                    }
-                    for item in account.conditional
-                    if item.get("status") in ("open", "triggered", "canceled", "rejected")
-                ][-50:][::-1],
-            }
+    def api_account(market: str = "spot", symbol: str | None = None) -> dict[str, Any]:
+        """Balances, positions, open orders and the fill ledger for one market.
 
-    @app.get("/api/account/live")
-    def api_live_account(market: str = "spot", symbol: str | None = None) -> dict[str, Any]:
-        """Balances, positions and open orders straight from the exchange.
+        Everything here comes from the venue. There is no simulated account any
+        more, so the trading panel, the portfolio page and the AI panel all read
+        this one snapshot — the numbers cannot dissagree between pages because
+        there is only one place they come from.
 
-        The paper account is local and always available; this one is only as
-        good as the API key and the network, so every read failure becomes an
-        HTTP error the panel can show instead of an empty account that would
-        look like "you own nothing".
+        The service caches the snapshot for a few seconds: the panels poll, and
+        signing balance + positions + open orders per poll would burn the
+        request weight budget for nothing.
+
+        A missing key is not an error: the page still renders, and "尚未配置
+        API Key" is a message, not a blank screen.
         """
         state = get_state()
-        mt = _market(market)
-        with state.locks[mt]:
-            rest = state.ctx.rest_for(mt)
-            if not rest.has_credentials:
-                raise HTTPException(status_code=400, detail=f"{mt.label}尚未配置 API Key。")
-            try:
-                balance = rest.fetch_balance(mt)
-            except Exception as exc:
-                raise HTTPException(status_code=503, detail=f"读取实盘余额失败：{exc}") from exc
-            quote_asset = "BTC" if mt is MarketType.COINM else "USDT"
-            result = _empty_live_account(mt)
-            result["quote_asset"] = quote_asset
-            result["cash"] = _balance_free(balance, quote_asset)
-
-            positions: list[dict[str, Any]] = []
-            if mt.is_futures:
-                try:
-                    raw_positions = rest.fetch_positions(mt, [symbol] if symbol else None)
-                except Exception as exc:
-                    log.warning("读取实盘持仓失败 %s", exc, exc_info=True)
-                    raw_positions = []
-                for item in raw_positions:
-                    contracts = float(item.get("contracts") or 0.0)
-                    if abs(contracts) <= 1e-12:
-                        continue
-                    positions.append(
-                        {
-                            "symbol": item.get("symbol") or "",
-                            "contracts": contracts if item.get("side") != "short" else -contracts,
-                            "side": "short" if item.get("side") == "short" else "long",
-                            "entry_price": float(
-                                item.get("entryPrice") or item.get("markPrice") or 0.0
-                            ),
-                            "realized_pnl": float(
-                                (item.get("info") or {}).get("realizedPnl") or 0.0
-                            ),
-                        }
-                    )
-            elif symbol:
-                # Spot has no position object: what is held is simply the base
-                # balance, and only the pair being viewed is of interest.
-                base = symbol.split("/")[0].upper()
-                held = _balance_free(balance, base)
-                if held > 0:
-                    positions.append(
-                        {
-                            "symbol": symbol,
-                            "contracts": held,
-                            "side": "long",
-                            "entry_price": 0.0,
-                            "realized_pnl": 0.0,
-                        }
-                    )
-
-            orders: list[dict[str, Any]] = []
-            try:
-                for order in rest.fetch_open_orders(mt, symbol):
-                    orders.append(
-                        {
-                            "id": str(order.get("id") or ""),
-                            "symbol": order.get("symbol") or "",
-                            "market": mt.value,
-                            "side": order.get("side") or "buy",
-                            "type": order.get("type") or "limit",
-                            "amount": float(order.get("amount") or 0.0),
-                            "price": float(order.get("price") or 0.0),
-                            "filled": float(order.get("filled") or 0.0),
-                            "status": "open",
-                            "timestamp": int(order.get("timestamp") or 0),
-                        }
-                    )
-            except Exception as exc:
-                log.warning("读取实盘挂单失败 %s", exc, exc_info=True)
-
-            result["positions"] = positions
-            result["orders"] = orders
-            result["trades"] = []
-            result["realized_pnl_by_symbol"] = {
-                item["symbol"]: item["realized_pnl"] for item in positions
-            }
-            return result
+        snapshot = state.ctx.account.snapshot(_market(market), symbol)
+        return snapshot.as_payload()
 
     @app.post("/api/orders/preview")
     def api_preview_order(payload: PreviewPayload) -> dict[str, Any]:
@@ -880,7 +660,6 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail="下单数量必须大于 0")
 
         trading = state.ctx.trading
-        paper = state.ctx.paper
         notional = abs(amount) * reference
         base = {
             "symbol": payload.symbol,
@@ -890,8 +669,8 @@ def create_app() -> FastAPI:
             "price": reference,
             "amount_base": amount,
             "quote_notional": notional,
-            "fee_rate": paper.fee_rate,
-            "slippage_bps": paper.slippage_bps,
+            "fee_rate": TAKER_FEE_RATE,
+            "slippage_bps": SLIPPAGE_BPS,
         }
 
         try:
@@ -926,7 +705,6 @@ def create_app() -> FastAPI:
                     state, mt, payload.symbol, payload.side, base_qty
                 ),
                 market_type=mt,
-                mode=RunMode.PAPER,
             )
         )
         return {
@@ -936,7 +714,7 @@ def create_app() -> FastAPI:
             "amount_base": base_qty,
             "exchange_amount": exchange_amount,
             "quote_notional": abs(base_qty) * reference,
-            "fee_estimate": abs(base_qty) * reference * paper.fee_rate,
+            "fee_estimate": abs(base_qty) * reference * TAKER_FEE_RATE,
         }
 
     @app.post("/api/orders")
@@ -947,30 +725,29 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail="订单类型必须是 limit 或 market")
         if payload.size_mode not in ("amount", "quote"):
             raise HTTPException(status_code=400, detail="数量模式必须是 amount 或 quote")
-        if payload.mode not in ("paper", "live"):
-            raise HTTPException(status_code=400, detail="模式必须是 paper 或 live")
 
         state = get_state()
         mt = _market(payload.market)
-        mode = RunMode(payload.mode)
 
-        if mode is RunMode.LIVE:
-            # Two gates: the account must be able to sign, and the caller must
-            # have acknowledged this leaves the building. A testnet order also
-            # needs credentials, so the check is not network-specific.
-            with state.locks[mt]:
-                signed = state.ctx.rest_for(mt).has_credentials
-            _require_live_ready(
-                signed=signed,
-                confirm_live=payload.confirm_live,
-                market=mt,
-                stop_loss=payload.stop_loss,
-                take_profit=payload.take_profit,
-            )
+        # Every order is real now, so the gates are always on: the account must
+        # be able to sign, and on mainnet the caller must acknowledge that this
+        # leaves the building. Testnet asks for no ceremony — rehearsing should
+        # not require extra clicks.
+        with state.locks[mt]:
+            signed = state.ctx.rest_for(mt).has_credentials
+        _require_live_ready(
+            signed=signed,
+            confirm_live=payload.confirm_live,
+            network=state.ctx.network,
+            market=mt,
+            stop_loss=payload.stop_loss,
+            take_profit=payload.take_profit,
+        )
 
-        # A paper fill is simulated against the charting feed; a live order must
-        # be priced by the venue that will actually execute it.
-        quote = state.ctx.quote_rest(mt, paper=mode is RunMode.PAPER)
+        # An order is always priced by the venue that will execute it; quoting
+        # it from the charting feed would send a testnet order with a
+        # mainnet-only price.
+        quote = state.ctx.quote_rest(mt)
         reference = payload.price if payload.order_type == "limit" else None
         if reference is None:
             try:
@@ -1000,11 +777,7 @@ def create_app() -> FastAPI:
         # clamp that instead of rejecting what is clearly a full exit.
         adjusted = False
         if mt is MarketType.SPOT and payload.side == "sell":
-            available = (
-                _live_spot_available(state, payload.symbol, mt)
-                if mode is RunMode.LIVE
-                else _paper_held(state, payload.symbol)
-            )
+            available = _live_spot_available(state, payload.symbol, mt)
             if available <= 0:
                 raise HTTPException(
                     status_code=400,
@@ -1033,10 +806,9 @@ def create_app() -> FastAPI:
             # what lets a halted or emergency-stopped account still flatten:
             # the entry breakers are skipped for reduce-only orders.
             reduce_only=_is_reducing(
-                state, mt, payload.symbol, payload.side, amount, mode
+                state, mt, payload.symbol, payload.side, amount
             ),
             market_type=mt,
-            mode=mode,
         )
         if payload.stop_loss or payload.take_profit:
             # Spot is long-only: a sell there is an exit, never a new short.
@@ -1067,78 +839,11 @@ def create_app() -> FastAPI:
             "quote_notional": result.quote_notional,
             "amount_base": result.amount_base,
             "amount_exchange": result.amount_exchange,
-            "mode": result.mode.value,
+            "network": state.ctx.network.value,
             "adjusted": adjusted,
-            "protection": (
-                state.ctx.paper.protections().get(payload.symbol)
-                if mode is RunMode.PAPER
-                else result.protection
-            ),
+            "protection": result.protection,
             "warnings": result.warnings,
         }
-
-    # ---------------------------------------------------- conditional orders
-    @app.post("/api/orders/conditional")
-    def api_place_conditional(payload: ConditionalPayload) -> dict[str, Any]:
-        """Arm a standalone stop/limit order.
-
-        Paper only: a live exchange conditional order needs its own endpoint
-        (``STOP_MARKET`` etc.) and is not wired up yet, so this refuses rather
-        than silently sending a plain market order.
-        """
-        if payload.mode != "paper":
-            raise HTTPException(status_code=400, detail="条件单目前只支持纸面模式")
-        if payload.side not in ("buy", "sell"):
-            raise HTTPException(status_code=400, detail="方向必须是 buy 或 sell")
-        if payload.direction not in ("below", "above"):
-            raise HTTPException(status_code=400, detail="触发方向必须是 below 或 above")
-        mt = _market(payload.market)
-        state = get_state()
-        amount = payload.size
-        if payload.size_mode == "quote":
-            if not payload.trigger:
-                raise HTTPException(status_code=400, detail="按金额下单需要触发价")
-            amount = payload.size / payload.trigger
-        if amount <= 0:
-            raise HTTPException(status_code=400, detail="条件单数量必须大于 0")
-        try:
-            with state.account_lock:
-                item = state.ctx.paper.place_conditional(
-                    payload.symbol,
-                    payload.side,
-                    amount,
-                    payload.trigger,
-                    direction=payload.direction,
-                    order_type=payload.order_type,
-                    price=payload.price,
-                    market=mt.value,
-                    allow_short=mt.is_futures,
-                    reduce_only=payload.reduce_only,
-                )
-                state.ctx.trading.save_paper_state()
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {"ok": True, "conditional": item, "amount_base": amount}
-
-    @app.delete("/api/orders/conditional/{order_id}")
-    def api_cancel_conditional(order_id: str) -> dict[str, Any]:
-        state = get_state()
-        with state.account_lock:
-            item = state.ctx.paper.cancel_conditional(order_id)
-            if item is None:
-                raise HTTPException(
-                    status_code=404, detail="未找到可撤销的条件单（可能已触发或已撤销）。"
-                )
-            state.ctx.trading.save_paper_state()
-        return {"ok": True, "conditional": item}
-
-    @app.post("/api/paper/reset")
-    def api_reset_paper(balance: float | None = None) -> dict[str, Any]:
-        state = get_state()
-        with state.account_lock:
-            state.ctx.paper.reset(balance)
-            state.ctx.trading.save_paper_state()
-        return {"ok": True, "cash": state.ctx.paper.account.cash}
 
     # ---------------------------------------------------------------- cancel
     @app.delete("/api/orders/{order_id}")
@@ -1146,25 +851,19 @@ def create_app() -> FastAPI:
         order_id: str,
         symbol: str,
         market: str | None = None,
-        mode: str = "paper",
     ) -> dict[str, Any]:
         """Cancel a resting order.
 
-        Paper and live orders share the same route; ``mode`` decides where it
-        goes. The response carries the final order state so the UI can update
-        the row without a refetch.
+        The response carries the final order state so the UI can update the row
+        without a refetch.
         """
-        if mode not in ("paper", "live"):
-            raise HTTPException(status_code=400, detail="模式必须是 paper 或 live")
         if not symbol:
             raise HTTPException(status_code=400, detail="缺少交易对")
         state = get_state()
         mt = _market(market) if market else _market_for_symbol(symbol)
         try:
             with state.account_lock:
-                order = state.ctx.trading.cancel(
-                    mt, symbol, order_id, RunMode(mode), market=mt.value
-                )
+                order = state.ctx.trading.cancel(mt, symbol, order_id, market=mt.value)
         except OrderRejected as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
@@ -1174,40 +873,31 @@ def create_app() -> FastAPI:
     # ---------------------------------------------------------------- closing
     @app.post("/api/positions/close")
     def api_close_position(payload: ClosePayload) -> dict[str, Any]:
-        """Market-close a paper position (optionally a partial size).
+        """Market-close a position (optionally a partial size).
 
-        Kept separate from ``/api/orders`` so the caller does not have to know
-        the signed size or the direction: the server reads the position and
-        sends the opposite side with ``reduceOnly``. Live positions are read
-        from the exchange for the same reason.
+        Kept separate from /api/orders so the caller does not have to know the
+        signed size or the direction: the server reads the position from the
+        venue and sends the opposite side with reduceOnly.
         """
-        if payload.mode not in ("paper", "live"):
-            raise HTTPException(status_code=400, detail="模式必须是 paper 或 live")
         # An omitted market is inferred from the symbol: a futures pair carries
         # its settle currency ("BTC/USDT:USDT"), spot does not. Defaulting to
         # spot here made every futures exit fail as "没有该交易对的持仓".
         mt = _market(payload.market) if payload.market else _market_for_symbol(payload.symbol)
         state = get_state()
-        mode = RunMode(payload.mode)
 
-        if mode is RunMode.LIVE:
-            with state.locks[mt]:
-                signed = state.ctx.rest_for(mt).has_credentials
-            _require_live_ready(
-                signed=signed,
-                confirm_live=payload.confirm_live,
-                stop_loss=None,
-                take_profit=None,
-            )
-            held = _live_held(state, payload.symbol, mt)
-        else:
-            position = state.ctx.paper.account.positions.get(payload.symbol)
-            held = position.contracts if position else 0.0
+        with state.locks[mt]:
+            signed = state.ctx.rest_for(mt).has_credentials
+        _require_live_ready(
+            signed=signed,
+            confirm_live=payload.confirm_live,
+            network=state.ctx.network,
+        )
+        held = _live_held(state, payload.symbol, mt)
         if abs(held) <= 1e-12:
             raise HTTPException(status_code=400, detail="当前没有该交易对的持仓")
         size = abs(held) if payload.size is None else min(abs(payload.size), abs(held))
         try:
-            quote = state.ctx.quote_rest(mt, paper=mode is RunMode.PAPER)
+            quote = state.ctx.quote_rest(mt)
             with state.locks[mt]:
                 reference = float(
                     quote.fetch_ticker(mt, payload.symbol).get("last") or 0.0
@@ -1226,7 +916,6 @@ def create_app() -> FastAPI:
             price=reference,
             reduce_only=True,
             market_type=mt,
-            mode=mode,
         )
         try:
             with state.account_lock:
@@ -1243,70 +932,6 @@ def create_app() -> FastAPI:
             "size": size,
             "side": side,
         }
-
-    @app.put("/api/positions/protection")
-    def api_set_protection(payload: ProtectionPayload) -> dict[str, Any]:
-        """Arm, update, or clear the guard of a position that already exists.
-
-        Kept separate from ordering so a position opened bare (or a stop that
-        needs moving as the trade develops) can be protected without touching
-        the entry — and so spot positions can use it too.
-        """
-        state = get_state()
-        with state.account_lock:
-            position = state.ctx.paper.account.positions.get(payload.symbol)
-            held = position.contracts if position else 0.0
-            if abs(held) <= 1e-12:
-                raise HTTPException(status_code=400, detail="当前没有该交易对的持仓")
-            long = held > 0
-            try:
-                market = _market_for_symbol(payload.symbol)
-                with state.locks[market]:
-                    reference = float(
-                        state.ctx.market_rest_for(market)
-                        .fetch_ticker(market, payload.symbol)
-                        .get("last")
-                        or 0.0
-                    )
-            except Exception as exc:
-                raise HTTPException(status_code=503, detail=f"无法获取最新价：{exc}") from exc
-            if reference <= 0:
-                # Falling back to the entry price keeps a stop usable offline.
-                reference = position.entry_price
-            try:
-                _check_protection_levels(
-                    reference,
-                    payload.stop_loss or None,
-                    payload.take_profit or None,
-                    "buy" if long else "sell",
-                )
-            except HTTPException:
-                # The market may have moved past the level already. The entry
-                # price is the honest reference for "is this a stop?", so only
-                # reject when the level is wrong for that too.
-                _check_protection_levels(
-                    position.entry_price,
-                    payload.stop_loss or None,
-                    payload.take_profit or None,
-                    "buy" if long else "sell",
-                )
-            guard = state.ctx.paper.set_protection(
-                payload.symbol, payload.stop_loss, payload.take_profit
-            )
-            state.ctx.trading.save_paper_state()
-        return {"ok": True, "protection": guard or None}
-
-    @app.delete("/api/positions/protection")
-    def api_clear_protection(symbol: str) -> dict[str, Any]:
-        """Disarm the stop-loss / take-profit guard of one symbol."""
-        if not symbol:
-            raise HTTPException(status_code=400, detail="缺少交易对")
-        state = get_state()
-        with state.account_lock:
-            existed = state.ctx.paper.clear_protection(symbol)
-            if existed:
-                state.ctx.trading.save_paper_state()
-        return {"ok": True, "cleared": existed}
 
     # -------------------------------------------------------------- logs
     @app.get("/api/logs")
@@ -1439,69 +1064,25 @@ def _warm() -> None:
         log.debug("预热交易对失败", exc_info=True)
 
 
-# Paper limit orders have no exchange to match them, so a light poll does it:
-# every couple of seconds the last price of each symbol with a resting order is
-# fetched and any order the market has crossed is filled.
-RECONCILE_SECONDS = 2.0
-
-# Live fills feed the same breakers as paper ones, but each poll costs a
-# signed request per market plus one per symbol. Five seconds keeps the loss
-# breakers close to real time while staying far below Binance's request weight
-# budget (a handful of calls per interval, not per symbol per second).
+# Live fills feed the daily-loss and losing-streak breakers, and a stop-loss
+# fired by the venue is only visible through them. Each poll costs a signed
+# request per market, so five seconds keeps the breakers close to real time
+# while staying far below Binance's request weight budget. The account snapshot
+# is refreshed on the same tick, which is what keeps the panels current without
+# every page polling the venue itself.
 LIVE_SYNC_SECONDS = 5.0
 
 
-def _reconcile_paper_orders(state: _State) -> None:
-    last_live_sync = 0.0
-    while not state.stop_reconcile.wait(RECONCILE_SECONDS):
-        # Live fills feed the same breakers as paper ones, but a signed request
-        # per symbol is far too expensive at the paper cadence.
-        now = time.monotonic()
-        if now - last_live_sync >= LIVE_SYNC_SECONDS:
-            last_live_sync = now
-            try:
-                with state.account_lock:
-                    booked = state.ctx.trading.sync_live_fills()
-                if booked:
-                    log.info("实盘成交已回填风控 %d 笔", len(booked))
-            except Exception:  # the reconciler must survive a bad exchange
-                log.debug("实盘成交同步异常", exc_info=True)
+def _reconcile_live_fills(state: _State) -> None:
+    while not state.stop_reconcile.wait(LIVE_SYNC_SECONDS):
         try:
-            resting = state.ctx.paper.open_orders()
-            # Symbols guarded by a stop/target must be polled even when no
-            # order rests on them: a market entry closes its order at once.
-            guarded = state.ctx.paper.protections()
-            conditional = state.ctx.paper.open_conditional()
-            wanted = {(order.get("market") or "spot", order["symbol"]) for order in resting}
-            for symbol in guarded:
-                wanted.add((_market_for_symbol(symbol).value, symbol))
-            for item in conditional:
-                wanted.add((item.get("market") or "spot", item["symbol"]))
-            for market_value, symbol in sorted(wanted):
-                try:
-                    market = MarketType(market_value)
-                except ValueError:
-                    continue
-                try:
-                    with state.locks[market]:
-                        raw = state.ctx.market_rest_for(market).fetch_ticker(market, symbol)
-                    price = float(raw.get("last") or 0.0)
-                except Exception as exc:
-                    log.debug("纸面撮合取价失败 %s: %s", symbol, exc)
-                    continue
-                if price <= 0:
-                    continue
-                for order in state.ctx.trading.settle_paper_orders(symbol, price):
-                    if order.get("protection"):
-                        log.info(
-                            "纸面%s触发 %s %s @ %s",
-                            "止损" if order["protection"] == "stop_loss" else "止盈",
-                            symbol, format_amount(order["amount"]), order.get("average"),
-                        )
-                    else:
-                        log.info(
-                            "纸面限价成交 %s %s %s @ %s",
-                            symbol, order["side"], format_amount(order["amount"]), order["price"],
-                        )
-        except Exception:  # keep the loop alive whatever one cycle does
-            log.exception("纸面撮合循环异常")
+            with state.account_lock:
+                booked = state.ctx.trading.sync_live_fills()
+            if booked:
+                log.info("交易所成交已回填风控 %d 笔", len(booked))
+        except Exception:  # the poller must survive a bad exchange
+            log.debug("成交同步异常", exc_info=True)
+        try:
+            state.ctx.account.refresh_all()
+        except Exception:  # pragma: no cover - snapshot refresh is best effort
+            log.debug("账户快照刷新异常", exc_info=True)

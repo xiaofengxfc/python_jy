@@ -21,7 +21,7 @@ class ExchangeError(RuntimeError):
 
 # Binance publishes read-only spot market data on its own host. Unlike
 # api.binance.com it is reachable from networks where the trading host refuses
-# connections, which is what lets a paper account chart real candles without
+# connections, which is what lets a charting client read real candles without
 # sending a single order to the exchange. Candles, tickers and the book are
 # the same feed the trading host serves.
 PUBLIC_SPOT_HOST = "https://data-api.binance.vision/api/v3"
@@ -79,7 +79,13 @@ class BinanceREST:
             params: dict[str, Any] = {
                 "enableRateLimit": True,
                 "timeout": 20_000,
-                "options": {"defaultType": "swap" if market.is_futures else "spot"},
+                "options": {
+                    "defaultType": "swap" if market.is_futures else "spot",
+                    # The 委托 tab and the protection column need every open
+                    # order, not just one pair's. Acknowledged here so ccxt
+                    # stops raising; the account cache keeps the cost low.
+                    "fetchOpenOrders": {"warnWithoutSymbol": False},
+                },
             }
             client = klass(params)
             if self.proxy:
@@ -134,9 +140,8 @@ class BinanceREST:
     ) -> ContractSpec:
         """Contract size / minimum amount for a symbol, cached after first use.
 
-        ``allow_network=False`` only reads the cache. Paper trading uses that so
-        an order never blocks on a network round trip, and so an offline session
-        can still place simulated orders.
+        ``allow_network=False`` only reads the cache, so a preview never blocks on
+        a network round trip.
         """
         key = (market, symbol)
         with self._lock:

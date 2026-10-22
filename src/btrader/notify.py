@@ -30,7 +30,7 @@ they are logged, surfaced to the settings page, and never allowed to interrupt
 trading.
 
 Sends go through a bounded background queue. A hanging gateway must not stall an
-order submission or the paper reconciler, which run on critical paths.
+order submission or the fill reconciler, which run on critical paths.
 """
 
 from __future__ import annotations
@@ -715,7 +715,7 @@ class WeChatNotifier:
         market: str = "",
     ) -> str:
         action = _action_label(side)
-        where = "实盘" if mode == "live" else "纸面"
+        where = _venue_label(mode)
         venue = {"spot": "现货", "usdm": "U 本位", "coinm": "币本位"}.get(market, market)
         lines = [
             f"【{where}成交】{symbol}",
@@ -732,7 +732,7 @@ class WeChatNotifier:
         *, symbol: str, kind: str, price: float, amount: float, mode: str
     ) -> str:
         label = {"stop_loss": "止损", "take_profit": "止盈"}.get(kind, "保护单")
-        where = "实盘" if mode == "live" else "纸面"
+        where = _venue_label(mode)
         return (
             f"【{where}{label}触发】{symbol}\n"
             f"平仓 {_format_amount(amount)} @ {_format_price(price)}"
@@ -763,6 +763,16 @@ class WeChatNotifier:
         text = f"【风险提示】{title}"
         return f"{text}\n{detail}" if detail else text
 
+
+def _venue_label(mode: str) -> str:
+    """Where a fill happened.
+
+    The testnet is a real venue with fake money, so its fills must not be
+    announced as paper: the label tells the reader whether the money was real.
+    """
+    if mode == "testnet":
+        return "测试网"
+    return "实盘"
 
 def _action_label(side: str) -> str:
     """Name the trade direction without inventing one.

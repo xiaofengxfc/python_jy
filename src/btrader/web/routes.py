@@ -30,8 +30,6 @@ from ..core.types import (
     TIMEFRAME_SECONDS,
     MarketType,
     Network,
-    RunMode,
-    market_for_symbol,
     timeframe_seconds,
 )
 from ..engine.ai_trader import AITrader, AITraderConfig, TradeLease
@@ -130,7 +128,7 @@ def _strategy_in_use(auto, ai_ctl, key: str) -> str:
 def _engine_clash(auto_running: bool, ai_state: str, *, starting: str) -> str:
     """另一个引擎占着账户的原因，没有冲突时返回空串。
 
-    量化执行引擎（auto）和 AI 交易共用同一个纸面/实盘账户：两个 poller
+    量化执行引擎（auto）和 AI 交易共用同一个交易所账户：两个 poller
     同时下单只会互相把仓位改回去，所以启动前互斥（INV-14）。
     """
     if starting == "auto" and ai_state in ("running", "paused"):
@@ -196,9 +194,8 @@ class SettingsPayload(BaseModel):
 
 
 class AITraderStartPayload(BaseModel):
-    """启动 AI 交易。实盘必须显式 ``confirm_live``。"""
+    """启动 AI 交易。主网必须显式 confirm_live，测试网不需要。"""
 
-    mode: str = ""
     market: str = ""
     symbol: str = ""
     timeframe: str = ""
@@ -294,7 +291,6 @@ class AIReviewPayload(BaseModel):
     symbol: str
     market: str = "spot"
     timeframe: str = "1h"
-    mode: str = "paper"
 
 
 class AIDescribePayload(BaseModel):
@@ -326,7 +322,6 @@ class AutoStartPayload(BaseModel):
     position_pct: float = Field(default=1.0, gt=0, le=1)
     leverage: float = Field(default=1.0, ge=1.0, le=125.0)
     poll_seconds: float = Field(default=10.0, ge=1.0)
-    mode: str = "paper"
     confirm_live: bool = False
 
 
@@ -419,22 +414,17 @@ class AutoController:
             return self._trader is not None and self._trader.running
 
     def start(self, ctx, payload: AutoStartPayload) -> None:
-        if payload.mode not in ("paper", "live"):
-            raise HTTPException(status_code=400, detail="模式必须是 paper 或 live")
-        mode = RunMode(payload.mode)
         market = _market(payload.market)
 
-        if mode is RunMode.LIVE:
-            if ctx.network is not Network.MAINNET:
-                raise HTTPException(
-                    status_code=400, detail="测试网不支持实盘自动交易，请切换到主网"
-                )
-            if not ctx.rest_for(market).has_credentials:
-                raise HTTPException(status_code=400, detail="实盘自动交易需要配置 API Key")
-            if not payload.confirm_live:
-                raise HTTPException(
-                    status_code=400, detail="实盘自动交易需要显式确认（confirm_live=true）"
-                )
+        # The runner always trades the configured venue; the only question is
+        # whether the user is allowed to arm it. Testnet needs no confirmation —
+        # rehearsing is the point of it — mainnet does.
+        if not ctx.rest_for(market).has_credentials:
+            raise HTTPException(status_code=400, detail="自动交易需要先配置 API Key")
+        if ctx.network is Network.MAINNET and not payload.confirm_live:
+            raise HTTPException(
+                status_code=400, detail="主网自动交易需要显式确认（confirm_live=true）"
+            )
 
         try:
             strategy = ctx.strategies.get(payload.strategy)
@@ -453,7 +443,6 @@ class AutoController:
                 symbol=payload.symbol,
                 market_type=market,
                 timeframe=payload.timeframe,
-                mode=mode,
                 strategy_key=payload.strategy,
                 params=params,
                 position_pct=payload.position_pct,
@@ -474,7 +463,7 @@ class AutoController:
                 "timeframe": config.timeframe,
                 "strategy": config.strategy_key,
                 "params": params,
-                "mode": mode.value,
+                "network": ctx.network.value,
                 "position_pct": config.position_pct,
                 "leverage": config.leverage,
             }
@@ -516,11 +505,11 @@ class AutoController:
             f"{config.get('symbol', '')} {config.get('timeframe', '')}"
             f" · {config.get('strategy', '')}"
         ).strip()
-        mode = "实盘" if config.get("mode") == "live" else "纸面"
+        venue = "实盘" if ctx.network is Network.MAINNET else "测试网"
         _notify_task(
             ctx,
             "自动交易已启动" if running else "自动交易已停止",
-            [label, f"模式：{mode}"],
+            [label, f"环境：{venue}"],
         )
         if not running:
             self._error_notified_at = 0.0
@@ -556,7 +545,7 @@ class AutoController:
                 frame=bars,
                 target=target,
                 target_delta=changed,
-                mode=config.mode.label,
+                mode="实盘" if ctx.network is Network.MAINNET else "测试网",
             )
             if not result["ok"]:
                 log.debug("AI 简报失败：%s", result.get("error"))
@@ -692,9 +681,6 @@ class AITraderController:
         """
         ctx = state.ctx
         cfg = ctx.settings.ai_auto
-        mode = payload.mode or cfg.mode or "paper"
-        if mode not in ("paper", "live"):
-            raise HTTPException(status_code=400, detail="模式必须是 paper 或 live")
         market = _market(payload.market) if payload.market else ctx.market_type
         symbol = (payload.symbol or cfg.symbol or ctx.settings.last_symbol).strip()
         timeframe = payload.timeframe or cfg.timeframe or ctx.settings.timeframe
@@ -714,23 +700,23 @@ class AITraderController:
             signal_strategy = ctx.strategies.get(strategy_key)
         except KeyError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        if mode == "live":
-            if not cfg.live_enabled:
-                raise HTTPException(
-                    status_code=400, detail="实盘未在设置中显式开启（ai_auto.live_enabled）"
-                )
-            if not payload.confirm_live:
-                raise HTTPException(
-                    status_code=400, detail="实盘需要显式确认（confirm_live=true）"
-                )
-            if ctx.network is not Network.MAINNET:
-                raise HTTPException(status_code=400, detail="实盘必须使用主网")
-            if not ctx.rest_for(market).has_credentials:
-                raise HTTPException(status_code=400, detail="实盘需要配置 API Key")
+        # Arming rules, identical for testnet and mainnet except for the
+        # confirmation: live_enabled is the master switch, credentials decide
+        # whether an order can be signed at all, and mainnet additionally needs
+        # the caller to have said out loud that this is real money.
+        if not cfg.live_enabled:
+            raise HTTPException(
+                status_code=400, detail="AI 交易未在设置中显式开启（ai_auto.live_enabled）"
+            )
+        if not ctx.rest_for(market).has_credentials:
+            raise HTTPException(status_code=400, detail="AI 交易需要先配置 API Key")
+        if ctx.network is Network.MAINNET and not payload.confirm_live:
+            raise HTTPException(
+                status_code=400, detail="主网 AI 交易需要显式确认（confirm_live=true）"
+            )
 
         config = AITraderConfig(
             enabled=True,
-            mode=mode,
             live_enabled=cfg.live_enabled,
             confirm_live=payload.confirm_live,
             network=ctx.network.value,
@@ -860,83 +846,52 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
 
     # ------------------------------------------------------------ portfolio
     @router.get("/api/portfolio")
-    def portfolio() -> dict[str, Any]:
+    def portfolio(market: str = "") -> dict[str, Any]:
+        """The venue account, plus the equity curve this process has sampled.
+
+        Same snapshot the trading panel reads, so the two pages cannot quote a
+        different equity for one account. The curve starts at the recorded
+        baseline: a fresh install has no history, and inventing one would make
+        the first flattering point look like profit.
+        """
         state = get_state()
         ctx = state.ctx
-        market = ctx.market_type
-        # Prices are fetched before the account lock: a slow ticker must never
-        # hold up an order submission.
-        with state.account_lock:
-            symbols = [
-                position.symbol
-                for position in ctx.paper.account.positions.values()
-                if abs(position.contracts) > 1e-12
-            ]
-        marks = {symbol: _position_price(state, symbol) for symbol in symbols}
-        with state.account_lock:
-            account = ctx.paper.account
-            # Booked result per pair; it survives the position going flat, so
-            # the page total no longer resets to zero after a round trip.
-            ledger = account.realized_by_symbol
-            positions = []
-            for position in account.positions.values():
-                if abs(position.contracts) <= 1e-12:
-                    continue
-                last = marks.get(position.symbol) or position.entry_price
-                positions.append(
+        mt = _market(market) if market else ctx.market_type
+        snapshot = ctx.account.snapshot(mt, refresh=True)
+        equity = snapshot.equity
+        # Sample the equity curve at most every 20s: the panel polls every 4s
+        # and a point per poll would make the chart unreadable.
+        now = time.time()
+        if now - state.equity_stamp >= 20:
+            state.equity_stamp = now
+            if not state.equity_history:
+                state.equity_history.append(
                     {
-                        "symbol": position.symbol,
-                        "contracts": position.contracts,
-                        "side": position.side,
-                        "entry_price": position.entry_price,
-                        "last": last,
-                        "unrealized": (last - position.entry_price) * position.contracts,
-                        "quote_value": last * position.contracts,
-                        # The position's own result (0 for a fresh entry);
-                        # the pair total is not shown here on purpose.
-                        "realized_pnl": position.realized_pnl,
-                        "fees": position.fees,
+                        "t": int((now - 1) * 1000),
+                        "equity": float(snapshot.baseline or equity),
                     }
                 )
-            holdings_value = sum(item["quote_value"] for item in positions)
-            equity = account.cash + holdings_value
-            # Sample the equity curve at most every 20s: the panel polls every
-            # 4s and a point per poll would make the chart unreadable.
-            now = time.time()
-            if now - state.equity_stamp >= 20:
-                state.equity_stamp = now
-                if not state.equity_history:
-                    state.equity_history.append(
-                        {
-                            "t": int((now - 1) * 1000),
-                            "equity": float(account.starting_balance),
-                        }
-                    )
-                state.equity_history.append({"t": int(now * 1000), "equity": float(equity)})
-                del state.equity_history[:-720]
-            trades = [dict(trade) for trade in account.trades[-100:]][::-1]
-            # Full order history, newest first: the drawer shows open orders,
-            # the portfolio page shows everything including fills and cancels.
-            orders = [dict(order) for order in account.orders[-200:]][::-1]
-            return {
-                "market": market.value,
-                "quote_asset": account.quote_asset,
-                "cash": account.cash,
-                "starting_balance": account.starting_balance,
-                "equity": equity,
-                "realized_pnl": account.realized_pnl,
-                "realized_pnl_by_symbol": {
-                    **{
-                        symbol: 0.0
-                        for symbol in (item["symbol"] for item in positions)
-                    },
-                    **ledger,
-                },
-                "positions": positions,
-                "orders": orders,
-                "trades": trades,
-                "equity_history": list(state.equity_history),
-            }
+            state.equity_history.append({"t": int(now * 1000), "equity": float(equity)})
+            del state.equity_history[:-720]
+        positions = [dict(item) for item in snapshot.positions]
+        realized = dict(snapshot.realized_by_symbol)
+        for item in positions:
+            realized.setdefault(item["symbol"], float(item.get("realized_pnl") or 0.0))
+        return {
+            "market": mt.value,
+            "quote_asset": snapshot.quote_asset,
+            "cash": snapshot.cash,
+            "starting_balance": snapshot.baseline,
+            "equity": equity,
+            "realized_pnl": snapshot.realized_pnl,
+            "realized_pnl_by_symbol": realized,
+            "positions": positions,
+            "orders": [dict(item) for item in snapshot.orders],
+            "trades": [dict(item) for item in snapshot.trades],
+            "equity_history": list(state.equity_history),
+            "has_credentials": snapshot.has_credentials,
+            "error": snapshot.error,
+        }
 
     # ------------------------------------------------------------- settings
     @router.get("/api/settings")
@@ -1140,17 +1095,21 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
             )
         position: dict[str, Any] = {}
         try:
-            account = ctx.trading.paper.account if payload.mode != "live" else None
-            if account is not None:
-                held = account.positions.get(symbol)
-                if held:
-                    position = {
-                        "side": "long" if held.contracts >= 0 else "short",
-                        "contracts": held.contracts,
-                        "entry_price": held.entry_price,
-                        "mark_price": held.entry_price,
-                        "unrealized_pnl": 0.0,
-                    }
+            snapshot = ctx.account.snapshot(market, symbol)
+            for item in snapshot.positions:
+                if item.get("symbol") != symbol:
+                    continue
+                contracts = float(item.get("contracts") or 0.0)
+                if abs(contracts) <= 1e-12:
+                    continue
+                position = {
+                    "side": "long" if contracts >= 0 else "short",
+                    "contracts": contracts,
+                    "entry_price": float(item.get("entry_price") or 0.0),
+                    "mark_price": float(item.get("last") or 0.0),
+                    "unrealized_pnl": float(item.get("unrealized") or 0.0),
+                }
+                break
         except Exception:  # a missing position is not an error
             log.debug("读取持仓失败", exc_info=True)
         frame = None
@@ -1194,13 +1153,18 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
             raise HTTPException(status_code=400, detail="没有取到 K 线，请检查交易对与周期")
         note = ""
         if ctx.settings.ai.share_position:
-            held = getattr(ctx.trading.paper.account, "positions", {})
-            item = held.get(symbol) if isinstance(held, dict) else None
-            if item:
+            try:
+                snapshot = ctx.account.snapshot(market, symbol)
+            except Exception:  # the second opinion must survive a read failure
+                snapshot = None
+            for item in (snapshot.positions if snapshot else []):
+                if item.get("symbol") != symbol:
+                    continue
                 note = (
-                    f"当前持有 {getattr(item, 'contracts', 0):.6f} 份，"
-                    f"开仓价 {getattr(item, 'entry_price', 0):,.4f}。"
+                    f"当前持有 {float(item.get('contracts') or 0):.6f} 份，"
+                    f"开仓价 {float(item.get('entry_price') or 0):,.4f}。"
                 )
+                break
         result = ai.prejudge_order(
             ctx.ai,
             symbol=symbol,
@@ -1742,23 +1706,6 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
 
 
 # ------------------------------------------------------------------- helpers
-def _position_price(state, symbol: str) -> float:
-    """Last price of one paper position, 0.0 when the market is unreachable.
-
-    Priced off the symbol's own venue, not the market currently selected in
-    the UI: a spot position must keep its value after the user switches to
-    futures, and /api/account uses the same rule so both pages agree.
-    """
-    try:
-        with state.locks[market_for_symbol(symbol)]:
-            raw = state.ctx.market_rest_for(market_for_symbol(symbol)).fetch_ticker(
-                market_for_symbol(symbol), symbol
-            )
-        return float(raw.get("last") or 0.0)
-    except Exception:
-        log.debug("持仓取价失败 %s", symbol, exc_info=True)
-        return 0.0
-
 def _last_price(state, market: MarketType, symbol: str) -> float | None:
     try:
         with state.locks[market]:
@@ -1875,8 +1822,6 @@ def _apply_ai_auto(target: AIAutoSettings, values: dict[str, Any]) -> None:
             raise HTTPException(
                 status_code=400, detail=f"AI 自动交易字段 {key} 的值无效"
             ) from None
-    if target.mode not in ("paper", "live"):
-        raise HTTPException(status_code=400, detail="ai_auto.mode 必须是 paper 或 live")
     for name in ("max_order_quote", "max_position_quote", "max_price_drift_pct"):
         if getattr(target, name) < 0:
             raise HTTPException(status_code=400, detail=f"ai_auto.{name} 不能为负")
@@ -1889,20 +1834,14 @@ def _ai_portfolio(state, symbol: str) -> dict[str, Any]:
     ctx = state.ctx
     market = ctx.market_type
     price = _last_price(state, market, symbol)
-    with state.account_lock:
-        account = ctx.paper.account
-        position = account.positions.get(symbol)
-        position_quote = 0.0
-        if position is not None and abs(position.contracts) > 1e-12:
-            last = price or position.entry_price
-            position_quote = abs(position.contracts) * last
-        holdings = 0.0
-        for item in account.positions.values():
-            if abs(item.contracts) <= 1e-12:
-                continue
-            last = price if item.symbol == symbol and price else item.entry_price
-            holdings += abs(item.contracts) * last
-        equity = account.cash + holdings
+    snapshot = ctx.account.snapshot(market, symbol)
+    position_quote = 0.0
+    for item in snapshot.positions:
+        if item.get("symbol") != symbol:
+            continue
+        position_quote = abs(float(item.get("quote_value") or 0.0))
+        break
+    equity = snapshot.equity
     risk = ctx.trading.risk
     return {
         "price": price,

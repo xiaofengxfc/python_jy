@@ -37,14 +37,13 @@ class RiskSettings:
 
 @dataclass
 class AIAutoSettings:
-    """AI 自主交易的持久化配置（默认关闭、纸面模式）。
+    """AI 自主交易的持久化配置（默认关闭）。
 
-    ``live_enabled`` 只是“允许实盘”的一半条件：每次启动仍要显式传
-    ``confirm_live``，并且必须主网 + 未急停（见 ``engine/ai_trader.py``）。
+    live_enabled 是“允许真下单”的总闸：每次启动仍要显式传
+    confirm_live，并且必须未急停（见 engine/ai_trader.py）。
     """
 
     enabled: bool = False
-    mode: str = "paper"
     live_enabled: bool = False
     symbol: str = ""
     timeframe: str = ""

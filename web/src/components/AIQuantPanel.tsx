@@ -184,14 +184,13 @@ export default function AIQuantPanel({ market, symbol, timeframe, onNavigate }: 
           timeframe,
           strategy: key,
           params: {},
-          mode: "paper",
           position_pct: 1,
           leverage: 1,
           poll_seconds: 10,
           confirm_live: false,
         }),
       });
-      setNotice(`已部署 ${selected.name}（${key}）并以纸面模式自动执行。`);
+      setNotice(`已部署 ${selected.name}（${key}）并开始自动执行，下一根 K 线才会下单。`);
       await load();
     } catch (caught) {
       setNotice("");
@@ -317,7 +316,7 @@ export default function AIQuantPanel({ market, symbol, timeframe, onNavigate }: 
                   disabled={busy !== "" || !canDeploy}
                   onClick={() => void deploy()}
                 >
-                  {busy === "deploy" ? "部署中…" : "部署并以纸面自动执行"}
+                  {busy === "deploy" ? "部署中…" : "部署并自动执行"}
                 </button>
                 <button
                   type="button"
@@ -346,7 +345,7 @@ export default function AIQuantPanel({ market, symbol, timeframe, onNavigate }: 
               <div><b>1. 生成</b><span>模型读取策略模板和行情特征，写出候选源码。</span></div>
               <div><b>2. 回测</b><span>候选只在沙箱检查，回测/优化通过后才可批准。</span></div>
               <div><b>3. 批准</b><span>人工在策略实验室复核源码和指标，批准不是自动注册。</span></div>
-              <div><b>4. 执行</b><span>本页把批准候选注册为正式策略，并启动纸面自动交易。</span></div>
+              <div><b>4. 执行</b><span>本页把批准候选注册为正式策略，并启动自动交易（真实下单）。</span></div>
             </div>
           </div>
           <div className="card">

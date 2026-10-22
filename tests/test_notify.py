@@ -317,7 +317,7 @@ def test_windows_shim_runs_the_node_entry_without_a_shell(monkeypatch, tmp_path)
     )
     node = tmp_path / "node.exe"
     node.write_text("", encoding="utf-8")
-    message = "【纸面成交】BTC/USDT\n买入 0.5 @ 82,000.0000\nA&B 100% | x>y"
+    message = "【测试网成交】BTC/USDT\n买入 0.5 @ 82,000.0000\nA&B 100% | x>y"
     argv = WeChatNotifier._wrap_launcher([str(shim), "message", "send", "--message", message])
     assert argv[0] == str(node)
     assert argv[1] == str(script)
@@ -401,11 +401,11 @@ def test_fill_format_names_the_market_and_pnl() -> None:
         side="sell",
         amount=0.5,
         price=82000.0,
-        mode="paper",
+        mode="testnet",
         realized=12.5,
         market="usdm",
     )
-    assert "纸面成交" in text and "BTC/USDT" in text
+    assert "测试网成交" in text and "BTC/USDT" in text
     assert "卖出" in text and "U 本位" in text
     assert "+12.5000" in text
 
@@ -417,10 +417,19 @@ def test_protection_format_labels_stop_loss() -> None:
     assert "实盘止损触发" in text and "ETH/USDT" in text
 
 
+def test_testnet_fill_is_not_announced_as_paper() -> None:
+    """The testnet is a real venue: calling its fills "纸面" misleads the reader."""
+    text = WeChatNotifier.format_fill(
+        symbol="BTC/USDT", side="buy", amount=0.5, price=82000.0, mode="testnet"
+    )
+    assert "测试网成交" in text
+    assert "纸面" not in text
+
+
 def test_small_price_is_not_rounded_away() -> None:
     """A 0.00001234 price used to print as 0.0000 — a useless fill message."""
     text = WeChatNotifier.format_fill(
-        symbol="SHIB/USDT", side="buy", amount=1_000_000, price=0.00001234, mode="paper"
+        symbol="SHIB/USDT", side="buy", amount=1_000_000, price=0.00001234, mode="testnet"
     )
     assert "0.00001234" in text
     assert "0.0000 " not in text
@@ -428,7 +437,7 @@ def test_small_price_is_not_rounded_away() -> None:
 
 def test_large_price_keeps_cents_without_noise() -> None:
     text = WeChatNotifier.format_fill(
-        symbol="BTC/USDT", side="buy", amount=0.5, price=82000.0, mode="paper"
+        symbol="BTC/USDT", side="buy", amount=0.5, price=82000.0, mode="testnet"
     )
     assert "82,000.00" in text
     assert "82,000.0000" not in text
@@ -436,7 +445,7 @@ def test_large_price_keeps_cents_without_noise() -> None:
 
 def test_dust_amount_does_not_use_scientific_notation() -> None:
     text = WeChatNotifier.format_protection(
-        symbol="BTC/USDT", kind="take_profit", price=90000.0, amount=1e-7, mode="paper"
+        symbol="BTC/USDT", kind="take_profit", price=90000.0, amount=1e-7, mode="testnet"
     )
     assert "0.0000001" in text
     assert "e-07" not in text.lower()
@@ -445,7 +454,7 @@ def test_dust_amount_does_not_use_scientific_notation() -> None:
 def test_unknown_side_does_not_claim_a_direction() -> None:
     """Reporting "卖出" for a blank side is worse than saying nothing."""
     text = WeChatNotifier.format_fill(
-        symbol="BTC/USDT", side="", amount=0.1, price=82000.0, mode="paper"
+        symbol="BTC/USDT", side="", amount=0.1, price=82000.0, mode="testnet"
     )
     assert "卖出" not in text
     assert "成交" in text

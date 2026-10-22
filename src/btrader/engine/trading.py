@@ -1,7 +1,8 @@
 """Order execution used by manual trading and the automated engine.
 
 The service is the single place where an order can leave the application. It
-applies risk checks, precision rounding and (in paper mode) the paper broker.
+applies risk checks and precision rounding, then hands the order to the venue
+configured by the current network (mainnet or testnet).
 """
 
 from __future__ import annotations
@@ -16,13 +17,9 @@ from ..core.types import MarketType, Network, OrderSide, OrderType, RunMode
 from ..exchange.rest import BinanceREST, ExchangeError
 from ..exchange.symbols import format_amount
 from ..notify import WeChatNotifier
-from .paper import PaperBroker
 from .risk import RiskDecision, RiskManager
 
 log = logging.getLogger(__name__)
-
-# settings_kv key holding the serialized simulated account.
-PAPER_STATE_KEY = "paper.account.v1"
 
 # Live fills already folded into the risk manager, plus the per-symbol cost
 # ledger used to derive closing PnL. Kept in SQLite so a restart does not
@@ -66,8 +63,7 @@ class OrderRequest:
     reduce_only: bool = False
     leverage: float = 1.0
     market_type: MarketType = MarketType.SPOT
-    mode: RunMode = RunMode.PAPER
-    # Protective exits, only meaningful for paper entries.
+    # Protective exits, handed to the venue as reduce-only stop orders.
     stop_loss: float | None = None
     take_profit: float | None = None
 
@@ -75,7 +71,6 @@ class OrderRequest:
 @dataclass
 class OrderResult:
     order: dict
-    mode: RunMode
     quote_notional: float
     amount_base: float = 0.0
     amount_exchange: float = 0.0
@@ -91,14 +86,12 @@ class TradingService:
         settings: AppSettings,
         rest: BinanceREST,
         risk: RiskManager,
-        paper: PaperBroker,
         db: Database,
         notifier: "WeChatNotifier | None" = None,
     ) -> None:
         self.settings = settings
         self.rest = rest
         self.risk = risk
-        self.paper = paper
         self.db = db
         # Optional: pushes fills, protective exits and breaker trips to WeChat.
         # Always best-effort, never on the order path's critical section.
@@ -109,50 +102,6 @@ class TradingService:
         # Leverage already pushed to the venue, keyed by (market, symbol).
         # Setting it on every order would burn a signed request each time.
         self._leverage_applied: dict[tuple[MarketType, str], float] = {}
-        # Orders the paper broker created by itself (conditional orders). They
-        # are recorded and notified here, then claimed by the reconciler so
-        # ``mark`` returning them cannot double-book the fill.
-        self._paper_external: set[str] = set()
-        self._attach_paper_observer()
-
-    def _attach_paper_observer(self) -> None:
-        paper = self.paper
-        if paper is None:
-            return
-        try:
-            paper.set_order_observer(self.on_broker_order)
-        except AttributeError:  # a stand-in broker without the hook
-            log.debug("纸面 broker 不支持订单观察器")
-
-    def _claim_external(self, order: dict) -> bool:
-        """Take an order out of the "already handled" set.
-
-        Returns ``True`` when this order was created outside ``submit`` — the
-        caller must then skip the accounting it does for ordinary orders.
-        """
-        order_id = str((order or {}).get("id") or "")
-        if not order_id or order_id not in self._paper_external:
-            return False
-        self._paper_external.discard(order_id)
-        return True
-
-    def on_broker_order(self, order: dict) -> None:
-        """Handle an order the paper broker produced on its own.
-
-        A conditional order fires inside the broker's own lock, while the
-        reconciler is what normally books fills. Recording it here, at the
-        moment it happens, keeps the risk manager exact — the breaker must see
-        an exit immediately, not one poll later — and reporting it to WeChat is
-        the same message a stop-loss produces.
-        """
-        if not order:
-            return
-        order_id = str(order.get("id") or "")
-        if order_id:
-            self._paper_external.add(order_id)
-        self._record_fill(order)
-        self._notify_protection(order)
-        self.notify_risk_halt()
 
     # ------------------------------------------------------------------ sizing
     def amount_from_quote(self, market_type: MarketType, symbol: str, quote: float, price: float) -> float:
@@ -174,14 +123,14 @@ class TradingService:
 
         Returns ``(exchange_amount, base_qty)``. For inverse contracts the
         exchange amount is a number of contracts (each worth ``contractSize``
-        USD), so the returned base quantity is the rounded value that the paper
-        account and the risk checks should use. Spot and linear markets keep
-        the base quantity itself as the exchange amount.
+        USD), so the returned base quantity is the rounded value the risk
+        checks should use. Spot and linear markets keep the base quantity
+        itself as the exchange amount.
 
-        ``offline=True`` is used for paper trading: it never touches the
-        network, so a simulated order cannot be refused just because the
-        exchange is unreachable. Contract specs already fetched by the market
-        page are reused from the cache.
+        ``offline=True`` is used by the order preview: it never touches the
+        network, so the ticket still shows a size estimate while the venue is
+        unreachable. Contract specs already fetched by the market page are
+        reused from the cache.
 
         Raises ``OrderRejected`` when the rounded size falls below the market
         minimum (e.g. less than one contract on coin-M).
@@ -198,8 +147,8 @@ class TradingService:
                 f"{format_amount(spec.min_amount)}。（{spec.describe()}）"
             )
         if offline:
-            # Paper fills are simulated locally: round exactly the way the
-            # venue would (inverse contracts are whole numbers, never up).
+            # A preview never places anything: round exactly the way the venue
+            # would (inverse contracts are whole numbers, never up).
             exchange_amount = math.floor(raw + 1e-12) if spec.inverse else raw
         else:
             exchange_amount = self.rest.amount_to_precision(market_type, symbol, raw)
@@ -246,17 +195,14 @@ class TradingService:
     def _equity(self, req: OrderRequest, price: float) -> float:
         """Account equity used by the percentage-based per-order cap.
 
-        Paper mode is exact. Live mode reports the venue's total balance; when
-        it is unavailable the percentage cap simply does not apply (the fixed
-        ceiling still does).
+        The venue reports its total balance; when it is unavailable the
+        percentage cap simply does not apply (the fixed ceiling still does).
 
         ccxt groups balances as ``{"total": {"USDT": 1234.5}}`` — the inner
         value, not the mapping, is the number. Reading ``balance["total"]``
         directly always yielded zero, so in live mode ``max_order_pct`` never
         took effect.
         """
-        if req.mode is RunMode.PAPER:
-            return self.paper.account.cash
         if not self.rest.has_credentials:
             return 0.0
         try:
@@ -284,16 +230,14 @@ class TradingService:
     def _current_position_quote(self, req: OrderRequest, price: float) -> float | None:
         """Current exposure used by the position limit, or ``None`` if unknown.
 
-        Paper mode is exact. Live mode queries the exchange; a failed query
-        returns ``None`` rather than zero, because zero silently disables the
-        position cap — the order would be checked as if nothing were held.
-        Coin-margined positions are reported in contracts, so they go through
-        the contract spec to produce a USD notional.
+        A failed query returns ``None`` rather than zero, because zero silently
+        disables the position cap — the order would be checked as if nothing
+        were held. Coin-margined positions are reported in contracts, so they go
+        through the contract spec to produce a USD notional.
         """
-        if req.mode is RunMode.PAPER:
-            held = self.paper.account.positions.get(req.symbol)
-            return abs(held.contracts) * price if held and held.contracts else 0.0
         if not self.rest.has_credentials:
+            # No key means no position to protect: a fresh testnet account is
+            # genuinely flat, and refusing every order would be useless.
             return 0.0
         try:
             positions = self.rest.fetch_positions(req.market_type, [req.symbol])
@@ -310,42 +254,23 @@ class TradingService:
 
     # ------------------------------------------------------------------ submit
     def submit(self, req: OrderRequest) -> OrderResult:
-        if req.mode is RunMode.BACKTEST:
-            raise OrderRejected("回测模式不允许下单。")
-
         price = req.price or 0.0
         if req.order_type == OrderType.MARKET.value and price <= 0:
             raise OrderRejected("市价单需要最新成交价作为参考。")
 
         # Callers always express size in base coins; convert it to whatever the
         # exchange expects (coins for spot/linear, contracts for coin-M).
-        # Paper orders are converted offline: a simulated fill must not depend
-        # on the venue being reachable.
         exchange_amount, base_qty = self.exchange_amount(
             req.market_type,
             req.symbol,
             req.amount,
             price,
-            offline=req.mode is RunMode.PAPER,
         )
         if exchange_amount <= 0:
             spec = self.rest.contract_spec(req.market_type, req.symbol)
             raise OrderRejected(
                 f"数量精度处理后为 0，请增加下单数量。（{spec.describe()}）"
             )
-
-        if (
-            req.market_type is MarketType.SPOT
-            and req.side == OrderSide.SELL.value
-            and req.mode is RunMode.PAPER
-        ):
-            held = self.paper.account.positions.get(req.symbol)
-            available = held.contracts if held else 0.0
-            if base_qty > available + 1e-12:
-                raise OrderRejected(
-                    f"现货不能做空：当前持有 {format_amount(available)}，无法卖出 {format_amount(base_qty)}。"
-                    "如需做空请切换到合约市场。"
-                )
 
         decision = self.precheck(
             OrderRequest(
@@ -357,43 +282,15 @@ class TradingService:
                 reduce_only=req.reduce_only,
                 leverage=req.leverage,
                 market_type=req.market_type,
-                mode=req.mode,
             )
         )
         if not decision:
             raise OrderRejected(decision.reason)
 
-        if req.mode is RunMode.PAPER:
-            order = self.paper.place_order(
-                symbol=req.symbol,
-                side=req.side,
-                order_type=req.order_type,
-                amount=base_qty,
-                price=price,
-                reduce_only=req.reduce_only,
-                allow_short=req.market_type.is_futures,
-                market=req.market_type.value,
-                stop_loss=req.stop_loss,
-                take_profit=req.take_profit,
+        if not self.rest.has_credentials:
+            raise OrderRejected(
+                f"尚未配置 API Key：{self.network.value} 网络无法下单。"
             )
-            quote = abs(base_qty) * price
-            self.risk.record_order()
-            # A market order (and a marketable exit in particular) closes
-            # immediately, so its realized PnL never reaches the background
-            # reconciler. Recording it here is what lets the daily-loss and
-            # consecutive-loss breakers see exits at all.
-            self._record_fill(order)
-            self.notify_fill(order, mode=req.mode, market=req.market_type.value)
-            self.db.save_order("paper", req.market_type.value, order, req.mode.value)
-            self.save_paper_state()
-            log.info(
-                "纸面下单 %s %s %s %s @ %s",
-                req.symbol, req.side, format_amount(base_qty), req.order_type, price,
-            )
-            return OrderResult(order, req.mode, quote, base_qty, exchange_amount)
-
-        if self.network is Network.MAINNET and not self.rest.has_credentials:
-            raise OrderRejected("实盘下单需要先配置 API Key。")
 
         if req.market_type.is_futures and req.leverage > 0 and not req.reduce_only:
             # The venue sizes a position with its own leverage, not the one in
@@ -431,7 +328,7 @@ class TradingService:
             )
         quote = abs(base_qty) * price
         self.risk.record_order()
-        self.db.save_order(self._account_id(), req.market_type.value, order, req.mode.value)
+        self.db.save_order(self._account_id(), req.market_type.value, order, RunMode.LIVE.value)
 
         protection: list[dict] = []
         warnings: list[str] = []
@@ -445,25 +342,25 @@ class TradingService:
                     ),
                     kind="warning",
                 )
-        self.notify_fill(order, mode=req.mode, market=req.market_type.value)
+        self.notify_fill(order, market=req.market_type.value)
         log.info(
             "实盘下单 %s %s %s %s @ %s -> %s",
             req.symbol, req.side, format_amount(base_qty), req.order_type, price,
             order.get("id"),
         )
         return OrderResult(
-            order, req.mode, quote, base_qty, exchange_amount, protection, warnings
+            order, quote, base_qty, exchange_amount, protection, warnings
         )
 
     def _arm_live_protection(
         self, req: OrderRequest, order: dict, exchange_amount: float
     ) -> tuple[list[dict], list[str]]:
-        """Place venue-side stops for a live entry.
+        """Place venue-side stops for an entry.
 
-        Paper mode keeps its guards inside the app; a live position needs them
-        at the exchange, otherwise closing the app leaves it naked. A failure
-        here must not undo the entry that already filled, so each order is
-        attempted separately and reported back as a warning.
+        The guard must live at the exchange, otherwise closing the app leaves
+        the position naked. A failure here must not undo the entry that already
+        filled, so each order is attempted separately and reported back as a
+        warning.
         """
         if not (req.stop_loss or req.take_profit):
             return [], []
@@ -504,7 +401,7 @@ class TradingService:
         for item in placed:
             try:
                 self.db.save_order(
-                    self._account_id(), req.market_type.value, item, req.mode.value
+                    self._account_id(), req.market_type.value, item, RunMode.LIVE.value
                 )
             except Exception:  # pragma: no cover - history is best effort
                 log.warning("保护单写库失败", exc_info=True)
@@ -516,71 +413,22 @@ class TradingService:
         market_type: MarketType,
         symbol: str,
         order_id: str,
-        mode: RunMode,
         market: str | None = None,
     ) -> dict:
         """Cancel a resting order and return its final state.
 
-        Paper orders are cancelled locally; live orders go to the exchange.
-        The order row is written back to SQLite either way so the UI and the
-        history agree on the state.
+        The cancel goes to the venue; the order row is written back to SQLite
+        so the UI and the history agree on the state.
         """
-        if mode is RunMode.PAPER:
-            order = self.paper.cancel(order_id)
-            if order is None:
-                raise OrderRejected("未找到可撤销的委托（可能已成交或已撤销）。")
-            self.db.save_order(
-                "paper",
-                market or market_type.value,
-                order,
-                mode.value,
-            )
-            self.save_paper_state()
-            log.info("纸面撤单 %s %s", symbol, order_id)
-            return order
         order = self.rest.cancel_order(market_type, order_id, symbol)
         try:
             self.db.save_order(
-                self._account_id(), market or market_type.value, order, mode.value
+                self._account_id(), market or market_type.value, order, RunMode.LIVE.value
             )
         except Exception:  # a failed history write must not lose the cancel
             log.warning("撤单状态写库失败", exc_info=True)
-        log.info("实盘撤单 %s %s", symbol, order_id)
+        log.info("撤单 %s %s", symbol, order_id)
         return order
-
-    # ------------------------------------------------------- paper execution
-    def save_paper_state(self) -> None:
-        """Persist the simulated account (cash, positions, resting orders, SL/TP).
-
-        Best effort: a failed write must never roll back a fill that already
-        happened in memory.
-        """
-        try:
-            self.db.set_json(PAPER_STATE_KEY, self.paper.snapshot())
-        except Exception:  # pragma: no cover - storage is best effort
-            log.warning("保存纸面账户失败", exc_info=True)
-
-    def _record_fill(self, order: dict) -> None:
-        """Feed a paper fill's realized PnL into the risk manager.
-
-        ``record_order`` already counted the order itself; this is the other
-        half — the daily-loss and consecutive-loss circuit breakers only ever
-        see exits, which is why they used to be dead code.
-        """
-        if not order or order.get("status") != "closed":
-            return
-        closed = float(order.get("closedQty") or 0.0)
-        if closed <= 0:
-            return
-        realized = float(order.get("realized") or 0.0)
-        self.risk.record_trade(realized)
-        log.info(
-            "纸面平仓 %s %s %s 已实现 %.4f",
-            order.get("symbol"),
-            order.get("side"),
-            format_amount(closed),
-            realized,
-        )
 
     # ------------------------------------------------------------ notifications
     def _notify(self, text: str, *, kind: str) -> None:
@@ -597,8 +445,13 @@ class TradingService:
         except Exception:  # pragma: no cover - notification is best effort
             log.debug("微信通知入队失败", exc_info=True)
 
-    def notify_fill(self, order: dict, *, mode: RunMode, market: str = "") -> None:
-        """Push one executed order. Used by the paper and live paths alike."""
+    def notify_fill(self, order: dict, *, market: str = "") -> None:
+        """Push one executed order.
+
+        The heading says whether the money was real: on the testnet the same
+        fill is real code but fake funds, and announcing it as "实盘" would be
+        a lie the reader cannot check.
+        """
         if not order:
             return
         status = str(order.get("status") or "").lower()
@@ -606,8 +459,8 @@ class TradingService:
             return
         try:
             # ``filled`` is the traded size, ``amount`` the requested one; the
-            # two differ on a partial fill. A paper order that a trigger closed
-            # has ``price`` 0 and only the traded level in ``triggerPrice``.
+            # two differ on a partial fill. A triggered stop carries ``price`` 0
+            # and only the crossed level in ``triggerPrice``.
             amount = float(order.get("filled") or order.get("amount") or 0.0)
             price = float(
                 order.get("average")
@@ -619,9 +472,9 @@ class TradingService:
             return
         if amount <= 0 or price <= 0:
             return
-        # An entry books its fee as realized PnL (see PaperBroker._fill), but
-        # announcing "已实现 -3.99" on a plain buy would read as a loss on a
-        # trade that has not closed anything yet: only report a closed round.
+        # A fee on an entry is a cost, but announcing "已实现 -3.99" on a plain
+        # buy reads as a loss on a trade that has not closed anything yet: only
+        # report a closed round.
         closed = float(order.get("closedQty") or 0.0)
         realized = order.get("realized") if closed > 1e-12 else None
         text = WeChatNotifier.format_fill(
@@ -629,7 +482,7 @@ class TradingService:
             side=str(order.get("side") or ""),
             amount=amount,
             price=price,
-            mode=mode.value,
+            mode="testnet" if self.network is Network.TESTNET else "live",
             realized=float(realized) if realized is not None else None,
             market=market or str(order.get("market") or ""),
         )
@@ -695,10 +548,11 @@ class TradingService:
     def sync_live_fills(self, markets: list[MarketType] | None = None) -> list[dict]:
         """Pull recent live fills and feed closing PnL into the risk manager.
 
-        Paper fills are accounted where they happen, but a live exit comes
-        back from the exchange long after the order was submitted. Without
-        this the daily-loss and losing-streak breakers stayed silent in live
-        mode — they looked configurable but could never fire.
+        An exit comes back from the exchange long after the order was
+        submitted, and a stop-loss fired by the venue is never seen by the
+        submitting process at all. Without this the daily-loss and
+        losing-streak breakers would stay silent — configurable, but unable to
+        ever fire.
 
         Spot trades carry no realized PnL, so a weighted-average cost book per
         symbol is kept here: the first fill that reduces a position turns the
@@ -763,7 +617,7 @@ class TradingService:
                     side=summary["side"],
                     amount=summary["amount"],
                     price=summary["price"],
-                    mode=RunMode.LIVE.value,
+                    mode="testnet" if self.network is Network.TESTNET else "live",
                     realized=summary["realized"],
                     market=summary["market"],
                 ),
@@ -903,83 +757,6 @@ class TradingService:
             "price": price,
             "realized": realized,
         }
-
-    def settle_paper_orders(self, symbol: str, price: float) -> list[dict]:
-        """Fill paper limit orders against a fresh last price.
-
-        Called by the backend's background reconciler. Returns the orders that
-        filled so the caller can persist them.
-        """
-        filled = self.paper.mark(symbol, price)
-        for order in filled:
-            # A conditional order is booked and announced the moment it fires
-            # (see ``on_broker_order``). ``mark`` still returns it — that is
-            # what the caller persists — but claiming it here is what keeps the
-            # risk manager from counting the same exit twice.
-            if self._claim_external(order):
-                continue
-            self._record_fill(order)
-            self.notify_fill(order, mode=RunMode.PAPER, market=order.get("market") or "spot")
-            try:
-                self.db.save_order(
-                    "paper", order.get("market") or "spot", order, RunMode.PAPER.value
-                )
-            except Exception:  # pragma: no cover - history is best effort
-                log.warning("纸面成交写库失败", exc_info=True)
-        if filled:
-            self.save_paper_state()
-            self.notify_risk_halt()
-        return filled
-
-    def check_protections(self, symbol: str, price: float) -> list[dict]:
-        """Trigger stop-loss / take-profit exits for one symbol."""
-        orders = self.paper.check_protections(symbol, price)
-        for order in orders:
-            self._record_fill(order)
-            self._notify_protection(order)
-            try:
-                self.db.save_order(
-                    "paper", order.get("market") or "spot", order, RunMode.PAPER.value
-                )
-            except Exception:  # pragma: no cover - history is best effort
-                log.warning("保护单写库失败", exc_info=True)
-        if orders:
-            self.save_paper_state()
-            self.notify_risk_halt()
-        return orders
-
-    def _notify_protection(self, order: dict) -> None:
-        """Push a stop-loss / take-profit exit.
-
-        These are the messages worth waking up for, so they get their own
-        wording instead of blending into the ordinary fill stream.
-        """
-        kind = str(order.get("protection") or "")
-        if kind not in ("stop_loss", "take_profit"):
-            self.notify_fill(order, mode=RunMode.PAPER, market=order.get("market") or "")
-            return
-        try:
-            amount = float(order.get("filled") or order.get("amount") or 0.0)
-            # A guard fires a *market* exit: the order carries price 0 and
-            # records the crossed level in ``triggerPrice``. Without the
-            # fallback such an exit was dropped as "price <= 0".
-            price = float(
-                order.get("average") or order.get("price") or order.get("triggerPrice") or 0.0
-            )
-        except (TypeError, ValueError):
-            return
-        if amount <= 0 or price <= 0:
-            return
-        self._notify(
-            WeChatNotifier.format_protection(
-                symbol=str(order.get("symbol") or ""),
-                kind=kind,
-                price=price,
-                amount=amount,
-                mode=RunMode.PAPER.value,
-            ),
-            kind="protection",
-        )
 
     # --------------------------------------------------------------- hierarchy
     def _ensure_leverage(

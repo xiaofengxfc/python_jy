@@ -113,6 +113,13 @@ def make_trader(
     **cfg,
 ) -> tuple[AITrader, FakeLLM, FakeTrading, FakeRisk]:
     cfg.setdefault("enabled", True)
+    # These tests exercise the running machinery, so the arming switch is on.
+    # Whether it *should* be on is what the gate tests below check.
+    cfg.setdefault("live_enabled", True)
+    cfg.setdefault("confirm_live", True)
+    # These tests are about the decision machinery, not about protective
+    # stops; the stop requirement has its own gate test below.
+    cfg.setdefault("require_stop", False)
     # A long poll interval keeps the background thread from racing the
     # synchronous decide_once() calls these tests make.
     cfg.setdefault("poll_sec", 3600.0)
@@ -230,27 +237,31 @@ def test_kill_switch_blocks_and_releases_lease(tmp_path):
     assert trader.step() is None
 
 
-def test_start_requires_all_live_conditions(tmp_path):
-    trader, _llm, _trading, _risk = make_trader(
-        tmp_path, mode="live", live_enabled=True, confirm_live=False,
-    )
-    ok, message = trader.start()
+def test_start_requires_arming_conditions(tmp_path):
+    """Testnet and mainnet share one path; only the confirmation differs."""
+    unarmed = make_trader(tmp_path, live_enabled=False, market_type="usdm")[0]
+    ok, message = unarmed.start()
+    assert not ok and "live_enabled" in message
+
+    unconfirmed = make_trader(tmp_path, confirm_live=False, market_type="usdm")[0]
+    ok, message = unconfirmed.start()
     assert not ok and "二次确认" in message
 
-    spot = make_trader(tmp_path, mode="live", live_enabled=True, confirm_live=True)[0]
+    # Binance spot has no reduce-only stop, so a stop-requiring run cannot arm.
+    spot = make_trader(tmp_path, confirm_live=True, require_stop=True)[0]
     ok, message = spot.start()
     assert not ok and "止损" in message
 
+    # The testnet needs no acknowledgement: rehearsing is the point of it.
     testnet = make_trader(
-        tmp_path, mode="live", live_enabled=True, confirm_live=True,
-        network="testnet", market_type="usdm",
+        tmp_path, confirm_live=False, network="testnet", market_type="usdm",
     )[0]
     ok, message = testnet.start()
-    assert not ok and "主网" in message
+    assert ok, message
+    testnet.stop()
 
     live = make_trader(
-        tmp_path, mode="live", live_enabled=True, confirm_live=True,
-        market_type="usdm", max_position_quote=500.0,
+        tmp_path, confirm_live=True, market_type="usdm", max_position_quote=500.0,
     )[0]
     ok, message = live.start()
     assert ok, message

@@ -1662,7 +1662,7 @@ input[type="range"].input:focus {
   line-height: 1.5;
 }
 
-.paper-line {
+.ticket-line {
   display: flex;
   align-items: center;
   gap: 10px;
@@ -1671,7 +1671,7 @@ input[type="range"].input:focus {
   font-size: 11px;
 }
 
-.paper-line b {
+.ticket-line b {
   color: var(--text-2);
   font-weight: 500;
 }
@@ -2020,6 +2020,25 @@ input[type="range"].input:focus {
   color: var(--text-3);
 }
 
+/* Which network the orders go to. Testnet is the calm default; the mainnet
+   badge is the one that should catch the eye. */
+.env-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-2);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.env-badge.live {
+  border-color: color-mix(in srgb, var(--warn) 40%, var(--border));
+  background: var(--warn-weak);
+  color: var(--warn);
+}
+
 /* ------------------------------------------------------- credentials */
 .cred-row {
   display: flex;
@@ -2184,9 +2203,9 @@ input[type="range"].input:focus {
   border-bottom: 1px solid var(--border);
 }
 
-/* ------------------------------------------------- paper / live switch */
-/* A live session is the exception, so the page says so once, plainly, and
-   the confirmation asks before the first order leaves the machine. */
+/* ------------------------------------------------------- venue banner */
+/* One line, only when something is missing: no key for this market, or a
+   read the exchange refused. A working session stays silent. */
 .mode-flag {
   display: flex;
   align-items: center;

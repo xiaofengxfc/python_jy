@@ -9,7 +9,7 @@ from .core.config import AppSettings, ConfigStore
 from .core.credentials import CredentialStore, Credentials
 from .core.storage import Database
 from .core.types import MarketType, Network
-from .engine.paper import PaperBroker
+from .engine.account import AccountService
 from .engine.risk import RiskManager
 from .engine.trading import TradingService
 from .exchange.klines import KlineStore
@@ -22,9 +22,6 @@ from .notify import WeChatNotifier
 from .strategy.registry import StrategyRegistry
 
 log = logging.getLogger(__name__)
-
-# Where the simulated account is persisted between runs.
-PAPER_STATE_KEY = "paper.account.v1"
 
 
 class AppContext:
@@ -46,13 +43,6 @@ class AppContext:
         self.market_rest = BinanceREST(
             self.network, Credentials(), market_data=True, proxy=self.settings.proxy
         )
-        self.paper = PaperBroker(starting_balance=10_000.0)
-        # Resume the simulated account instead of handing out a fresh 10,000
-        # every launch: cash, positions, resting orders and SL/TP guards.
-        try:
-            self.paper.restore(self.db.get_json(PAPER_STATE_KEY))
-        except Exception:  # pragma: no cover - a corrupt row must not block startup
-            log.warning("恢复纸面账户失败，使用初始资金", exc_info=True)
         self.risk = RiskManager(self.settings.risk, self.db)
         # Outbound WeChat push. Constructed even when disabled so the settings
         # page can report whether the OpenClaw CLI is actually reachable.
@@ -64,8 +54,16 @@ class AppContext:
         # the live objects now that both exist.
         self._attach_settings()
         self.trading = TradingService(
-            self.settings, self.rest, self.risk, self.paper, self.db,
+            self.settings, self.rest, self.risk, self.db,
             notifier=self.notifier,
+        )
+        # The single source of account truth: exchange balances, positions,
+        # open orders and the stored fill ledger, cached for the polling panels.
+        self.account = AccountService(
+            rest_for=self.rest_for,
+            chart_rest_for=self.market_rest_for,
+            db=self.db,
+            network=self.network,
         )
         # Installs the CLI the notifier shells out to. Separate object because
         # it owns a process, not a message queue.
@@ -116,15 +114,15 @@ class AppContext:
             )
         return self._data_rest[market]
 
-    def quote_rest(self, market: MarketType, *, paper: bool) -> BinanceREST:
-        """Where a fill price comes from.
+    def quote_rest(self, market: MarketType) -> BinanceREST:
+        """Where an order price comes from: the venue that will execute it.
 
-        A paper fill is simulated, so quoting it from the same feed the chart
-        draws keeps the chart, the fills and the P/L consistent. A live order
-        must be priced against the venue that will execute it, otherwise a
-        testnet order would be sent with a mainnet-only price.
+        Quoting from the charting feed would send a testnet order with a
+        mainnet-only price, so orders and the close route always read the
+        trading client. The chart keeps using market_rest_for() and is allowed
+        to disagree — it shows the real market, the testnet shows its own.
         """
-        return self.market_rest_for(market) if paper else self.rest_for(market)
+        return self.rest_for(market)
 
     def set_network(self, network: Network) -> None:
         self.network = network
@@ -137,6 +135,8 @@ class AppContext:
         self.market_rest.reset()
         self._market_rest = {self.market_type: self.rest}
         self._data_rest = {self.market_type: self.market_rest}
+        self.account.network = network
+        self.account.invalidate()
         self.config.save()
 
     def set_market_type(self, market: MarketType) -> None:
@@ -160,6 +160,8 @@ class AppContext:
             self.creds = creds
             self.rest.credentials = creds
             self.rest.reset()
+            # A fresh key can mean a different account: drop the cached view.
+            self.account.invalidate()
         return ok
 
     def save_settings(self) -> None:
@@ -182,6 +184,7 @@ class AppContext:
         self.market_rest.proxy = cleaned
         self.market_rest.reset()
         self._data_rest = {self.market_type: self.market_rest}
+        self.account.invalidate()
 
     def reload_settings(self) -> None:
         """Re-read the config file into the live settings object.

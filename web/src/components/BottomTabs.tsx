@@ -2,16 +2,8 @@ import { useState } from "react";
 import type { ReactNode } from "react";
 import { api, query } from "../api";
 import { fmt, fmtPrice, parseNumber } from "../format";
-import type {
-  Account,
-  PaperConditional,
-  PaperOrder,
-  PaperPosition,
-  PaperProtection,
-  PaperTrade,
-} from "../types";
+import type { Account, OrderRow, Position, Protection, TradeRow } from "../types";
 import NewsPanel from "./NewsPanel";
-import ProtectionDialog from "./ProtectionDialog";
 import Table from "./Table";
 import TradeDetailDialog from "./TradeDetailDialog";
 
@@ -22,8 +14,6 @@ interface Props {
   /** Venue the panel is showing; closes must name it, or a futures exit is
    * looked up in the spot book and reported as "没有该交易对的持仓". */
   market?: string;
-  /** Paper cancels/closes locally; live sends them to the exchange. */
-  mode?: "paper" | "live";
   /** Reload the account after a cancel or close. */
   onChanged?: () => void;
   onError?: (message: string) => void;
@@ -52,7 +42,6 @@ export default function BottomTabs({
   account,
   symbol = "",
   market = "spot",
-  mode = "paper",
   onChanged,
   onError,
   aiPanel,
@@ -69,25 +58,19 @@ export default function BottomTabs({
   const [busy, setBusy] = useState<string | null>(null);
   // Per-position exit size in base coins; empty means "the whole position".
   const [closeSizes, setCloseSizes] = useState<Record<string, string>>({});
-  // Pair whose stop-loss / take-profit dialog is open. Kept as a symbol so the
-  // dialog keeps reading the live position (price, size) after every refresh.
-  const [protectSymbol, setProtectSymbol] = useState<string | null>(null);
   // Fill whose full record is open.
-  const [tradeDetail, setTradeDetail] = useState<PaperTrade | null>(null);
+  const [tradeDetail, setTradeDetail] = useState<TradeRow | null>(null);
 
   const orders = (account?.orders ?? []).filter((order) => order.status === "open");
-  const conditionals = (account?.conditional ?? []).filter(
-    (item) => item.status === "open",
-  );
   const trades = account?.trades ?? [];
   const positions = account?.positions ?? [];
   const guards = account?.protections ?? [];
-  /** The guard armed for a pair, if the position carries one. */
-  const guardFor = (pair: string): PaperProtection | null =>
+  /** The stop / take-profit orders the venue holds for a pair, if any. */
+  const guardFor = (pair: string): Protection | null =>
     guards.find((guard) => guard.symbol === pair) ?? null;
   const count =
     tab === "open"
-      ? orders.length + conditionals.length
+      ? orders.length
       : tab === "trades"
         ? trades.length
         : tab === "positions"
@@ -107,26 +90,18 @@ export default function BottomTabs({
     }
   };
 
-  const cancel = (order: PaperOrder) =>
+  const cancel = (order: OrderRow) =>
     run(`cancel:${order.id}`, () =>
       api(
-        `/api/orders/${encodeURIComponent(order.id)}?${query({
+        `T/api/orders/${encodeURIComponent(order.id)}?${query({
           symbol: order.symbol,
           market: order.market,
-          mode,
         })}`,
         { method: "DELETE" },
       ),
     );
 
-  const cancelConditional = (item: PaperConditional) =>
-    run(`cancel:${item.id}`, () =>
-      api(`/api/orders/conditional/${encodeURIComponent(item.id)}`, {
-        method: "DELETE",
-      }),
-    );
-
-  const close = (position: PaperPosition) => {
+  const close = (position: Position) => {
     const typed = parseNumber(closeSizes[position.symbol] ?? "");
     const held = Math.abs(position.contracts);
     const size = typed > 0 ? Math.min(typed, held) : undefined;
@@ -139,17 +114,11 @@ export default function BottomTabs({
           // futures exit could be looked up in the spot book.
           market,
           size,
-          mode,
-          confirm_live: mode === "live",
         }),
       });
       setCloseSizes((current) => ({ ...current, [position.symbol]: "" }));
     });
   };
-
-  const protectTarget = protectSymbol
-    ? (positions.find((item) => item.symbol === protectSymbol) ?? null)
-    : null;
 
   return (
     <>
@@ -170,7 +139,7 @@ export default function BottomTabs({
               {key !== "news" && key !== "ai" && (
                 <span className="count num" style={{ marginLeft: 6 }}>
                   {key === "open"
-                    ? orders.length + conditionals.length
+                    ? orders.length
                     : key === "trades"
                       ? trades.length
                       : positions.length}
@@ -190,11 +159,7 @@ export default function BottomTabs({
                   for (const position of positions) {
                     await api("/api/positions/close", {
                       method: "POST",
-                      body: JSON.stringify({
-                        symbol: position.symbol,
-                        mode,
-                        confirm_live: mode === "live",
-                      }),
+                      body: JSON.stringify({ symbol: position.symbol, market }),
                     });
                   }
                 })
@@ -236,53 +201,31 @@ export default function BottomTabs({
         <div className="panel-body" hidden={collapsed}>
           {tab === "open" && (
             <Table
-              headers={["交易对", "方向", "类型", "数量", "触发/价格", "状态", "时间", "操作"]}
+              headers={["交易对", "方向", "类型", "数量", "价格", "状态", "时间", "操作"]}
               rightFrom={3}
-              rows={[
-                ...conditionals.map((item) => [
-                  item.symbol,
-                  <span className={item.side === "buy" ? "up" : "down"}>
-                    {item.side === "buy" ? "买入" : "卖出"}
-                  </span>,
-                  <span className="faint">
-                    条件{item.type === "limit" ? "限价" : "市价"}
-                  </span>,
-                  fmt(item.amount, 6),
-                  <span>
-                    {item.direction === "below" ? "跌破" : "涨破"}{" "}
-                    <b className="num">{fmtPrice(item.trigger)}</b>
-                  </span>,
-                  "等待触发",
-                  new Date(item.createdAt).toLocaleTimeString("zh-CN", { hour12: false }),
-                  <button
-                    type="button"
-                    className="btn-sm"
-                    disabled={busy !== null}
-                    onClick={() => cancelConditional(item)}
-                  >
-                    {busy === `cancel:${item.id}` ? "撤销中…" : "撤单"}
-                  </button>,
-                ]),
-                ...orders.map((order) => [
-                  order.symbol,
-                  <span className={order.side === "buy" ? "up" : "down"}>
-                    {order.side === "buy" ? "买入" : "卖出"}
-                  </span>,
-                  order.type === "limit" ? "限价" : "市价",
-                  fmt(order.amount, 6),
-                  order.price ? fmtPrice(order.price) : "市价",
-                  "未成交",
-                  new Date(order.timestamp).toLocaleTimeString("zh-CN", { hour12: false }),
-                  <button
-                    type="button"
-                    className="btn-sm"
-                    disabled={busy !== null}
-                    onClick={() => cancel(order)}
-                  >
-                    {busy === `cancel:${order.id}` ? "撤销中…" : "撤单"}
-                  </button>,
-                ]),
-              ]}
+              rows={orders.map((order) => [
+                order.symbol,
+                <span className={order.side === "buy" ? "up" : "down"}>
+                  {order.side === "buy" ? "买入" : "卖出"}
+                </span>,
+                order.trigger
+                  ? `止损/止盈`
+                  : order.type === "limit"
+                    ? "限价"
+                    : "市价",
+                fmt(order.amount, 6),
+                order.price ? fmtPrice(order.price) : order.trigger ? fmtPrice(order.trigger) : "市价",
+                "未成交",
+                new Date(order.timestamp).toLocaleTimeString("zh-CN", { hour12: false }),
+                <button
+                  type="button"
+                  className="btn-sm"
+                  disabled={busy !== null}
+                  onClick={() => cancel(order)}
+                >
+                  {busy === `cancel:${order.id}` ? "撤销中…" : "撤单"}
+                </button>,
+              ])}
               empty="没有未成交的委托"
             />
           )}
@@ -322,7 +265,7 @@ export default function BottomTabs({
                 "最新价",
                 "浮动盈亏",
                 "已实现盈亏",
-                "止损 / 止盈",
+                "交易所止损 / 止盈",
                 "平仓数量",
                 "操作",
               ]}
@@ -337,29 +280,36 @@ export default function BottomTabs({
                   {position.side === "long" ? "多头" : position.side === "short" ? "空头" : "—"}
                 </span>,
                 fmt(position.contracts, 6),
-                fmtPrice(position.entry_price),
-                position.last ? fmtPrice(position.last) : "—",
+                // No fill history for this coin (a transfer, or a position
+                // opened elsewhere) means the cost basis is unknown: say so
+                // instead of printing a fake zero.
+                position.entry_price > 0 ? fmtPrice(position.entry_price) : "—",
+                fmtPrice(position.last),
                 // Marked by the same server call the 资产 page uses, so the two
                 // pages cannot show a different PnL for one position.
-                <span className={(position.unrealized ?? 0) >= 0 ? "up" : "down"}>
-                  {position.unrealized === undefined ? "—" : fmt(position.unrealized, 2)}
+                <span className={position.unrealized >= 0 ? "up" : "down"}>
+                  {fmt(position.unrealized, 2)}
                 </span>,
                 <span className={position.realized_pnl >= 0 ? "up" : "down"}>
                   {fmt(position.realized_pnl, 2)}
                 </span>,
-                // The armed guard, so a position's protection is visible without
-                // opening the dialog.
+                // The protective orders the venue holds, read straight from the
+                // exchange: the app keeps no local copy that could go stale.
                 <span className="num">
                   {(() => {
                     const guard = guardFor(position.symbol);
-                    if (!guard || (guard.stopLoss <= 0 && guard.takeProfit <= 0)) {
-                      return <span className="faint">未设置</span>;
+                    if (!guard || (guard.stop_loss <= 0 && guard.take_profit <= 0)) {
+                      return <span className="faint">无</span>;
                     }
                     return (
                       <>
-                        <b className="down">{guard.stopLoss > 0 ? fmtPrice(guard.stopLoss) : "—"}</b>
+                        <b className="down">
+                          {guard.stop_loss > 0 ? fmtPrice(guard.stop_loss) : "—"}
+                        </b>
                         {" / "}
-                        <b className="up">{guard.takeProfit > 0 ? fmtPrice(guard.takeProfit) : "—"}</b>
+                        <b className="up">
+                          {guard.take_profit > 0 ? fmtPrice(guard.take_profit) : "—"}
+                        </b>
                       </>
                     );
                   })()}
@@ -384,14 +334,6 @@ export default function BottomTabs({
                     type="button"
                     className="btn-sm"
                     disabled={busy !== null}
-                    onClick={() => setProtectSymbol(position.symbol)}
-                  >
-                    止损/止盈
-                  </button>
-                  <button
-                    type="button"
-                    className="btn-sm"
-                    disabled={busy !== null}
                     onClick={() => void close(position)}
                   >
                     {busy === `close:${position.symbol}`
@@ -411,19 +353,9 @@ export default function BottomTabs({
         </div>
       </div>
 
-    {protectTarget && (
-      <ProtectionDialog
-        position={protectTarget}
-        protection={guardFor(protectTarget.symbol)}
-        mode={mode}
-        onClose={() => setProtectSymbol(null)}
-        // Reload the account so the 止损/止盈 column shows the new levels.
-        onSaved={onChanged}
-      />
-    )}
-    {tradeDetail && (
-      <TradeDetailDialog trade={tradeDetail} onClose={() => setTradeDetail(null)} />
-    )}
+      {tradeDetail && (
+        <TradeDetailDialog trade={tradeDetail} onClose={() => setTradeDetail(null)} />
+      )}
     </>
   );
 }

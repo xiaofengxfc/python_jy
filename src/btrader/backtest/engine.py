@@ -2,7 +2,7 @@
 
 The engine walks candles bar by bar, evaluates the strategy at each close and
 executes the resulting target position at the next bar's open. This mirrors how
-paper/live trading works (signal on close, fill on the following open) and keeps
+a real session works (signal on close, fill on the following open) and keeps
 results free of look-ahead bias.
 
 Target semantics: 1.0 = fully long of allocated capital, 0.0 = flat,

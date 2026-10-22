@@ -29,12 +29,11 @@ interface AIDecisionRecord {
   stop_loss?: number | null;
   rationale?: string;
   order_id?: string | null;
-  mode?: string;
+  network?: string;
   state?: string;
 }
 
 interface AITraderConfig {
-  mode?: string;
   symbol?: string;
   market_type?: string;
   timeframe?: string;
@@ -64,7 +63,6 @@ interface AITraderStatus {
 /** The subset of `AppSettings.ai_auto` this panel reads and writes. */
 interface AIAutoSettings {
   enabled: boolean;
-  mode: string;
   live_enabled: boolean;
   symbol: string;
   timeframe: string;
@@ -85,7 +83,6 @@ interface AIAutoSettings {
 
 const DEFAULT_AUTO: AIAutoSettings = {
   enabled: false,
-  mode: "paper",
   live_enabled: false,
   symbol: "",
   timeframe: "",
@@ -132,11 +129,6 @@ const EVENT_LABEL: Record<string, string> = {
   resume: "继续",
   halt: "熔断",
 };
-
-const MODES: [string, string][] = [
-  ["paper", "纸面"],
-  ["live", "实盘"],
-];
 
 function pad(value: number): string {
   return String(value).padStart(2, "0");
@@ -250,7 +242,9 @@ export default function AITradePanel({ market, symbol, timeframe, onNavigate }: 
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState("");
-  const [mode, setMode] = useState<"paper" | "live">("paper");
+  /** Which network the server trades on. Only the mainnet needs a by-hand
+   * confirmation before each live run; the testnet is a rehearsal. */
+  const [network, setNetwork] = useState("mainnet");
   const [strategies, setStrategies] = useState<Strategy[]>([]);
   const [strategyKey, setStrategyKey] = useState("");
   /** null while unknown; false is worth a banner because start would 400. */
@@ -321,7 +315,6 @@ export default function AITradePanel({ market, symbol, timeframe, onNavigate }: 
       const merged: AIAutoSettings = { ...DEFAULT_AUTO, ...(data.settings.ai_auto ?? {}) };
       setAuto(merged);
       setDraft(merged);
-      setMode(merged.mode === "live" ? "live" : "paper");
       setSettingsLoaded(true);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -332,6 +325,12 @@ export default function AITradePanel({ market, symbol, timeframe, onNavigate }: 
   useEffect(() => {
     void loadSettings();
   }, [loadSettings]);
+
+  useEffect(() => {
+    api<{ network: string }>("/api/health")
+      .then((data) => setNetwork(data.network))
+      .catch(() => undefined);
+  }, []);
 
   // A disabled assistant is the most common reason start returns 400; say it
   // up front instead of only after the click.
@@ -388,23 +387,11 @@ export default function AITradePanel({ market, symbol, timeframe, onNavigate }: 
   const counters = status?.counters ?? {};
   const last = status?.last_decision ?? null;
 
-  const shownMode = running ? (status?.config?.mode ?? mode) : mode;
+  const venue = network === "mainnet" ? "主网" : "测试网";
   const shownSymbol = (running ? status?.config?.symbol : "") || symbol || "—";
   const shownTimeframe = (running ? status?.config?.timeframe : "") || timeframe || "—";
 
   const stateLabel = STATE_LABEL[state] ?? state;
-
-  const pickMode = (next: "paper" | "live") => {
-    if (next === mode) return;
-    if (next === "live" && !auto.live_enabled) {
-      setError(
-        "实盘未在设置中显式开启（ai_auto.live_enabled）。请展开配置，勾选「允许实盘」并保存后再切换。",
-      );
-      return;
-    }
-    setError("");
-    setMode(next);
-  };
 
   const start = async () => {
     if (busy) return;
@@ -417,15 +404,15 @@ export default function AITradePanel({ market, symbol, timeframe, onNavigate }: 
       setError("请先选择产生信号的策略。");
       return;
     }
-    if (mode === "live") {
-      if (!auto.live_enabled) {
-        setError(
-          "实盘未在设置中显式开启（ai_auto.live_enabled），启动被拒绝。请先在配置里打开「允许实盘」并保存。",
-        );
-        return;
-      }
+    if (!auto.live_enabled) {
+      setError(
+        "真下单未在设置中显式开启（ai_auto.live_enabled），启动被拒绝。请先在配置里打开「允许实盘」并保存。",
+      );
+      return;
+    }
+    if (network === "mainnet") {
       const ok = window.confirm(
-        `即将以【实盘】启动 AI 交易\n\n${symbol} · ${timeframe}\n\n` +
+        `即将在【主网】启动 AI 交易\n\n${symbol} · ${timeframe}\n\n` +
           "模型会真实下单，成交使用真实资金，盈亏由交易所结算。确认继续？",
       );
       if (!ok) return;
@@ -437,8 +424,7 @@ export default function AITradePanel({ market, symbol, timeframe, onNavigate }: 
       const result = await api<{ ok: boolean; status: AITraderStatus }>("/api/ai/trader/start", {
         method: "POST",
         body: JSON.stringify({
-          mode,
-          confirm_live: mode === "live",
+          confirm_live: network === "mainnet",
           market,
           symbol,
           timeframe,
@@ -450,9 +436,7 @@ export default function AITradePanel({ market, symbol, timeframe, onNavigate }: 
         }),
       });
       applyStatus(result.status, true);
-      setNotice(
-        `已启动：${mode === "live" ? "实盘" : "纸面"} · ${symbol} · ${timeframe} · 策略 ${selected.name}`,
-      );
+      setNotice(`已启动：${venue} · ${symbol} · ${timeframe} · 策略 ${selected.name}`);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -489,9 +473,9 @@ export default function AITradePanel({ market, symbol, timeframe, onNavigate }: 
       setError("请先选择产生信号的策略。");
       return;
     }
-    if (mode === "live") {
+    if (network === "mainnet") {
       const ok = window.confirm(
-        `即将以【实盘】让模型决策一次\n\n${symbol} · ${timeframe}\n\n` +
+        `即将在【主网】让模型决策一次\n\n${symbol} · ${timeframe}\n\n` +
           "如果模型给出开仓且通过闸门，会真的下单。确认继续？",
       );
       if (!ok) return;
@@ -505,8 +489,7 @@ export default function AITradePanel({ market, symbol, timeframe, onNavigate }: 
         {
           method: "POST",
           body: JSON.stringify({
-            mode,
-            confirm_live: mode === "live",
+            confirm_live: network === "mainnet",
             market,
             symbol,
             timeframe,
@@ -665,7 +648,7 @@ export default function AITradePanel({ market, symbol, timeframe, onNavigate }: 
           {stateLabel}
         </span>
         <span className="faint" style={{ fontSize: 11 }}>
-          {shownMode === "live" ? "实盘" : "纸面"} · {shownSymbol} · {shownTimeframe}
+          {venue} · {shownSymbol} · {shownTimeframe}
         </span>
         <select
           className="select ai-strategy-select"
@@ -687,19 +670,6 @@ export default function AITradePanel({ market, symbol, timeframe, onNavigate }: 
             已应用优化参数
           </span>
         )}
-        <div className="segmented" role="group" aria-label="AI 交易模式">
-          {MODES.map(([value, label]) => (
-            <button
-              key={value}
-              type="button"
-              aria-pressed={mode === value}
-              disabled={running || busy !== ""}
-              onClick={() => pickMode(value === "live" ? "live" : "paper")}
-            >
-              {label}
-            </button>
-          ))}
-        </div>
         <div className="ai-head-actions">
           <button
             type="button"
@@ -819,23 +789,6 @@ export default function AITradePanel({ market, symbol, timeframe, onNavigate }: 
                       </label>
                     </div>
                     <div className="field">
-                      <label className="field-label" htmlFor="ai-auto-mode">
-                        <span>运行模式</span>
-                      </label>
-                      <select
-                        id="ai-auto-mode"
-                        className="select"
-                        value={draft.mode}
-                        onChange={(event) => patch({ mode: event.target.value })}
-                      >
-                        {MODES.map(([value, label]) => (
-                          <option key={value} value={value}>
-                            {label}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                    <div className="field">
                       <span className="field-label">
                         <span>实盘开关</span>
                         <em>live_enabled</em>
@@ -947,7 +900,7 @@ export default function AITradePanel({ market, symbol, timeframe, onNavigate }: 
             <span className="card-title">运行概览</span>
             <span className="spacer" />
             <span className="faint" style={{ fontSize: 11 }}>
-              {shownMode === "live" ? "实盘" : "纸面"} · {shownSymbol}
+              {venue} · {shownSymbol}
             </span>
           </div>
           <div className="card-body">
@@ -1082,8 +1035,10 @@ export default function AITradePanel({ market, symbol, timeframe, onNavigate }: 
                       <span className={`ai-tag ${outcomeClass(item)}`}>{outcomeLabel(item)}</span>
                       <strong>{item.kind === "lifecycle" ? "生命周期" : actionLabel(item.action) || "—"}</strong>
                       {item.symbol && <span className="ai-audit-meta">{item.symbol}</span>}
-                      {item.mode && (
-                        <span className="ai-audit-meta">{item.mode === "live" ? "实盘" : "纸面"}</span>
+                      {item.network && (
+                        <span className="ai-audit-meta">
+                          {item.network === "mainnet" ? "主网" : "测试网"}
+                        </span>
                       )}
                     </div>
                     {item.reason && <div className="ai-audit-text">原因：{item.reason}</div>}
