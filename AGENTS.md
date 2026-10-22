@@ -71,6 +71,15 @@ Node 不在 PATH 时，先把 Node 目录加进去。
 - 账户数字只来自 `ctx.account`，也就是 `engine/account.py` 的 `AccountService`。
   `/api/account?market&symbol` 和 `/api/portfolio` 读同一份快照。
   单交易对读会借用全钱包的权益，缓存 10 秒，所以侧栏和资产页永远是同一个数。
+- 要「此刻」就带 `refresh=1`：`GET /api/account?market&symbol&refresh=1` 走 `live_snapshot` 现读，
+  默认仍吃缓存。缓存是给每 2 秒轮询的面板用的；但刚成交完那 10 秒里缓存里那一行还是「钱包余额」，
+  界面于是把程序刚买的仓位画成「卖出 / 预填整笔余额」。现读只按交易对读：不带 symbol 的整钱包
+  现读是 `/api/portfolio` 的后台刷新在做的，面板按需触发一次代价太大，所以那种情况照旧给缓存。
+  这条路不进 `account_lock`——读账户不该排在订单后面。
+- 下单预览（`POST /api/orders/preview`）带 `min_amount`（最小数量，基础币）和 `min_notional`
+  （最小名义额，计价币）两个字段，取自交易所的 `limits.amount.min` / `limits.cost.min`；
+  拿不到就是 null，不拿「最小数量 × 现价」凑一个数。它只是**报数**，不是新闸门：太小的单仍然是
+  交易所自己拒（实测 4.77 USDT 被 NOTIONAL 拒），界面据此提示。
 - 权益基线存在 `account.baseline.v1:<network>:<market>`，只有全钱包读会写。
   单交易对读只继承。如果让单交易对读也写，第一次读的那一对会把偏小的金额
   冻成「起始资金」。
@@ -96,6 +105,15 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   1 BTC 一次卖掉。现在 `POST /api/positions/close` 不带 size 时，合约照旧全平，现货只平
   `trading._live_ledger()["books"][symbol]["contracts"]` 并封顶于钱包余额；账本没有这一对就 400
   让调用方显式给 size。界面上的钱包余额那一行因此是「卖出」（预填该行余额），账本行才是「平仓」。
+- 现货的「仓位」只算**本程序买的**：仓位上限（`max_position_quote`）与 AI 交易的同一个上限
+  都按本地成交账本里这一对的数量算，并封顶于钱包余额（账本比钱包多说明币已被提走）。
+  以前直接拿钱包余额当持仓：钱包里有用户自己的 1 BTC（约 8.1 万）、上限 5000，于是任何现货
+  买单都 400「持仓金额将达 81225.76，超过上限 5000.00」，现货买不了任何东西。合约侧读的是
+  交易所那份持仓，本来就对，不要动。
+- 现货行的未实现盈亏只按**账本数量 × 账本均价**算，行上带 `unrealized_basis: "ledger"` 和
+  `ledger_size` 标明是账本口径；`contracts` / `quote_value` 仍是钱包事实。两者混用过一次：
+  `entry_price` 取账本、数量取钱包，钱包 1.00042 而账本 0.00042 时报出 +1000 USDT 的假浮盈。
+  没有账本的行（充值、空投、测试网白送）origin 是 `wallet`，未实现盈亏恒 0。
 - 保护单接口是重挂语义。先调 `cancel_protective_orders`，只撤该交易对的止损止盈，
   不会撤掉挂着的限价单。条件单的类型由触发价和现价的相对位置决定，不要自己猜。
 - 符号有两种写法：现货是 `BTC/USDT`，合约带结算币 `BTC/USDT:USDT`，币本位 `BTC/USD:BTC`，
