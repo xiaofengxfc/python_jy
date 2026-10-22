@@ -13,7 +13,6 @@ interface Props {
   positionQty: number;
   realizedPnl: number;
   /** Configured default order size in quote currency. */
-  defaultQuote?: number;
   feeRate: number;
   pickedPrice: number | null;
   /** Stop / take-profit orders the venue already holds for this pair. */
@@ -60,7 +59,6 @@ export default function OrderTicket({
   cash,
   positionQty,
   realizedPnl,
-  defaultQuote = 0,
   feeRate,
   pickedPrice,
   protection,
@@ -74,7 +72,7 @@ export default function OrderTicket({
   const [price, setPrice] = useState("");
   const [size, setSize] = useState(() => {
     const remembered = readLastQuote();
-    return remembered || (defaultQuote > 0 ? String(defaultQuote) : "");
+    return remembered;
   });
   const [stopLoss, setStopLoss] = useState("");
   const [takeProfit, setTakeProfit] = useState("");
@@ -115,7 +113,7 @@ export default function OrderTicket({
     setPrice("");
     setSize(
       sizeMode === "quote"
-        ? readLastQuote() || (defaultQuote > 0 ? String(defaultQuote) : "")
+        ? readLastQuote()
         : "",
     );
     setStopLoss("");
@@ -129,13 +127,6 @@ export default function OrderTicket({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [symbol, market]);
 
-  // Settings can arrive after the ticket mounted (App loads them async).
-  // Fill the size only while the user has not typed anything; never overwrite
-  // an amount already being edited.
-  useEffect(() => {
-    if (sizeMode !== "quote" || defaultQuote <= 0) return;
-    setSize((current) => (current.trim() ? current : String(defaultQuote)));
-  }, [defaultQuote, sizeMode]);
 
   // Flipping side must not leave a limit price from the other direction: a buy
   // parked at 60,000 becomes a market-crossing sell once the user switches, and

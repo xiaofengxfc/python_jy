@@ -56,6 +56,9 @@ export interface Position {
   last: number;
   unrealized: number;
   quote_value: number;
+  /** 现货才分得出来：ledger 是买来的（有成交记录和成本价），wallet 是钱包里
+   * 本来就有的（充值、空投、测试网赠送），成本价未知。合约恒为 ledger。 */
+  origin?: "ledger" | "wallet";
 }
 
 /** One order row: resting on the venue, or already filled. */
@@ -120,6 +123,8 @@ export interface Account {
   /** Realized PnL for each pair, including pairs whose position is closed. */
   realized_pnl_by_symbol?: Record<string, number>;
   positions: Position[];
+  /** 钱包里没买过的那部分市值合计，算在权益里但不算持仓。 */
+  wallet_value?: number;
   orders: OrderRow[];
   trades: TradeRow[];
   protections?: Protection[];
@@ -290,10 +295,7 @@ export interface AppSettings {
   network: string;
   market_type: string;
   last_symbol: string;
-  timeframe: string;
-  default_order_quote: number;
-  kline_limit: number;
-  /** HTTP(S) proxy for exchange calls; empty means direct. */
+  timeframe: string;  /** HTTP(S) proxy for exchange calls; empty means direct. */
   proxy: string;
   risk: {
     max_order_quote: number;

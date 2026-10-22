@@ -76,8 +76,7 @@ class AppSettings:
     market_type: str = MarketType.SPOT.value
     last_symbol: str = "BTC/USDT"
     timeframe: str = "15m"
-    default_order_quote: float = 100.0
-    kline_limit: int = 1000
+    # 下单金额和 K 线条数不再进配置：金额由下单框自己记，K 线固定拉满。
     # HTTP(S) proxy for exchange requests, e.g. "http://127.0.0.1:7890".
     # Needed where Binance's domains are blocked or DNS-poisoned.
     proxy: str = ""

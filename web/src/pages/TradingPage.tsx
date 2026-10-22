@@ -23,6 +23,9 @@ import OrderBook from "../components/OrderBook";
 import OrderTicket from "../components/OrderTicket";
 import SymbolPicker from "../components/SymbolPicker";
 
+/** 一次拉多少根 K 线。交易所上限 1000，拉满省得用户再去配。 */
+const KLINE_BARS = 1000;
+
 interface Props {
   health: Health | null;
   healthError: string;
@@ -110,7 +113,7 @@ export default function TradingPage({
   onAccountChange,
   onNavigate,
 }: Props) {
-  const [market, setMarket] = useState("spot");
+  const [market, setMarket] = useState(settings?.market_type || "spot");
   const [symbol, setSymbol] = useState("");
   const [symbols, setSymbols] = useState<SymbolInfo[]>([]);
   const [timeframe, setTimeframe] = useState(settings?.timeframe || "15m");
@@ -209,12 +212,18 @@ export default function TradingPage({
   }, [drawings, market, symbol, timeframe]);
 
   /* ---------------------------------------------------------- symbols */
-  const defaultsApplied = useRef(false);
+  // 设置里改过的东西要落到本页，但不能把手上正在看的东西抢走：只有用户没在
+  // 本页手动改过的那一项，才跟着设置走。
+  const picked = useRef({ market: false, symbol: false, timeframe: false });
   useEffect(() => {
-    if (!settings || defaultsApplied.current) return;
-    defaultsApplied.current = true;
-    if (settings.timeframe) setTimeframe(settings.timeframe);
-  }, [settings]);
+    if (!settings) return;
+    if (!picked.current.market && settings.market_type) setMarket(settings.market_type);
+    if (!picked.current.timeframe && settings.timeframe) setTimeframe(settings.timeframe);
+  }, [settings?.market_type, settings?.timeframe]);
+  useEffect(() => {
+    if (!settings?.last_symbol || picked.current.symbol) return;
+    setSymbol((current) => current || settings.last_symbol);
+  }, [settings?.last_symbol]);
 
   useEffect(() => {
     let cancelled = false;
@@ -289,7 +298,7 @@ export default function TradingPage({
     setChartLoading(true);
     try {
       const data = await api<{ candles: Candle[]; source?: string; degraded?: boolean }>(
-        `/api/klines?${query({ market, symbol, timeframe, limit: settings?.kline_limit ?? 400 })}`,
+        `/api/klines?${query({ market, symbol, timeframe, limit: KLINE_BARS })}`,
       );
       if (id !== requestId.current) return;
       setCandles(data.candles ?? []);
@@ -307,7 +316,7 @@ export default function TradingPage({
     } finally {
       if (id === requestId.current) setChartLoading(false);
     }
-  }, [market, symbol, timeframe, settings?.kline_limit]);
+  }, [market, symbol, timeframe]);
 
   useEffect(() => {
     void loadKlines();
@@ -325,7 +334,7 @@ export default function TradingPage({
     setOlderLoading(true);
     try {
       const data = await api<{ candles: Candle[] }>(
-        `/api/klines?${query({ market, symbol, timeframe, limit: settings?.kline_limit ?? 400, before: first })}`,
+        `/api/klines?${query({ market, symbol, timeframe, limit: KLINE_BARS, before: first })}`,
       );
       const older = data.candles ?? [];
       if (!older.length) return;
@@ -339,7 +348,7 @@ export default function TradingPage({
     } finally {
       setOlderLoading(false);
     }
-  }, [market, symbol, timeframe, candles, olderLoading, settings?.kline_limit]);
+  }, [market, symbol, timeframe, candles, olderLoading]);
 
   /* ------------------------------------------------- live last candle */
   // The socket is the only thing that moves between REST snapshots, so fold
@@ -470,6 +479,7 @@ export default function TradingPage({
   const cash = account?.cash ?? 0;
 
   const handleMarket = (value: string) => {
+    picked.current.market = true;
     setMarket(value);
     onMarketChange(value);
     setSymbols([]);
@@ -522,7 +532,8 @@ export default function TradingPage({
               symbols={symbols}
               value={symbol}
               onChange={(value) => {
-                setSymbol(value);
+                picked.current.symbol = true;
+    setSymbol(value);
                 setPickedPrice(null);
               }}
               loading={symbols.length === 0}
@@ -562,7 +573,10 @@ export default function TradingPage({
                     key={value}
                     type="button"
                     aria-pressed={timeframe === value}
-                    onClick={() => setTimeframe(value)}
+                    onClick={() => {
+                  picked.current.timeframe = true;
+                  setTimeframe(value);
+                }}
                   >
                     {label}
                   </button>
@@ -782,7 +796,7 @@ export default function TradingPage({
               account?.positions.find((position) => position.symbol === symbol)
                 ?.realized_pnl ?? 0
             }
-            defaultQuote={settings?.default_order_quote}
+
             feeRate={FEE_RATE}
             pickedPrice={pickedPrice}
             protection={account?.protections?.find((item) => item.symbol === symbol) ?? null}

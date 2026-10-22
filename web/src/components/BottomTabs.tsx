@@ -59,6 +59,7 @@ export default function BottomTabs({
     onTabChange?.(next);
   };
   const [collapsed, setCollapsed] = useState(false);
+  const [walletOpen, setWalletOpen] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   // Per-position exit size in base coins; empty means "the whole position".
   const [closeSizes, setCloseSizes] = useState<Record<string, string>>({});
@@ -70,6 +71,10 @@ export default function BottomTabs({
   const orders = (account?.orders ?? []).filter((order) => order.status === "open");
   const trades = account?.trades ?? [];
   const positions = account?.positions ?? [];
+  // 合约持仓都来自交易所，现货里要分「买来的」和「钱包本来就有的」。
+  const ledgerPositions = positions.filter((item) => item.origin !== "wallet");
+  const walletPositions = positions.filter((item) => item.origin === "wallet");
+  const walletValue = walletPositions.reduce((sum, item) => sum + item.quote_value, 0);
   const guards = account?.protections ?? [];
   /** The stop / take-profit orders the venue holds for a pair, if any. */
   const guardFor = (pair: string): Protection | null =>
@@ -126,6 +131,94 @@ export default function BottomTabs({
     });
   };
 
+  /** 一行持仓。合约和现货共用，钱包余额那张表也用它。 */
+  const positionRow = (position: Position) => [
+    position.symbol,
+    <span
+      className={
+        position.side === "long" ? "up" : position.side === "short" ? "down" : ""
+      }
+    >
+      {position.side === "long" ? "多头" : position.side === "short" ? "空头" : "—"}
+    </span>,
+    fmt(position.contracts, 6),
+    // No fill history for this coin (a transfer, or a position
+    // opened elsewhere) means the cost basis is unknown: say so
+    // instead of printing a fake zero.
+    position.entry_price > 0 ? fmtPrice(position.entry_price) : "—",
+    fmtPrice(position.last),
+    // Marked by the same server call the 资产 page uses, so the two
+    // pages cannot show a different PnL for one position.
+    <span className={position.unrealized >= 0 ? "up" : "down"}>
+      {fmt(position.unrealized, 2)}
+    </span>,
+    <span className={position.realized_pnl >= 0 ? "up" : "down"}>
+      {fmt(position.realized_pnl, 2)}
+    </span>,
+    // The protective orders the venue holds, read straight from the
+    // exchange: the app keeps no local copy that could go stale.
+    <span className="num">
+      {(() => {
+        const guard = guardFor(position.symbol);
+        if (!guard || (guard.stop_loss <= 0 && guard.take_profit <= 0)) {
+          return <span className="faint">无</span>;
+        }
+        return (
+          <>
+            <b className="down">
+              {guard.stop_loss > 0 ? fmtPrice(guard.stop_loss) : "—"}
+            </b>
+            {" / "}
+            <b className="up">
+              {guard.take_profit > 0 ? fmtPrice(guard.take_profit) : "—"}
+            </b>
+          </>
+        );
+      })()}
+    </span>,
+    <input
+      className="input input-xs"
+      type="text"
+      inputMode="decimal"
+      autoComplete="off"
+      aria-label={`平仓数量 ${position.symbol}`}
+      placeholder={fmt(Math.abs(position.contracts), 6)}
+      value={closeSizes[position.symbol] ?? ""}
+      onChange={(event) =>
+        setCloseSizes((current) => ({
+          ...current,
+          [position.symbol]: event.target.value,
+        }))
+      }
+    />,
+    <div className="row-actions">
+      {/* Spot has no venue-side stop, so the button would only
+          lead to a rejection. Futures only. */}
+      {market !== "spot" && (
+        <button
+          type="button"
+          className="btn-sm"
+          disabled={busy !== null}
+          onClick={() => setGuarded(position)}
+        >
+          止损止盈
+        </button>
+      )}
+      <button
+        type="button"
+        className="btn-sm"
+        disabled={busy !== null}
+        onClick={() => void close(position)}
+      >
+        {busy === `close:${position.symbol}`
+          ? "平仓中…"
+          : parseNumber(closeSizes[position.symbol] ?? "") > 0
+            ? "部分平仓"
+            : "平仓"}
+      </button>
+    </div>,
+  ];
+
   return (
     <>
       <div
@@ -154,7 +247,7 @@ export default function BottomTabs({
             </button>
           ))}
           <span className="spacer" />
-          {tab === "positions" && positions.length > 1 && (
+          {tab === "positions" && ledgerPositions.length > 1 && (
             <button
               type="button"
               className="link-btn"
@@ -162,7 +255,7 @@ export default function BottomTabs({
               disabled={busy !== null}
               onClick={() =>
                 run("close:all", async () => {
-                  for (const position of positions) {
+                  for (const position of ledgerPositions) {
                     await api("/api/positions/close", {
                       method: "POST",
                       body: JSON.stringify({ symbol: position.symbol, market }),
@@ -262,7 +355,8 @@ export default function BottomTabs({
           )}
 
           {tab === "positions" && (
-            <Table
+            <>
+              <Table
               headers={[
                 "交易对",
                 "方向",
@@ -276,94 +370,50 @@ export default function BottomTabs({
                 "操作",
               ]}
               rightFrom={2}
-              rows={positions.map((position) => [
-                position.symbol,
-                <span
-                  className={
-                    position.side === "long" ? "up" : position.side === "short" ? "down" : ""
-                  }
-                >
-                  {position.side === "long" ? "多头" : position.side === "short" ? "空头" : "—"}
-                </span>,
-                fmt(position.contracts, 6),
-                // No fill history for this coin (a transfer, or a position
-                // opened elsewhere) means the cost basis is unknown: say so
-                // instead of printing a fake zero.
-                position.entry_price > 0 ? fmtPrice(position.entry_price) : "—",
-                fmtPrice(position.last),
-                // Marked by the same server call the 资产 page uses, so the two
-                // pages cannot show a different PnL for one position.
-                <span className={position.unrealized >= 0 ? "up" : "down"}>
-                  {fmt(position.unrealized, 2)}
-                </span>,
-                <span className={position.realized_pnl >= 0 ? "up" : "down"}>
-                  {fmt(position.realized_pnl, 2)}
-                </span>,
-                // The protective orders the venue holds, read straight from the
-                // exchange: the app keeps no local copy that could go stale.
-                <span className="num">
-                  {(() => {
-                    const guard = guardFor(position.symbol);
-                    if (!guard || (guard.stop_loss <= 0 && guard.take_profit <= 0)) {
-                      return <span className="faint">无</span>;
-                    }
-                    return (
-                      <>
-                        <b className="down">
-                          {guard.stop_loss > 0 ? fmtPrice(guard.stop_loss) : "—"}
-                        </b>
-                        {" / "}
-                        <b className="up">
-                          {guard.take_profit > 0 ? fmtPrice(guard.take_profit) : "—"}
-                        </b>
-                      </>
-                    );
-                  })()}
-                </span>,
-                <input
-                  className="input input-xs"
-                  type="text"
-                  inputMode="decimal"
-                  autoComplete="off"
-                  aria-label={`平仓数量 ${position.symbol}`}
-                  placeholder={fmt(Math.abs(position.contracts), 6)}
-                  value={closeSizes[position.symbol] ?? ""}
-                  onChange={(event) =>
-                    setCloseSizes((current) => ({
-                      ...current,
-                      [position.symbol]: event.target.value,
-                    }))
-                  }
-                />,
-                <div className="row-actions">
-                  {/* Spot has no venue-side stop, so the button would only
-                      lead to a rejection. Futures only. */}
-                  {market !== "spot" && (
-                    <button
-                      type="button"
-                      className="btn-sm"
-                      disabled={busy !== null}
-                      onClick={() => setGuarded(position)}
-                    >
-                      止损止盈
-                    </button>
-                  )}
+                rows={ledgerPositions.map(positionRow)}
+                empty={
+                  walletPositions.length ? "没有买来的持仓，钱包里的余额在下面" : "当前没有持仓"
+                }
+              />
+              {/* 钱包里没买过的那部分单独收起来：测试网白送几十个币，展开就把
+                  真正的持仓挤没了。 */}
+              {walletPositions.length > 0 && (
+                <div className="wallet-group">
                   <button
                     type="button"
-                    className="btn-sm"
-                    disabled={busy !== null}
-                    onClick={() => void close(position)}
+                    className="wallet-toggle"
+                    aria-expanded={walletOpen}
+                    onClick={() => setWalletOpen((open) => !open)}
                   >
-                    {busy === `close:${position.symbol}`
-                      ? "平仓中…"
-                      : parseNumber(closeSizes[position.symbol] ?? "") > 0
-                        ? "部分平仓"
-                        : "平仓"}
+                    <span>
+                      另有 {walletPositions.length} 项钱包余额 · 合计{" "}
+                      {fmt(walletValue, 2)} {account?.quote_asset ?? "USDT"}
+                    </span>
+                    <em>非成交持仓：充值、空投或测试网赠送，没有成本价</em>
+                    <b className="faint">{walletOpen ? "收起" : "展开"}</b>
                   </button>
-                </div>,
-              ])}
-              empty="当前没有持仓"
-            />
+                  {walletOpen && (
+                    <Table
+              headers={[
+                "交易对",
+                "方向",
+                "数量",
+                "开仓价",
+                "最新价",
+                "浮动盈亏",
+                "已实现盈亏",
+                "交易所止损 / 止盈",
+                "平仓数量",
+                "操作",
+              ]}
+              rightFrom={2}
+                      rows={walletPositions.map(positionRow)}
+                      empty=""
+                    />
+                  )}
+                </div>
+              )}
+            </>
           )}
 
           {tab === "ai" && aiPanel}

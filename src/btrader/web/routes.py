@@ -182,8 +182,7 @@ class SettingsPayload(BaseModel):
     market_type: str | None = None
     last_symbol: str | None = None
     timeframe: str | None = None
-    default_order_quote: float | None = Field(default=None, gt=0)
-    kline_limit: int | None = Field(default=None, ge=100, le=1000)
+
     proxy: str | None = None
     theme: str | None = None
     notification_sound: bool | None = None
@@ -837,6 +836,7 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
             "realized_pnl": snapshot.realized_pnl,
             "realized_pnl_by_symbol": realized,
             "positions": positions,
+            "wallet_value": snapshot.wallet_value,
             "orders": [dict(item) for item in snapshot.orders],
             "trades": [dict(item) for item in snapshot.trades],
             "equity_history": list(state.equity_history),
@@ -1522,7 +1522,7 @@ def apply_settings(ctx: Any, payload: "SettingsPayload") -> list[str]:
     if target_market is not None and target_market is not ctx.market_type:
         ctx.set_market_type(target_market, persist=False)
         changed.append("market_type")
-    for name in ("last_symbol", "timeframe", "default_order_quote", "kline_limit"):
+    for name in ("last_symbol", "timeframe"):
         value = getattr(payload, name)
         if value is not None and getattr(settings, name) != value:
             setattr(settings, name, value)

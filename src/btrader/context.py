@@ -88,6 +88,12 @@ class AppContext:
     # ------------------------------------------------------------------ market
     def rest_for(self, market: MarketType) -> BinanceREST:
         """A REST client for any market type (public data works unauthenticated)."""
+        # 当前市场永远用 self.rest：切换市场、保存凭证都只更新那一个对象。
+        # 以前这里会另建一个客户端存进缓存，保存新 key 之后缓存那份还是旧的，
+        # 账户就会一直报「尚未配置 API Key」。
+        if market == self.market_type:
+            self._market_rest[market] = self.rest
+            return self.rest
         if market not in self._market_rest:
             # Each market authorises against its own key slot: sending a spot
             # key to fapi/dapi makes Binance answer -2015.
@@ -154,8 +160,10 @@ class AppContext:
         self.creds = creds
         self.rest.credentials = creds
         self.rest.reset()
-        self._market_rest = {}
+        # 当前市场的客户端就是 self.rest，缓存里也放了它，别留空表让人另建一份。
+        self._market_rest = {market: self.rest}
         self._data_rest = {self.market_type: self.market_rest}
+        self.account.invalidate()
         if persist:
             self.config.save()
 
@@ -185,6 +193,9 @@ class AppContext:
             self.creds = creds
             self.rest.credentials = creds
             self.rest.reset()
+            # 缓存里那份客户端也是 self.rest，但显式对齐一次，免得以后有人又
+            # 往缓存里塞别的实例。
+            self._market_rest = {self.market_type: self.rest}
             # A fresh key can mean a different account: drop the cached view.
             self.account.invalidate()
         return ok

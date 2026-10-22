@@ -105,6 +105,9 @@ class Snapshot:
     cash: float = 0.0
     equity: float = 0.0
     baseline: float = 0.0
+    # 钱包里没买过、也没成交记录的那部分资产市值。它算在权益里（钱确实在账上），
+    # 但不算「持仓」：测试网白送的 60 个币不该冒充成你买的。
+    wallet_value: float = 0.0
     positions: list[dict[str, Any]] = field(default_factory=list)
     orders: list[dict[str, Any]] = field(default_factory=list)
     trades: list[dict[str, Any]] = field(default_factory=list)
@@ -250,6 +253,11 @@ class AccountService:
         snap.cash = self._cash(balance, snap.quote_asset)
         holdings = sum(float(item.get("quote_value") or 0.0) for item in snap.positions)
         unrealized = sum(float(item.get("unrealized") or 0.0) for item in snap.positions)
+        snap.wallet_value = sum(
+            float(item.get("quote_value") or 0.0)
+            for item in snap.positions
+            if item.get("origin") == "wallet"
+        )
         total = self._total(balance, snap.quote_asset)
         if market.is_futures:
             # Wallet balance plus open PnL: margin locked in a position is
@@ -414,6 +422,11 @@ class AccountService:
                 continue
             state = ledger.get(name) or {}
             entry = float(state.get("entry") or 0.0)
+            amount_in_ledger = abs(float(state.get("size") or 0.0))
+            # 有成交台账、成本价也拿得到，才算「买来的持仓」。其余是钱包里本来就
+            # 有的东西：充值的、测试网白送的、空投的。它们的成本价是 0，硬算盈亏
+            # 会得到一个假数字，所以单独标出来。
+            origin = "ledger" if amount_in_ledger > 0 and entry > 0 else "wallet"
             out.append(
                 {
                     "symbol": name,
@@ -421,13 +434,18 @@ class AccountService:
                     "side": "long",
                     "entry_price": entry,
                     "last": last,
-                    "unrealized": (last - entry) * amount if entry else 0.0,
+                    "unrealized": (last - entry) * amount if entry and origin == "ledger" else 0.0,
                     "quote_value": amount * last,
                     "realized_pnl": float(state.get("realized") or 0.0),
                     "fees": float(state.get("fees") or 0.0),
+                    "origin": origin,
                 }
             )
-        return sorted(out, key=lambda item: item["quote_value"], reverse=True)
+        return sorted(
+            out,
+            key=lambda item: (item["origin"] == "ledger", item["quote_value"]),
+            reverse=True,
+        )
 
     # ----------------------------------------------------------------- orders
     def _open_orders(

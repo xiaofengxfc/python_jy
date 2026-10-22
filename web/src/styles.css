@@ -3501,3 +3501,37 @@ main.main > .lab-page:not(.page-head) {
   z-index: 2;
   background: var(--bg);
 }
+/* 持仓表把「买来的」和「钱包里本来就有的」分开：后者折成一行，点开才展开。 */
+.wallet-group {
+  margin-top: 8px;
+}
+
+.wallet-toggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 7px 10px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  text-align: left;
+  font-size: 12px;
+  color: var(--text-1);
+}
+
+.wallet-toggle:hover {
+  background: var(--bg-hover);
+}
+
+.wallet-toggle em {
+  font-style: normal;
+  color: var(--text-3);
+}
+
+.wallet-toggle b {
+  margin-left: auto;
+  font-weight: 500;
+  color: var(--text-2);
+}

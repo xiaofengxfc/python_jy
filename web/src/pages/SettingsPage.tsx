@@ -305,8 +305,6 @@ export default function SettingsPage({ settings, onSaved }: Props) {
       market_type: next.market_type,
       last_symbol: next.last_symbol,
       timeframe: next.timeframe,
-      default_order_quote: next.default_order_quote,
-      kline_limit: next.kline_limit,
       proxy: next.proxy,
       theme: next.theme,
       notification_sound: next.notification_sound,
@@ -853,39 +851,6 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                       </option>
                     ))}
                   </select>
-                </div>
-                <div className="field">
-                  <label className="field-label" htmlFor="set-quote">
-                    <span>默认下单金额</span>
-                    <em>USDT</em>
-                  </label>
-                  <input
-                    id="set-quote"
-                    className="input"
-                    type="number"
-                    min={1}
-                    step={1}
-                    value={draft.default_order_quote}
-                    onChange={(event) =>
-                      patch({ default_order_quote: Number(event.target.value) })
-                    }
-                  />
-                </div>
-                <div className="field">
-                  <label className="field-label" htmlFor="set-limit">
-                    <span>K 线加载条数</span>
-                    <em>100–1000</em>
-                  </label>
-                  <input
-                    id="set-limit"
-                    className="input"
-                    type="number"
-                    min={100}
-                    max={1000}
-                    step={100}
-                    value={draft.kline_limit}
-                    onChange={(event) => patch({ kline_limit: Number(event.target.value) })}
-                  />
                 </div>
               </div>
               <div className="field">
