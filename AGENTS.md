@@ -160,10 +160,17 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   锁死——以前 halt 不释放租约，熔断一次自动交易和 AI 量化就再也起不来。
 - `start()` 里租约拿到、决策线程却起不来时，state 回 `stopped`、租约放回、记一条
   `start_failed` 审计，异常照旧抛出去。界面显示在跑而实际没有 poller 是最坏的一种状态。
-- 下单不改全局市场：订单落在哪个市场由 `OrderRequest.market_type` 决定，`POST /api/orders`
-  只是借用那个市场的 Key 槽，`set_market_type(..., persist=False)`，用完还原。以前默认
-  `persist=True`，下一张现货单就把侧栏、图表、设置页和 `config.json` 一起切成现货，
-  配置文件坏的时候还会在下单前 409。
+- 下单不改全局市场：`TradingService` 按 `OrderRequest.market_type` 自己解出那个市场的
+  客户端（`rest_for`，构造时由 `AppContext.rest_for` 注入，缺省退回 `self.rest`），
+  `ctx.market_type` / `settings.market_type` / `config.json` 全程不动。以前下单前会
+  `set_market_type` 借一下全局市场（默认还落盘），下一张现货单就把侧栏、图表、设置页一起
+  切成现货；后来改成只借不落盘，但并发读设置仍能看到借走那一瞬。别退回那两种做法。
+- `account_lock` 在 `TradingService.submit` 上，不是在各引擎里：下单框、`AutoTrader`、
+  `AITrader` 都从 `submit` 出去（INV-1），锁放这儿才一次覆盖三路。锁里只放提交那一下
+  （读余额持仓、撤旧挂单、下单、挂保护单），模型调用、K 线拉取、`strategy.generate` 一律
+  在锁外，否则慢模型会把下单框冻住。并发的第二张单排队等锁，不丢弃也不报错。
+- 成交回填 `_reconcile_live_fills` 刻意不拿这把锁：一次同步要对每个市场逐个交易对发签名
+  请求，几秒，拿锁等于把下单框挡在轮询后面。账本只有那一个线程写。
 - 读持仓失败不等于没有持仓：`_live_held` 读不到就退回本地成交账本
   （`trading._live_ledger()["books"]`），两边都不知道才返回 `None`——平仓和挂保护单报 503
   说实话，`_is_reducing` 返回 False，不冒充减仓去赌交易所的 reduceOnly。以前读失败返回 0，
