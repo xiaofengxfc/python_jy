@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import math
@@ -207,6 +208,73 @@ class _AuditState:
 _AUDIT_STATE: dict[str, _AuditState] = {}
 _AUDIT_STATE_GUARD = threading.Lock()
 
+# 跨进程锁的等待上限。别的进程只在 append 期间持锁（微秒级），等不到就是出事了：
+# 那时宁可记一条日志照写，也不能把决策线程挂在这儿。
+AUDIT_LOCK_TIMEOUT = 2.0
+_AUDIT_LOCK_POLL = 0.01
+
+
+def _lock_handle(handle: int) -> None:
+    """给一个已经打开的句柄加排它锁；拿不到就抛 OSError。"""
+    if os.name == "nt":
+        import msvcrt
+
+        os.lseek(handle, 0, os.SEEK_SET)
+        msvcrt.locking(handle, msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_handle(handle: int) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        os.lseek(handle, 0, os.SEEK_SET)
+        msvcrt.locking(handle, msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def _audit_file_lock(path: Path):
+    """跨进程互斥（yield 是否真的拿到锁），等待有上限，绝不死等。
+
+    锁的是旁边那个 ``.lock`` 文件，不锁审计文件本身：Windows 的字节锁连读都
+    挡住，面板正在读日志时撞上写入就会报错。进程退出时系统收回锁，不会留下僵尸锁。
+    """
+    handle: int | None = None
+    acquired = False
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
+        deadline = time.monotonic() + max(0.0, AUDIT_LOCK_TIMEOUT)
+        while True:
+            try:
+                _lock_handle(handle)
+                acquired = True
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    log.warning("拿不到审计文件锁，本条序号可能和别的进程撞：%s", path)
+                    break
+                time.sleep(_AUDIT_LOCK_POLL)
+        yield acquired
+    finally:
+        if handle is not None:
+            if acquired:
+                try:
+                    _unlock_handle(handle)
+                except OSError:  # pragma: no cover - 关句柄也会放锁
+                    pass
+            try:
+                os.close(handle)
+            except OSError:  # pragma: no cover
+                pass
+
 
 def _audit_state(path: Path) -> _AuditState:
     key = str(Path(path).resolve()).lower()
@@ -253,14 +321,20 @@ def _last_seq_in(path: Path) -> int:
 
 
 class AuditLog:
-    """一份共享审计文件的写入器：seq 在这份文件里单调，跨实例不重号。
+    """一份共享审计文件的写入器：seq 在这份文件里单调，跨实例、跨进程都不重号。
 
-    以前 seq 是实例内自增（每个新建的 AITrader 从 1 开始数），于是同一个文件里
-    decision 行全是 1、lifecycle 行干脆没有 seq。页面固定 since=0 全量取看不出
-    问题，但任何按 seq 增量取的地方都会漏行。
+    三轮才走到位，记一下为什么：
 
-    重启后端 = 新进程：计数器第一次用到时从文件尾部读回最大号接着数，所以 seq
-    不会倒退——页面带着上次的 since 来取也不会漏掉重启后的新行。
+    1. 最早 seq 是实例内自增（每个新建的 AITrader 从 1 开始数），同一个文件里
+       decision 行全是 1、lifecycle 行干脆没有 seq。
+    2. 改成按「文件」共享一个进程内计数器：跨实例对了，跨进程还是撞——计数器
+       只在进程第一次写时读一次文件尾部，别的进程后来写进来的号它看不见。
+    3. 现在每次 append 都在**文件锁**里重读一遍尾部最大号再定号，读写在同一段
+       临界区里。代价是每次几十 KB 的顺序读，一小时几十行的量可以忽略。
+
+    进程退出时系统收回文件锁，不会留下僵尸锁；等不到锁（2 秒）就记日志照写，
+    绝不把决策线程挂住（INV-15）。重启也不倒退：号是从文件里读出来的，不是从
+    内存里带过来的。
     """
 
     def __init__(self, path: Path) -> None:
@@ -268,37 +342,44 @@ class AuditLog:
         self._state = _audit_state(self.path)
 
     @property
+    def lock_path(self) -> Path:
+        return self.path.with_name(self.path.name + ".lock")
+
+    @property
     def last_seq(self) -> int:
         with self._state.lock:
-            self._seed()
+            self._state.last = max(int(self._state.last or 0), _last_seq_in(self.path))
             return int(self._state.last or 0)
 
-    def _seed(self) -> None:
-        if self._state.last is None:
-            self._state.last = _last_seq_in(self.path)
-
     def append(self, record: dict[str, Any]) -> dict[str, Any]:
-        """补一个 seq 并整行写下去，返回真正写出去的那行。"""
+        """补一个 seq 并整行写下去，返回真正写出去的那行。
+
+        seq = 「文件里现有的最大号」+ 1，这一句读、定号、写都在文件锁里完成，
+        所以两个进程不会同时读到同一个最大号。_state.last 只当兜底下限用
+        （读不到文件时至少不比本进程见过的号小）。
+        """
         with self._state.lock:
-            self._seed()
-            self._state.last = int(self._state.last or 0) + 1
             row = dict(record)
-            row["seq"] = self._state.last
-            line = json.dumps(row, ensure_ascii=False) + "\n"
-            try:
-                self.path.parent.mkdir(parents=True, exist_ok=True)
-                # 一次 os.write 落一整行：O_APPEND 加上单次写，别的线程插不进
-                # 半行。用 open("a") 的缓冲写，一行可能分两次落盘，读的人会
-                # 看到半行（那一行 JSON 就废了，整张事件表跟着解析失败）。
-                handle = os.open(
-                    self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644
-                )
+            line = ""
+            with _audit_file_lock(self.lock_path):
+                best = max(int(self._state.last or 0), _last_seq_in(self.path))
+                self._state.last = best + 1
+                row["seq"] = self._state.last
+                line = json.dumps(row, ensure_ascii=False) + "\n"
                 try:
-                    os.write(handle, line.encode("utf-8"))
-                finally:
-                    os.close(handle)
-            except OSError:  # pragma: no cover - 磁盘满等
-                log.warning("写入 AI 交易审计失败", exc_info=True)
+                    self.path.parent.mkdir(parents=True, exist_ok=True)
+                    # 一次 os.write 落一整行。缓冲写会把一行拆成两次落盘，读的人
+                    # 会看到半行——那一行 JSON 就废了，整张事件表跟着解析失败；
+                    # 两个进程同时追加时还会互相插进对方行中间。
+                    handle = os.open(
+                        self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644
+                    )
+                    try:
+                        os.write(handle, line.encode("utf-8"))
+                    finally:
+                        os.close(handle)
+                except OSError:  # pragma: no cover - 磁盘满等
+                    log.warning("写入 AI 交易审计失败", exc_info=True)
             return row
 
 

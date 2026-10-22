@@ -6,8 +6,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
+import subprocess
+import sys
 import threading
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -1174,6 +1179,47 @@ def test_two_writers_at_once_never_repeat_a_seq_or_tear_a_line(tmp_path):
     assert [row["seq"] for row in rows] == list(range(1, 101))
 
 
+def test_read_audit_rows_on_a_legacy_file_with_repeated_seqs(tmp_path):
+    """老文件里 seq 是实例内自增的：同一个文件里几十行都是 1。
+
+    read_audit_rows 只按「seq > since」过滤，不去猜文件里有没有重号——重号的
+    老行属于写入侧的历史债，靠 .zcf/tools/renumber-audit-seq.py 一次性抹平。
+    这条测试把读侧的行为钉住：since=0 全量（含重号行、按文件顺序），since=N 只
+    取更大的，安静跳过空行与坏行。以后有人看到重号以为是读函数的问题，先看这里。
+    """
+    path = tmp_path / "audit.jsonl"
+    lines = ['{"kind": "lifecycle", "event": "start"}']  # 老 lifecycle 行：没有 seq
+    lines += ['{"kind": "decision", "seq": 1}' for _ in range(5)]  # 重号的老 decision 行
+    lines += ['{"kind": "decision", "seq": 2}', '{"kind": "decision", "seq": 3}']
+    # 空行与坏行不该污染结果，也不该挡住后面的行
+    lines += ["", '{"kind": "decision", "seq": 4', '{"kind": "lifecycle", "event": "stop"}']
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    # since=0：全都要，重号行照样原样给出，顺序就是文件顺序
+    rows = read_audit_rows(path, limit=100)
+    assert [row.get("seq") for row in rows] == [None, 1, 1, 1, 1, 1, 2, 3, None]
+    assert [row.get("event") for row in rows if "event" in row] == ["start", "stop"]
+
+    # since=N：只取更大的号。那 5 行重号的 1 在 since=1 时一条都不出现
+    assert [row["seq"] for row in read_audit_rows(path, since=1)] == [2, 3]
+    assert [row["seq"] for row in read_audit_rows(path, since=3)] == []
+    # 没有 seq 的老行在 since>0 时也不算新行，否则增量取会反复拿到同一批
+    assert all("seq" in row for row in read_audit_rows(path, since=1))
+
+    # 重编号之后（seq 恰好是 1..N）增量取才对得上：这是维护脚本要达到的状态
+    renumbered = tmp_path / "renumbered.jsonl"
+    renumbered.write_text(
+        "".join(
+            '{"kind": "decision", "seq": %d}\n' % (index + 1)
+            for index in range(len(rows))
+        ),
+        encoding="utf-8",
+    )
+    assert [row["seq"] for row in read_audit_rows(renumbered, since=3)] == list(
+        range(4, len(rows) + 1)
+    )
+
+
 def test_read_audit_rows_filters_by_since(tmp_path):
     """端点用这个读：since 之后的新行。老行没有 seq，只在 since=0 时算新行。"""
     path = tmp_path / "audit.jsonl"
@@ -1189,3 +1235,83 @@ def test_read_audit_rows_filters_by_since(tmp_path):
     assert read_audit_rows(path, since=2) == []
     assert len(read_audit_rows(path, limit=2)) == 2
     assert read_audit_rows(tmp_path / "missing.jsonl") == []
+
+
+def test_two_processes_sharing_one_file_never_share_a_seq(tmp_path):
+    """跨进程也要单调：两个进程各写 50 行，合并后 seq 必须恰好 1..101 无重复。
+
+    以前计数器只在进程第一次写时读一次文件尾部，别的进程后来写进来的号它看不见：
+    两边各从 2 开始数，实测合并后有两行同为 99。
+    """
+    path = tmp_path / "audit.jsonl"
+    go = tmp_path / "go"
+    seeded = tmp_path / "seeded"
+    script = tmp_path / "writer.py"
+    # 子进程先写一行（老代码会在这里把「读到哪儿」缓存下来），再告诉父进程可以开始。
+    # 之后两个进程各写 50 行：老代码两边都从 2 开始数，撞号。
+    script.write_text(
+        "\n".join(
+            [
+                "import sys, time",
+                "from pathlib import Path",
+                "from btrader.engine.ai_trader import AuditLog",
+                "log = AuditLog(Path(sys.argv[1]))",
+                "go = Path(sys.argv[2])",
+                "seeded = Path(sys.argv[3])",
+                "while not go.exists():",
+                "    time.sleep(0.001)",
+                "log.append({'kind': 'decision', 'writer': 'child', 'i': 0})",
+                "seeded.write_text('', encoding='utf-8')",
+                "for i in range(1, 50):",
+                "    log.append({'kind': 'decision', 'writer': 'child', 'i': i})",
+                "    time.sleep(0.002)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    root = str(Path(__file__).resolve().parents[1] / "src")
+    env["PYTHONPATH"] = root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+
+    parent = AuditLog(path)
+    parent.append({"kind": "lifecycle", "event": "start"})  # 第 1 行，让子进程看得见非零起点
+    child = subprocess.Popen(
+        [sys.executable, str(script), str(path), str(go), str(seeded)],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    go.write_text("", encoding="utf-8")
+    deadline = time.monotonic() + 120
+    while not seeded.exists():
+        assert time.monotonic() < deadline, "子进程没有起来"
+        time.sleep(0.005)
+    for index in range(50):
+        parent.append({"kind": "decision", "writer": "parent", "i": index})
+        time.sleep(0.002)
+    _, child_err = child.communicate(timeout=120)
+    assert child.returncode == 0, child_err.decode("utf-8", errors="replace")
+
+    rows = audit_rows(path)
+    seqs = [row["seq"] for row in rows]
+    assert len(rows) == 101, len(rows)
+    assert len(set(seqs)) == len(seqs), f"有重复的 seq: {sorted(seqs)}"
+    assert sorted(seqs) == list(range(1, 102)), sorted(seqs)
+
+
+def test_a_stuck_audit_lock_does_not_hang_or_raise(tmp_path, monkeypatch):
+    """拿不到跨进程锁也不能卡住交易线程：照写，只记日志（INV-15）。"""
+    import btrader.engine.ai_trader as module
+
+    @contextlib.contextmanager
+    def stuck(path):
+        yield False
+
+    monkeypatch.setattr(module, "_audit_file_lock", stuck)
+
+    log = AuditLog(tmp_path / "audit.jsonl")
+    row = log.append({"kind": "decision"})
+    assert isinstance(row["seq"], int)
+    assert row["seq"] >= 1
+    assert len(audit_rows(tmp_path / "audit.jsonl")) == 1
