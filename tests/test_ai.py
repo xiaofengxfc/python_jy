@@ -158,6 +158,30 @@ def test_analyze_klines_attaches_validated_levels(candles) -> None:
     assert "{" not in result["text"]
 
 
+def test_a_level_survives_when_the_first_timeframe_has_no_closed_bars(candles) -> None:
+    """轮询里的第一个周期只剩一根未收盘 K 线时，价位校验不能落空。
+
+    ``_closed_only`` 会把正在走的那根削掉，削完就是空帧。空帧本来就不进提示词，
+    却曾经被当成「主周期」：区间从它算，模型给的价位全被丢掉；缓存 key 还退化成
+    固定的 ``kline|...|empty``，任何行情都共用同一条答案。
+    """
+    last = float(candles["close"].iloc[-1])
+    reply = "1. 趋势：震荡。\n" + json.dumps(
+        {"levels": [{"price": last, "kind": "support", "label": "当前价"}]}
+    )
+    fake = FakeLLM(reply=reply)
+    empty = pd.DataFrame(columns=candles.columns)
+
+    result = ai.analyze_klines(
+        fake, symbol="BTC/USDT", frames={"15m": empty, "1h": candles}
+    )
+
+    assert len(result["levels"]) == 1
+    # 缓存 key 要指向真有数据的那个周期，不能是固定的 ...|empty
+    assert "empty" not in fake.keys[0]
+    assert str(int(candles["timestamp"].iloc[-1])) in fake.keys[0]
+
+
 def test_analyze_klines_without_data_fails_without_calling_the_model() -> None:
     fake = FakeLLM()
     result = ai.analyze_klines(fake, symbol="BTC/USDT", frames={})
@@ -499,6 +523,33 @@ def test_cache_entry_expires(tmp_path, monkeypatch) -> None:
     assert store.get("key", 0) is None
 
 
+def test_a_cached_answer_is_not_served_to_a_different_model(tmp_path, monkeypatch) -> None:
+    """缓存 key 只描述「哪一根 K 线」；供应商/模型/温度/额度变了就是另一个问题。"""
+    monkeypatch.setenv("BITRADER_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(llm, "load_key", lambda: "sk-test")
+    llm.reset_cache()
+    calls: list[str] = []
+
+    def fake_request(spec, settings, key, system, prompt, **kwargs):
+        calls.append(settings.model)
+        return f"来自 {settings.model}", 5, "stop"
+
+    old_model = LLMService(AISettings(enabled=True, provider="deepseek"))
+    monkeypatch.setattr(old_model, "_request", fake_request)
+    new_model = LLMService(AISettings(enabled=True, provider="openai"))
+    monkeypatch.setattr(new_model, "_request", fake_request)
+
+    first = old_model.ask("分析", cache_key="kline|BTC|1h|1")
+    assert first["text"] == "来自 deepseek-chat"
+    second = new_model.ask("分析", cache_key="kline|BTC|1h|1")
+    # 换了模型还命中，用户看到的是上一个模型的答案，标签却是新模型。
+    assert second["cached"] is False
+    assert second["text"] == "来自 gpt-4o-mini"
+    assert len(calls) == 2
+    # 同一个模型再问一次照样命中：指纹没变，缓存该省的钱还是省。
+    assert new_model.ask("分析", cache_key="kline|BTC|1h|1")["cached"] is True
+
+
 def test_audit_tail_records_every_call(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("BITRADER_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(llm, "load_key", lambda: "sk-test")
@@ -510,6 +561,68 @@ def test_audit_tail_records_every_call(tmp_path, monkeypatch) -> None:
     assert len(tail) == 1
     assert tail[0]["kind"] == "test"
     assert tail[0]["ok"] is True
+
+
+def test_an_unwritable_audit_dir_does_not_break_the_call(tmp_path, monkeypatch) -> None:
+    """审计是旁路：写不进去只能少一条记录，不能把调用变成异常。
+
+    原来 ``_audit_file()`` 在 try 外面：logs 目录建不出来时，一次已经成功的
+    调用会带着 OSError 冲出去（分析接口 500、走流水线的决策直接作废）。
+    """
+    monkeypatch.setenv("BITRADER_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(llm, "load_key", lambda: "sk-test")
+    llm.reset_cache()
+    service = LLMService(AISettings(enabled=True))
+    monkeypatch.setattr(service, "_request", lambda *args, **kwargs: ("答案", 5, "stop"))
+
+    def unwritable():
+        raise OSError("[Errno 13] Permission denied: logs")
+
+    monkeypatch.setattr(llm.paths, "logs_dir", unwritable)
+
+    result = service.ask("问题", kind="test")
+    assert result["ok"] is True
+    assert result["text"] == "答案"
+    # 设置页读审计尾巴，同样不能因为目录不可读就 500
+    assert llm.audit_tail(10) == []
+    assert service.status()["calls_today"] == 1
+
+    # 失败那次也一样：模型那边的真实错误不能被 OSError 顶掉
+    def failing(*args, **kwargs):
+        raise llm.AIError("模型超过 60 秒没有响应。")
+
+    monkeypatch.setattr(service, "_request", failing)
+    failed = service.ask("问题")
+    assert failed["ok"] is False
+    assert "60 秒" in failed["error"]
+
+
+def test_an_unwritable_cache_dir_does_not_break_the_call(tmp_path, monkeypatch) -> None:
+    """缓存是省钱用的：目录不可写时降级成「不命中」，请求照发。"""
+    monkeypatch.setenv("BITRADER_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(llm, "load_key", lambda: "sk-test")
+    llm.reset_cache()
+    service = LLMService(AISettings(enabled=True))
+    calls: list[str] = []
+
+    def fake_request(spec, settings, key, system, prompt, **kwargs):
+        calls.append(prompt)
+        return "答案", 5, "stop"
+
+    monkeypatch.setattr(service, "_request", fake_request)
+
+    def unwritable():
+        raise OSError("[Errno 13] Permission denied: cache")
+
+    monkeypatch.setattr(llm.paths, "cache_dir", unwritable)
+
+    first = service.ask("问题", cache_key="kline|BTC|1h|1")
+    second = service.ask("问题", cache_key="kline|BTC|1h|1")
+
+    # 一次都不许抛：降级的是「落盘」，进程内的缓存照样生效
+    assert first["ok"] is True and second["ok"] is True
+    assert second["cached"] is True
+    assert len(calls) == 1
 
 
 def test_key_masking_never_reveals_the_secret() -> None:
@@ -1005,6 +1118,29 @@ def test_truncation_is_read_from_each_provider_field(
 
 
 # ------------------------------- truncation across providers and through the cache
+def test_anthropic_max_tokens_with_an_empty_answer_says_the_budget_ran_out(
+    tmp_path, monkeypatch
+) -> None:
+    """Anthropic 说 max_tokens；空正文时也必须报「额度用完」，不能报「空内容」。
+
+    ``_empty_answer_text`` 只认了 OpenAI 的 length，Claude 撞额度时用户看到的是
+    「模型返回了空内容」，而结果里其实已经是 truncated=True——两种失败又混在一起了。
+    """
+    service = _service(tmp_path, monkeypatch, "anthropic")
+    _capture_request(
+        monkeypatch,
+        {"content": [{"type": "text", "text": ""}], "stop_reason": "max_tokens"},
+    )
+
+    result = service.ask("写一个策略", max_tokens=llm.OUTPUT_TOKENS_CODE)
+
+    assert result["ok"] is False
+    assert result["truncated"] is True
+    assert "截断" in result["error"]
+    assert "8000 tokens" in result["error"]
+    assert result["error"] != "模型返回了空内容。"
+
+
 def test_anthropic_max_tokens_counts_as_truncation(tmp_path, monkeypatch) -> None:
     """Anthropic 说 max_tokens，OpenAI 说 length：两条都是「额度用完」。"""
     service = _service(tmp_path, monkeypatch, "anthropic")

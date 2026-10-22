@@ -180,7 +180,17 @@ def analyze_klines(
     if not blocks:
         return _fail("没有可用的 K 线数据。")
 
-    primary = next(iter(frames))
+    # 空帧不参与 blocks，也不能拿来当「主周期」：用它的最后一根 K 线做缓存 key
+    # 会退化成 kline|...|empty（不同行情共用一条缓存答案），拿它校验价位则会把
+    # 模型给的价位全丢掉。取第一个真有数据的周期。
+    primary = next(
+        (
+            name
+            for name, item in frames.items()
+            if item is not None and not item.empty
+        ),
+        next(iter(frames)),
+    )
     key_frame = frames.get(primary)
     cache_key = candle_key(f"{symbol}|multi", primary, key_frame) if key_frame is not None else ""
 

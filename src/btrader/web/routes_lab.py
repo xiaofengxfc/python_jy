@@ -181,16 +181,22 @@ class LabController:
                     ),
                 ) from exc
             raise HTTPException(status_code=502, detail=str(exc)) from exc
-        key, key_note = ai_candidate.sanitize_key(parsed["strategy_key"], taken)
-        notes = "；".join(note for note in (parsed.get("note"), key_note) if note)
-        candidate = self.candidates.create(
-            parsed["code"],
-            strategy_key=key,
-            name=parsed.get("name") or key,
-            base_key=payload.base_key,
-            model=getattr(ctx.ai.settings, "model", ""),
-            note=notes,
-        )
+        # 建候选这一段要和 _taken_keys 一起串起来：快照和落盘之间的窗口里，
+        # 两个同时点「生成」的请求会拿到同一个 key 快照，候选 id 由「秒 + key」
+        # 拼出来，于是后一个把前一个的文件顶掉（Windows 上直接 PermissionError）。
+        with self._lock:
+            key, key_note = ai_candidate.sanitize_key(
+                parsed["strategy_key"], self._taken_keys(ctx)
+            )
+            notes = "；".join(note for note in (parsed.get("note"), key_note) if note)
+            candidate = self.candidates.create(
+                parsed["code"],
+                strategy_key=key,
+                name=parsed.get("name") or key,
+                base_key=payload.base_key,
+                model=getattr(ctx.ai.settings, "model", ""),
+                note=notes,
+            )
         return {"ok": True, "candidate": candidate.to_dict()}
 
     def _taken_keys(self, ctx: Any) -> set[str]:

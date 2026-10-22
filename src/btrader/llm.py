@@ -222,7 +222,13 @@ class _Cache:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        raw = _read_json(_cache_file(), {})
+        try:
+            # 缓存目录建不出来（只读盘、权限）时降级成「永不命中」，
+            # 让调用照样发出去，而不是在 ask 的开头就抛异常。
+            raw = _read_json(_cache_file(), {})
+        except OSError as exc:  # pragma: no cover - disk trouble
+            log.warning("读取 AI 缓存失败: %s", exc)
+            raw = {}
         self._entries: dict[str, dict] = raw.get("entries") or {}
         self._calls: dict[str, int] = raw.get("calls") or {}
 
@@ -232,7 +238,10 @@ class _Cache:
             ordered = sorted(self._entries.items(), key=lambda kv: kv[1].get("at", 0))
             for key, _ in ordered[: len(self._entries) - CACHE_LIMIT]:
                 self._entries.pop(key, None)
-        _write_json(_cache_file(), {"entries": self._entries, "calls": self._calls})
+        try:
+            _write_json(_cache_file(), {"entries": self._entries, "calls": self._calls})
+        except OSError as exc:  # pragma: no cover - disk trouble
+            log.warning("写入 AI 缓存失败: %s", exc)
 
     def get(self, key: str, ttl: float) -> dict | None:
         """A cached answer, or None when it is missing or older than ``ttl``.
@@ -251,7 +260,9 @@ class _Cache:
                 return None
             return entry
 
-    def put(self, key: str, text: str, tokens: int, finish: str = "") -> None:
+    def put(
+        self, key: str, text: str, tokens: int, finish: str = "", fingerprint: str = ""
+    ) -> None:
         with self._lock:
             self._entries[key] = {
                 "at": time.time(),
@@ -259,6 +270,9 @@ class _Cache:
                 "tokens": int(tokens),
                 # finish 存下来，缓存命中时才能照样报出 truncated。
                 "finish": str(finish or ""),
+                # 供应商/模型/温度/额度。同一句问题换了这些就是另一个问题，
+                # 命中时要靠它判断这条答案还能不能用。
+                "fingerprint": str(fingerprint or ""),
             }
             self._flush()
 
@@ -301,8 +315,10 @@ def reset_cache() -> None:
 
 # ----------------------------------------------------------------------- audit
 def _append_audit(record: dict[str, Any]) -> None:
-    path = _audit_file()
+    # 路径解析（logs 目录建不出来）也算写盘失败的一种：审计是旁路，写不进去
+    # 只能少一条记录，不能把一次已经成功的模型调用变成异常。
     try:
+        path = _audit_file()
         if path.exists() and path.stat().st_size > AUDIT_LIMIT_BYTES:
             path.replace(path.with_suffix(".1.jsonl"))
         with path.open("a", encoding="utf-8") as handle:
@@ -313,10 +329,10 @@ def _append_audit(record: dict[str, Any]) -> None:
 
 def audit_tail(limit: int = 50) -> list[dict[str, Any]]:
     """Newest audit records first. Used by the settings page and hit-rate page."""
-    path = _audit_file()
-    if not path.exists():
-        return []
     try:
+        path = _audit_file()
+        if not path.exists():
+            return []
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return []
@@ -407,6 +423,12 @@ class LLMService:
         """
         started = time.time()
         settings = self.settings.resolved()
+        # 影响输出的四件事。缓存 key 由调用方给（「哪一根 K 线」），这里补上
+        # 「问的是谁、用多大额度」，否则换个模型后 5 分钟内还拿旧模型的答案。
+        fingerprint = (
+            f"{settings.provider}|{settings.model}"
+            f"|{float(settings.temperature):g}|{int(max_tokens or OUTPUT_TOKENS)}"
+        )
         result: dict[str, Any] = {
             "ok": False,
             "text": "",
@@ -428,6 +450,10 @@ class LLMService:
 
         if cache_key:
             hit = cache().get(cache_key, CACHE_SECONDS)
+            stored = str(hit.get("fingerprint") or "") if hit else ""
+            # 老版本写下的条目没有指纹字段，空串照旧命中（几分钟内自然过期）。
+            if hit and stored and stored != fingerprint:
+                hit = None
             if hit:
                 cached_finish = str(hit.get("finish") or "")
                 result.update(
@@ -482,7 +508,7 @@ class LLMService:
         if cache_key and not truncated:
             # 被截断的回答不进缓存：它是一次「没写完」的结果，缓存下来只会
             # 让同样的半截答案在 5 分钟里反复命中。
-            cache().put(cache_key, text, tokens, finish)
+            cache().put(cache_key, text, tokens, finish, fingerprint)
         result.update(
             ok=True,
             text=text,
@@ -688,7 +714,7 @@ def _empty_answer_text(style: str, data: Any, limit: int) -> str:
     额度是常量，用户改不了，所以文案只说用户能动手的事：重试、把要求写短。
     别再把用户指到设置页去——那里没有「输出上限」这一项。
     """
-    if _finish_reason(style, data) == "length":
+    if is_truncated(_finish_reason(style, data)):
         return (
             f"回答被输出上限截断了（上限 {limit} tokens）。"
             "推理模型先花额度思考，正文就没额度了。"

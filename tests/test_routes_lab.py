@@ -348,6 +348,54 @@ def test_generate_renames_a_key_that_would_shadow_a_builtin(tmp_path: Path):
     assert candidate["checks"]["ok"] is True
 
 
+def test_two_generates_at_once_do_not_collide_on_the_candidate_file(tmp_path: Path):
+    """手快连点两次「生成」：同一秒、同一个 key 会算出同一个候选 id。
+
+    快照和落盘之间的窗口里，后一个请求把前一个的 ``cand-<秒>-<key>.py`` 顶掉，
+    Windows 上直接 PermissionError 冒出成 500，前一个候选也没了。两个候选
+    必须各自落盘、各自有 key。
+    """
+    barrier = threading.Barrier(2)
+
+    class RacingLLM:
+        settings = SimpleNamespace(model="fake-model")
+
+        def ask(self, prompt: str, **kwargs) -> dict:
+            barrier.wait(5.0)
+            return {
+                "ok": True,
+                "text": json.dumps({"strategy_key": "gen_strategy", "code": SAFE_CODE}),
+                "tokens": 5,
+                "finish": "stop",
+                "truncated": False,
+            }
+
+    controller = make_controller({"strategy_key": "gen_strategy", "code": SAFE_CODE}, tmp_path)
+    controller.get_state().ctx.ai = RacingLLM()
+
+    results: list[dict] = []
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            results.append(controller.generate(CandidateGeneratePayload())["candidate"])
+        except BaseException as exc:  # 让线程里的异常在断言里现身
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert len(results) == 2
+    assert len({item["id"] for item in results}) == 2
+    assert len({item["strategy_key"] for item in results}) == 2
+    assert len(list(tmp_path.glob("cand-*.json"))) == 2
+    assert len(list(tmp_path.glob("cand-*.py"))) == 2
+
+
 def test_generate_tells_the_model_which_keys_are_taken(tmp_path: Path):
     """提示词里念一遍现有 key，比让模型猜要省一次重试。"""
     controller = make_controller({"strategy_key": "gen_strategy", "code": SAFE_CODE}, tmp_path)
