@@ -1022,7 +1022,7 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
         """One tiny round trip, so "配置对不对" is answered before it matters."""
         ctx = get_state().ctx
         result = ctx.ai.ask(
-            "只回复两个字：可用", system="你是一个连通性测试，只回复用户要求的内容。", kind="test"
+            "只回复两个字：可用", system="这是一个连通性测试，只回复要求的内容。", kind="test"
         )
         if not result["ok"]:
             raise HTTPException(status_code=400, detail=result["error"])

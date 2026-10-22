@@ -396,7 +396,7 @@ export default function TradingViewChart({
       }
     } else if (previous && previous.key === key && candles.length > previous.length && first < previous.first) {
       // 历史分页：整表重设，并把可视范围右移「新增的根数」，
-      // 用户停在哪根 K 线就还停在哪根，不会跳到最左边。
+      // 停在哪根 K 线就还停在哪根，不会跳到最左边。
       fullReset = true;
       const added = Math.max(0, candles.findIndex((candle) => candle.t >= previous.first));
       const range = chart.timeScale().getVisibleLogicalRange();
@@ -416,7 +416,7 @@ export default function TradingViewChart({
 
     prevDataRef.current = { key, first, length: candles.length };
     // 新数据落地时库会把视野铺满整段行情（逻辑坐标 0 出现在左边界），
-    // 那不算用户往回拖。给它一点时间，别一换币种就自动多拉一屏历史。
+    // 那不算往回拖。给它一点时间，别一换币种就自动多拉一屏历史。
     if (fullReset) askOlderRef.current = Date.now() + 800;
     // 指标线跟着同一份 K 线走，数值不能落后一根。
     indicatorRef.current.forEach((entry) => entry.paint(candles, palette));
@@ -430,7 +430,7 @@ export default function TradingViewChart({
       if (!range) return;
       if (range.from > 12) return;
       const now = Date.now();
-      // 用户往回拖会连着触发很多帧，别把后端问穿。askOlderRef 既是节流时间戳，
+      // 往回拖会连着触发很多帧，别把后端问穿。askOlderRef 既是节流时间戳，
       // 也用于整表重设后的短暂屏蔽（见上面的数据 effect）。
       if (now < askOlderRef.current) return;
       if (live.current.olderLoading) return;
@@ -602,7 +602,7 @@ export default function TradingViewChart({
       }
     }
 
-    // 副图指标各占一个 pane，顺序与用户开启的顺序一致。
+    // 副图指标各占一个 pane，顺序和打开的顺序一致。
     for (const config of indicators) {
       if (INDICATOR_SPECS[config.name].kind !== "sub") continue;
       chart.addPane();

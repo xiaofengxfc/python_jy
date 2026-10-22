@@ -546,8 +546,8 @@ class AITrader:
             stop_loss=decision.stop_loss,
             take_profit=decision.take_profit,
         )
-        # 停止/急停发生在模型调用的那几秒里时，这一单不能再发出去：用户按了
-        # 停止之后还冒出一笔成交是最不能接受的一种 bug。
+        # 停止或急停可能发生在模型调用的那几秒里，这时这一单不能再发出去。
+        # 按了停止之后还冒出一笔成交，是最不能接受的一类 bug。
         if self._stop_event.is_set():
             raise RuntimeError("已停止，取消本次下单")
         # 唯一下单出口（INV-1）：任何 broker/交易所调用都不得出现在本模块。

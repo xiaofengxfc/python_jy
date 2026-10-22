@@ -256,7 +256,7 @@ def save_source(
             raise StrategySourceError(f"策略 {key} 已存在")
         target = existing.resolve()
         if target.parent != directory:
-            raise StrategySourceError("只能编辑用户策略目录内的文件", status=403)
+            raise StrategySourceError("只能编辑自己策略目录里的文件", status=403)
     else:
         if not create:
             # Saving under a new key is still useful: treat it as a new plugin.

@@ -43,7 +43,7 @@ SYSTEM = (
     "只根据给定的数据回答，不要编造数据里没有的价位或指标。"
     "如果数据不足以判断，直接说“数据不足”。"
     "结论要具体到可执行：给方向、给关键价位、给止损参考、给置信度。"
-    "不要给投资建议免责声明，用户知道自己在做什么。"
+    "不要写投资建议免责声明。"
     "用简体中文，控制在 300 字以内。"
 )
 
@@ -464,7 +464,7 @@ def explain_anomaly(
     prompt = (
         f"交易系统出现异常：{kind}\n详细信息：{detail}\n"
         + (f"上下文：{context}\n" if context else "")
-        + "\n请用两三句话说明最可能的原因，以及用户应该先检查什么。"
+        + "\n请用两三句话说明最可能的原因，以及先检查哪里。"
         "不要重复报错原文。"
     )
     return llm.ask(prompt, system=SYSTEM, cache_key="", kind="anomaly")
@@ -533,8 +533,8 @@ def suggest_strategy(
         first = next(iter(frames.items()))
         body += "\n\n当前行情：\n" + digest(first[1], timeframe=first[0], label=first[0], bars=8)
     prompt = (
-        f"用户的想法：{idea}\n\n{body}\n\n"
-        "从上面这些策略里挑一个最接近用户想法的，并给出参数。"
+        f"想法：{idea}\n\n{body}\n\n"
+        "从上面这些策略里挑一个最接近这个想法的，并给出参数。"
         "只输出一个 JSON 对象，不要任何其他文字，格式：\n"
         '{"strategy": "策略key", "params": {"参数名": 数值}, "reason": "一句话理由"}'
     )

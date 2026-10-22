@@ -589,7 +589,7 @@ export default function BacktestPage() {
                     {isCandidate
                       ? "候选策略 · 用源码里的默认参数回测，不会注册为正式策略"
                       : strategy?.editable
-                        ? `用户策略 · ${strategy.source_name || `${strategy.key}.py`}`
+                        ? `自定义策略 · ${strategy.source_name || `${strategy.key}.py`}`
                         : "内置策略 · 只读"}
                   </span>
                   <button

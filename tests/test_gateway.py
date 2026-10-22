@@ -177,7 +177,7 @@ def test_a_failed_start_quotes_what_the_child_said(monkeypatch) -> None:
         if supervisor.output():
             break
         time.sleep(0.01)
-    assert set_mode == [], "未确认原因时不得改写用户的网关配置"
+    assert set_mode == [], "没确认原因时不得改写网关配置"
     assert "The CLI command failed" in status["error"]
     assert "退出码 1" in status["error"]
 

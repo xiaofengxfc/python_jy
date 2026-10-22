@@ -412,7 +412,7 @@ def test_closing_a_short_buys_and_closing_a_long_sells(tmp_path):
 def test_stop_between_decision_and_submit_blocks_the_order(tmp_path):
     """停止信号在模型调用期间到达时，这一单不能再发出去。"""
     trader, _llm, trading, _risk = make_trader(tmp_path)
-    trader._stop_event.set()  # 相当于用户在这几秒里按了停止
+    trader._stop_event.set()  # 相当于这几秒里按了停止
     record = trader.decide_once()
     assert record is not None and record["outcome"] == "error"
     assert trading.requests == []
