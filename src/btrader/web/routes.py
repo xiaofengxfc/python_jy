@@ -33,7 +33,7 @@ from ..core.types import (
     timeframe_seconds,
 )
 from ..ai_pipeline import DEPTHS
-from ..engine.ai_trader import AITrader, AITraderConfig, TradeLease
+from ..engine.ai_trader import AITrader, AITraderConfig, TradeBudget, TradeLease
 from ..engine.auto import AutoTrader, AutoTraderConfig
 from ..exchange import mirror
 from ..exchange.rest import PLATFORMS, SUPPORTED_PLATFORMS, BinanceREST
@@ -74,6 +74,27 @@ def _market(value: str) -> MarketType:
         return MarketType(value)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"未知市场：{value}") from exc
+
+
+def _strategy_params(strategy, params: dict[str, Any]) -> dict[str, Any]:
+    """校验策略参数，坏值报 400 并点名是哪个参数。
+
+    ``Strategy.validate_params`` 只负责把数字夹到范围内：``int("abc")`` /
+    ``float(None)`` 会抛 ValueError / TypeError，裸调用时整个请求变成 500，用户
+    看到的是 Internal Server Error，还得自己猜是哪个框填错了。
+    """
+    for spec in getattr(strategy, "params_spec", ()) or ():
+        if spec.kind not in ("int", "float"):
+            continue
+        value = params.get(spec.name, spec.default)
+        try:
+            int(value) if spec.kind == "int" else float(value)
+        except (TypeError, ValueError, OverflowError):
+            raise HTTPException(
+                status_code=400,
+                detail=f"策略参数 {spec.name}（{spec.label}）不是数字：{value!r}",
+            ) from None
+    return strategy.validate_params(params)
 
 
 # A candidate is addressed as ``cand:<id>`` everywhere a strategy key is
@@ -396,6 +417,17 @@ class AutoController:
 
     def start(self, ctx, payload: AutoStartPayload) -> None:
         market = _market(payload.market)
+        # 交易所没有的周期在这里就拦住。以前不校验：7m 能启动成功，然后每一轮
+        # ``timeframe_seconds`` 抛 ValueError 被循环吞成「循环异常」，界面显示
+        # 在跑却永远不下单。AI 交易和回测都校验了，就这条漏了。
+        if payload.timeframe not in TIMEFRAME_SECONDS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"不支持的周期：{payload.timeframe}"
+                    f"（可用：{'、'.join(TIMEFRAME_SECONDS)}）"
+                ),
+            )
 
         # The runner always trades the configured venue; the only question is
         # whether the user is allowed to arm it. Testnet needs no confirmation —
@@ -411,14 +443,17 @@ class AutoController:
             strategy = ctx.strategies.get(payload.strategy)
         except KeyError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        params = strategy.validate_params(payload.params)
+        params = _strategy_params(strategy, payload.params)
 
         with self._lock:
             if self._trader is not None and self._trader.running:
                 raise HTTPException(status_code=409, detail="自动交易已在运行")
 
             if ctx.market_type is not market:
-                ctx.set_market_type(market)
+                # 只借不落盘：部署顺手把市场写进 config.json，等于替用户改了设置，
+                # 写盘失败还会让整个部署变成 500。界面（内存里的市场）仍然跟着引擎
+                # 走，回滚这一条要等引擎停下来才谈得上。
+                ctx.set_market_type(market, persist=False)
 
             config = AutoTraderConfig(
                 symbol=payload.symbol,
@@ -635,6 +670,9 @@ class AITraderController:
         self._lock = threading.RLock()
         self._trader: AITrader | None = None
         self.lease = TradeLease()
+        # 轮询和「立即决策」都从 _build 出去，budget 由控制器持有：当日决策次数、
+        # 每小时下单数、冷却时间是同一个账户的账，不能跟着实例走一遍。
+        self.budget = TradeBudget()
 
     @property
     def trader(self) -> AITrader | None:
@@ -714,6 +752,7 @@ class AITraderController:
             llm=ctx.ai,
             risk=ctx.trading.risk,
             lease=self.lease,
+            budget=self.budget,
             frame_provider=lambda: _closed_only(
                 _market_frame(state, ctx, market, symbol, timeframe, 300), timeframe
             ),
@@ -1111,7 +1150,7 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
             strategy = ctx.strategies.get(payload.strategy)
         except KeyError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        params = strategy.validate_params(payload.params)
+        params = _strategy_params(strategy, payload.params)
         source = _strategy_source(strategy)
         result = ai.describe_strategy(
             ctx.ai,
@@ -1909,14 +1948,18 @@ def _validate_backtest(state, payload: BacktestPayload):
     if payload.timeframe not in TIMEFRAME_SECONDS:
         raise HTTPException(status_code=400, detail=f"不支持的周期：{payload.timeframe}")
     strategy = _strategy_for(state, payload.strategy)
-    params = strategy.validate_params(payload.params)
+    params = _strategy_params(strategy, payload.params)
+    # 现货没有杠杆，也不能做空。原样透传会让现货回测跑出「做空 + 10 倍杠杆」这种
+    # 根本不存在的曲线（``BacktestConfig.deploy = position_pct * max(1, leverage)``）。
+    # 自动交易那条路径（``AutoController.start``）早就按市场收了，这里漏了同一句话；
+    # 前端碰巧传 1，直调接口就绕过去了。
     config = BacktestConfig(
         initial_capital=payload.initial_capital,
         fee_rate=payload.fee_rate,
         slippage_bps=payload.slippage_bps,
         position_pct=payload.position_pct,
-        leverage=payload.leverage,
-        allow_short=payload.allow_short,
+        leverage=payload.leverage if market.is_futures else 1.0,
+        allow_short=bool(payload.allow_short) and market.is_futures,
         stop_loss_pct=payload.stop_loss_pct,
         take_profit_pct=payload.take_profit_pct,
         timeframe=payload.timeframe,

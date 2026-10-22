@@ -23,7 +23,13 @@ from ..backtest import BacktestConfig
 from ..core.types import MarketType
 from ..strategy.candidates import Candidate, CandidateError, CandidateStore
 from ..strategy.source import StrategySourceError, save_source
-from .routes import JobStore, _closed_only, _market_frame, _strategy_source
+from .routes import (
+    JobStore,
+    _closed_only,
+    _market_frame,
+    _strategy_params,
+    _strategy_source,
+)
 
 # 一个能过静态检查的最小样例，直接念给模型看。要求它「照着格式写」比列字段名管用：
 # 只写字段名时它会给散文 + 代码块（实测四次全这样）。
@@ -353,7 +359,9 @@ class LabController:
             raise HTTPException(status_code=404, detail=f"策略不存在：{payload.base_key}") from exc
         market = _market(payload.market)
         timeframe = payload.timeframe
-        base_params = strategy.validate_params(payload.params or strategy.default_params())
+        base_params = _strategy_params(
+            strategy, payload.params or strategy.default_params()
+        )
         rounds = max(1, min(int(payload.rounds), 5))
 
         job_id = self.jobs.create("lab-optimize")
@@ -383,7 +391,16 @@ class LabController:
                         job_id, progress=min(0.99, i / max(1, total))
                     ),
                 )
-                self.jobs.update(job_id, status="done", progress=1.0, result=result)
+                # 取消就是取消：optimize_params 会带着 stopped="cancel" 正常返回，
+                # 以前这里无条件写 done，页面于是提示「优化完成」，前端的
+                # cancelled 分支永远是死的。
+                cancelled = str(result.get("stopped") or "") == "cancel"
+                self.jobs.update(
+                    job_id,
+                    status="cancelled" if cancelled else "done",
+                    progress=1.0,
+                    result=result,
+                )
             except Exception as exc:  # pragma: no cover - depends on live data
                 self.jobs.update(job_id, status="failed", error=str(exc))
             finally:
