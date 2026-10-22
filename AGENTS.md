@@ -112,9 +112,22 @@ Node 不在 PATH 时，先把 Node 目录加进去。
 - 缓存窗口和每日调用次数也不进设置，固定在 `CACHE_SECONDS`。
   设置页只留开关、供应商、模型、接口地址、Key。
 - `ask()` 的返回除了 `ok` / `text` / `error` / `tokens`，还有 `finish`（供应商的 finish_reason）
-  和 `truncated`（`finish == "length"`）。被截断的回答可能带着半截正文，所以报错时要把
-  「额度用完、被截断」和「回答不合格、JSON 解析不出来」分开说，别再让用户去改一个改不了的额度。
-  Anthropic 用 `stop_reason: max_tokens` 表示截断，这一支目前不会置 `truncated`。
+  和 `truncated`。截断有两种叫法：OpenAI 风格的 `finish_reason="length"` 和 Anthropic 的
+  `stop_reason="max_tokens"`，两个都算（`llm.TRUNCATED_FINISH` / `llm.is_truncated()`）。
+  被截断的回答可能带着半截正文，所以报错时要把「额度用完、被截断」和「回答不合格、解析不出来」
+  分开说。缓存命中也会带上 `finish` / `truncated`（`_Cache.put` 存 finish），
+  被截断的答案根本不进缓存——半截答案缓存下来，只会在 5 分钟里反复命中。
+- 策略实验室的生成不要求模型回 JSON：解析在 `ai_candidate.py`，`from_answer` 依次试
+  纯 JSON → json 围栏 → python 围栏 → 正文里带括号的 `class Xxx(...)` → 失败，第一个抠到代码的赢。
+  最后一段按「第一个带括号的类」切，切到散文里的示例类就会静态检查不通过——取错比整段丢掉值。
+  实测模型回的是「散文 + 一个 python 代码块 + 尾部参数表格」，别把这种回答当成「JSON 坏了」。
+  - `absolute_strategy_imports`：模型会照抄参考源码的 `from ..base` / `from ...core`，候选是数据
+    目录里的独立模块，这两条相对导入解析不了，写盘前换成 `btrader.strategy.base` / `btrader.core`。
+  - `sanitize_key`：`key` 撞上已有策略或已有候选就加 `_ai` / `_ai2` 后缀，原名写进候选的 note。
+    提示词里也念一遍现有 key，那只是减少重试；真正兜底的是这个函数。
+  - 解析只负责把代码捞出来。候选代码仍然要过 `sandbox.check_code`，那是唯一闸门；
+    批准时 `_register_candidate` 再改写一次类属性 `key = "..."`，所以候选列表上的 key 和最终
+    注册的 key 可能差一个后缀。
 
 ## 7. AI 交易与 AI 量化
 
@@ -138,7 +151,8 @@ Node 不在 PATH 时，先把 Node 目录加进去。
 
 - 内置策略在包里：`src/btrader/strategy/builtin/*.py`，跟着程序升级走。用户策略是数据目录
   `%APPDATA%/biTrader/strategies/*.py`（`paths.user_strategies_dir()`）下的普通 `.py` 文件。
-  AI 候选在 `strategies/candidates/`，不参与正式注册。策略是本机 Python 代码，权限和本程序相同。
+  AI 候选在 `strategies/candidates/`，不参与正式注册；批准时才复制进用户目录，并顺手把类属性
+  `key = "..."` 改写成最终 key（撞库就带后缀）。策略是本机 Python 代码，权限和本程序相同。
 - 加载顺序是先内置、再用户目录。用户目录里的同名 `key` 顶掉内置，这就是「改内置」的实现：
   顶替只在用户目录落盘，包内源码一个字节都不动。两个用户文件用同一个 key 仍然算冲突，
   照旧报「策略 key 重复」并只留先加载的那个。
