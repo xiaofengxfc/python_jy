@@ -81,7 +81,8 @@ _SHIM_SCRIPT_RE = re.compile(r'"([^"]+\.(?:js|mjs|cjs))"', re.IGNORECASE)
 # A dead gateway costs one CLI round trip per message (~30 s) because the CLI
 # waits for a gateway that is not there. Three failures in a row open the
 # breaker for a few minutes, so the queue drains instead of stacking timeouts —
-# which used to mean ten notifications took five minutes to all fail.
+# Parallel sends would make ten already-doomed messages fail five minutes
+# sooner, which tells the user nothing new.
 BREAKER_THRESHOLD = 3
 BREAKER_COOLDOWN = 300.0
 # The CLI's own failure takes ~30 s; a TCP probe answers "is anything listening"

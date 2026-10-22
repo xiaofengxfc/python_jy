@@ -128,7 +128,7 @@ def _mirror_candles(
         # down, the second says the fallback could not rescue it either.
         raise HTTPException(
             status_code=503,
-            detail=_market_data_hint(market, f"{primary}；备用源：{exc}"),
+            detail=_market_data_hint(market, f"{primary}。备用源：{exc}"),
         ) from exc
     if not rows:
         return None
@@ -145,8 +145,8 @@ def _market_data_hint(market: MarketType, detail: str) -> str:
     if market.is_futures and looks_like_network:
         return (
             "无法连接币安合约行情接口（fapi.binance.com / dapi.binance.com），"
-            "常见原因是 DNS 污染或网络限制。可采取：1) 在设置里填写代理；"
-            "2) 合约图表会自动改用 Gate.io 永续行情（若其也失败则会显示这条错误）。"
+            "常见原因是 DNS 污染或网络限制。可以这样处理。一是在设置里填代理。"
+            "二是让合约图表改用 Gate.io 永续行情，那边也失败时才会显示这条错误。"
             f"原始错误：{text[:300]}"
         )
     return text
@@ -351,22 +351,20 @@ def _require_live_ready(
 ) -> None:
     """Gate an order behind credentials and, on mainnet, a second confirm.
 
-    Testnet is a real venue with fake funds, so it needs no extra click: the
-    whole point of it is to rehearse without ceremony. Mainnet keeps the
-    acknowledgement because there a typo costs money.
+    Testnet is a real venue with fake funds, so it needs no extra click.
+    Mainnet keeps the acknowledgement because there a typo costs money.
 
-    Protective exits used to be refused here because the exchange side could
-    not honour them. They are now placed as STOP_MARKET / TAKE_PROFIT_MARKET
-    orders, so a futures order may carry them. Spot still cannot: Binance has
-    no reduce-only stop for spot balances, and pretending to arm one would
-    leave the position unhedged.
+    A futures order may carry a stop / take-profit: they are placed as
+    STOP_MARKET / TAKE_PROFIT_MARKET orders. A spot order may not. Binance has
+    no reduce-only stop for spot balances, and arming nothing while reporting
+    success would leave the position unprotected.
     """
     if not signed:
         raise HTTPException(status_code=400, detail="下单需要先配置该市场的 API Key。")
     if network is Network.MAINNET and not confirm_live:
         raise HTTPException(
             status_code=400,
-            detail="主网下单需要二次确认（confirm_live=true）；测试网不需要。",
+            detail="主网下单需要二次确认（confirm_live=true）。测试网不需要。",
         )
     if (stop_loss or take_profit) and market is not None and not market.is_futures:
         raise HTTPException(
@@ -519,9 +517,9 @@ def create_app() -> FastAPI:
 
     app = FastAPI(title="biTrader Web", lifespan=lifespan)
     app.include_router(build_router(get_state))
-    # Phase 4-B: candidate review + multi-round parameter reflection.
+    # Candidate review and multi-round parameter reflection.
     app.include_router(build_lab_router(get_state))
-    # Phase 5-A: source editor for user strategy plugins.
+    # Source editor for user strategy plugins.
     app.include_router(build_strategy_router(get_state))
 
     if STATIC_DIR.is_dir():
@@ -586,7 +584,7 @@ def create_app() -> FastAPI:
                 frame = frame[frame["timestamp"] < int(before)].tail(limit)
         except Exception as exc:
             # 币安合约域名在部分网络会被 DNS 污染，界面就只剩「无法查看合约 K 线」。
-            # 现货有公共镜像，合约没有；此时用 Gate 永续兜底，并且把来源带回去，
+            # 现货有公共镜像，合约没有；此时改用 Gate 永续行情，并把来源一起返回，
             # 让界面能标明「这不是币安的价格」。
             rows = _mirror_candles(mt, symbol, timeframe, limit, since, exc)
             if rows is None:
@@ -1188,7 +1186,7 @@ def create_app() -> FastAPI:
         if not placed:
             raise HTTPException(
                 status_code=400,
-                detail="；".join(warnings) if warnings else "止损/止盈都没有挂上",
+                detail="。".join(warnings) if warnings else "止损/止盈都没有挂上",
             )
         return {
             "ok": True,

@@ -274,7 +274,7 @@ class AutoTrader:
         """Current live position expressed in base coins, or ``None``.
 
         ``None`` means "unknown", and callers must skip the rebalance. Returning
-        zero here used to be indistinguishable from "flat", so one failed read
+        zero is indistinguishable from "flat", so one failed read
         made ``_rebalance`` treat the whole target as missing and buy it again —
         a transient network error could double a live position.
         """

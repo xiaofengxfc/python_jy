@@ -515,7 +515,7 @@ class AutoController:
             self._error_notified_at = 0.0
 
     def _on_log(self, ctx, level: str, message: str) -> None:
-        """循环异常写日志；同一条错误只推一次，避免刷屏。"""
+        """循环异常写日志。同一条错误只推一次，避免刷屏。"""
         self.events.add("log", level, message)
         if level != "ERROR":
             return
@@ -762,14 +762,14 @@ class AITraderController:
                 signal_strategy.validate_params(payload.params or {}),
             ),
         )
-        # 改参数重启是常规操作：旧实例握着共享租约，必须先停掉，否则新实例的
-        # acquire 会失败，用户看到的是「交易权已被占用」这种莫名其妙的报错。
         return trader
 
     def start(self, state, payload: AITraderStartPayload) -> dict[str, Any]:
         trader = self._build(state, payload)
         with self._lock:
             previous = self._trader
+        # 改参数要重启。旧实例还握着共享租约，不停掉新实例就拿不到，
+        # 报错是「交易权已被占用」。
         if previous is not None and previous is not trader:
             previous.stop()
         ok, message = trader.start()
@@ -780,10 +780,9 @@ class AITraderController:
         return trader.status()
 
     def decide(self, state, payload: AITraderStartPayload) -> dict[str, Any]:
-        """立即决策一次：同样的闸门和账，但不启动轮询线程。
+        """立即决策一次：同样的闸门和记账，不启动轮询线程。
 
-        AITrader.decide_once 从 Phase 3-A 起就为这个入口准备着（测试和
-        「立即决策」共用），只是之前没有对外的路由。
+        「立即决策」和测试共用 AITrader.decide_once，走同一条路径。
         """
         with self._lock:
             trader_in_use = (
@@ -988,7 +987,7 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
 
     @router.post("/api/risk/kill")
     def risk_kill(payload: AITraderHaltPayload) -> dict[str, Any]:
-        """一键急停：打开全局风控开关，并停掉 AI/自动交易（INV-8）。"""
+        """急停：打开全局风控开关，停掉 AI 交易和自动交易（INV-8）。"""
         state = get_state()
         ctx = state.ctx
         ctx.settings.risk.kill_switch = True
@@ -1268,7 +1267,7 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
         ctx = get_state().ctx
         notifier = ctx.notifier
         text = payload.message.strip() or (
-            "biTrader 企业微信通知测试：如果你收到这条消息，说明推送已打通。"
+            "biTrader 企业微信通知测试：收到这条消息说明推送正常。"
         )
         candidate = replace(
             notifier.settings,
@@ -1903,7 +1902,7 @@ def _market_frame(state, ctx, market, symbol: str, timeframe: str, limit: int):
             rows = mirror.fetch_ohlcv(market, symbol, timeframe, limit=limit)
         except Exception as exc:
             raise HTTPException(
-                status_code=503, detail=f"无法获取 K 线：{primary}；备用源：{exc}"
+                status_code=503, detail=f"无法获取 K 线：{primary}。备用源：{exc}"
             ) from exc
         frame = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
         if frame.empty:

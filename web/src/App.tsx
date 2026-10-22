@@ -10,7 +10,7 @@ import BacktestPage from "./pages/BacktestPage";
 import StrategyLabPage from "./pages/StrategyLabPage";
 import type { AppSettings, Health } from "./types";
 
-/** 「自动交易」页已经合并进交易页（AI 量化执行引擎），没有独立的 auto 页。 */
+/** 「自动交易」在交易页里，是 AI 量化执行引擎面板，没有单独的页面。 */
 export type PageKey = "trading" | "portfolio" | "backtest" | "lab" | "settings";
 
 export default function App() {

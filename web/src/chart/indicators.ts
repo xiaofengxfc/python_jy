@@ -1,7 +1,7 @@
 /** 指标计算：纯函数，不碰 DOM、不碰 React。
  *
- * 算法是从原来手绘 canvas 的 Chart.tsx 里原样搬过来的，一个数都没改，
- * 所以换成 TradingView 图表之后，图上每一根线的数值与旧版完全一致。
+ * 算法从手绘 canvas 版原样搬过来，一个数都没改。
+ * 所以图上每条线的数值和历史版本一致。
  */
 
 import type { Candle } from "../types";

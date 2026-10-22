@@ -704,8 +704,8 @@ export default function TradingPage({
             )}
             {chartSource && (
               <div className="banner warn" role="status">
-                行情来源：{chartSource}（币安合约接口在当前网络不可达，图表改用备用永续行情；
-                价格与币安存在价差，下单仍走币安）
+                行情来源：{chartSource}。币安合约接口在当前网络不可达，图表改用备用永续行情。
+                它和币安有价差，下单仍然走币安。
               </div>
             )}
             <TradingViewChart

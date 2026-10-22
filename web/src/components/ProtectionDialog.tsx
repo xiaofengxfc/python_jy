@@ -88,7 +88,7 @@ export default function ProtectionDialog({
 
   const apply = async () => {
     if (!stopValue && !targetValue) {
-      setError("请填写止损价或止盈价；要取消全部保护请点“撤销保护”。");
+      setError("请填写止损价或止盈价。要取消全部保护，点「撤销保护」。");
       return;
     }
     if (problem) {

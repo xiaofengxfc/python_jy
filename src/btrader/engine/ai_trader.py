@@ -1,15 +1,11 @@
-"""AI 交易核心（Phase 3-A）。
+"""AI 交易：决策，闸门，下单。
 
-设计依据：``docs/ai-autonomy-plan.md`` §5.2/§5.4/§5.5/§5.6/§5.9。
+这个模块只做这三件事。它不 import 交易所，也不 import 数据库。唯一的
+下单出口是注入的 ``TradingService.submit()``（INV-1）。风控仍然以
+``RiskManager`` 为准，``AIGuard`` 只在它前面加一层 AI 自己的收紧（INV-2）。
 
-这个模块只做三件事：**决策 → 闸门 → 经 TradingService 下单**。它不直接
-import 交易所或数据库；唯一下单出口是注入的 ``TradingService.submit()``
-（INV-1）。风控的权威仍然是 ``RiskManager``，本模块的 ``AIGuard`` 只是在其
-前面再加一层 AI 专属的收紧（INV-2）。
-
-默认构造即停止；真下单必须同时满足
-``live_enabled + confirm_live + 未急停``（INV-9）。测试网与主网走同一条
-路径，区别只是 ``network`` 指向哪一个——练习不该需要另一套代码。
+构造完成后是停止状态。真下单要同时满足 ``live_enabled``、``confirm_live``
+和未急停（INV-9）。测试网和主网走同一条路径，只差 ``network`` 指向谁。
 """
 
 from __future__ import annotations
@@ -44,8 +40,8 @@ DECISION_PROMPT = (
     '{"action":"open_long|open_short|close_long|close_short|hold",'
     '"symbol":"交易对","quote":下单金额USDT,"price":参考价,"stop_loss":止损价或null,'
     '"take_profit":止盈价或null,"confidence":0到1,"ttl_sec":决策有效期秒,"rationale":"一句话理由"}\n'
-    "约束：没有把握就输出 hold；quote 不得超过账户可用资金；不要给出杠杆；"
-    "止损必须在方向上合理（多单止损低于参考价，空单高于参考价）。"
+    "约束：没有把握就输出 hold。quote 不得超过账户可用资金。不要给出杠杆。"
+    "止损必须在方向上合理，多单止损低于参考价，空单高于参考价。"
 )
 
 
@@ -77,7 +73,7 @@ class AIDecision:
 
 @dataclass
 class AITraderConfig:
-    """一份自包含的运行配置；实盘开关默认关闭。"""
+    """一份自包含的运行配置。实盘开关默认关闭。"""
 
     enabled: bool = False
     live_enabled: bool = False
@@ -165,7 +161,7 @@ def parse_decision(text: str, *, now: float | None = None) -> tuple[AIDecision |
 
 
 def validate_decision(decision: AIDecision, config: AITraderConfig) -> list[str]:
-    """结构校验；任何一条不过都不允许下单。"""
+    """结构校验。任何一条不过都不允许下单。"""
     errors: list[str] = []
     if decision.action not in ACTIONS:
         errors.append("动作非法")
@@ -587,7 +583,7 @@ class AITrader:
             direction = "做多" if signal_target > 0 else "做空" if signal_target < 0 else "空仓"
             signal_line = (
                 f"【策略信号】目标仓位 {signal_target:+.0%}（{direction}）。"
-                "你只做复核：同意该方向才可开对应方向；不同意就 hold。"
+                "你只做复核。同意该方向才可开对应方向，不同意就 hold。"
                 "不得反向开仓，不得在空仓信号下开新仓。\n"
             )
         return (
@@ -641,7 +637,7 @@ class AITrader:
         return record
 
     def _audit(self, record: dict[str, Any]) -> None:
-        """每笔决策/状态变更追加一行；写失败绝不能打断交易（INV-15）。"""
+        """每笔决策或状态变更追加一行。写失败绝不能打断交易（INV-15）。"""
         try:
             self.audit_path.parent.mkdir(parents=True, exist_ok=True)
             with self.audit_path.open("a", encoding="utf-8") as handle:

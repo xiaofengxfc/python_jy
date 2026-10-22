@@ -295,7 +295,7 @@ export default function StrategyEditor({
             disabled={busy !== "" || isNew || !detail?.editable || detail?.builtin}
             title={
               detail?.builtin
-                ? "内置策略只读；先「复制为新策略」再改名"
+                ? "内置策略只读。先「复制为新策略」再改名"
                 : "改文件名和 key，引用会自动跟上"
             }
           >
@@ -345,7 +345,7 @@ export default function StrategyEditor({
         <div className="strategy-editor-newkey">
           <label className="field-label" htmlFor="strategy-rename-key">
             <span>新 key</span>
-            <em>小写字母开头；文件名会一起改，引用自动迁移</em>
+            <em>小写字母开头。文件名会一起改，引用自动迁移</em>
           </label>
           <input
             id="strategy-rename-key"

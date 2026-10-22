@@ -14,7 +14,7 @@ interface Props {
 }
 
 const TOOLS: { value: DrawingTool; label: string; title: string }[] = [
-  { value: "select", label: "选择", title: "选择并拖动已有画线；拖空白处平移图表" },
+  { value: "select", label: "选择", title: "选择并拖动已有画线。拖空白处平移图表" },
   { value: "hline", label: "水平线", title: "点击图表放置一条水平线" },
   { value: "trend", label: "趋势线", title: "按下并拖动，画一条两点趋势线" },
 ];

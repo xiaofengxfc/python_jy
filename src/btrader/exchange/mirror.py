@@ -1,15 +1,15 @@
 """备用合约行情：Gate.io 公开接口。
 
-为什么需要它：币安合约的域名（``fapi.binance.com`` / ``dapi.binance.com``）
-在部分网络里会被 DNS 污染或直接丢包，界面就只剩「无法查看合约 K 线」。现货有
-``data-api.binance.vision`` 这个公共镜像可以兜底，合约没有等价的镜像，所以在
-币安合约不可达时，图表改用 Gate.io 的永续公开 K 线。
+币安合约域名（``fapi.binance.com`` / ``dapi.binance.com``）在部分网络
+会被 DNS 污染或丢包，界面就只剩「无法查看合约 K 线」。现货有
+``data-api.binance.vision`` 这个公共镜像，合约没有，所以在币安合约不可达时
+图表改用 Gate.io 永续公开 K 线。
 
-边界写死在这里，不要越界：
+三条边界：
 
-* **只用于图表和回测取数**，永远不用于下单、不用于仓位与盈亏计算；
-* 返回的数据一定带 ``source``，界面必须显示来源，避免把 Gate 的价格当成币安；
-* 只在币安（含代理）失败后才尝试，且失败不掩盖原因：两条错误都会带回去。
+* 只用于图表和回测取数，不用于下单、仓位和盈亏计算。
+* 返回的数据带 ``source``，界面必须显示来源，否则会把 Gate 的价格当成币安。
+* 只在币安失败后才试，且不掩盖原因：两条错误都返回。
 
 Gate 的公开行情不需要鉴权，K 线接口是
 ``/api/v4/futures/{usdt|btc}/candlesticks?contract=BTC_USDT&interval=1h&limit=400``，
@@ -32,7 +32,7 @@ log = logging.getLogger(__name__)
 BASE_URL = "https://api.gateio.ws/api/v4"
 TIMEOUT = 8.0
 
-# Gate 的周期名与项目内部的一一对应；只列真正支持的那些。
+# Gate 的周期名与项目内部一一对应。这里只列真正支持的那些。
 _INTERVALS = {
     "1m": "1m",
     "5m": "5m",
@@ -57,7 +57,7 @@ def supports(market: MarketType, timeframe: str) -> bool:
 
 
 def contract_for(market: MarketType, symbol: str) -> str:
-    """``BTC/USDT`` → ``BTC_USDT``；反向量合约 ``BTC/USD:BTC`` → ``BTC_USD``。"""
+    """``BTC/USDT`` → ``BTC_USDT``。反向量合约 ``BTC/USD:BTC`` → ``BTC_USD``。"""
     base = symbol.split(":")[0].replace("/", "_")
     if market is MarketType.COINM:
         # 反向量合约以币计价；Binance 写作 BTC/USD:BTC。

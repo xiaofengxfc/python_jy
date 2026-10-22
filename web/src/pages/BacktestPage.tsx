@@ -761,7 +761,7 @@ export default function BacktestPage() {
                     />
                     <div className="hint">
                       回测按「仓位比例 × 杠杆」放大下单量，不会因保证金不足被强平，
-                      也没有资金费与维持保证金。高杠杆的收益与最大回撤都会偏乐观。
+                      也不算资金费和维持保证金。所以高杠杆的收益和回撤都偏乐观。
                     </div>
                   </div>
                 )}
@@ -930,7 +930,7 @@ export default function BacktestPage() {
                     </div>
                     {compared.length > 0 && (
                       <div className="hint" style={{ marginTop: 8 }}>
-                        对比基于本次会话跑出的结果；最多叠加 4 条曲线。
+                        对比基于本次会话跑出的结果，最多叠加 4 条曲线。
                         <button
                           type="button"
                           className="btn-sm"
@@ -985,9 +985,9 @@ export default function BacktestPage() {
                   </div>
                   <div className="card-body">
                     <div className="hint" style={{ marginBottom: 10 }}>
-                      重跑同一次回测，再把每个开仓点交给模型复核：只给它开仓<em>之前</em>
-                      的 K 线，看不到结果，所以偷不到答案。被否掉的交易整笔剔除，
-                      两边的数字可直接对比。每个开仓点是一次付费调用，按下面的上限截断。
+                      重跑同一次回测，把每个开仓点交给模型复核。只给它开仓<em>之前</em>
+                      的 K 线，它看不到结果。被否掉的交易整笔剔除，两边数字可以对比。
+                      每个开仓点是一次付费调用，超过下面的上限就不再复核。
                     </div>
                     <div className="row" style={{ gap: 8, alignItems: "flex-end" }}>
                       <div className="field" style={{ maxWidth: 140 }}>

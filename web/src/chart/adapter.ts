@@ -3,8 +3,8 @@
  * 换算只发生在这一层：库要的是秒级 UTCTimestamp，我们手里是币安返回的
  * 毫秒开盘时间。除了单位，这里还负责两件事：
  *
- * 1. 时间必须严格递增且唯一 —— 库对 setData 有这个硬要求，而历史分页、
- *    实时折叠、Gate 兜底行情重叠时都可能给出重复或乱序的 bar；
+ * 1. 时间必须严格递增且唯一。库对 setData 有这个硬要求。历史分页、
+ *    实时折叠、Gate 备用行情重叠时都会给出重复或乱序的 bar。
  * 2. 让指标值、成交量与价格共用同一套下标，谁的序列都不能错位一格。
  */
 
@@ -118,7 +118,7 @@ export function indexOfTime(candles: Candle[], t: number): number {
 }
 
 /** 成交时间 → 它所在那根 K 线的开盘时间。买卖点标记必须落在真实存在的
- * bar 上，否则库会把标记丢掉；用整段行情推算比按周期取模更可靠
+ * bar 上，否则库会把标记丢掉。用整段行情推算比按周期取模更可靠
  * （周线的锚点是周一，不是 epoch 0 所在的周四）。 */
 export function barTimeAt(candles: Candle[], ms: number): number | null {
   if (!candles.length) return null;

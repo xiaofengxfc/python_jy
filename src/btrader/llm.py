@@ -582,7 +582,7 @@ def _http_error_text(code: int, detail: str, provider: str) -> str:
     if code == 403 and _looks_like_waf_block(detail):
         hint = (
             "请求被服务商前面的防火墙拦截了（Cloudflare 1010），"
-            "不是 Key 或模型权限问题；检查网络/代理，或联系服务商放行客户端。"
+            "不是 Key 或模型权限的问题。检查网络和代理，或者联系服务商放行客户端。"
         )
     else:
         hint = {

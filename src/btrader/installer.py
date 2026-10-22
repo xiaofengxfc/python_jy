@@ -259,7 +259,7 @@ class OpenClawInstaller:
         args = self.plan(options)
         with self._lock:
             if self._run is not None and self._run.state == "running":
-                raise ValueError("已有安装任务在进行中，请等待它结束。")
+                raise ValueError("已有安装任务进行中，等它结束再来。")
             run = _Run(command=args)
             self._run = run
             self._thread = threading.Thread(
@@ -303,7 +303,7 @@ class OpenClawInstaller:
         args = self.channel_plan()
         with self._lock:
             if self._run is not None and self._run.state == "running":
-                raise ValueError("已有安装任务在进行中，请等待它结束。")
+                raise ValueError("已有安装任务进行中，等它结束再来。")
             run = _Run(command=args)
             self._run = run
             self._thread = threading.Thread(
@@ -386,8 +386,8 @@ class OpenClawInstaller:
                 # not on PATH; that is a real, confusing failure, so name it.
                 run.state = "failed"
                 run.error = (
-                    "安装命令成功，但仍找不到 openclaw；请确认 npm 全局目录在 PATH 中，"
-                    "或直接把它的完整路径填到“OpenClaw 路径”。"
+                    "安装命令成功，但仍找不到 openclaw。请确认 npm 全局目录在 PATH 里，"
+                    "或者把它的完整路径填到「OpenClaw 路径」。"
                 )
                 return
             run.state = "done"
@@ -423,8 +423,8 @@ class OpenClawInstaller:
                 # build the running gateway refuses to load.
                 run.state = "failed"
                 run.error = (
-                    "插件已下载，但网关未能加载它。请查看日志中的加载错误；"
-                    "通常是插件版本与 OpenClaw 版本不兼容。"
+                    "插件已下载，但网关没能加载它。请查看日志里的加载错误。"
+                    "通常是插件版本和 OpenClaw 版本不兼容。"
                 )
                 return
             run.state = "done"

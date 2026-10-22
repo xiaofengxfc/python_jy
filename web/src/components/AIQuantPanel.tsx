@@ -168,7 +168,7 @@ export default function AIQuantPanel({ market, symbol, timeframe, onNavigate }: 
         },
       );
       if (tradeCount <= 0) {
-        throw new Error("回测没有成交，已阻止部署；请调整策略后重试");
+        throw new Error("回测没有成交，已阻止部署。请调整策略后重试");
       }
       if (totalReturn <= 0) {
         throw new Error(

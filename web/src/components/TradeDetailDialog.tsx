@@ -74,8 +74,8 @@ export default function TradeDetailDialog({ trade, onClose }: Props) {
         </div>
 
         <p className="modal-text faint">
-          本笔已实现盈亏 = 平掉那部分的价差 − 本笔手续费；只开仓（平仓数量为 0）的成交会记一笔手续费，
-          明细里因此显示的是手续费本身。
+          本笔已实现盈亏 = 平掉那部分的价差 − 本笔手续费。
+          只开仓的成交（平仓数量为 0）也会记一笔手续费，所以这里显示的是手续费本身。
         </p>
 
         <div className="modal-actions">

@@ -20,9 +20,8 @@ import type { Drawing } from "../components/drawings";
 
 type RenderTarget = Parameters<IPrimitivePaneRenderer["draw"]>[0];
 
-/** 价格/时间 → 屏幕像素。由组件注入，用的是它手上那份 K 线数组，因此
- * 即使某个点在当前可视范围之外也能算出坐标（库自带的 timeToCoordinate
- * 只对已加载的 bar 有效）。 */
+/** 价格和时间转屏幕像素。由组件注入，用组件手上那份 K 线数组。
+ * 点落在可视范围外也能算出坐标。库自带的 timeToCoordinate 只认已加载的 bar。 */
 export interface PrimitiveContext {
   timeToX: (t: number) => number | null;
   priceToY: (price: number) => number | null;

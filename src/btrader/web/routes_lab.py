@@ -1,4 +1,4 @@
-"""Strategy lab REST endpoints (Phase 4-B).
+"""Strategy lab REST endpoints.
 
 Candidate code never leaves the candidate directory and is never imported here;
 the optimizer only tunes numeric parameters of an already-registered strategy.
@@ -164,7 +164,7 @@ class LabController:
     def _register_candidate(self, candidate_id: str) -> Candidate:
         """Create a real user strategy when a candidate is approved.
 
-        Approval previously only flipped the candidate status; the deploy
+        Approval is not the deployment: the deploy
         button wrote a differently named file later. Keep approval as the
         single hand-off point so the lab, backtest page and AI trader all see
         the same strategy.

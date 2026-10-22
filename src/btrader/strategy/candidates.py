@@ -1,6 +1,6 @@
-"""AI 候选策略的落盘与人工审核（Phase 4）。
+"""AI 候选策略的落盘与人工审核。
 
-候选先写 ``%APPDATA%/biTrader/strategies/candidates/``；审核通过时由
+候选先写 ``%APPDATA%/biTrader/strategies/candidates/``。审核通过时由
 ``routes_lab`` 复制为正式用户策略并触发热加载。候选目录本身仍不 import，
 也不直接参与交易。
 """

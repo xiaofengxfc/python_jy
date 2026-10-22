@@ -93,7 +93,7 @@ class GatewaySupervisor:
             with self._lock:
                 self._info = _Gateway(
                     state="failed",
-                    error="未找到 openclaw，微信推送不可用；可在设置页自动安装。",
+                    error="未找到 openclaw，微信推送不可用。可以在设置页自动安装。",
                 )
             return self.status()
 
@@ -101,7 +101,7 @@ class GatewaySupervisor:
             busy = self._starting
             self._starting = not busy
         if busy:
-            log.info("网关启动已在进行中，忽略重复请求")
+            log.info("网关已在启动，忽略重复请求")
             return self.status()
         try:
             return self._spawn(exe, retried=False)

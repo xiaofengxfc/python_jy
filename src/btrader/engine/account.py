@@ -1,10 +1,8 @@
 """Exchange account snapshots: the one source of account truth.
 
-The app used to keep a simulated account in memory and only read the exchange
-in "live" mode. Paper trading is gone, so every page — trading, portfolio,
-auto trading, AI trading — reads the *same* venue account, and this module is
-the single place that turns signed exchange calls into the payload shape the
-UI renders.
+Every page — trading, portfolio, auto trading, AI trading — reads the *same*
+venue account. This module is the single place that turns signed exchange
+calls into the payload shape the UI renders.
 
 Two things live here on purpose:
 

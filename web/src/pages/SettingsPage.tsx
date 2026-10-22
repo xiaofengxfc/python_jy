@@ -679,7 +679,7 @@ export default function SettingsPage({ settings, onSaved }: Props) {
           </div>
           <div className="card-body">
             <div className="hint">
-              新闻面板聚合以下无需密钥的公开来源，交易对相关度按币种过滤：
+              新闻面板聚合下面这些公开源，都不需要密钥：
               <ul style={{ margin: "8px 0 0 18px", padding: 0 }}>
                 {NEWS_SOURCES.map((source) => (
                   <li key={source}>{source}</li>
@@ -687,8 +687,8 @@ export default function SettingsPage({ settings, onSaved }: Props) {
               </ul>
             </div>
             <div className="hint" style={{ marginTop: 8 }}>
-              币安公告不会按币种过滤（上币、下架、维护都会影响交易），
-              CoinTelegraph 与 Decrypt 只保留标题提及当前币种的内容。不再需要任何 Token。
+              币安公告不按币种过滤，上币、下架、维护都会影响交易。
+              CoinTelegraph 和 Decrypt 只保留标题提到当前币种的条目。
             </div>
           </div>
         </div>
@@ -704,9 +704,9 @@ export default function SettingsPage({ settings, onSaved }: Props) {
           </div>
           <div className="card-body">
             <div className="hint" style={{ marginBottom: 12 }}>
-              让模型读多周期 K 线、标关键价位、给收盘简报。它只给判断，不会下单：
-              所有订单仍然只由策略和风控产生，模型无法进入策略循环。
-              数字指标都在本地算好后作为文本发给模型，不传截图。
+              模型读多周期 K 线，标关键价位，写收盘简报。它只给判断，不下单：
+              订单仍然只由策略和风控产生，模型进不了策略循环。
+              指标在本地算好，以文本发给模型，不传截图。
             </div>
 
             <div className="form-grid">
@@ -782,7 +782,7 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                   value={draft.ai.daily_limit}
                   onChange={(event) => patchAI({ daily_limit: Number(event.target.value) })}
                 />
-                <span className="field-hint">0 表示不限制；超出后所有 AI 调用直接返回失败，不会偷偷花钱。</span>
+                <span className="field-hint">填 0 表示不限制。超额后调用直接失败，不会继续计费。</span>
               </div>
 
               <div className="field">
@@ -852,7 +852,7 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                   <span>允许把持仓和盈亏发给模型（持仓复核需要）</span>
                 </label>
                 <span className="field-hint">
-                  默认关闭。持仓数量、开仓价、未实现盈亏属于隐私数据，只有打开后才会出现在请求里。
+                  默认关闭。持仓数量、开仓价、未实现盈亏属于隐私数据，打开后才出现在请求里。
                 </span>
               </div>
 
@@ -866,7 +866,7 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                   <span>自动交易每根收盘 K 线推一条 AI 简报</span>
                 </label>
                 <span className="field-hint">
-                  简报在独立线程生成，不会拖慢下单；生成失败只记日志，不影响交易。
+                  简报在独立线程生成，不占下单线程。生成失败只记日志，不影响交易。
                 </span>
               </div>
             </div>
@@ -1011,8 +1011,8 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                   onChange={(event) => patch({ proxy: event.target.value })}
                 />
                 <div className="faint" style={{ fontSize: 12 }}>
-                  币安合约域名（fapi.binance.com / dapi.binance.com）在部分网络被 DNS
-                  污染，填写代理后合约 K 线与下单才能直连币安；不填时代理不生效。
+                  部分网络会污染币安合约域名（fapi.binance.com / dapi.binance.com）的 DNS。
+                  填了代理，合约 K 线和下单才能直连币安。留空则不走代理。
                 </div>
               </div>
             </div>
@@ -1118,8 +1118,8 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                   the user to discover a checkbox. */}
               {draft.notify.mode !== "wecom_api" && channel?.configured && !draft.notify.enabled && (
                 <div className="hint" style={{ color: "var(--warn, #b45309)" }}>
-                  企业微信渠道已配置，但推送总开关是关的：成交、风控通知都不会发出。
-                  勾选上面的“启用企业微信推送”并保存后生效。
+                  渠道已配置，但推送总开关是关的。成交和风控通知不会发出。
+                  勾选上面的「启用企业微信推送」并保存。
                 </div>
               )}
               <div className="form-grid">
@@ -1195,7 +1195,7 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                     <div className="field">
                       <label className="field-label" htmlFor="notify-api-base">
                         <span>API 地址</span>
-                        <em>一般不用改；代理环境可填内网地址</em>
+                        <em>一般不用改。代理环境可以填内网地址</em>
                       </label>
                       <input
                         id="notify-api-base"
@@ -1236,7 +1236,7 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                     </div>
                   </div>
                   <div className="hint">
-                    企业微信后台 → 应用管理 → 自建应用，获取 CorpID、AgentId 和 Secret；
+                    到企业微信后台的「应用管理 → 自建应用」取 CorpID、AgentId 和 Secret。
                     “接收人”填应用可见范围内的成员 userid。Secret 只进系统密钥环。
                   </div>
                 </>
@@ -1617,13 +1617,13 @@ export default function SettingsPage({ settings, onSaved }: Props) {
               {notifyStatus && notifyStatus.breaker_seconds > 0 && (
                 <div className="verdict bad">
                   通道连续发送失败，已暂停 {notifyStatus.breaker_seconds} 秒。
-                  请先检查网关是否在运行；“发送测试”可随时手动探活并恢复。
+                  先确认网关在运行。点「发送测试」可以手动探活并恢复。
                 </div>
               )}
               {notifyStatus && notifyStatus.spooled > 0 && (
                 <div className="verdict bad">
-                  有 {notifyStatus.spooled} 条消息因发送失败暂存在本地，
-                  通道恢复后会自动补发（标注【补发】，超过 6 小时的会丢弃）。
+                  {notifyStatus.spooled} 条消息发送失败，暂存在本地。
+                  通道恢复后自动补发，标题带【补发】。超过 6 小时的丢弃。
                 </div>
               )}
               {notifyStatus && notifyStatus.last_success_at > 0 && (
@@ -1635,8 +1635,8 @@ export default function SettingsPage({ settings, onSaved }: Props) {
               )}
               <div className="hint">
                 {draft.notify.mode === "wecom_api"
-                  ? "自建应用 API 直接调用 qyapi.weixin.qq.com，不需要 OpenClaw。接收人填应用可见范围内的成员 userid；Secret 存系统密钥环，保存设置时生效。"
-                  : "推送经由本机 OpenClaw 网关的长连接直接送到企业微信智能机器人，没有二维码、也不会过期；“接收人”填企业微信里的成员 userid，对方先给机器人发过消息，推送才送得进去。“发送测试”用的就是上面填写的内容，无需先保存。"}
+                  ? "自建应用 API 直接调用 qyapi.weixin.qq.com，不用 OpenClaw。接收人填应用可见范围内的成员 userid。Secret 存系统密钥环，保存设置时生效。"
+                  : "推送走本机 OpenClaw 网关的长连接，直接送到企业微信智能机器人。不用扫码，登录态不会过期。「接收人」填成员 userid，对方要先给机器人发过消息，推送才送得进去。「发送测试」直接用上面填的内容，不用先保存。"}
               </div>
             </div>
           </div>
@@ -1707,8 +1707,8 @@ export default function SettingsPage({ settings, onSaved }: Props) {
                   </div>
                 </div>
                 <div className="hint">
-                  解除熔断只恢复下单权限，当日已发生的亏损仍会计入统计；
-                  额度按解除时刻重新起算。全局急停需在上方风控参数中关闭。
+                  解除熔断只恢复下单权限。当日已发生的亏损仍计入统计，额度从解除时刻重新起算。
+                  全局急停要在上面的风控参数里关。
                 </div>
               </>
             ) : (

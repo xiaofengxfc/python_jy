@@ -137,8 +137,8 @@ export default function AIPanel({
           <span className="card-title">AI 分析</span>
         </div>
         <div className="faint" style={{ fontSize: 12, lineHeight: 1.6 }}>
-          未启用。到「设置 → AI 助手」里选一个模型供应商并填入 API Key，就能在图上标注
-          支撑/阻力/止损，并让模型读多周期 K 线。
+          未启用。到「设置 → AI 助手」选供应商，填入 API Key。
+          之后可以在图上标支撑、阻力、止损，也能让模型读多周期 K 线。
         </div>
       </div>
     );

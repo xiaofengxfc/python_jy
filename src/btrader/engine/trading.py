@@ -22,7 +22,7 @@ from .risk import RiskDecision, RiskManager
 log = logging.getLogger(__name__)
 
 # Live fills already folded into the risk manager, plus the per-symbol cost
-# ledger used to derive closing PnL. Kept in SQLite so a restart does not
+# ledger derives closing PnL. It lives in SQLite so a restart does not
 # charge the same exit twice.
 LIVE_LEDGER_KEY = "live.ledger.v1"
 LIVE_TRADE_LIMIT = 800

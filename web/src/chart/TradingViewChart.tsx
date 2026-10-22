@@ -1,12 +1,11 @@
-/** TradingView 图表（lightweight-charts v5）。
+/** TradingView 图表，用 lightweight-charts v5。
  *
- * 数据仍然来自我们自己的后端（币安 REST 为主、Gate 永续兜底），这一层只
- * 负责「怎么画」：K 线、成交量、主图/副图指标、无限历史分页、实时尾部、
- * 画线（水平线/趋势线，可拖拽）、AI 价位、成交买卖点标记、持仓均价。
+ * 行情来自本机后端（币安 REST 为主，Gate 永续备用）。这一层只管画：
+ * K 线、成交量、主图和副图指标、历史分页、实时尾部、画线、AI 价位、
+ * 成交标记、持仓均价。
  *
- * 与旧的手绘 canvas 版本相比，对外 props 基本不变，TradingPage 只需要换
- * import。所有坐标换算都走库的 API（priceToCoordinate / logicalToCoordinate），
- * 不再自己维护一套几何量。
+ * 坐标换算全部走库的 API（priceToCoordinate / logicalToCoordinate）。
+ * 自己算坐标会和库的缩放对不上。
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -431,7 +430,7 @@ export default function TradingViewChart({
       if (!range) return;
       if (range.from > 12) return;
       const now = Date.now();
-      // 用户往回拖会连着触发很多帧，别把后端问穿；askOlderRef 既是节流时间戳，
+      // 用户往回拖会连着触发很多帧，别把后端问穿。askOlderRef 既是节流时间戳，
       // 也用于整表重设后的短暂屏蔽（见上面的数据 effect）。
       if (now < askOlderRef.current) return;
       if (live.current.olderLoading) return;
@@ -952,7 +951,7 @@ export default function TradingViewChart({
       const drag = dragRef.current;
       const { x, y } = point(event);
       if (!drag) {
-        // 悬停在一条线上时给个抓手，告诉用户这条线可以拖。
+        // 悬停在线上时换指针样式，表示这条线能拖。
         wrap.style.cursor = drawingAt(x, y) ? "grab" : "";
         return;
       }

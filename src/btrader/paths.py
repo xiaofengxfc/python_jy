@@ -61,7 +61,7 @@ def user_strategies_dir() -> Path:
 
 
 def strategy_candidates_dir() -> Path:
-    """AI 生成的候选策略目录；永远不参与 registry 的 import。"""
+    """AI 生成的候选策略目录。这个目录永远不参与 registry 的 import。"""
     path = user_strategies_dir() / "candidates"
     path.mkdir(parents=True, exist_ok=True)
     return path

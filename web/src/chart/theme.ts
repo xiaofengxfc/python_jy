@@ -1,7 +1,7 @@
 /** 主题：CSS 设计变量 → lightweight-charts 的选项。
  *
- * 原来手绘 canvas 时颜色可以每次重绘现读 CSS 变量；换成库之后必须显式
- * 下发，所以集中在这一层做映射，主题切换时用 applyOptions 整包刷新。
+ * 库不会自己读 CSS 变量，颜色要显式下发。
+ * 所以映射集中在这一层，切换主题时用 applyOptions 整包刷新。
  */
 
 import {

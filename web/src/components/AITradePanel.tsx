@@ -406,7 +406,7 @@ export default function AITradePanel({ market, symbol, timeframe, onNavigate }: 
     }
     if (!auto.live_enabled) {
       setError(
-        "真下单未在设置中显式开启（ai_auto.live_enabled），启动被拒绝。请先在配置里打开「允许实盘」并保存。",
+        "设置里没打开「允许实盘」（ai_auto.live_enabled），启动被拒绝。先在配置里打开并保存。",
       );
       return;
     }

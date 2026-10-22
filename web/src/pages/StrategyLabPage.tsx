@@ -674,7 +674,7 @@ export default function StrategyLabPage() {
                       type="button"
                       className="btn-sm"
                       disabled={backtestBusy || !selected.checks?.ok}
-                      title="用源码默认参数跑一次回测；不会注册为正式策略"
+                      title="用源码默认参数跑一次回测。不会注册为正式策略"
                       onClick={() => void backtestCandidate()}
                     >
                       {backtestBusy ? "回测中…" : "回测候选"}
@@ -879,7 +879,7 @@ export default function StrategyLabPage() {
                     disabled={optimizeBusy || !baseKey}
                     onClick={() => void startOptimize()}
                   >
-                    {jobRunning ? "优化进行中…" : "启动优化"}
+                    {jobRunning ? "优化中…" : "启动优化"}
                   </button>
                   <button
                     type="button"
@@ -995,8 +995,8 @@ export default function StrategyLabPage() {
                       ))}
                     </div>
                     <div className="hint">
-                      参数不会自动写入正在运行的交易：点「应用到 AI 交易」后，下次启动 AI 交易时使用；
-                      也可复制 JSON 手动填写。
+                      参数不会写进正在运行的交易。点「应用到 AI 交易」后，下次启动 AI 交易时才用。
+                      也可以复制 JSON 手动填写。
                     </div>
                   </div>
                 )}

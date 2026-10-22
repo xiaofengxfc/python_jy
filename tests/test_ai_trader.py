@@ -1,4 +1,4 @@
-"""AI 自主交易核心的离线测试（Phase 3-A）。
+"""AI 自主交易核心的离线测试。
 
 全部离线：FakeLLM / FakeTrading / FakeRisk，不联网、不读密钥环、不依赖网关。
 审计文件用 ``tmp_path`` 隔离。

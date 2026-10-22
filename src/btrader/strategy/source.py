@@ -250,7 +250,7 @@ def save_source(
 
     existing = registry.source_path(key)
     if existing is None and key in registry:
-        raise StrategySourceError("内置策略只读；请复制为新策略后再修改", status=403)
+        raise StrategySourceError("内置策略只读。请复制为新策略后再修改", status=403)
     if existing is not None:
         if create:
             raise StrategySourceError(f"策略 {key} 已存在")
@@ -305,7 +305,7 @@ def rename_source(
     old_path = registry.source_path(key)
     if old_path is None:
         if key in registry:
-            raise StrategySourceError("内置策略只读；请先「复制为新策略」再改名", status=403)
+            raise StrategySourceError("内置策略只读。请先「复制为新策略」再改名", status=403)
         raise StrategySourceError(f"未知策略：{key}", status=404)
     new_key = (new_key or "").strip()
     if new_key == key:
