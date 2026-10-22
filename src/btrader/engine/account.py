@@ -468,7 +468,16 @@ class AccountService:
         self, rest: Any, market: MarketType, symbol: str | None
     ) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
-        for order in rest.fetch_open_orders(market, symbol):
+        rows: list[dict[str, Any]] = list(rest.fetch_open_orders(market, symbol))
+        # 止损、止盈、条件单在币安是算法单，普通挂单接口里一条都没有。少了这一路，
+        # 刚挂上的保护单在面板上不存在，重挂时也就「没有旧单可撤」。
+        fetch_algo = getattr(rest, "fetch_algo_orders", None)
+        if fetch_algo is not None:
+            try:
+                rows.extend(fetch_algo(market, symbol))
+            except Exception as exc:  # 算法单一挂，普通挂单还得显示
+                log.warning("读取算法单失败 %s：%s", market.value, exc)
+        for order in rows:
             out.append(
                 {
                     "id": str(order.get("id") or ""),

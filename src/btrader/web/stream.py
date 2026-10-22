@@ -21,6 +21,7 @@ from typing import Any
 import ccxt.pro as ccxtpro
 
 from ..core.types import MarketType, Network
+from ..exchange.rest import ticker_bid_ask
 
 log = logging.getLogger(__name__)
 
@@ -71,9 +72,10 @@ class StreamHub:
         self._queues: dict[tuple[str, str], set[asyncio.Queue]] = {}
         self._lock = asyncio.Lock()
         self._closed = False
-        # ccxt's spot ``watch_ticker`` leaves bid/ask as None; the watcher below
-        # remembers the last real book so the ticker frame still carries a
-        # usable spread instead of zeroes.
+        # Neither spot's nor futures' ``watch_ticker`` reliably carries bid/ask
+        # (Binance's futures ticker has no such field at all); the book watcher
+        # remembers the top of the ladder so the ticker frame can still show a
+        # real spread instead of zeroes.
         self._top: dict[tuple[str, str], tuple[float, float]] = {}
 
     # ------------------------------------------------------------- exchange
@@ -239,14 +241,9 @@ class StreamHub:
         while True:
             try:
                 ticker = await exchange.watch_ticker(symbol)
-                bid = _num(ticker.get("bid"))
-                ask = _num(ticker.get("ask"))
-                if not bid or not ask:
-                    # Spot tickers carry no bid/ask; fall back to the book we
-                    # already stream, never to a misleading 0.
-                    book_bid, book_ask = self._top.get(key, (0.0, 0.0))
-                    bid = bid or book_bid
-                    ask = ask or book_ask
+                # 币安合约的 ticker 没有买一卖一，用盘口帧记住的两档补上；
+                # 两样都没有就是 0，前端显示「—」，绝不编一个价。
+                bid, ask = ticker_bid_ask(ticker, *self._top.get(key, (0.0, 0.0)))
                 self._publish(
                     key,
                     {

@@ -19,6 +19,12 @@ def load_symbols(rest: BinanceREST, market: MarketType) -> list[SymbolInfo]:
     for symbol, raw in markets.items():
         if not raw.get("active", True):
             continue
+        # 报价币对得上还不够：ccxt 币安客户端的 load_markets 会把现货、U 本位、
+        # 币本位和交割合约一次全取回来（实测现货客户端 1461 项，其中 600 项是
+        # 合约），只按报价币过滤就会串味——现货列表里出现 BTC/USDT:USDT，
+        # 设置记住它之后，现货下单会把合约符号发给现货客户端。
+        if _market_kind(symbol, raw) is not market:
+            continue
         quote = raw.get("quote") or ""
         if quote not in quotes:
             continue
@@ -38,6 +44,32 @@ def load_symbols(rest: BinanceREST, market: MarketType) -> list[SymbolInfo]:
             )
         )
     return infos
+
+
+def _market_kind(symbol: str, raw: dict) -> MarketType:
+    """Which market type one ccxt market belongs to.
+
+    The symbol shape is the fallback that never lies: ccxt writes contracts
+    as ``BASE/QUOTE:SETTLE`` and a dated delivery contract as
+    ``BASE/QUOTE:SETTLE-YYMMDD``; spot has no colon at all. Without a
+    fallback, a ccxt version that stops filling ``swap``/``contract`` would
+    quietly put contracts back into the spot list.
+    """
+    settle_part = symbol.split(":")[-1] if ":" in symbol else ""
+    settle = settle_part.split("-")[0]
+    declared = str(raw.get("settle") or settle)
+    contract = bool(
+        raw.get("contract")
+        or raw.get("swap")
+        or raw.get("future")
+        or raw.get("option")
+        or settle_part
+    )
+    if not contract:
+        return MarketType.SPOT
+    base = str(raw.get("base") or symbol.split("/")[0])
+    inverse = bool(raw.get("inverse")) or (bool(declared) and declared == base)
+    return MarketType.COINM if inverse else MarketType.USDM
 
 
 def _precision(raw: dict | None, side: str) -> int:

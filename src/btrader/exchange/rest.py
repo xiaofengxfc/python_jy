@@ -19,6 +19,57 @@ class ExchangeError(RuntimeError):
     """Raised for normalized, user-facing exchange errors."""
 
 
+# Binance 把触发类订单（止损、止盈、条件单）放进独立的算法单端点，返回 algoId /
+# algoType: CONDITIONAL。普通挂单接口（fetch_open_orders / cancel_order）里一条
+# 都查不到，ccxt 4.5.88 也没有统一封装，所以直接用原始端点。键是市场类型，
+# 值分别是「列挂着的算法单」和「撤一张算法单」。
+_ALGO_ENDPOINTS: dict[MarketType, tuple[str, str]] = {
+    MarketType.USDM: ("fapiPrivateGetOpenAlgoOrders", "fapiPrivateDeleteAlgoOrder"),
+    MarketType.COINM: ("dapiPrivateGetOpenAlgoOrders", "dapiPrivateDeleteAlgoOrder"),
+}
+
+
+def _looks_unknown_order(exc: BaseException) -> bool:
+    """交易所说这张单不存在（币安 -2011），也就是该换算法单端点再试一次。"""
+    text = str(exc).lower()
+    return "-2011" in text or "unknown order" in text
+
+
+def _as_float(value: Any) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+# 买卖一的来源。币安的合约 24 小时 ticker 里根本没有买一卖一，只有 bookTicker
+# 端点给这两档（权重 2，不用拉整档盘口）。
+_BOOK_TICKER: dict[MarketType, str] = {
+    MarketType.SPOT: "publicGetTickerBookTicker",
+    MarketType.USDM: "fapiPublicGetTickerBookTicker",
+    MarketType.COINM: "dapiPublicGetTickerBookTicker",
+}
+
+
+def ticker_bid_ask(
+    ticker: dict, book_bid: float = 0.0, book_ask: float = 0.0
+) -> tuple[float, float]:
+    """(bid, ask) out of a ccxt ticker, topped up from the book when empty.
+
+    Binance's futures ticker carries no bid/ask at all (ccxt leaves them
+    None, which used to be flattened to 0.0 and shown as an empty spread);
+    spot's does. 0.0 means "the venue did not tell us" — callers turn that
+    into a dash, never into an invented price.
+    """
+    bid = _as_float(ticker.get("bid"))
+    ask = _as_float(ticker.get("ask"))
+    if not bid or not ask:
+        info = ticker.get("info") or {}
+        bid = bid or _as_float(info.get("bidPrice"))
+        ask = ask or _as_float(info.get("askPrice"))
+    return bid or book_bid, ask or book_ask
+
+
 # Binance publishes read-only spot market data on its own host. Unlike
 # api.binance.com it is reachable from networks where the trading host refuses
 # connections, which is what lets a charting client read real candles without
@@ -249,6 +300,43 @@ class BinanceREST:
         except Exception as exc:
             raise ExchangeError(_message(exc)) from exc
 
+    def fetch_bid_ask(self, market: MarketType, symbol: str) -> tuple[float, float]:
+        """Top of book (bid, ask) without pulling the depth ladder.
+
+        Public data, no credentials needed: the charting client reads it for
+        the spread next to 最新价, and the venue's ticker has no such field.
+        """
+        client = self.client(market)
+        name = _BOOK_TICKER[market]
+        call = getattr(client, name, None)
+        if call is None:
+            log.debug("%s 客户端没有 %s，买卖一读不到", market.ccxt_id, name)
+            return 0.0, 0.0
+        try:
+            client.load_markets()
+        except Exception:  # pragma: no cover - symbol mapping only
+            log.debug("加载市场失败，买卖一按原样交易对请求", exc_info=True)
+        venue_symbol = self._venue_symbol(client, symbol)
+        try:
+            payload = call({"symbol": venue_symbol})
+        except Exception as exc:
+            raise ExchangeError(_message(exc)) from exc
+        row = payload
+        if isinstance(payload, list):
+            # 币本位带 symbol 也返回数组。
+            row = next(
+                (item for item in payload if str(item.get("symbol")) == venue_symbol),
+                payload[0] if payload else {},
+            )
+        if not isinstance(row, dict):
+            return 0.0, 0.0
+        return _as_float(row.get("bidPrice")), _as_float(row.get("askPrice"))
+
+    @classmethod
+    def _venue_symbol(cls, client: ccxt.Exchange, symbol: str) -> str:
+        """ccxt symbol -> venue id, with a plain-text fallback for odd clients."""
+        return cls._market_id(client, symbol) or symbol.replace("/", "").split(":")[0]
+
     def fetch_order_book(self, market: MarketType, symbol: str, limit: int = 20) -> dict:
         try:
             return self.client(market).fetch_order_book(symbol, limit)
@@ -304,11 +392,41 @@ class BinanceREST:
             raise ExchangeError(_message(exc)) from exc
 
     def cancel_order(self, market: MarketType, order_id: str, symbol: str) -> dict:
+        """Cancel one resting order, whichever endpoint holds it.
+
+        A conditional order lives on the algo endpoint, so the ordinary
+        cancel answers -2011 Unknown order for a perfectly live stop. The
+        fallback is what makes a stop reachable from the order list.
+        """
         self._require_auth()
+        client = self.client(market)
         try:
-            return self.client(market).cancel_order(order_id, symbol)
+            return client.cancel_order(order_id, symbol)
         except Exception as exc:
-            raise ExchangeError(_message(exc)) from exc
+            if not market.is_futures or not _looks_unknown_order(exc):
+                raise ExchangeError(_message(exc)) from exc
+            row = self._find_algo(market, symbol, order_id)
+            try:
+                result = self.cancel_algo_order(market, order_id)
+            except ExchangeError:
+                # 两条链路都没有这张单：报原来那句，路由会翻成「没有这个挂单」。
+                raise ExchangeError(_message(exc)) from exc
+            order = dict(row or {})
+            order.update(
+                {"id": str(order_id), "symbol": order.get("symbol") or symbol, "status": "canceled"}
+            )
+            if not order.get("info"):
+                order["info"] = result
+            return order
+
+    def _find_algo(self, market: MarketType, symbol: str, order_id: str) -> dict | None:
+        try:
+            for order in self.fetch_algo_orders(market, symbol):
+                if str(order.get("id")) == str(order_id):
+                    return order
+        except ExchangeError:
+            log.debug("读取算法单失败，撤单只用算法单号", exc_info=True)
+        return None
 
     def set_leverage(self, symbol: str, leverage: float, market: MarketType) -> dict:
         self._require_auth()
@@ -319,6 +437,122 @@ class BinanceREST:
             return client.set_leverage(leverage, symbol)
         except Exception as exc:
             raise ExchangeError(_message(exc)) from exc
+
+    # ------------------------------------------------------- algo orders
+    def fetch_algo_orders(
+        self, market: MarketType, symbol: str | None = None
+    ) -> list[dict]:
+        """Open conditional orders, normalized into ccxt's order shape.
+
+        They are the stops, targets and trigger entries the venue holds for
+        us; without this call the app cannot see (or cancel) a single guard
+        it armed itself.
+        """
+        self._require_auth()
+        if not market.is_futures:
+            # 现货没有交易所侧触发单，也就没有算法单可读。
+            return []
+        client = self.client(market)
+        fetch_name = _ALGO_ENDPOINTS[market][0]
+        fetch = getattr(client, fetch_name, None)
+        if fetch is None:
+            log.debug("%s 客户端没有 %s，算法单不可读", market.ccxt_id, fetch_name)
+            return []
+        try:
+            client.load_markets()
+        except Exception:  # pragma: no cover - symbol mapping only
+            log.debug("加载市场失败，算法单交易对按交易所原文返回", exc_info=True)
+        params: dict[str, Any] = {}
+        if symbol:
+            venue_symbol = self._market_id(client, symbol)
+            if venue_symbol:
+                params["symbol"] = venue_symbol
+        try:
+            payload = fetch(params) or {}
+        except Exception as exc:
+            raise ExchangeError(_message(exc)) from exc
+        rows = payload.get("orders") if isinstance(payload, dict) else payload
+        out: list[dict] = []
+        for row in rows or []:
+            order = self._algo_order(client, row, market)
+            if order is not None:
+                out.append(order)
+        return out
+
+    def cancel_algo_order(self, market: MarketType, order_id: str) -> dict:
+        """Delete one conditional order on the algo endpoint."""
+        self._require_auth()
+        if not market.is_futures:
+            raise ExchangeError("现货没有交易所侧条件单，无需撤销。")
+        client = self.client(market)
+        delete_name = _ALGO_ENDPOINTS[market][1]
+        delete = getattr(client, delete_name, None)
+        if delete is None:
+            raise ExchangeError(f"{market.ccxt_id} 客户端不支持撤销算法单，请升级 ccxt。")
+        try:
+            return delete({"algoId": str(order_id)}) or {}
+        except Exception as exc:
+            raise ExchangeError(_message(exc)) from exc
+
+    def _algo_order(
+        self, client: ccxt.Exchange, row: dict, market: MarketType
+    ) -> dict | None:
+        """One algo row in the same shape as a ccxt order dict."""
+        algo_id = row.get("algoId") or row.get("algoID") or row.get("id")
+        if not algo_id:
+            return None
+        kind = str(row.get("orderType") or row.get("algoType") or "conditional")
+        return {
+            "id": str(algo_id),
+            "clientOrderId": row.get("clientAlgoId") or "",
+            "symbol": self._unified_symbol(client, row.get("symbol"), market.is_futures),
+            "side": str(row.get("side") or "buy").lower(),
+            # STOP_MARKET / TAKE_PROFIT_MARKET 转成小写和 ccxt 对齐，
+            # _protections 与 PROTECTIVE_TYPES 认的就是这种写法。
+            "type": kind.lower(),
+            "amount": _as_float(row.get("quantity")),
+            "price": _as_float(row.get("price")),
+            "triggerPrice": _as_float(row.get("triggerPrice") or row.get("stopPrice")),
+            "reduceOnly": bool(row.get("reduceOnly") or row.get("closePosition")),
+            "filled": 0.0,
+            "status": "open",
+            "timestamp": int(row.get("createTime") or 0),
+            # 撤销时按这个标记换端点，普通挂单走 client.cancel_order。
+            "algo": True,
+            "info": dict(row),
+        }
+
+    @staticmethod
+    def _market_id(client: ccxt.Exchange, symbol: str) -> str:
+        """ccxt symbol -> venue id ("BTC/USDT:USDT" -> "BTCUSDT")."""
+        try:
+            return str((client.market(symbol) or {}).get("id") or "")
+        except Exception:
+            log.debug("找不到 %s 的交易所代码", symbol, exc_info=True)
+            return ""
+
+    @staticmethod
+    def _unified_symbol(client: ccxt.Exchange, raw: Any, futures: bool = True) -> str:
+        """venue id -> ccxt symbol, so algo rows line up with open orders."""
+        text = str(raw or "")
+        if not text:
+            return ""
+        fallback = ""
+        markets = getattr(client, "markets", None)
+        if isinstance(markets, dict):
+            for market in markets.values():
+                if str(market.get("id") or "") != text:
+                    continue
+                symbol = str(market.get("symbol") or text)
+                # 合约客户端里同一个 id 也挂着现货市场（BTCUSDT），触发单一定属于
+                # 合约那一份。挑错的话保护单会和持仓对不上号。
+                contract = bool(
+                    market.get("contract") or market.get("swap") or market.get("inverse")
+                )
+                if contract == futures:
+                    return symbol
+                fallback = fallback or symbol
+        return fallback or text
 
     # ---------------------------------------------------- protection orders
     def create_stop_market(
@@ -418,23 +652,25 @@ class BinanceREST:
 
         Re-arming a guard must replace the old one, but blanket-cancelling
         everything would also kill a resting limit entry the user still wants.
+        Both chains are read: the venue keeps triggers on the algo endpoint,
+        and a guard that is not in ``fetch_open_orders`` is exactly the one
+        that used to survive every re-arm.
         """
         self._require_auth()
         client = self.client(market)
         try:
-            resting = client.fetch_open_orders(symbol)
+            resting = list(client.fetch_open_orders(symbol) or [])
         except Exception as exc:
             raise ExchangeError(_message(exc)) from exc
+        # 算法单读不到就别假装撤完了：留下旧止损比报错更危险。
+        resting.extend(self.fetch_algo_orders(market, symbol))
         canceled = 0
-        for order in resting or []:
+        for order in resting:
             kind = str(order.get("type") or "").lower()
             if kind not in PROTECTIVE_TYPES:
                 continue
-            try:
-                client.cancel_order(order.get("id"), symbol, order.get("params") or {})
+            if self._cancel_resting(client, market, order, symbol):
                 canceled += 1
-            except Exception:  # already filled or canceled by the venue
-                log.debug("撤销保护单失败 %s", order.get("id"), exc_info=True)
         return canceled
 
     def cancel_symbol_orders(self, market: MarketType, symbol: str) -> int:
@@ -442,23 +678,37 @@ class BinanceREST:
 
         Used before a close: a leftover ``reduceOnly`` stop would otherwise be
         re-triggered by the exit and flip the position instead of flattening
-        it. Individual failures are logged and skipped so one stale order
-        cannot block the close itself.
+        it — and that stop lives on the algo endpoint, so both chains are
+        cleared here. Individual failures are logged and skipped so one stale
+        order cannot block the close itself.
         """
         self._require_auth()
         client = self.client(market)
         try:
-            resting = client.fetch_open_orders(symbol)
+            resting = list(client.fetch_open_orders(symbol) or [])
         except Exception as exc:
             raise ExchangeError(_message(exc)) from exc
+        resting.extend(self.fetch_algo_orders(market, symbol))
         canceled = 0
-        for order in resting or []:
-            try:
-                client.cancel_order(order.get("id"), symbol, order.get("params") or {})
+        for order in resting:
+            if self._cancel_resting(client, market, order, symbol):
                 canceled += 1
-            except Exception:  # already filled or canceled by the venue
-                log.debug("撤销保护单失败 %s", order.get("id"), exc_info=True)
         return canceled
+
+    def _cancel_resting(
+        self, client: ccxt.Exchange, market: MarketType, order: dict, symbol: str
+    ) -> bool:
+        """Cancel one resting order, algo or plain; False when it is already gone."""
+        order_id = order.get("id")
+        try:
+            if order.get("algo"):
+                self.cancel_algo_order(market, str(order_id))
+            else:
+                client.cancel_order(order_id, symbol, order.get("params") or {})
+            return True
+        except Exception:  # already filled or canceled by the venue
+            log.debug("撤销挂单失败 %s", order_id, exc_info=True)
+            return False
 
     # ---------------------------------------------------------------- helpers
     def _require_auth(self) -> None:
