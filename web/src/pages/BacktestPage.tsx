@@ -21,14 +21,14 @@ const TABS: [Tab, string][] = [
   ["history", "历史记录"],
 ];
 
-const METRIC_LABELS: [string, string, "pct" | "num"][] = [
+const METRIC_LABELS: [string, string, "pct" | "num" | "int"][] = [
   ["total_return", "总收益", "pct"],
   ["annual_return", "年化收益", "pct"],
   ["max_drawdown", "最大回撤", "pct"],
   ["sharpe", "夏普", "num"],
   ["win_rate", "胜率", "pct"],
   ["profit_factor", "盈亏比", "num"],
-  ["trades", "成交笔数", "num"],
+  ["trades", "成交笔数", "int"],
   ["fee_paid", "手续费", "num"],
 ];
 
@@ -864,8 +864,13 @@ export default function BacktestPage({ onEditStrategy }: Props) {
                 <div className="metrics">
                   {METRIC_LABELS.map(([key, label, kind]) => {
                     const value = result.metrics[key] ?? 0;
+                    // 笔数是整数：15 笔不该写成 15.00 笔。
                     const shown =
-                      kind === "pct" ? `${fmt(value * 100, 2)}%` : fmt(value, 2);
+                      kind === "pct"
+                        ? `${fmt(value * 100, 2)}%`
+                        : kind === "int"
+                          ? fmt(Math.round(value), 0)
+                          : fmt(value, 2);
                     const tone =
                       key === "max_drawdown" || key === "fee_paid"
                         ? "down"

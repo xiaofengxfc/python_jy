@@ -7,6 +7,7 @@ import type {
   Candidate,
   Health,
   OptimizeJob,
+  OptimizeRound,
   Strategy,
   SymbolInfo,
 } from "../types";
@@ -48,6 +49,12 @@ const STOPPED_LABEL: Record<string, string> = {
   cancel: "已取消",
   no_improvement: "连续未改善",
 };
+
+/** 一轮有没有真的跑成。模型调用失败时后端仍然给一个 score，但 metrics 是空的：
+ * 那个分数是拿空结果算出来的，既不能进排名，也不能当「最优参数」写进 AI 交易。 */
+function roundFailed(round: OptimizeRound): boolean {
+  return Boolean(round.error) || !round.metrics || Object.keys(round.metrics).length === 0;
+}
 
 function stageOf(candidate: Candidate | null): string {
   if (!candidate) return "generate";
@@ -314,7 +321,20 @@ export default function StrategyLabPage({ settings, health, onNavigate }: Props)
       if (data.status === "running" || data.status === "cancelling") return;
       stopPolling();
       setBusy("");
-      if (data.status === "done") setNotice("优化完成，看下面的轮次表。");
+      if (data.status === "done") {
+        const rounds = data.result?.rounds ?? [];
+        const failed = rounds.filter(roundFailed);
+        if (rounds.length > 0 && failed.length === rounds.length) {
+          // 后端那句话自带句号，这里去掉再拼，免得出现「。。」。
+          const reason = (failed.map((round) => round.error || round.reason).find(Boolean) ??
+            "模型没有给出可用的结果").replace(/[。．.]+$/, "");
+          // 每轮都失败还报「优化完成」，用户只会看到两次一样的参数和一个硬凑出来的分数。
+          setNotice("");
+          setError(`优化结束，但没有一轮跑成功：${reason}。`);
+        } else {
+          setNotice("优化完成，看下面的轮次表。");
+        }
+      }
       if (data.status === "failed") setError(data.error || "优化失败");
     } catch (caught) {
       stopPolling();
@@ -391,6 +411,8 @@ export default function StrategyLabPage({ settings, health, onNavigate }: Props)
     "pending",
   ];
   const result = job?.result ?? null;
+  /** 至少有一轮真的跑出了指标，best 才有意义。 */
+  const anyRoundSucceeded = !!result?.rounds?.some((round) => !roundFailed(round));
   const running = job?.status === "running" || job?.status === "cancelling";
   const backtest = selected?.backtest ?? {};
 
@@ -771,20 +793,24 @@ export default function StrategyLabPage({ settings, health, onNavigate }: Props)
                       <div key={round.round} className="mini-row">
                         <span>{round.round}</span>
                         <span className={round.accepted ? "up" : ""}>
-                          {round.score === undefined ? "—" : fmt(round.score, 3)}
+                          {roundFailed(round) || round.score === undefined
+                            ? "—"
+                            : fmt(round.score, 3)}
                         </span>
                         <span>
                           {round.metrics?.total_return === undefined
                             ? "—"
                             : `${fmt(Number(round.metrics.total_return) * 100, 2)}%`}
                         </span>
-                        <span className="faint">{paramsText(round.params) || round.reason || "—"}</span>
+                        <span className="faint">
+                          {round.error || paramsText(round.params) || round.reason || "—"}
+                        </span>
                       </div>
                     ))}
                   </div>
                 )}
 
-                {result?.best && (
+                {result?.best && anyRoundSucceeded && (
                   <div className="optimize-best">
                     <div className="gate-row">
                       <span>最优参数</span>

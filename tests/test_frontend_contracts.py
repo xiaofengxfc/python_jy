@@ -220,3 +220,72 @@ def test_auto_trading_page_shows_the_kline_shortfall_the_backend_reports() -> No
     assert "{data.message" in console, "执行台没把后端的 message 显示出来"
     for used in ("data.fetched_bars", "data.required_bars", "data.max_bars"):
         assert used in console, f"执行台没显示 {used}"
+
+def test_backtest_trade_count_is_not_rendered_with_decimals() -> None:
+    """成交笔数是整数：界面上不该出现「15.00 笔」。
+
+    回测结果那排指标共用一个小数位格式，笔数混在里面就带着两位小数，
+    读起来像金额。
+    """
+    page = (UI_DIR / "pages" / "BacktestPage.tsx").read_text(encoding="utf-8")
+    assert '["trades", "成交笔数", "int"]' in page, "成交笔数没按整数处理"
+    assert 'kind === "int"' in page, "指标渲染没有整数分支"
+    assert "fmt(Math.round(value), 0)" in page, "整数分支没有收成 0 位小数"
+
+
+def test_lab_optimize_says_so_when_no_round_succeeded() -> None:
+    """优化每轮都失败时不能报「优化完成」。
+
+    没有 API Key 时后端每轮都记 error，却仍然给出一个用空 metrics 算出来的
+    score，界面上就成了「优化完成 + 两轮一样的参数 + 一个分数 + 最优参数」。
+    """
+    page = (UI_DIR / "pages" / "StrategyLabPage.tsx").read_text(encoding="utf-8")
+    types_source = (UI_DIR / "types.ts").read_text(encoding="utf-8")
+    assert "error?: string;" in types_source, "OptimizeRound 少了 error 字段"
+
+    assert "function roundFailed(round: OptimizeRound): boolean" in page, "没有判断失败轮次的函数"
+    assert "没有一轮跑成功" in page, "全部失败时没有给出提示"
+    assert "anyRoundSucceeded" in page, "没有过滤「最优参数」的显示条件"
+    assert "{result?.best && anyRoundSucceeded && (" in page, "全失败时还在显示最优参数"
+    assert "{round.error || paramsText(round.params)" in page, "轮次表把失败原因挡住了"
+
+def test_wallet_balance_rows_sell_instead_of_closing() -> None:
+    """钱包余额行（origin === "wallet"）卖的是余额，不是平仓。
+
+    现货的「持仓」就是钱包余额：后端不带 size 时只平本地成交账本记的数量，
+    账本里没有就 400，所以这一行必须把余额显式填进请求里，按钮也不能再写「平仓」。
+    """
+    panel = (UI_DIR / "components" / "BottomTabs.tsx").read_text(encoding="utf-8")
+
+    # 输入框里显示的和真正发出去的 size 用的是同一个默认值
+    assert "value={closeSizes[position.symbol] ?? defaultCloseSize(position)}" in panel
+    assert (
+        "const typed = parseNumber(closeSizes[position.symbol] ?? defaultCloseSize(position));"
+        in panel
+    ), "钱包行点了卖出却没把余额带进请求"
+
+    # 只有钱包行取整笔余额，买来的持仓留空（空值 = 全平，语义不变）
+    assert 'position.origin === "wallet" ? plainAmount(Math.abs(position.contracts)) : ""' in panel
+
+    # 钱包行「卖出」，账本行仍然是「平仓 / 部分平仓」
+    for label in ('"卖出中…"', '"卖出"', '"平仓中…"', '"部分平仓"', '"平仓"'):
+        assert label in panel, f"少了按钮文案 {label}"
+
+    # 两张表的表头分开，别让钱包行还顶着「平仓数量」
+    assert '"平仓数量",' in panel and '"卖出数量",' in panel
+
+
+def test_trading_page_explains_a_cross_market_symbol_fallback() -> None:
+    """设置里的默认交易对在别的市场不叫这个名字时，退回要说一句。
+
+    ETH/USDT 是现货写法，合约里叫 ETH/USDT:USDT。静默换成 BTC/USDT:USDT
+    会让用户以为自己的选择丢了。可用时那一行不能出现。
+    """
+    page = (UI_DIR / "pages" / "TradingPage.tsx").read_text(encoding="utf-8")
+
+    assert "const [symbolFallback, setSymbolFallback] = useState" in page
+    assert "{symbolFallback && (" in page, "说明没有按条件渲染"
+    assert "市场不可用，已切到" in page
+    assert "settings?.last_symbol && chosen && chosen !== settings.last_symbol" in page
+    # 用户自己选、换市场、以及默认交易对可用时都要清掉
+    assert page.count("setSymbolFallback(null)") >= 3, "说明不会消失"

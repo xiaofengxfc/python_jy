@@ -131,6 +131,9 @@ export default function TradingPage({
   const [chartError, setChartError] = useState("");
   const [chartLoading, setChartLoading] = useState(true);
   const [symbolError, setSymbolError] = useState("");
+  /** 设置里的默认交易对在这个市场没有（ETH/USDT 是现货写法，合约里叫 ETH/USDT:USDT）。
+   *  退回会把用户自己的选择悄悄换掉，所以记下来在行情头下面说一句，可用时不出现。 */
+  const [symbolFallback, setSymbolFallback] = useState<{ from: string; to: string } | null>(null);
   const [account, setAccount] = useState<Account | null>(null);
   const [liveError, setLiveError] = useState("");
   const [pickedPrice, setPickedPrice] = useState<number | null>(null);
@@ -242,9 +245,17 @@ export default function TradingPage({
             data.items.find((item) => item.symbol === "BTC/USDT") ??
             data.items.find((item) => item.quote === "USDT") ??
             data.items[0];
-          setSymbol(fallback?.symbol ?? "");
-        } else if (preferred !== symbol) {
-          setSymbol(preferred);
+          const chosen = fallback?.symbol ?? "";
+          setSymbol(chosen);
+          // 设置里存的是另一个市场的写法时为真：这时候要告诉用户换成了哪个。
+          setSymbolFallback(
+            settings?.last_symbol && chosen && chosen !== settings.last_symbol
+              ? { from: settings.last_symbol, to: chosen }
+              : null,
+          );
+        } else {
+          if (preferred !== symbol) setSymbol(preferred);
+          setSymbolFallback(null);
         }
       })
       .catch((error: unknown) => {
@@ -484,7 +495,12 @@ export default function TradingPage({
     setSymbol("");
     setCandles([]);
     setPickedPrice(null);
+    setSymbolFallback(null);
   };
+
+  /** 说明里用全长市场名（「U 本位合约」），比行情头那个简称更好读。 */
+  const marketLabel =
+    health?.markets.find((item) => item.value === market)?.label ?? MARKET_LABELS[market] ?? market;
 
   const banner = actionError || healthError || liveError || symbolError;
 
@@ -533,6 +549,7 @@ export default function TradingPage({
                 picked.current.symbol = true;
     setSymbol(value);
                 setPickedPrice(null);
+                setSymbolFallback(null);
               }}
               loading={symbols.length === 0}
             />
@@ -562,6 +579,12 @@ export default function TradingPage({
               </div>
             </div>
           </div>
+
+          {symbolFallback && (
+            <div className="symbol-note faint">
+              {symbolFallback.from} 在「{marketLabel}」市场不可用，已切到 {symbolFallback.to}
+            </div>
+          )}
 
           <div className="card">
             <div className="card-head">

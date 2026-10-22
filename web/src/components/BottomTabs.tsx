@@ -31,6 +31,11 @@ interface Props {
 
 export type BottomTab = "open" | "trades" | "positions" | "ai" | "news";
 
+/** 余额写进输入框时去掉多余的零和千分位：0.103000 就是 0.103，用户还能顺手改。 */
+function plainAmount(value: number): string {
+  return value > 0 ? String(Number(value.toFixed(8))) : "";
+}
+
 const TABS: [BottomTab, string][] = [
   ["open", "委托"],
   ["trades", "成交"],
@@ -112,8 +117,13 @@ export default function BottomTabs({
       ),
     );
 
+  /** 钱包余额的默认卖出量：整笔余额。买来的持仓留空，空值在 close() 里表示全平。
+   *  现货的「持仓」就是钱包余额，不带 size 全平等于清空钱包，所以钱包行必须显式给数量。 */
+  const defaultCloseSize = (position: Position) =>
+    position.origin === "wallet" ? plainAmount(Math.abs(position.contracts)) : "";
+
   const close = (position: Position) => {
-    const typed = parseNumber(closeSizes[position.symbol] ?? "");
+    const typed = parseNumber(closeSizes[position.symbol] ?? defaultCloseSize(position));
     const held = Math.abs(position.contracts);
     const size = typed > 0 ? Math.min(typed, held) : undefined;
     return run(`close:${position.symbol}`, async () => {
@@ -131,8 +141,23 @@ export default function BottomTabs({
     });
   };
 
-  /** 一行持仓。合约和现货共用，钱包余额那张表也用它。 */
-  const positionRow = (position: Position) => [
+  /** 一行持仓。合约和现货共用，钱包余额那张表也用它。
+   *  钱包余额不是持仓：没有开仓价、没有本地成交账本，卖它就是把这笔余额卖掉。
+   *  所以钱包行按钮写「卖出」、数量框预填整笔余额；买来的持仓仍然是「平仓」。 */
+  const positionRow = (position: Position) => {
+    const wallet = position.origin === "wallet";
+    const typedClose = parseNumber(closeSizes[position.symbol] ?? defaultCloseSize(position));
+    const closing = busy === `close:${position.symbol}`;
+    const actionLabel = wallet
+      ? closing
+        ? "卖出中…"
+        : "卖出"
+      : closing
+        ? "平仓中…"
+        : typedClose > 0
+          ? "部分平仓"
+          : "平仓";
+    return [
     position.symbol,
     <span
       className={
@@ -181,9 +206,9 @@ export default function BottomTabs({
       type="text"
       inputMode="decimal"
       autoComplete="off"
-      aria-label={`平仓数量 ${position.symbol}`}
+      aria-label={`${wallet ? "卖出数量" : "平仓数量"} ${position.symbol}`}
       placeholder={fmt(Math.abs(position.contracts), 6)}
-      value={closeSizes[position.symbol] ?? ""}
+      value={closeSizes[position.symbol] ?? defaultCloseSize(position)}
       onChange={(event) =>
         setCloseSizes((current) => ({
           ...current,
@@ -210,14 +235,11 @@ export default function BottomTabs({
         disabled={busy !== null}
         onClick={() => void close(position)}
       >
-        {busy === `close:${position.symbol}`
-          ? "平仓中…"
-          : parseNumber(closeSizes[position.symbol] ?? "") > 0
-            ? "部分平仓"
-            : "平仓"}
+        {actionLabel}
       </button>
     </div>,
-  ];
+    ];
+  };
 
   return (
     <>
@@ -403,7 +425,7 @@ export default function BottomTabs({
                 "浮动盈亏",
                 "已实现盈亏",
                 "交易所止损 / 止盈",
-                "平仓数量",
+                "卖出数量",
                 "操作",
               ]}
               rightFrom={2}

@@ -1087,6 +1087,15 @@ input[type="range"].input:focus {
   min-width: 0;
 }
 
+/* 设置里的默认交易对在这个市场没有、只能退回别的对时的一行说明。
+   不弹窗、不换行成块、不推挤下面的图表；选中的对可用时整块不出现。 */
+.symbol-note {
+  padding: 0 14px;
+  margin: -4px 0 8px;
+  font-size: var(--fs-12);
+  line-height: 1.45;
+}
+
 /* ------------------------------------------------------ pair picker */
 .picker {
   position: relative;
