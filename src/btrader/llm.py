@@ -85,9 +85,14 @@ DEFAULT_PROVIDER = "deepseek"
 USER_AGENT = "biTrader/0.5 (+desktop)"
 ACCEPT = "application/json"
 
-# 输出额度不开放给用户调。推理模型先把额度花在思考上：3000 时正文偶尔被截成空，
-# 4000 留够余量。写策略那种长回答由调用方显式传更大的值。
+# 输出额度不开放给用户调。改额度只动下面这两个常量，别在调用点写数字。
+# 推理模型先把额度花在思考上：3000 时正文偶尔被截成空，4000 留够余量。
+# 问答、分析、简报这类普通回答用它。
 OUTPUT_TOKENS = 4000
+# 写代码这类长回答（策略实验室生成一个完整模块）用它。推理模型先花掉一部分
+# 额度思考，源码又长，2400 那种小额度会让 JSON 从中间断掉；DeepSeek 和
+# Claude 3.5 Haiku 的上限都是 8192，8000 各家都吃得下，别再往下砍。
+OUTPUT_TOKENS_CODE = 8000
 # 同一根已收盘 K 线重复提问不该计费两次。缓存窗口固定，不给调。
 CACHE_SECONDS = 300.0
 CACHE_LIMIT = 500
@@ -128,7 +133,17 @@ class AISettings:
 
 
 class AIError(RuntimeError):
-    """A call could not be completed; the message is shown to the user."""
+    """A call could not be completed; the message is shown to the user.
+
+    ``finish`` is the provider's ``finish_reason`` when the request actually
+    reached the model (empty otherwise). It rides on the exception so
+    :meth:`ask` can still report "被截断" on the failure path, where the text
+    itself is empty and the finish reason would otherwise be lost.
+    """
+
+    def __init__(self, message: str, *, finish: str = "") -> None:
+        super().__init__(message)
+        self.finish = finish
 
 
 # --------------------------------------------------------------------- keyring
@@ -386,6 +401,10 @@ class LLMService:
             "elapsed": 0.0,
             "error": "",
             "kind": kind,
+            # finish / truncated 是新增字段：老调用方只读 ok/text/error/tokens，
+            # 那几个字段的含义一个都没改。
+            "finish": "",
+            "truncated": False,
         }
         if not self.settings.enabled:
             result["error"] = "AI 助手未启用，请在设置里打开开关。"
@@ -408,11 +427,15 @@ class LLMService:
         if spec["needs_key"] and not key:
             result["error"] = "还没有填写 API Key。"
             return result
+        finish = ""
         try:
-            text, tokens = self._request(
+            text, tokens, finish = self._request(
                 spec, settings, key, system, prompt, max_tokens=max_tokens
             )
         except AIError as exc:
+            finish = str(getattr(exc, "finish", "") or "")
+            result["finish"] = finish
+            result["truncated"] = finish == "length"
             result["error"] = str(exc)
             result["elapsed"] = round(time.time() - started, 3)
             _append_audit(
@@ -440,6 +463,10 @@ class LLMService:
             ok=True,
             text=text,
             tokens=tokens,
+            finish=finish,
+            # 被截断的回答也可能有正文——JSON 停在字符串中间。routes_lab 靠这个
+            # 把「截断」和「模型答非所问」分开报，不能在这里丢掉。
+            truncated=finish == "length",
             elapsed=round(time.time() - started, 3),
         )
         _append_audit(
@@ -470,7 +497,12 @@ class LLMService:
         prompt: str,
         *,
         max_tokens: int | None = None,
-    ) -> tuple[str, int]:
+    ) -> tuple[str, int, str]:
+        """Returns ``(text, tokens, finish)``.
+
+        ``finish`` is the provider's finish reason, or "" when it does not say.
+        Callers need it to tell "模型写完了但 JSON 坏了" from "被截断了".
+        """
         style = spec["style"]
         base = settings.base_url.rstrip("/")
         output_limit = int(max_tokens or OUTPUT_TOKENS)
@@ -551,9 +583,10 @@ class LLMService:
             raise AIError("模型返回的不是 JSON，可能被代理或防火墙拦截了。") from exc
 
         text, tokens = _extract(style, data)
+        finish = _finish_reason(style, data)
         if not text:
-            raise AIError(_empty_answer_text(style, data, output_limit))
-        return text, tokens
+            raise AIError(_empty_answer_text(style, data, output_limit), finish=finish)
+        return text, tokens, finish
 
 
 # A 403 from the edge is not a 403 from the model: a WAF in front of an
@@ -590,37 +623,55 @@ def _http_error_text(code: int, detail: str, provider: str) -> str:
     return f"{PROVIDERS.get(provider, {}).get('label', provider)}：{message}"
 
 
+def _finish_reason(style: str, data: Any) -> str:
+    """The provider's own "why did it stop" field, or "" when it is missing."""
+    if not isinstance(data, dict):
+        return ""
+    if style == "openai":
+        choices = data.get("choices") or []
+        if choices and isinstance(choices[0], dict):
+            return str(choices[0].get("finish_reason") or "")
+        return ""
+    if style == "anthropic":
+        return str(data.get("stop_reason") or "")
+    if style == "ollama":
+        return str(data.get("done_reason") or "")
+    return ""
+
+
+def _reasoning_text(style: str, data: Any) -> str:
+    """Hidden reasoning a model emitted instead of an answer, if any."""
+    if not isinstance(data, dict):
+        return ""
+    if style == "openai":
+        choices = data.get("choices") or []
+        if choices and isinstance(choices[0], dict):
+            message = choices[0].get("message") or {}
+            return str(message.get("reasoning_content") or message.get("reasoning") or "")
+        return ""
+    if style == "ollama":
+        return str((data.get("message") or {}).get("thinking") or "")
+    return ""
+
+
 def _empty_answer_text(style: str, data: Any, limit: int) -> str:
     """正文为空时说清楚原因：是被截断，还是模型只给了思考过程。
 
     推理模型把 ``max_tokens`` 先花在隐藏的思考上。额度不够时整段预算都被
     思考吃掉，``content`` 是空串、``finish_reason`` 是 length，用户看到的
     “模型返回了空内容”完全指不到问题在哪。
+
+    额度是常量，用户改不了，所以文案只说用户能动手的事：重试、把要求写短。
+    别再把用户指到设置页去——那里没有「输出上限」这一项。
     """
-    finish = ""
-    reasoning = ""
-    if isinstance(data, dict):
-        if style == "openai":
-            choices = data.get("choices") or []
-            if choices and isinstance(choices[0], dict):
-                finish = str(choices[0].get("finish_reason") or "")
-                message = choices[0].get("message") or {}
-                reasoning = str(
-                    message.get("reasoning_content") or message.get("reasoning") or ""
-                )
-        elif style == "anthropic":
-            finish = str(data.get("stop_reason") or "")
-        elif style == "ollama":
-            finish = str(data.get("done_reason") or "")
-            reasoning = str((data.get("message") or {}).get("thinking") or "")
-    if finish == "length":
+    if _finish_reason(style, data) == "length":
         return (
             f"回答被输出上限截断了（上限 {limit} tokens）。"
             "推理模型先花额度思考，正文就没额度了。"
-            "到设置里把输出上限调到 2000 以上再试。"
+            "重试一次，或把要求写短一点。"
         )
-    if reasoning.strip():
-        return "模型只返回了思考过程，没有正文。把输出上限调大后重试。"
+    if _reasoning_text(style, data).strip():
+        return "模型只返回了思考过程，没有正文。重试一次，或把要求写短一点。"
     return "模型返回了空内容。"
 
 

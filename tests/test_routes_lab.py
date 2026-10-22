@@ -10,8 +10,10 @@ from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+import pytest
 from fastapi import HTTPException
 
+from btrader import llm
 from btrader.core.types import MarketType
 from btrader.strategy.base import IntParam, Strategy
 from btrader.strategy.candidates import CandidateStore
@@ -64,15 +66,26 @@ def make_frame(bars: int = 200) -> pd.DataFrame:
 
 
 class FakeLLM:
-    def __init__(self, payload: dict | None = None, text: str | None = None) -> None:
+    def __init__(
+        self, payload: dict | None = None, text: str | None = None, *, truncated: bool = False
+    ) -> None:
         self.payload = payload
         self.text = text
+        self.truncated = truncated
         self.calls = 0
+        self.kwargs: dict = {}
         self.settings = SimpleNamespace(model="fake-model")
 
     def ask(self, prompt: str, **kwargs) -> dict:
         self.calls += 1
-        return {"ok": True, "text": self.text or json.dumps(self.payload), "tokens": 5}
+        self.kwargs = kwargs
+        return {
+            "ok": True,
+            "text": self.text or json.dumps(self.payload),
+            "tokens": 5,
+            "finish": "length" if self.truncated else "stop",
+            "truncated": self.truncated,
+        }
 
 
 class FakeStrategies:
@@ -106,12 +119,19 @@ class FakeKlines:
         return make_frame()
 
 
-def make_controller(payload: dict | None, tmp_path: Path, *, text: str | None = None, enabled=True) -> LabController:
+def make_controller(
+    payload: dict | None,
+    tmp_path: Path,
+    *,
+    text: str | None = None,
+    enabled: bool = True,
+    truncated: bool = False,
+) -> LabController:
     strategy_dir = tmp_path / "strategies"
     strategy_dir.mkdir(parents=True, exist_ok=True)
     ctx = SimpleNamespace(
         settings=SimpleNamespace(ai=SimpleNamespace(enabled=enabled)),
-        ai=FakeLLM(payload, text),
+        ai=FakeLLM(payload, text, truncated=truncated),
         strategies=FakeStrategies(strategy_dir),
         klines=FakeKlines(),
     )
@@ -147,14 +167,59 @@ def test_review_approves_candidate(tmp_path: Path):
     assert "gen_strategy" in controller.get_state().ctx.strategies
 
 
-def test_generate_rejects_unparsable_answer(tmp_path: Path):
+def test_generate_reports_broken_json_apart_from_truncation(tmp_path: Path):
+    """没被截断却解析不出来，是模型答非所问，不该说成额度不够。"""
     controller = make_controller(None, tmp_path, text="没有 JSON")
-    try:
+
+    with pytest.raises(HTTPException) as info:
         controller.generate(CandidateGeneratePayload())
-    except HTTPException as exc:
-        assert exc.status_code == 502
-    else:  # pragma: no cover
-        raise AssertionError("expected HTTPException")
+
+    assert info.value.status_code == 502
+    assert info.value.detail == "模型返回的 JSON 不完整，重试一次"
+
+
+def test_generate_reports_truncation_with_its_own_message(tmp_path: Path):
+    """截断和 JSON 坏了是两种不同的失败，文案必须自己说清是哪一种。"""
+    controller = make_controller(
+        None,
+        tmp_path,
+        text='{"strategy_key": "gen_strategy", "code": "from btrader.strategy.base import',
+        truncated=True,
+    )
+
+    with pytest.raises(HTTPException) as info:
+        controller.generate(CandidateGeneratePayload())
+
+    assert info.value.status_code == 502
+    assert info.value.detail == "模型输出被截断（上限 8000 tokens），把改进要求写短一点再试"
+    assert "设置" not in info.value.detail
+
+
+def test_generate_asks_for_the_code_budget(tmp_path: Path):
+    """写代码走 OUTPUT_TOKENS_CODE，别再退回 2400 那种让 JSON 断掉的值。"""
+    controller = make_controller(
+        {"strategy_key": "gen_strategy", "code": SAFE_CODE}, tmp_path
+    )
+
+    controller.generate(CandidateGeneratePayload())
+
+    assert controller.get_state().ctx.ai.kwargs["max_tokens"] == llm.OUTPUT_TOKENS_CODE
+    assert controller.get_state().ctx.ai.kwargs["max_tokens"] == 8000
+
+
+def test_generate_succeeds_and_writes_the_candidate_to_disk(tmp_path: Path):
+    """正常一路走完是 200：返回 ok，代码和元数据都落盘。"""
+    controller = make_controller(
+        {"strategy_key": "gen_strategy", "name": "生成", "code": SAFE_CODE}, tmp_path
+    )
+
+    result = controller.generate(CandidateGeneratePayload())
+
+    assert result["ok"] is True
+    candidate_id = result["candidate"]["id"]
+    assert result["candidate"]["checks"]["ok"] is True
+    assert (tmp_path / f"{candidate_id}.py").read_text(encoding="utf-8") == SAFE_CODE
+    assert (tmp_path / f"{candidate_id}.json").exists()
 
 
 def test_unknown_candidate_is_404(tmp_path: Path):

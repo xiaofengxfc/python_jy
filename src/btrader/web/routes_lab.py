@@ -15,7 +15,7 @@ from typing import Any, Callable
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from .. import ai, paths
+from .. import ai, llm, paths
 from ..ai_optimize import optimize_params
 from ..backtest import BacktestConfig
 from ..core.types import MarketType
@@ -119,19 +119,26 @@ class LabController:
             prompt,
             system=GENERATE_SYSTEM,
             kind="ai_lab",
-            # A whole strategy module is 3-6k characters; the default 1200
-            # output tokens truncate the JSON mid-string and the candidate is
-            # then rejected for reasons the user cannot see.
-            # 写代码比问答长，一次给够，别让 JSON 从中间断掉。
-                max_tokens=2400,
+            # 写代码比问答长：一个完整的策略模块 3-6k 字符，走专门的额度常量，
+            # 让 JSON 一次写完整。改额度只动 llm 里那两个常量，别在这里写数字。
+            max_tokens=llm.OUTPUT_TOKENS_CODE,
         )
+        # 截断和「答非所问」要分开报：前者是改进要求写太长，后者重试一次就好。
+        if answer.get("truncated"):
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"模型输出被截断（上限 {llm.OUTPUT_TOKENS_CODE} tokens），"
+                    "把改进要求写短一点再试"
+                ),
+            )
         if not answer.get("ok"):
             raise HTTPException(
                 status_code=502, detail=f"模型调用失败：{answer.get('error') or '未知错误'}"
             )
         found = ai._find_json_object(str(answer.get("text") or ""))
         if found is None:
-            raise HTTPException(status_code=502, detail="模型没有返回可解析的 JSON")
+            raise HTTPException(status_code=502, detail="模型返回的 JSON 不完整，重试一次")
         data, _start, _end = found
         code = data.get("code")
         if not isinstance(code, str) or not code.strip():

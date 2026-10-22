@@ -478,7 +478,7 @@ def test_cache_returns_the_same_answer_without_a_second_call(tmp_path, monkeypat
 
     def fake_request(spec, settings, key, system, prompt, **kwargs):
         calls.append(prompt)
-        return "答案", 7
+        return "答案", 7, "stop"
 
     monkeypatch.setattr(service, "_request", fake_request)
     first = service.ask("问题", cache_key="kline|BTC|1h|1")
@@ -504,7 +504,7 @@ def test_audit_tail_records_every_call(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(llm, "load_key", lambda: "sk-test")
     llm.reset_cache()
     service = LLMService(AISettings(enabled=True))
-    monkeypatch.setattr(service, "_request", lambda *args, **kwargs: ("好的", 5))
+    monkeypatch.setattr(service, "_request", lambda *args, **kwargs: ("好的", 5, "stop"))
     service.ask("问题", kind="test")
     tail = llm.audit_tail(10)
     assert len(tail) == 1
@@ -701,12 +701,12 @@ def test_ask_can_override_output_tokens_per_call(tmp_path, monkeypatch) -> None:
     service = _service(tmp_path, monkeypatch, "openai")
     seen = _capture_request(monkeypatch, _COMPLETIONS["openai"])
 
-    result = service.ask("写一个策略", max_tokens=2400)
+    result = service.ask("写一个策略", max_tokens=llm.OUTPUT_TOKENS_CODE)
 
     assert result["ok"] is True
     payload = json.loads(seen[0].data.decode("utf-8"))
-    assert payload["max_tokens"] == 2400
-
+    assert payload["max_tokens"] == llm.OUTPUT_TOKENS_CODE
+    assert payload["max_tokens"] == 8000
 
 def test_anthropic_request_uses_its_own_headers_and_a_system_field(
     tmp_path, monkeypatch
@@ -837,7 +837,7 @@ def test_a_truncated_reasoning_model_says_the_budget_ran_out(tmp_path, monkeypat
     """思考过程也占输出上限。
 
     推理模型把预算花在思考上，正文是空的。只说「模型返回了空内容」用户无从下手，
-    所以截断时要说明上限被用完了，并指出该往上调。
+    所以截断时要说明上限用完了，并给出用户真能做的事：重试、把要求写短。
     """
     service = _service(tmp_path, monkeypatch, "openai")
     _capture_request(
@@ -856,11 +856,19 @@ def test_a_truncated_reasoning_model_says_the_budget_ran_out(tmp_path, monkeypat
     result = service.ask("分析一下 BTCUSDT")
 
     assert result["ok"] is False
+    assert result["finish"] == "length"
+    assert result["truncated"] is True
     assert "截断" in result["error"]
     assert "输出上限" in result["error"]
+    assert f"{llm.OUTPUT_TOKENS} tokens" in result["error"]
+    assert "重试一次" in result["error"]
+    assert "设置" not in result["error"]
 
 
-def test_reasoning_without_an_answer_asks_for_a_bigger_budget(tmp_path, monkeypatch) -> None:
+def test_reasoning_without_an_answer_offers_something_the_user_can_do(
+    tmp_path, monkeypatch
+) -> None:
+    """思考过程有了、正文没有，也不是用户能修的：别让他去找一个不存在的设置项。"""
     service = _service(tmp_path, monkeypatch, "openai")
     _capture_request(
         monkeypatch,
@@ -874,7 +882,10 @@ def test_reasoning_without_an_answer_asks_for_a_bigger_budget(tmp_path, monkeypa
     result = service.ask("分析一下 BTCUSDT")
 
     assert result["ok"] is False
+    assert result["truncated"] is False
     assert "思考过程" in result["error"]
+    assert "重试一次" in result["error"]
+    assert "设置" not in result["error"]
 
 
 def test_an_empty_answer_without_a_reason_keeps_the_plain_message(tmp_path, monkeypatch) -> None:
@@ -885,3 +896,109 @@ def test_an_empty_answer_without_a_reason_keeps_the_plain_message(tmp_path, monk
 
     assert result["ok"] is False
     assert result["error"] == "模型返回了空内容。"
+
+
+# ------------------------------------- truncation stays visible to the caller
+def test_the_code_budget_is_its_own_constant_within_every_provider_cap() -> None:
+    """写代码的额度是单独的常量，不是调用点上的数字。
+
+    2400 比问答默认的 4000 还小，正是实验室生成被截断的原因。8192 是 DeepSeek
+    和 Claude 3.5 Haiku 的上限，8000 卡在它下面一点。
+    """
+    assert llm.OUTPUT_TOKENS == 4000
+    assert llm.OUTPUT_TOKENS_CODE == 8000
+    assert llm.OUTPUT_TOKENS_CODE > llm.OUTPUT_TOKENS
+    assert llm.OUTPUT_TOKENS_CODE <= 8192
+
+
+def test_ask_marks_a_truncated_answer_and_says_what_to_do(tmp_path, monkeypatch) -> None:
+    """截断要能被调用方看见，文案里不能提设置。
+
+    routes_lab 靠 truncated 把「被截断」和「JSON 坏了」分开报；设置页没有
+    「输出上限」这一项，文案再指过去只会让人找不到东西。
+    """
+    service = _service(tmp_path, monkeypatch, "openai")
+    _capture_request(
+        monkeypatch,
+        {
+            "choices": [
+                {
+                    "finish_reason": "length",
+                    "message": {"content": "", "reasoning_content": "在想"},
+                }
+            ],
+            "usage": {"total_tokens": 8000},
+        },
+    )
+
+    result = service.ask("写一个策略", max_tokens=llm.OUTPUT_TOKENS_CODE)
+
+    assert result["ok"] is False
+    assert result["finish"] == "length"
+    assert result["truncated"] is True
+    assert "截断" in result["error"]
+    assert "8000 tokens" in result["error"]
+    assert "设置" not in result["error"]
+    # 老字段的语义一个都没动：老调用方不用改代码。
+    assert result["text"] == ""
+    assert result["tokens"] == 0
+    assert result["cached"] is False
+
+
+def test_ask_flags_a_truncated_answer_that_still_has_some_text(tmp_path, monkeypatch) -> None:
+    """JSON 停在字符串中间就是这种：有正文、被截断、解析不出来。"""
+    service = _service(tmp_path, monkeypatch, "openai")
+    _capture_request(
+        monkeypatch,
+        {
+            "choices": [
+                {
+                    "finish_reason": "length",
+                    "message": {"content": '{"strategy_key": "x", "code": "from btrader'},
+                }
+            ]
+        },
+    )
+
+    result = service.ask("写一个策略", max_tokens=llm.OUTPUT_TOKENS_CODE)
+
+    assert result["ok"] is True
+    assert result["finish"] == "length"
+    assert result["truncated"] is True
+    assert result["error"] == ""
+
+
+def test_ask_reports_a_finished_answer_as_not_truncated(tmp_path, monkeypatch) -> None:
+    service = _service(tmp_path, monkeypatch, "openai")
+    _capture_request(
+        monkeypatch,
+        {"choices": [{"finish_reason": "stop", "message": {"content": "好的"}}]},
+    )
+
+    result = service.ask("问题")
+
+    assert result["ok"] is True
+    assert result["finish"] == "stop"
+    assert result["truncated"] is False
+
+
+@pytest.mark.parametrize(
+    ("provider", "payload"),
+    [
+        ("anthropic", {"content": [{"type": "text", "text": ""}], "stop_reason": "length"}),
+        ("ollama", {"message": {"content": ""}, "done_reason": "length"}),
+    ],
+)
+def test_truncation_is_read_from_each_provider_field(
+    tmp_path, monkeypatch, provider, payload
+) -> None:
+    """每种协议的「为什么停住」字段名都不一样，别只认 openai 那个。"""
+    service = _service(tmp_path, monkeypatch, provider)
+    _capture_request(monkeypatch, payload)
+
+    result = service.ask("问题", max_tokens=llm.OUTPUT_TOKENS_CODE)
+
+    assert result["truncated"] is True
+    assert "截断" in result["error"]
+    assert "8000 tokens" in result["error"]
+    assert "设置" not in result["error"]

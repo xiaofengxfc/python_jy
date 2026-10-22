@@ -104,8 +104,17 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   它和 `/api/klines` 一样会回落到 Gate 永续行情。
   不要在 AI 路由里直接调 `ctx.klines.fetch`，否则图表能用，分析接口报 500。
 - AI 测试在 `tests/test_ai.py`，全部离线：`FakeLLM` 替身加 `monkeypatch` 密钥环。
-- 输出额度、缓存窗口、每日调用次数都不进设置，固定在 `llm.py` 的 `OUTPUT_TOKENS` 和 `CACHE_SECONDS`。
+- 输出额度是两个常量，都在 `llm.py`：`OUTPUT_TOKENS`（4000）给问答、分析、简报这类普通回答；
+  `OUTPUT_TOKENS_CODE`（8000）给写代码这类长回答，策略实验室生成一个完整模块走它。
+  推理模型先把额度花在思考上，写策略的额度给小了，JSON 会从中间断掉。
+  改额度只动这两个常量，别在调用点写数字。`routes_lab` 曾经自己写了 2400，比默认值还小，
+  长策略被截成坏 JSON，报出来的是「没有可解析的 JSON」，文案还让用户去设置里调一个不存在的项。
+- 缓存窗口和每日调用次数也不进设置，固定在 `CACHE_SECONDS`。
   设置页只留开关、供应商、模型、接口地址、Key。
+- `ask()` 的返回除了 `ok` / `text` / `error` / `tokens`，还有 `finish`（供应商的 finish_reason）
+  和 `truncated`（`finish == "length"`）。被截断的回答可能带着半截正文，所以报错时要把
+  「额度用完、被截断」和「回答不合格、JSON 解析不出来」分开说，别再让用户去改一个改不了的额度。
+  Anthropic 用 `stop_reason: max_tokens` 表示截断，这一支目前不会置 `truncated`。
 
 ## 7. AI 交易与 AI 量化
 
