@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 from dataclasses import dataclass, field
+from typing import Any, Callable
 
 from ..core.config import AppSettings
 from ..core.storage import Database
@@ -88,9 +90,17 @@ class TradingService:
         risk: RiskManager,
         db: Database,
         notifier: "Notifier | None" = None,
+        rest_for: Callable[[MarketType], Any] | None = None,
     ) -> None:
         self.settings = settings
         self.rest = rest
+        # Resolver for the client allowed to sign for a given market. The web
+        # context hands over AppContext.rest_for; without it every market falls
+        # back to self.rest (offline previews, unit tests).
+        self._rest_for = rest_for
+        # One order at a time, whoever submits it (INV-14). Every controller
+        # ends up in submit(), so the lock lives here instead of in each caller.
+        self.account_lock = threading.RLock()
         self.risk = risk
         self.db = db
         # Optional: pushes fills, protective exits and breaker trips to WeChat.
@@ -108,7 +118,30 @@ class TradingService:
         if price <= 0:
             raise OrderRejected("价格无效，无法计算下单数量。")
         raw = quote / price
-        return self.rest.amount_to_precision(market_type, symbol, raw)
+        return self.rest_for(market_type).amount_to_precision(market_type, symbol, raw)
+
+    def rest_for(self, market_type: MarketType) -> Any:
+        """The client that may sign for this market type.
+
+        Credentials live in one key slot per margined type, so signing a spot
+        order with the current futures client makes Binance answer -2015.
+        Callers used to borrow the global market for the length of one request,
+        which leaked a market switch into every concurrent settings reader. A
+        per-market client keeps the global market untouched.
+        """
+        resolve = self._rest_for
+        if resolve is None:
+            return self.rest
+        try:
+            client = resolve(market_type)
+        except Exception:  # a broken resolver must not lose the order path
+            log.warning(
+                "按市场取交易所客户端失败，退回当前客户端：%s",
+                market_type.value,
+                exc_info=True,
+            )
+            return self.rest
+        return client if client is not None else self.rest
 
     def exchange_amount(
         self,
@@ -135,7 +168,8 @@ class TradingService:
         Raises ``OrderRejected`` when the rounded size falls below the market
         minimum (e.g. less than one contract on coin-M).
         """
-        spec = self.rest.contract_spec(
+        rest = self.rest_for(market_type)
+        spec = rest.contract_spec(
             market_type, symbol, allow_network=not offline
         )
         raw = spec.base_to_contracts(base_qty, price)
@@ -151,7 +185,7 @@ class TradingService:
             # would (inverse contracts are whole numbers, never up).
             exchange_amount = math.floor(raw + 1e-12) if spec.inverse else raw
         else:
-            exchange_amount = self.rest.amount_to_precision(market_type, symbol, raw)
+            exchange_amount = rest.amount_to_precision(market_type, symbol, raw)
         if exchange_amount <= 0:
             raise OrderRejected(
                 f"下单量 {format_amount(raw)} 无法满足交易所的最小下单单位。"
@@ -203,10 +237,11 @@ class TradingService:
         directly always yielded zero, so in live mode ``max_order_pct`` never
         took effect.
         """
-        if not self.rest.has_credentials:
+        rest = self.rest_for(req.market_type)
+        if not rest.has_credentials:
             return 0.0
         try:
-            balance = self.rest.fetch_balance(req.market_type)
+            balance = rest.fetch_balance(req.market_type)
         except Exception:
             return 0.0
         # Coin-margined wallets hold the margin coin, so their total is marked
@@ -235,7 +270,8 @@ class TradingService:
         were held. Coin-margined positions are reported in contracts, so they go
         through the contract spec to produce a USD notional.
         """
-        if not self.rest.has_credentials:
+        rest = self.rest_for(req.market_type)
+        if not rest.has_credentials:
             # No key means no position to protect: a fresh testnet account is
             # genuinely flat, and refusing every order would be useless.
             return 0.0
@@ -244,7 +280,7 @@ class TradingService:
             # ccxt for positions raised NotSupported, which made every spot
             # order fail as "cannot read the position".
             try:
-                balance = self.rest.fetch_balance(req.market_type)
+                balance = rest.fetch_balance(req.market_type)
             except Exception:
                 log.warning("读取现货余额失败，无法校验持仓上限", exc_info=True)
                 return None
@@ -257,11 +293,11 @@ class TradingService:
             except (TypeError, ValueError):
                 return None
         try:
-            positions = self.rest.fetch_positions(req.market_type, [req.symbol])
+            positions = rest.fetch_positions(req.market_type, [req.symbol])
         except Exception:
             log.warning("读取实盘持仓失败，无法校验持仓上限", exc_info=True)
             return None
-        spec = self.rest.contract_spec(req.market_type, req.symbol)
+        spec = rest.contract_spec(req.market_type, req.symbol)
         total = 0.0
         for position in positions:
             contracts = float(position.get("contracts") or 0)
@@ -271,6 +307,19 @@ class TradingService:
 
     # ------------------------------------------------------------------ submit
     def submit(self, req: OrderRequest) -> OrderResult:
+        """Place one order, one order at a time.
+
+        The ticket, AutoTrader and the AI trader all reach the venue through
+        here (INV-1), so this is the single place where a shared lock can
+        serialise them. Only the order itself is inside it: model calls, kline
+        downloads and strategy runs belong to the callers and stay outside,
+        otherwise a slow model would freeze the ticket.
+        """
+        with self.account_lock:
+            return self._submit_locked(req)
+
+    def _submit_locked(self, req: OrderRequest) -> OrderResult:
+        rest = self.rest_for(req.market_type)
         price = req.price or 0.0
         if req.order_type == OrderType.MARKET.value and price <= 0:
             raise OrderRejected("市价单需要最新成交价作为参考。")
@@ -284,7 +333,7 @@ class TradingService:
             price,
         )
         if exchange_amount <= 0:
-            spec = self.rest.contract_spec(req.market_type, req.symbol)
+            spec = rest.contract_spec(req.market_type, req.symbol)
             raise OrderRejected(
                 f"数量精度处理后为 0，请增加下单数量。（{spec.describe()}）"
             )
@@ -304,7 +353,7 @@ class TradingService:
         if not decision:
             raise OrderRejected(decision.reason)
 
-        if not self.rest.has_credentials:
+        if not rest.has_credentials:
             raise OrderRejected(
                 f"尚未配置 API Key：{self.network.value} 网络无法下单。"
             )
@@ -324,23 +373,23 @@ class TradingService:
             # flip the position instead of flattening it. Clearing the symbol
             # first is what makes "close" mean close.
             try:
-                canceled = self.rest.cancel_symbol_orders(req.market_type, req.symbol)
+                canceled = rest.cancel_symbol_orders(req.market_type, req.symbol)
                 if canceled:
                     log.info("平仓前撤销 %s 的 %d 笔挂单", req.symbol, canceled)
             except ExchangeError as exc:
                 log.warning("平仓前撤单失败 %s：%s", req.symbol, exc)
         if req.order_type == OrderType.MARKET.value:
-            order = self.rest.create_order(
+            order = rest.create_order(
                 req.market_type, req.symbol, "market", req.side, exchange_amount, None, params
             )
         else:
-            order = self.rest.create_order(
+            order = rest.create_order(
                 req.market_type,
                 req.symbol,
                 "limit",
                 req.side,
                 exchange_amount,
-                self.rest.price_to_precision(req.market_type, req.symbol, price),
+                rest.price_to_precision(req.market_type, req.symbol, price),
                 params,
             )
         quote = abs(base_qty) * price
@@ -397,6 +446,7 @@ class TradingService:
         if not _is_filled(order):
             return [], ["挂单尚未成交，成交后可再次设置止损/止盈。"]
 
+        rest = self.rest_for(req.market_type)
         exit_side = "sell" if req.side == OrderSide.BUY.value else "buy"
         # Size the guard by what actually filled. A stop larger than the
         # position is rejected by the venue as reduce-only, which left the
@@ -419,13 +469,13 @@ class TradingService:
             try:
                 if take_profit:
                     placed.append(
-                        self.rest.create_take_profit_market(
+                        rest.create_take_profit_market(
                             req.market_type, req.symbol, exit_side, size, price
                         )
                     )
                 else:
                     placed.append(
-                        self.rest.create_stop_market(
+                        rest.create_stop_market(
                             req.market_type, req.symbol, exit_side, size, price
                         )
                     )
@@ -468,7 +518,7 @@ class TradingService:
         The cancel goes to the venue; the order row is written back to SQLite
         so the UI and the history agree on the state.
         """
-        order = self.rest.cancel_order(market_type, order_id, symbol)
+        order = self.rest_for(market_type).cancel_order(market_type, order_id, symbol)
         try:
             self.db.save_order(
                 self._account_id(), market or market_type.value, order, RunMode.LIVE.value
@@ -828,7 +878,7 @@ class TradingService:
         if abs(self._leverage_applied.get(key, 0.0) - leverage) < 1e-9:
             return
         try:
-            self.rest.set_leverage(symbol, leverage, market_type)
+            self.rest_for(market_type).set_leverage(symbol, leverage, market_type)
         except ExchangeError as exc:
             raise OrderRejected(f"设置杠杆 {leverage:g}x 失败：{exc}") from exc
         self._leverage_applied[key] = leverage

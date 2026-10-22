@@ -79,7 +79,9 @@ class _State:
         self.locks = {market: threading.RLock() for market in MarketType}
         self.loading = {market: threading.Lock() for market in MarketType}
         self.symbols: dict[str, list[dict[str, Any]]] = {}
-        self.account_lock = threading.RLock()
+        # The same lock the trading service takes around a submit, so a web
+        # route and an engine poll can never place an order at the same time.
+        self.account_lock = self.ctx.trading.account_lock
         self.equity_history: list[dict[str, Any]] = []
         self.equity_stamp = 0.0
         self.stream: StreamHub | None = None
@@ -913,29 +915,21 @@ def create_app() -> FastAPI:
             request.stop_loss = payload.stop_loss
             request.take_profit = payload.take_profit
 
-        # 订单落在哪个市场由 OrderRequest.market_type 决定，可签名用的是那个市场的
-        # Key 槽，所以得借用那个市场的客户端。以前这里调 set_market_type(mt)（默认
-        # persist=True）：下一张现货单就把侧栏、图表、设置页一起切成现货，还把市场
-        # 写进 config.json；配置文件坏了更是在下单前 409。现在只借不落盘，
-        # 请求结束就还回去。整段在 account_lock 里，两张跨市场的单子不会互相盖。
-        previous_market = state.ctx.market_type
+        # 订单落在哪个市场由 OrderRequest.market_type 决定，签名的 Key 也由
+        # TradingService 按同一个市场去取，全局市场全程不动：以前这里要先把
+        # ctx.market_type 借成请求的市场，并发读设置会看到另一个市场。
+        # 提交段自己在 account_lock 里串行，跨市场两张单子不会互相盖。
         try:
-            with state.account_lock:
-                if previous_market is not mt:
-                    state.ctx.set_market_type(mt, persist=False)
-                try:
-                    result = state.ctx.trading.submit(request)
-                finally:
-                    if state.ctx.market_type is not previous_market:
-                        try:
-                            state.ctx.set_market_type(previous_market, persist=False)
-                        except Exception:  # 还原失败也不能盖掉真正的错误
-                            log.warning("下单后还原市场失败", exc_info=True)
+            result = state.ctx.trading.submit(request)
         except OrderRejected as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
             log.exception("下单失败")
             raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        # 以前借全局市场时会顺手 invalidate 掉账户快照，成交之后面板立刻是新的。
+        # 借市场没了，这一步要显式做，否则刚下的单在缓存里最多还是 10 秒前的账。
+        state.ctx.account.invalidate()
 
         return {
             "ok": True,
@@ -1427,8 +1421,10 @@ LIVE_SYNC_SECONDS = 5.0
 def _reconcile_live_fills(state: _State) -> None:
     while not state.stop_reconcile.wait(LIVE_SYNC_SECONDS):
         try:
-            with state.account_lock:
-                booked = state.ctx.trading.sync_live_fills()
+            # 这里刻意不拿 account_lock：那把锁现在包的是「提交这一下」，
+            # 而一次成交同步要对每个市场逐个交易对发签名请求，可能好几秒。
+            # 拿它等于把下单框挡在成交轮询后面。账本只有这一个线程在写。
+            booked = state.ctx.trading.sync_live_fills()
             if booked:
                 log.info("交易所成交已回填风控 %d 笔", len(booked))
         except Exception:  # the poller must survive a bad exchange

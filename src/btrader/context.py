@@ -64,6 +64,9 @@ class AppContext:
         self.trading = TradingService(
             self.settings, self.rest, self.risk, self.db,
             notifier=self.notifier,
+            # An order carries its own market type; the service resolves that
+            # market's client here instead of borrowing the global one.
+            rest_for=self.rest_for,
         )
         # The single source of account truth: exchange balances, positions,
         # open orders and the stored fill ledger, cached for the polling panels.
