@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, query } from "../api";
 import { TIMEFRAMES, fmt } from "../format";
 import type {
@@ -178,8 +178,6 @@ export default function StrategyLabPage({ settings, health }: Props) {
     // 只在换候选时读源码。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selected?.id]);
-
-  const visible = useMemo(() => candidates, [candidates]);
 
   /* ---------------------------------------------------------------- 动作 */
   const generate = async () => {
@@ -454,7 +452,7 @@ export default function StrategyLabPage({ settings, health }: Props) {
           </div>
           <div className="card-body">
             <CandidateList
-              items={visible}
+              items={candidates}
               selectedId={selected?.id ?? ""}
               onPick={(candidate) => void pickCandidate(candidate)}
               empty="还没有候选。右边「生成」写一条。"

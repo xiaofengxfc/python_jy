@@ -616,37 +616,6 @@ class AITrader:
         except Exception:  # pragma: no cover - 新闻拉不到不影响决策
             return ""
 
-    def _build_prompt(
-        self,
-        frame: Any,
-        portfolio: dict[str, Any],
-        signal_target: float | None = None,
-    ) -> str:
-        block = ""
-        try:
-            block = ai.digest(frame, timeframe=self.config.timeframe, label=self.config.symbol)
-        except Exception:  # pragma: no cover - digest is best effort
-            block = ""
-        position = float(portfolio.get("position_quote") or 0.0)
-        equity = float(portfolio.get("equity") or 0.0)
-        price = portfolio.get("price")
-        signal_line = ""
-        if signal_target is not None:
-            direction = "做多" if signal_target > 0 else "做空" if signal_target < 0 else "空仓"
-            signal_line = (
-                f"【策略信号】目标仓位 {signal_target:+.0%}（{direction}）。"
-                "你只做复核。同意该方向才可开对应方向，不同意就 hold。"
-                "不得反向开仓，不得在空仓信号下开新仓。\n"
-            )
-        return (
-            f"{DECISION_PROMPT}\n\n{signal_line}"
-            f"【账户】权益 {equity:.2f} USDT，"
-            f"当前持仓 {position:.2f} USDT，最新价 {price}。\n"
-            f"【上限】单笔 {self.config.max_order_quote:.2f} USDT，"
-            f"最大持仓 {self.config.max_position_quote:.2f} USDT，"
-            f"最小置信度 {self.config.min_confidence:.2f}。\n\n{block}"
-        )
-
     def _record(
         self,
         outcome: str,

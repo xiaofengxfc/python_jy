@@ -42,6 +42,9 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   这两个命令会按 GBK 写文件，中文变乱码，之后就是 SyntaxError。
 - `cmd` 脚本要 CRLF 加纯 ASCII。否则 `rem` 行会被当成命令执行。
 - 前端只读磁盘上的静态产物。`index.html` 带 `no-store`，改完刷新页面就行。
+- 交易页的市场、交易对、周期以设置为初值：用户没在本页手动改过的那一项跟着设置走。
+  判断依据是 `picked` 那三个标记，新增可配置项时照这个来，不要写死默认值。
+- K 线一次拉 1000 根（交易所上限），不做成设置项。下单金额由下单框自己记，也不进设置。
 
 ## 4. 账户只有一个来源
 
@@ -88,3 +91,16 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   它和 `/api/klines` 一样会回落到 Gate 永续行情。
   不要在 AI 路由里直接调 `ctx.klines.fetch`，否则图表能用，分析接口报 500。
 - AI 测试在 `tests/test_ai.py`，全部离线：`FakeLLM` 替身加 `monkeypatch` 密钥环。
+
+## 7. AI 交易与 AI 量化
+
+- AI 交易的决策拆在 `ai_pipeline.py`：技术面 → 新闻面 → 多空辩论 → 风控复核 → 裁决。
+  流水线只出文本。方向约束、`AIGuard`、下单都在 `engine/ai_trader.py`，分段不能放宽任何一条。
+- 深度三档存在 `ai_auto.depth`：quick 一次调用，standard 四段，deep 六段。
+  `AITraderConfig.depth` 默认 quick（测试和「决策一次」用），界面默认 standard。
+- 裁决段的提示词只有一份，在 `ai_pipeline.DECISION_PROMPT`，`engine/ai_trader` 直接引用。
+  改格式要同时改 `parse_decision`。
+- 三个页面各自独立，侧栏进：`AITradePage`（全自动交易）、`AIQuantPage`（候选 → 部署）、
+  `StrategyLabPage`（生成与调参）。`StageBar`、`CandidateList`、`MetricGrid`、`ExecutionConsole`
+  是共用件，别再各写一份。
+- 执行台和 AI 交易共用同一个账户，同时只能开一个，撞上了返回 409。

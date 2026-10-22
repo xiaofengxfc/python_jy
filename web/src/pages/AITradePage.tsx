@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, query } from "../api";
 import { MARKET_LABELS, TIMEFRAMES, fmt, fmtPrice } from "../format";
 import type {
@@ -92,8 +92,6 @@ export default function AITradePage({ settings, health }: Props) {
   const [auto, setAuto] = useState<AIAutoSettings>(FALLBACK_AUTO);
   const [depth, setDepth] = useState("standard");
 
-  const seq = useRef(0);
-
   /* ------------------------------------------------------------ settings */
   useEffect(() => {
     if (!settings) return;
@@ -132,9 +130,8 @@ export default function AITradePage({ settings, health }: Props) {
   /* -------------------------------------------------------------- polling */
   const refresh = useCallback(async () => {
     try {
-      const next = await api<AITraderStatus>(`/api/ai/trader/status?since=0`);
+      const next = await api<AITraderStatus>("/api/ai/trader/status?since=0");
       setStatus(next);
-      seq.current = next.seq ?? 0;
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     }

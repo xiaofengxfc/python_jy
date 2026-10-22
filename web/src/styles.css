@@ -1624,7 +1624,6 @@ input[type="range"].input:focus {
   }
 }
 
-
 .ticket-note {
   padding: 0 13px 12px;
   color: var(--text-3);
@@ -2089,7 +2088,6 @@ input[type="range"].input:focus {
 .cred-others > span.on {
   color: var(--up);
 }
-
 
 /* ------------------------------------------------------- log panel */
 .log-mask {
@@ -2730,38 +2728,7 @@ main.main > .auto-head:not(.page-head) {
   margin-right: 0;
 }
 
-.auto-section {
-  display: grid;
-  grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr);
-  gap: 12px;
-  align-items: start;
-  margin-top: 12px;
-}
-
-.auto-section > .auto-head {
-  grid-column: 1 / -1;
-  gap: 10px;
-}
-
-/* 标题栏是网格的兄弟节点（组件返回一个片段），所以要自带间距和整行宽度。 */
-.auto-head {
-  margin-top: 12px;
-  background: var(--bg);
-  border-radius: var(--radius);
-  padding: 10px 14px;
-}
-
-.auto-section > .stack {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  min-width: 0;
-}
-
 @media (max-width: 1100px) {
-  .auto-section {
-    grid-template-columns: minmax(0, 1fr);
-  }
 }
 
 main.main > .auto-section,
@@ -2780,20 +2747,8 @@ main.main > .ai-section:not(.page-head) {
   margin-right: 0;
 }
 
-.ai-section {
-  display: grid;
-  grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr);
-  gap: 12px;
-  align-items: start;
-  margin-top: 12px;
-}
-
 /* The head and the banners are rendered as siblings of the two columns, so
    they need to span the whole grid instead of landing in one cell. */
-.ai-section > .ai-head,
-.ai-section > .banner {
-  grid-column: 1 / -1;
-}
 
 .ai-head {
   display: flex;
@@ -2820,81 +2775,11 @@ main.main > .ai-workspace .ai-col {
   width: 100%;
 }
 
-.ai-mode-switch {
-  display: inline-flex;
-  align-self: flex-start;
-  gap: 4px;
-  padding: 3px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--bg);
-}
-
-.ai-mode-switch button {
-  border: 0;
-  border-radius: 6px;
-  padding: 6px 14px;
-  background: transparent;
-  color: var(--text-2);
-  font-size: 12px;
-  cursor: pointer;
-}
-
-.ai-mode-switch button.active {
-  background: var(--text);
-  color: var(--bg);
-}
-
-.ai-quant-list {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  max-height: 320px;
-  overflow: auto;
-}
-
-.ai-quant-item {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
-  align-items: center;
-  gap: 10px;
-  width: 100%;
-  padding: 9px 10px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--bg);
-  text-align: left;
-  cursor: pointer;
-}
-
-.ai-quant-item.active {
-  border-color: var(--text-2);
-  background: var(--bg-hover);
-}
-
 .ai-quant-name {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 12px;
-}
-
-.ai-quant-state {
-  padding: 1px 6px;
-  border-radius: 4px;
-  background: var(--bg-hover);
-  color: var(--text-2);
-  font-size: 10px;
-}
-
-.ai-quant-state.approved {
-  color: var(--up);
-  background: color-mix(in srgb, var(--up) 10%, transparent);
-}
-
-.ai-quant-state.rejected {
-  color: var(--down);
-  background: color-mix(in srgb, var(--down) 10%, transparent);
 }
 
 .ai-quant-checks {
@@ -3134,9 +3019,6 @@ main.main > .ai-workspace .ai-col {
 }
 
 @media (max-width: 1100px) {
-  .ai-section {
-    grid-template-columns: minmax(0, 1fr);
-  }
 }
 
 /* ============================================================
@@ -3163,27 +3045,6 @@ main.main > .lab-page:not(.page-head) {
   align-items: start;
 }
 
-.lab-gen {
-  display: flex;
-  align-items: flex-end;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-
-.lab-gen > .field {
-  flex: 0 0 180px;
-}
-
-.lab-gen > .field.lab-instruction {
-  flex: 1 1 260px;
-  min-width: 200px;
-}
-
-.lab-generate {
-  flex: none;
-  height: 34px;
-}
-
 /* --------------------------------------------------------- candidates */
 .lab-list {
   display: flex;
@@ -3191,55 +3052,6 @@ main.main > .lab-page:not(.page-head) {
   gap: 6px;
   max-height: 320px;
   overflow-y: auto;
-}
-
-.lab-candidate {
-  display: grid;
-  grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 6px 10px;
-  width: 100%;
-  padding: 9px 11px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--bg);
-  text-align: left;
-  transition: border-color 0.12s ease, background 0.12s ease;
-}
-
-.lab-candidate:hover {
-  background: var(--bg-subtle);
-  border-color: var(--border-strong);
-}
-
-.lab-candidate.active {
-  border-color: var(--ink);
-  background: var(--bg-subtle);
-}
-
-.lab-candidate-key {
-  font-size: 12px;
-  font-weight: 600;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.lab-candidate-name {
-  color: var(--text-2);
-  font-size: 12px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.lab-candidate .lab-check,
-.lab-candidate .lab-candidate-meta {
-  grid-column: 1 / -1;
-}
-
-.lab-candidate-meta {
-  font-size: 11px;
 }
 
 .lab-check {
@@ -3253,41 +3065,6 @@ main.main > .lab-page:not(.page-head) {
 
 .lab-check.bad {
   color: var(--down);
-}
-
-/* Status pill shared by candidates, rounds and the job badge. */
-.lab-chip {
-  display: inline-flex;
-  align-items: center;
-  justify-self: start;
-  height: 18px;
-  padding: 0 7px;
-  border-radius: 999px;
-  background: var(--bg-active);
-  color: var(--text-2);
-  font-size: 11px;
-  white-space: nowrap;
-}
-
-.lab-chip.pending {
-  background: var(--warn-weak);
-  color: var(--warn);
-}
-
-.lab-chip.approved {
-  background: var(--up-weak);
-  color: var(--up);
-}
-
-.lab-chip.rejected {
-  background: var(--down-weak);
-  color: var(--down);
-}
-
-/* -------------------------------------------------------------- code */
-.lab-code-meta {
-  font-size: 11px;
-  overflow-wrap: anywhere;
 }
 
 .lab-code {

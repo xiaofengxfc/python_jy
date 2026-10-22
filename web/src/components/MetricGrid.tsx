@@ -8,13 +8,11 @@ export interface MetricItem {
 
 interface Props {
   items: MetricItem[];
-  /** 紧凑模式：候选列表旁边那一排用得上。 */
-  dense?: boolean;
 }
 
-export default function MetricGrid({ items, dense = false }: Props) {
+export default function MetricGrid({ items }: Props) {
   return (
-    <div className={`metric-grid${dense ? " dense" : ""}`}>
+    <div className="metric-grid">
       {items.map((item) => (
         <div key={item.label} className="metric-cell">
           <span className="metric-cell-label">{item.label}</span>

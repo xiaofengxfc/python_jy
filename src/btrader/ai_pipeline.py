@@ -43,10 +43,6 @@ TITLES = {
     "verdict": "裁决",
 }
 
-STAGE_TOKENS = 700
-VERDICT_TOKENS = 900
-
-
 @dataclass
 class PipelineContext:
     """一次决策的全部输入。流水线不碰交易所，也不读配置。"""
@@ -217,13 +213,9 @@ def run(
             continue
         prompt = BUILDERS[stage](ctx, trace)
         started = clock()
-        answer = llm.ask(
-            prompt,
-            system="",
-            cache_key="",
-            kind=f"ai_{stage}",
-            max_tokens=VERDICT_TOKENS if stage == "verdict" else STAGE_TOKENS,
-        ) or {}
+        # 不在这里给单段设上限：推理模型把额度先花在思考上，段内预算太小会
+        # 直接截断成空回答。用设置里的「输出上限」，一段一个额度。
+        answer = llm.ask(prompt, system="", cache_key="", kind=f"ai_{stage}") or {}
         text = str(answer.get("text") or "").strip()
         ok = bool(answer.get("ok")) and bool(text)
         trace.append(
