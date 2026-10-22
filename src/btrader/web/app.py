@@ -35,6 +35,7 @@ from ..core.types import (
 from ..engine.trading import OrderRejected, OrderRequest
 from ..exchange.symbols import format_amount, load_symbols
 from ..exchange import mirror
+from ..exchange.rest import ExchangeError
 from ..logging_setup import error_buffer
 from .routes import build_router
 from .routes_lab import build_lab_router

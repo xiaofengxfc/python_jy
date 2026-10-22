@@ -124,11 +124,23 @@ class ConfigStore:
             self._backup = self._back_up_broken_file()
             log.error("配置文件结构不对（顶层不是对象），已备份，本次不保存任何设置")
             return AppSettings()
-
-        risk_raw = raw.pop("risk", {}) or {}
-        notify_raw = raw.pop("notify", {}) or {}
-        ai_raw = raw.pop("ai", {}) or {}
-        ai_auto_raw = raw.pop("ai_auto", {}) or {}
+        # 手改 config.json 时把某一层写错（``"ai": true``、写成列表）会让下面的
+        # ``.items()`` 抛 AttributeError，整份配置起不来。坏的那一块退回默认值，
+        # 其它块照常读——和坏 JSON 一样，都要人还能把程序打开。
+        blocks: dict[str, Any] = {
+            "risk": raw.pop("risk", {}),
+            "notify": raw.pop("notify", {}),
+            "ai": raw.pop("ai", {}),
+            "ai_auto": raw.pop("ai_auto", {}),
+        }
+        for name, block in blocks.items():
+            if block and not isinstance(block, dict):
+                log.warning("配置里的 %s 不是对象，已忽略，按默认值处理", name)
+                blocks[name] = {}
+        risk_raw = blocks["risk"] or {}
+        notify_raw = blocks["notify"] or {}
+        ai_raw = blocks["ai"] or {}
+        ai_auto_raw = blocks["ai_auto"] or {}
         # A settings file written by an older build may still carry a sidecar
         # block; it is dropped here so the field list stays authoritative.
         raw.pop("freqtrade", None)

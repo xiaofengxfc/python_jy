@@ -1565,42 +1565,71 @@ def apply_settings(ctx: Any, payload: "SettingsPayload") -> list[str]:
         _apply_ai_auto(ai_auto_draft, payload.ai_auto)
 
     # 字段都合法了，开始落地。切换类操作不落盘，统一在最后保存一次。
-    changed: list[str] = []
-    if target_platform is not None and target_platform != ctx.platform:
-        ctx.set_platform(target_platform, persist=False)
-        changed.append("platform")
-    if target_network is not None and target_network is not ctx.network:
-        ctx.set_network(target_network, persist=False)
-        changed.append("network")
-    if target_market is not None and target_market is not ctx.market_type:
-        ctx.set_market_type(target_market, persist=False)
-        changed.append("market_type")
-    for name in ("last_symbol", "timeframe"):
-        value = getattr(payload, name)
-        if value is not None and getattr(settings, name) != value:
-            setattr(settings, name, value)
-            changed.append(name)
-    if payload.proxy is not None and payload.proxy.strip() != settings.proxy:
-        # 重建客户端：ccxt 只读一次 proxies，旧客户端会继续直连。
-        ctx.apply_proxy(payload.proxy)
-        changed.append("proxy")
-    if payload.theme is not None and settings.theme != payload.theme:
-        settings.theme = payload.theme
-        changed.append("theme")
-    if payload.notification_sound is not None and settings.notification_sound != payload.notification_sound:
-        settings.notification_sound = payload.notification_sound
-        changed.append("notification_sound")
-    for name, draft in (
-        ("risk", risk_draft),
-        ("notify", notify_draft),
-        ("ai", ai_draft),
-        ("ai_auto", ai_auto_draft),
-    ):
-        if getattr(settings, name) != draft:
-            setattr(settings, name, draft)
-            changed.append(name)
+    # 落地前留一份快照：save_settings() 会因为配置文件坏了直接拒绝保存
+    # （ConfigError → 409），那时内存里已经换了一半、磁盘还是旧的，
+    # 界面显示的网络/市场与重启后对不上。保存失败就整体回滚。
+    snapshot = replace(settings)
+    old_platform, old_network, old_market = ctx.platform, ctx.network, ctx.market_type
+    try:
+        changed: list[str] = []
+        if target_platform is not None and target_platform != ctx.platform:
+            ctx.set_platform(target_platform, persist=False)
+            changed.append("platform")
+        if target_network is not None and target_network is not ctx.network:
+            ctx.set_network(target_network, persist=False)
+            changed.append("network")
+        if target_market is not None and target_market is not ctx.market_type:
+            ctx.set_market_type(target_market, persist=False)
+            changed.append("market_type")
+        for name in ("last_symbol", "timeframe"):
+            value = getattr(payload, name)
+            if value is not None and getattr(settings, name) != value:
+                setattr(settings, name, value)
+                changed.append(name)
+        if payload.proxy is not None and payload.proxy.strip() != settings.proxy:
+            # 重建客户端：ccxt 只读一次 proxies，旧客户端会继续直连。
+            ctx.apply_proxy(payload.proxy)
+            changed.append("proxy")
+        if payload.theme is not None and settings.theme != payload.theme:
+            settings.theme = payload.theme
+            changed.append("theme")
+        if payload.notification_sound is not None and settings.notification_sound != payload.notification_sound:
+            settings.notification_sound = payload.notification_sound
+            changed.append("notification_sound")
+        for name, draft in (
+            ("risk", risk_draft),
+            ("notify", notify_draft),
+            ("ai", ai_draft),
+            ("ai_auto", ai_auto_draft),
+        ):
+            if getattr(settings, name) != draft:
+                setattr(settings, name, draft)
+                changed.append(name)
 
-    ctx.save_settings()
+        ctx.save_settings()
+    except Exception:
+        # 切换类操作反向执行一遍，再把草稿之前的那份设置整体放回去。
+        ctx.set_platform(old_platform, persist=False)
+        ctx.set_network(old_network, persist=False)
+        ctx.set_market_type(old_market, persist=False)
+        if settings.proxy != snapshot.proxy:
+            ctx.apply_proxy(snapshot.proxy)
+        for name in (
+            "platform",
+            "network",
+            "market_type",
+            "last_symbol",
+            "timeframe",
+            "proxy",
+            "theme",
+            "notification_sound",
+            "risk",
+            "notify",
+            "ai",
+            "ai_auto",
+        ):
+            setattr(settings, name, getattr(snapshot, name))
+        raise
     return changed
 
 
@@ -1611,6 +1640,11 @@ def _apply_risk(risk: RiskSettings, values: dict[str, Any]) -> None:
             log.debug("忽略未知风控字段: %s", key)
             continue
         current = getattr(risk, key)
+        if value is None and isinstance(current, (bool, str)):
+            # null 不是「清空」：以前 bool(None) 会悄悄关掉急停开关，
+            # str(None) 会把文本字段写成字符串 "None"。当作没提供。
+            log.debug("忽略 null 风控字段: %s", key)
+            continue
         try:
             setattr(risk, key, bool(value) if isinstance(current, bool) else type(current)(value))
         except (TypeError, ValueError):
@@ -1626,6 +1660,12 @@ def _apply_notify(target: Any, values: dict[str, Any]) -> None:
     for key, value in values.items():
         if not hasattr(target, key):
             log.debug("忽略未知通知字段: %s", key)
+            continue
+        current = getattr(target, key)
+        if value is None and isinstance(current, (bool, str)):
+            # null 不是「清空」：以前 msg_format 会 400、webhook_url 会被清成空串、
+            # 开关会被悄悄关掉。当作没提供，保住已保存的值。
+            log.debug("忽略 null 通知字段: %s", key)
             continue
         if key == "msg_format":
             fmt = str(value or "").strip().lower()
@@ -1664,6 +1704,11 @@ def _apply_ai(target: Any, values: dict[str, Any]) -> None:
             log.debug("忽略未知 AI 字段: %s", key)
             continue
         current = getattr(target, key)
+        if value is None and isinstance(current, (bool, str)):
+            # null 不是「清空」：以前会把 model/base_url 写成字符串 "None"，
+            # 之后每次调用都失败，界面上还看不出哪里错了。当作没提供。
+            log.debug("忽略 null AI 字段: %s", key)
+            continue
         if isinstance(current, bool):
             setattr(target, key, bool(value))
             continue
@@ -1696,6 +1741,10 @@ def _apply_ai_auto(target: AIAutoSettings, values: dict[str, Any]) -> None:
             target.strategy_params = cleaned
             continue
         current = getattr(target, key)
+        if value is None and isinstance(current, (bool, str)):
+            # 同 _apply_ai：null 不该把 symbol/depth 写成 "None"，也不该悄悄关开关。
+            log.debug("忽略 null AI 自动交易字段: %s", key)
+            continue
         if isinstance(current, bool):
             setattr(target, key, bool(value))
             continue

@@ -183,7 +183,11 @@ class StreamHub:
             if self._closed:
                 raise RuntimeError("行情服务已关闭")
             self._queues.setdefault(key, set()).add(queue)
-            if key not in self._tasks:
+            task = self._tasks.get(key)
+            if task is None or task.done():
+                # 上一个 watcher 已经退出（例如建交易所客户端那一句就抛了）：
+                # 留着这个死任务，后来的订阅再也不会起新任务，图表从此收不到帧，
+                # 而且没有人报错。每次订阅都检查一遍任务是否还活着。
                 self._tasks[key] = asyncio.create_task(
                     self._watch_pair(market, symbol), name=f"ws:{key[0]}:{key[1]}"
                 )
@@ -219,8 +223,8 @@ class StreamHub:
     # -------------------------------------------------------------- watchers
     async def _watch_pair(self, market: MarketType, symbol: str) -> None:
         key = (market.value, symbol)
-        exchange = self._exchange(market)
         try:
+            exchange = self._exchange(market)
             await asyncio.gather(
                 self._watch_ticker(exchange, key, symbol),
                 self._watch_book(exchange, key, symbol),
