@@ -46,8 +46,9 @@ from ..exchange.rest import (
     ticker_bid_ask,
 )
 from ..logging_setup import error_buffer
-from .routes import build_router
+from .routes import build_router, resolve_order_leverage
 from .routes_deploy import build_deploy_router
+from .routes_update import build_update_router
 from .routes_lab import build_lab_router
 from .routes_strategy import build_strategy_router
 from .stream import StreamHub
@@ -252,6 +253,10 @@ class OrderPayload(BaseModel):
     size_mode: str = "amount"
     size: float
     price: float | None = None
+    # 这一张单用几倍杠杆。不填就取设置里按市场记住的那个值
+    # （trade.leverage[市场]）；合约超过 risk.max_leverage 按上限下单并在响应里说明。
+    # 现货恒 1 倍，传了也忽略。
+    leverage: float | None = None
     # Protective exits for a new entry (absolute prices). Omit to trade bare.
     stop_loss: float | None = None
     take_profit: float | None = None
@@ -267,6 +272,8 @@ class PreviewPayload(BaseModel):
     size_mode: str = "amount"
     size: float
     price: float | None = None
+    # 口径与下单一致：不填取设置值，超上限按上限报，现货恒 1。
+    leverage: float | None = None
 
 
 class ConditionalPayload(BaseModel):
@@ -746,6 +753,7 @@ def create_app() -> FastAPI:
     async def _config_error(_request: Request, exc: ConfigError) -> JSONResponse:
         """配置文件写不进去时给 409：这是用户的文件出了问题，不是服务端崩了。"""
         return JSONResponse(status_code=409, content={"detail": str(exc)})
+
     app.include_router(build_router(get_state))
     # Candidate review and multi-round parameter reflection.
     app.include_router(build_lab_router(get_state))
@@ -753,7 +761,8 @@ def create_app() -> FastAPI:
     app.include_router(build_strategy_router(get_state))
     # 域名与 HTTPS（Linux 服务器上的 Caddy）；非 Linux 一律 501。
     app.include_router(build_deploy_router())
-
+    # 在线更新：检查 / 一键更新 / 进度 / 回滚（重启由 updater 自己安排）。
+    app.include_router(build_update_router())
     if STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     if FONT_DIR.is_dir():
@@ -1027,6 +1036,10 @@ def create_app() -> FastAPI:
         mt = _market(payload.market)
         # 形状校验放在取价与风控之前：写错的符号不该花掉一次交易所请求。
         payload.symbol = _check_symbol_shape(mt, payload.symbol)
+        # 杠杆同一口径：界面要在预览里就报出「实际会按几倍下」，不能等到成交。
+        leverage, leverage_note = resolve_order_leverage(
+            state.ctx.settings, mt, payload.leverage
+        )
         reference = payload.price if payload.order_type == "limit" else None
         if reference is None:
             # A preview is an estimate for the ticket; quoting it from the
@@ -1073,6 +1086,8 @@ def create_app() -> FastAPI:
             "slippage_bps": SLIPPAGE_BPS,
             "min_amount": min_amount,
             "min_notional": min_notional,
+            "leverage": leverage,
+            "leverage_note": leverage_note,
         }
 
         try:
@@ -1106,6 +1121,7 @@ def create_app() -> FastAPI:
                 reduce_only=_is_reducing(
                     state, mt, payload.symbol, payload.side, base_qty
                 ),
+                leverage=leverage,
                 market_type=mt,
             )
         )
@@ -1147,6 +1163,11 @@ def create_app() -> FastAPI:
         mt = _market(payload.market)
         # 形状校验同样在取价、凭据、风控之前：写错的符号连一次签名请求都不该花。
         payload.symbol = _check_symbol_shape(mt, payload.symbol)
+        # 杠杆也在这里定下来：请求体没带就取设置里记住的值，合约超上限按上限下，
+        # 被收口的那句话随响应一起回去（别静默改数）。
+        leverage, leverage_note = resolve_order_leverage(
+            state.ctx.settings, mt, payload.leverage
+        )
 
         # Every order is real now, so the gates are always on: the account must
         # be able to sign, and on mainnet the caller must acknowledge that this
@@ -1224,6 +1245,7 @@ def create_app() -> FastAPI:
             reduce_only=_is_reducing(
                 state, mt, payload.symbol, payload.side, amount
             ),
+            leverage=leverage,
             market_type=mt,
         )
         if payload.stop_loss or payload.take_profit:
@@ -1271,6 +1293,8 @@ def create_app() -> FastAPI:
             "amount_exchange": result.amount_exchange,
             "network": state.ctx.network.value,
             "adjusted": adjusted,
+            "leverage": leverage,
+            "leverage_note": leverage_note,
             "protection": result.protection,
             "warnings": result.warnings,
         }

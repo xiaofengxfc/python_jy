@@ -131,6 +131,56 @@ class ExecSettings:
     poll_seconds: float = 10.0
 
 
+# 手动下单只给合约记住杠杆。现货恒 1 倍，存一个 "spot" 键等于在界面上造一个假
+# 的杠杆开关。币安两种合约的杠杆上限都是 125x。
+TRADE_LEVERAGE_MARKETS = ("usdm", "coinm")
+TRADE_LEVERAGE_MAX = 125
+
+
+@dataclass
+class TradeSettings:
+    """手动下单框按市场记住的杠杆（只存合约市场，默认各 1 倍）。
+
+    这是「下次打开还按上次那样填」，不是风控：真正的上限仍归
+    ``RiskSettings.max_leverage``——下单时取两者较小值，被收口会在响应里说明，
+    见 ``routes.resolve_order_leverage``。默认全是 1，和没有这一层时逐位一样。
+    """
+
+    leverage: dict[str, int] = field(
+        default_factory=lambda: {name: 1 for name in TRADE_LEVERAGE_MARKETS}
+    )
+
+
+def clean_trade_leverage(values: Any) -> dict[str, int]:
+    """读盘用：只留合约市场的整数杠杆，写坏的那一项退回 1。
+
+    手改 config.json 写进 0、999、"abc"、把 "spot" 也塞进来，都只丢那一项，
+    整份配置照样打得开——和 ``clean_symbol_list`` 同一条理由。PUT 那边要 400
+    给用户看，走的是它自己的校验（``routes._apply_trade``）。
+    """
+    out = {name: 1 for name in TRADE_LEVERAGE_MARKETS}
+    if not isinstance(values, dict):
+        if values not in (None, {}, []):
+            log.warning("配置里的 trade.leverage 不是对象（%r），按默认值处理", values)
+        return out
+    for key, value in values.items():
+        name = str(key or "").strip().lower()
+        if name not in TRADE_LEVERAGE_MARKETS:
+            log.warning("配置里的 trade.leverage.%s 不是合约市场，已忽略", key)
+            continue
+        number = None if isinstance(value, bool) else _as_float(value)
+        if number is None or number != round(number) or not 1 <= number <= TRADE_LEVERAGE_MAX:
+            log.warning(
+                "配置里的 trade.leverage.%s 不是 1-%d 的整数（%r），按 1x 处理",
+                name,
+                TRADE_LEVERAGE_MAX,
+                value,
+            )
+            continue
+        out[name] = int(round(number))
+    return out
+
+
 # 收藏与最近使用最多记这么多对：再多界面上也没人翻，config.json 却会一直涨。
 SYMBOL_LIST_LIMIT = 100
 
@@ -177,6 +227,8 @@ class AppSettings:
     ai_auto: AIAutoSettings = field(default_factory=AIAutoSettings)
     # 执行台最后用过的那一组参数（仓位比例 / 杠杆 / 轮询间隔）。
     exec: ExecSettings = field(default_factory=ExecSettings)
+    # 手动下单按市场记住的杠杆（只有合约市场）。风控上限仍在 risk.max_leverage。
+    trade: TradeSettings = field(default_factory=TradeSettings)
     # 交易对收藏与最近用过的（最近的在前）。未知交易对也照原样留着：换个市场
     # 之后它可能暂时不在列表里，删掉用户的选择比留一个空行更糟。
     favorites: list[str] = field(default_factory=list)
@@ -221,6 +273,7 @@ class ConfigStore:
             "ai": raw.pop("ai", {}),
             "ai_auto": raw.pop("ai_auto", {}),
             "exec": raw.pop("exec", {}),
+            "trade": raw.pop("trade", {}),
         }
         for name, block in blocks.items():
             if block and not isinstance(block, dict):
@@ -231,6 +284,7 @@ class ConfigStore:
         ai_raw = blocks["ai"] or {}
         ai_auto_raw = blocks["ai_auto"] or {}
         exec_raw = blocks["exec"] or {}
+        trade_raw = blocks["trade"] or {}
         # A settings file written by an older build may still carry a sidecar
         # block; it is dropped here so the field list stays authoritative.
         raw.pop("freqtrade", None)
@@ -250,6 +304,10 @@ class ConfigStore:
             **_coerce_block("ai_auto", AIAutoSettings, ai_auto_raw)
         )
         settings.exec = ExecSettings(**_coerce_block("exec", ExecSettings, exec_raw))
+        # trade 段只认合约市场的整数杠杆，写坏的退回 1（不整段丢掉）。
+        settings.trade = TradeSettings(
+            leverage=clean_trade_leverage(trade_raw.get("leverage"))
+        )
         settings.favorites = clean_symbol_list(settings.favorites)
         settings.recent_symbols = clean_symbol_list(settings.recent_symbols)
         return settings

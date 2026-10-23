@@ -27,10 +27,13 @@ import pandas as pd
 from ..backtest import BacktestConfig, grid_search, run_backtest
 from ..core.config import (
     SYMBOL_LIST_LIMIT,
+    TRADE_LEVERAGE_MAX,
+    TRADE_LEVERAGE_MARKETS,
     AIAutoSettings,
     AppSettings,
     ExecSettings,
     RiskSettings,
+    TradeSettings,
     clean_symbol_list,
 )
 from ..core.credentials import Credentials
@@ -261,6 +264,8 @@ class SettingsPayload(BaseModel):
     ai_auto: dict[str, Any] | None = None
     # 执行台那三项：仓位比例 / 杠杆 / 轮询间隔。
     exec: dict[str, Any] | None = None
+    # 手动下单按市场记住的杠杆：{"leverage": {"usdm": 10}}，只认合约市场。
+    trade: dict[str, Any] | None = None
     # 交易对收藏与最近用过的一串（最近的在前）。
     favorites: list[str] | None = None
     recent_symbols: list[str] | None = None
@@ -971,11 +976,26 @@ class AITraderController:
         }
 
 
+# 「一键更新」要问一句「现在有没有引擎在跑」。控制器是在 build_router 里建的，
+# 路由之间没有共享对象，所以这里留一张进程级探针表，由 build_router 填一次。
+RUNNING_ENGINE_PROBES: dict[str, Callable[[], bool]] = {}
+
 def build_router(get_state: Callable[[], Any]) -> APIRouter:
     router = APIRouter()
     auto = AutoController()
     ai_ctl = AITraderController()
     jobs = JobStore()
+
+    # 更新接口要的就是这两个答案：自动交易（含执行台部署）/ AI 交易（含 AI 量化）。
+    RUNNING_ENGINE_PROBES.clear()
+    RUNNING_ENGINE_PROBES.update(
+        {
+            "自动交易 / 执行台": lambda: auto.running,
+            "AI 交易 / AI 量化": lambda: bool(
+                ai_ctl.trader is not None and ai_ctl.trader.state in ("running", "paused")
+            ),
+        }
+    )
 
     # ------------------------------------------------------------ portfolio
     @router.get("/api/portfolio")
@@ -1764,6 +1784,8 @@ def apply_settings(ctx: Any, payload: "SettingsPayload") -> list[str]:
     ai_draft = replace(settings.ai)
     ai_auto_draft = replace(settings.ai_auto)
     exec_draft = replace(settings.exec)
+    # leverage 是 dict：replace() 是浅拷贝，直接用会改到线上那一份。
+    trade_draft = replace(settings.trade, leverage=dict(settings.trade.leverage))
     favorites_draft = list(settings.favorites)
     recent_draft = list(settings.recent_symbols)
     if payload.risk is not None:
@@ -1776,6 +1798,8 @@ def apply_settings(ctx: Any, payload: "SettingsPayload") -> list[str]:
         _apply_ai_auto(ai_auto_draft, payload.ai_auto)
     if payload.exec is not None:
         _apply_exec(exec_draft, payload.exec)
+    if payload.trade is not None:
+        _apply_trade(trade_draft, payload.trade)
     if payload.favorites is not None:
         favorites_draft = _clean_symbol_payload(payload.favorites, "favorites")
     if payload.recent_symbols is not None:
@@ -1822,6 +1846,7 @@ def apply_settings(ctx: Any, payload: "SettingsPayload") -> list[str]:
             ("ai", ai_draft, payload.ai is not None),
             ("ai_auto", ai_auto_draft, payload.ai_auto is not None),
             ("exec", exec_draft, payload.exec is not None),
+            ("trade", trade_draft, payload.trade is not None),
         ):
             if not provided:
                 continue
@@ -1860,6 +1885,7 @@ def apply_settings(ctx: Any, payload: "SettingsPayload") -> list[str]:
             "ai",
             "ai_auto",
             "exec",
+            "trade",
             "favorites",
             "recent_symbols",
         ):
@@ -1969,6 +1995,116 @@ def _apply_exec(target: ExecSettings, values: dict[str, Any]) -> None:
         raise HTTPException(status_code=400, detail="执行台的轮询间隔至少 1 秒。")
     _guard_finite("exec", target)
 
+
+def _apply_trade(target: Any, values: dict[str, Any]) -> None:
+    """trade 段：只有 ``leverage`` 一项，按市场合并。
+
+    只发一个市场时另一个市场不动（``{"usdm": 10}`` 不该把 coinm 写回 1）。
+    现货恒 1 倍，收一个 "spot" 键直接拒：存下来只会在界面上显示一个假的杠杆。
+    交易所只认整数杠杆（浮点会让币安回 -1102），所以 1.5 也当场拒，不四舍五入。
+    """
+    for key, value in values.items():
+        if key != "leverage":
+            log.debug("忽略未知 trade 字段: %s", key)
+            continue
+        if not isinstance(value, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "trade.leverage 要写成这样的对象：{\"usdm\": 10}，每个市场一项。"
+                ),
+            )
+        for market, number in value.items():
+            name = str(market or "").strip().lower()
+            if name == MarketType.SPOT.value:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"trade.leverage.{name} 写不了：现货没有杠杆，恒 1 倍。"
+                        "这一项只能放 usdm（U 本位合约）或 coinm（币本位合约）。"
+                    ),
+                )
+            if name not in TRADE_LEVERAGE_MARKETS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"trade.leverage 里不认识市场「{market}」："
+                        "只能写 usdm（U 本位合约）或 coinm（币本位合约）。"
+                    ),
+                )
+            # 和其他数字字段同一套：nan / inf / "nan" / true / null 都在这儿 400。
+            _check_number_input("trade", f"leverage.{name}", number)
+            amount = float(number)
+            if abs(amount - round(amount)) > 1e-9:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"trade.leverage.{name} 要是整数倍：{amount:g}x 下不了单，"
+                        "交易所只认整数杠杆。"
+                    ),
+                )
+            leverage = int(round(amount))
+            if not 1 <= leverage <= TRADE_LEVERAGE_MAX:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"trade.leverage.{name} 必须在 1–{TRADE_LEVERAGE_MAX} 之间："
+                        f"现在是 {leverage}x。"
+                    ),
+                )
+            target.leverage[name] = leverage
+
+
+def resolve_order_leverage(
+    settings: Any, market: MarketType, requested: float | None
+) -> tuple[float, str]:
+    """这一张单实际用几倍杠杆，外加一句「为什么不是你要的那个数」。
+
+    规则只有三条：
+
+    * 现货恒 1 倍，传 10 也按 1（现货根本没有杠杆，照传等于假装支持）；
+    * 合约取 ``min(请求值, risk.max_leverage)``——上限归风控卡，设置里的
+      ``trade.leverage`` 只是「上次填的那个数」；
+    * 请求体没带 leverage 就用 ``trade.leverage[市场]``，这正是「记住上次用的值」
+      生效的地方：以前 ``POST /api/orders`` 的 payload 压根没有这个字段，面板上
+      填 10 倍，交易所始终按账户默认杠杆开仓。
+
+    被收口时**必须**说明：静默把 20x 改成 5x，用户看到的和实际下单的不是一回事。
+    返回的第二项就是那句话，没改动时是空字符串。
+    """
+    if requested is not None:
+        _check_number_input("order", "leverage", requested)
+    if not market.is_futures:
+        if requested is not None and float(requested) != 1.0:
+            return 1.0, f"现货没有杠杆，按 1 倍下单（收到的是 {float(requested):g}x）。"
+        return 1.0, ""
+    saved = settings.trade.leverage.get(market.value, 1)
+    wanted = float(saved) if requested is None else float(requested)
+    cap = float(getattr(settings.risk, "max_leverage", 0.0) or 0.0)
+    limit = float(TRADE_LEVERAGE_MAX)
+    if cap >= 1:
+        limit = min(limit, cap)
+    if abs(wanted - round(wanted)) > 1e-9:
+        raise HTTPException(
+            status_code=400,
+            detail=f"合约杠杆只能是整数：现在是 {wanted:g}x。",
+        )
+    if wanted < 1:
+        raise HTTPException(status_code=400, detail="合约杠杆至少 1x。")
+    if wanted <= limit:
+        return wanted, ""
+    capped = int(round(limit))
+    if cap >= 1 and limit == cap:
+        note = (
+            f"杠杆按风控上限收口：请求 {wanted:g}x，risk.max_leverage 上限 {cap:g}x，"
+            f"这次按 {capped}x 下单。"
+        )
+    else:
+        note = (
+            f"杠杆按交易所上限收口：请求 {wanted:g}x，最多 {capped}x，"
+            f"这次按 {capped}x 下单。"
+        )
+    return float(capped), note
 
 def _clean_symbol_payload(values: Any, name: str) -> list[str]:
     """收藏 / 最近使用的一串交易对：去重、保序、判写法、卡上限。
@@ -2132,7 +2268,16 @@ def _apply_ai_auto(target: AIAutoSettings, values: dict[str, Any]) -> None:
 
 # 「恢复默认」认识这几段。网络、市场、主题、周期这些顶层设置不在里面：点一次
 # 「恢复默认运行配置」把用户切好的市场一起换掉，比把参数留着更糟。
-RESETTABLE_SECTIONS = ("risk", "notify", "ai", "ai_auto", "exec", "favorites", "recent_symbols")
+RESETTABLE_SECTIONS = (
+    "risk",
+    "notify",
+    "ai",
+    "ai_auto",
+    "exec",
+    "trade",
+    "favorites",
+    "recent_symbols",
+)
 
 
 def reset_settings(ctx: Any, section: str) -> dict[str, Any]:
@@ -2151,7 +2296,7 @@ def reset_settings(ctx: Any, section: str) -> dict[str, Any]:
             status_code=400,
             detail=(
                 f"未知的设置段落：{section}。"
-                "可选：ai_auto、exec、favorites、recent_symbols、risk、notify、ai，或 all。"
+                "可选：ai_auto、exec、trade、favorites、recent_symbols、risk、notify、ai，或 all。"
             ),
         )
     settings = ctx.settings
@@ -2160,7 +2305,13 @@ def reset_settings(ctx: Any, section: str) -> dict[str, Any]:
     try:
         for target in names:
             value = getattr(defaults, target)
-            setattr(settings, target, list(value) if isinstance(value, list) else value)
+            if isinstance(value, list):
+                setattr(settings, target, list(value))
+            elif isinstance(value, TradeSettings):
+                # dict 字段要拷一份：直接放进去会跟 defaults 共用同一个 dict。
+                setattr(settings, target, replace(value, leverage=dict(value.leverage)))
+            else:
+                setattr(settings, target, value)
         ctx.save_settings()
     except Exception:
         for target in names:
