@@ -19,8 +19,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -46,7 +48,7 @@ GITHUB_TIMEOUT = 10.0
 USER_AGENT = "biTrader-updater"
 
 SERVICE_NAME = "bitrader"
-WEB_PORT = 8765
+WEB_PORT = 8765  # 拿不到真实端口时的兜底
 WEB_HOST = "127.0.0.1"
 
 GIT_TIMEOUT = 60.0
@@ -54,6 +56,10 @@ FETCH_TIMEOUT = 120.0
 PIP_TIMEOUT = 900.0
 NPM_TIMEOUT = 900.0
 RESTART_TIMEOUT = 120.0
+# 重启要两头都确认：本进程先把端口放开，新进程再把端口接上。两段各有各的时限。
+RELEASE_TIMEOUT = 30.0
+LISTEN_TIMEOUT = 90.0
+LISTEN_POLL = 0.2
 
 STATE_NAME = "update-state.json"
 STATE_IDLE = "idle"
@@ -76,6 +82,42 @@ STEP_RESTART = "重启服务"
 LS_REMOTE_SOURCE = "ls-remote（只读到远端 SHA，没有提交标题）"
 
 WINDOWS_DETACHED = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+
+# 记下的起始提交得是这个样子才准拼进 git 命令（回滚用它）。
+SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+
+# 本进程实际在听的端口，由启动路径（web/__main__.build_server）交给 set_web_port。
+# 以前一律写死 8765：在 8799 上跑的实例，垫片盯的还是 8765，于是拉起来的 run_web.py
+# 直接 Errno 10048（端口被占）死掉，重启那一步「看起来成功、其实没起来」。
+_web_port: int | None = None
+
+
+def set_web_port(port: Any) -> None:
+    """启动路径告诉这里：我这个进程实际听的是哪个端口。"""
+    global _web_port
+    try:
+        value = int(port)
+    except (TypeError, ValueError):
+        return
+    if 0 < value < 65536:
+        _web_port = value
+
+
+def web_port() -> int:
+    """现在该盯着哪个端口。不知道就按 8765 兜底（状态里会写明是兜底值）。"""
+    return _web_port or WEB_PORT
+
+
+def web_port_known() -> bool:
+    """端口是不是从启动参数里拿到的。"""
+    return _web_port is not None
+
+
+def _port_note() -> str:
+    """用兜底值时得说一声，别让人以为它知道真实端口。"""
+    if web_port_known():
+        return ""
+    return f"（没拿到本进程的真实端口，按兜底值 {WEB_PORT} 算）"
 
 
 def now_iso() -> str:
@@ -358,6 +400,47 @@ def work_tree_state(repo=None) -> tuple[list[str], str]:
 def state_path() -> Path:
     return paths.data_dir() / STATE_NAME
 
+def is_commit_sha(value: Any) -> bool:
+    """看着像一个提交 SHA 才准往下走：回滚会把这段字符串拼进 git 命令。"""
+    return bool(SHA_RE.match(str(value or "").strip()))
+
+
+def _pid_alive(pid: Any) -> bool:
+    """那个进程还活着吗。
+
+    Windows 上绝不能用 os.kill(pid, 0) 试探：CPython 在 Windows 上把它实现成
+    TerminateProcess(handle, sig)——探一次就把人家杀了。所以那边走 OpenProcess。
+    """
+    try:
+        pid = int(pid or 0)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if os.name == "nt":
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
 
 def _default_state() -> dict[str, Any]:
     return {
@@ -371,6 +454,7 @@ def _default_state() -> dict[str, Any]:
         "started_at": "",
         "finished_at": "",
         "pid": 0,
+        "port": 0,
         "restart_pending": False,
     }
 
@@ -383,7 +467,9 @@ def write_state(state: dict[str, Any]) -> dict[str, Any]:
     except (TypeError, ValueError) as exc:
         log.warning("更新状态存不下去：%s", exc)
         return state
-    tmp = path.with_name(path.name + ".tmp")
+    # 临时文件名带 pid 和随机后缀：两个进程（或两个任务）同时写时，共用一个 .tmp
+    # 会一个把另一个还没写完的半个 JSON 换上去。
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
     try:
         tmp.write_text(payload, encoding="utf-8")
         os.replace(tmp, path)
@@ -392,31 +478,59 @@ def write_state(state: dict[str, Any]) -> dict[str, Any]:
     return state
 
 
-def _heal_after_restart(state: dict[str, Any]) -> dict[str, Any]:
-    """重启那一步跑完，本进程就没机会再写 done 了。新进程读到「重启中」时收尾。
+def _heal_state(state: dict[str, Any]) -> dict[str, Any]:
+    """把盘上那条 running 收个尾。两种结局，判据都只认「记下的那个 pid」。
 
-    判据是 pid 换了：同一个进程里读到的 running 就是还在跑，不许冒充完成。
+    * restart_pending 为真：重启那一步一定会把本进程带走，新进程读到这条时记下的
+      pid 已经不在了，就把这次更新收成 done 并补上「重启服务」这一步。
+    * restart_pending 为假：最后一步没跑完进程就没了（崩了、被杀了、断电），
+      收成 failed 并说清断在哪一步。不修这一条，那个任务在界面上永远转圈。
+
+    别人的进程读到这里时，记下的 pid 可能正是一个**还活着的**更新进程：那就一个字都
+    不许改。以前只比「不是我这个 pid」，于是任何别的进程读一次就把活任务收成 done，
+    还补上一条根本没发生过的「重启服务」。
     """
-    if state.get("state") != STATE_RUNNING or not state.get("restart_pending"):
+    if state.get("state") != STATE_RUNNING:
         return state
-    if int(state.get("pid") or 0) == os.getpid():
-        return state
+    owner = int(state.get("pid") or 0)
+    if owner == os.getpid():
+        return state  # 本进程正在跑这一个任务
+    if _pid_alive(owner):
+        return state  # 另一个还活着的进程在跑，不替它做决定
     steps = list(state.get("steps") or [])
-    steps.append(
-        {
-            "name": STEP_RESTART,
-            "ok": True,
-            "output": f"服务已重启，新进程（pid {os.getpid()}）读到这一步。",
-            "seconds": 0.0,
+    if state.get("restart_pending"):
+        steps.append(
+            {
+                "name": STEP_RESTART,
+                "ok": True,
+                "output": (
+                    f"服务已重启：pid {owner} 已经退出，新进程（pid {os.getpid()}）读到这一步。"
+                ),
+                "seconds": 0.0,
+            }
+        )
+        state = {
+            **state,
+            "steps": steps,
+            "state": STATE_DONE,
+            "restart_pending": False,
+            "finished_at": state.get("finished_at") or now_iso(),
         }
-    )
-    state = {
-        **state,
-        "steps": steps,
-        "state": STATE_DONE,
-        "restart_pending": False,
-        "finished_at": state.get("finished_at") or now_iso(),
-    }
+    else:
+        last = ""
+        if steps and isinstance(steps[-1], dict):
+            last = str(steps[-1].get("name") or "")
+        state = {
+            **state,
+            "state": STATE_FAILED,
+            "restart_pending": False,
+            "error": (
+                f"上次更新没跑完就断了（pid {owner} 已经不在了"
+                + (f"，断在「{last}」这一步" if last else "，一步都还没记下来")
+                + "）。盘上留下的是断之前的那些步骤，进程里的日志已经没了。"
+            ),
+            "finished_at": state.get("finished_at") or now_iso(),
+        }
     write_state(state)
     return state
 
@@ -438,7 +552,7 @@ def read_state() -> dict[str, Any]:
                 state[key] = raw[key]
     if not isinstance(state["steps"], list):
         state["steps"] = []
-    return _heal_after_restart(state)
+    return _heal_state(state)
 
 
 # ------------------------------------------------------------------ 跑任务
@@ -537,6 +651,11 @@ def _build_step(root: Path, state: dict[str, Any]) -> tuple[bool, str]:
 
 def _restart_step(state: dict[str, Any]) -> tuple[bool, str]:
     """重启前先落盘：进程随时会没，状态文件是重启之后唯一的记忆。"""
+    # 这一整步跑在非 daemon 的更新线程里（见 _spawn）：请求了优雅退出之后，
+    # 还要靠它把「新进程到底起没起来」等到答案，再把失败写进状态。
+    state["port"] = web_port()
+    if not web_port_known():
+        log.warning("没拿到本进程的真实端口，重启按兜底值 %s 处理", WEB_PORT)
     state["restart_pending"] = True
     write_state(state)
     ok, output = restart_service()
@@ -572,6 +691,8 @@ def _run_job(state: dict[str, Any], kind: str, info: dict[str, Any]) -> None:
             def revert() -> tuple[bool, str]:
                 if not target:
                     return False, "没有可回滚的目标提交。"
+                if not is_commit_sha(target):
+                    return False, f"记下的起始提交「{target}」不像一个提交 SHA，不拿它拼 git 命令。"
                 if _git_out(root, "rev-parse", "HEAD") == target:
                     return True, f"已经在 {target[:7]} 上，这次不用回滚。"
                 # 不改写历史：反向提交把内容退回目标提交，命令里没有 reset / force。
@@ -615,28 +736,63 @@ def _run_job(state: dict[str, Any], kind: str, info: dict[str, Any]) -> None:
         write_state(state)
 
 
+# 一次只跑一个更新任务：两道 start_job 撞在一起时，第二个在这儿排队而不是一起跑。
+JOB_LOCK = threading.Lock()
+
+
 def _spawn(fn: Callable[[], None]) -> None:
-    """后台线程跑流水线，接口立刻返回 job_id。测试把它换成就地执行。"""
-    thread = threading.Thread(target=fn, name="update-job", daemon=True)
+    """后台线程跑流水线，接口立刻返回 job_id。测试把它换成就地执行。
+
+    刻意不是 daemon 线程：重启那一步要等「本进程放开端口」+「新进程绑上端口」两段确认
+    （最多 LISTEN_TIMEOUT 秒）。daemon 线程会在 uvicorn 主线程退出时被直接掐掉，于是
+    「到底起没起来」永远没人知道，状态又变成一句谎——那正是 F1 要修的东西。
+    代价是退出时得等这一轮更新跑完；每一步都有 timeout（git / pip / build / 重启都有），
+    不会无限挂着。
+    """
+    thread = threading.Thread(target=fn, name="update-job", daemon=False)
     thread.start()
 
 
+class JobBusy(RuntimeError):
+    """已经有一个更新在跑。接口把它翻成 409，别让它变成 500。"""
+
+
+def running_job() -> dict[str, Any] | None:
+    """现在是不是已经有一个更新在跑（正在重启的那个也算）。"""
+    state = read_state()
+    if state.get("state") != STATE_RUNNING:
+        return None
+    return state
+
+
 def start_job(kind: str, info: dict[str, Any] | None = None) -> str:
-    """建任务、落盘、开线程，返回 job_id。"""
-    state = _default_state()
-    state.update(
-        {
-            "job_id": uuid.uuid4().hex[:8],
-            "kind": kind,
-            "state": STATE_RUNNING,
-            "started_at": now_iso(),
-            "pid": os.getpid(),
-        }
-    )
-    write_state(state)
+    """建任务、落盘、开线程，返回 job_id。
+
+    一次只许一个任务：两条流水线同时跑会互相抢工作树（第二个的 fetch/merge 撞上第一个的
+    merge），而且会互相把对方从盘上抹掉——第二个 start_job 写完 running，第一个每写一步
+    就盖一次，界面上看是两个任务在两个 job_id 之间跳。闸放在锁里，接口那边先查一遍只是
+    为了给 409 一句人话。
+    """
+    with JOB_LOCK:
+        busy = running_job()
+        if busy is not None:
+            raise JobBusy(
+                f"上一个更新还在跑（任务 {busy.get('job_id') or '?'}，pid {busy.get('pid')}），"
+                "等它结束再来。"
+            )
+        state = _default_state()
+        state.update(
+            {
+                "job_id": uuid.uuid4().hex[:8],
+                "kind": kind,
+                "state": STATE_RUNNING,
+                "started_at": now_iso(),
+                "pid": os.getpid(),
+            }
+        )
+        write_state(state)
     _spawn(lambda: _run_job(state, kind, dict(info or {})))
     return str(state["job_id"])
-
 
 # ------------------------------------------------------------------ 重启
 SHUTDOWN_HOOK: Callable[[], None] | None = None
@@ -670,11 +826,20 @@ def _request_shutdown() -> None:
         log.warning("没能发出退出信号：%s", exc)
 
 
-# 等端口释放再拉起新进程的小垫片。只用标准库、不 import btrader，能被 -c 直接跑。
+# 等端口释放、拉起新进程的小垫片。只用标准库、不 import btrader，能被 -c 直接跑。
+#
+# 它自己不打开任何文件：日志由父进程开好、用每次唯一的文件名传进来当 stdout/stderr，
+# 往 stdout 说话就是往日志里说话。以前垫片自己 open(<仓库>/.run_out.log)，那个文件正被
+# 活着的进程写着（Windows 上锁成只读），open 抛 PermissionError → exit 1；父进程又把它的
+# stderr 指到 DEVNULL、也没人看退出码，于是「垫片死了」被当成「重启成功」，服务就这么停死了。
 _WINDOWS_SHIM = "\n".join(
     [
         "import socket, subprocess, sys, time",
         "port, repo, py = int(sys.argv[1]), sys.argv[2], sys.argv[3]",
+        "log_path = sys.argv[4]",
+        "def say(msg):",
+        "    print(time.strftime('%Y-%m-%d %H:%M:%S ') + msg, flush=True)",
+        "say('垫片起来，日志 ' + log_path + '，等 127.0.0.1:%d 放开端口' % port)",
         "deadline = time.time() + 90",
         "while time.time() < deadline:",
         "    probe = socket.socket()",
@@ -686,17 +851,72 @@ _WINDOWS_SHIM = "\n".join(
         "    if not busy:",
         "        break",
         "    time.sleep(0.2)",
-        "log = open(repo + '/.run_out.log', 'ab')",
-        "subprocess.Popen([py, 'run_web.py', '--host', '127.0.0.1', '--port', str(port)],",
-        "                 cwd=repo, stdin=subprocess.DEVNULL, stdout=log,",
-        "                 stderr=subprocess.STDOUT, close_fds=True, creationflags=0x00000008)",
+        "else:",
+        "    say('90 秒里端口一直没放开，放弃拉起新进程')",
+        "    sys.exit(2)",
+        "try:",
+        "    child = subprocess.Popen([py, 'run_web.py', '--host', '127.0.0.1', '--port', str(port)],",
+        "                             cwd=repo, stdin=subprocess.DEVNULL, stdout=sys.stdout,",
+        "                             stderr=subprocess.STDOUT, close_fds=True,",
+        "                             creationflags=0x00000008)",
+        "except OSError as exc:",
+        "    say('拉新进程失败：%r' % (exc,))",
+        "    sys.exit(3)",
+        "say('新进程 pid %s 已拉起（run_web.py --port %d）' % (child.pid, port))",
         "",
     ]
 )
 
 
+def _restart_log_path() -> Path:
+    """这一次重启自己的日志。绝不复用活进程正写着的那个文件（Windows 会把它锁成只读）。"""
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return paths.logs_dir() / f"restart-{stamp}-{uuid.uuid4().hex[:6]}.log"
+
+
+def _open_restart_log(path: Path):
+    """开这次的日志。开不出来就抛出去——以前这一步失败被垫片吞掉，然后整条重启报成功。"""
+    return open(path, "ab")
+
+
+def _port_free(port: int | None = None, host: str = WEB_HOST) -> bool:
+    """这个端口现在没人听？连得上就算有人在听。"""
+    port = web_port() if port is None else port
+    probe = socket.socket()
+    probe.settimeout(0.3)
+    try:
+        return probe.connect_ex((host, port)) != 0
+    finally:
+        probe.close()
+
+
+def _wait_until(
+    predicate: Callable[[], bool], timeout: float, poll: float = LISTEN_POLL
+) -> bool:
+    """等到 predicate 成真，或者超时。超时返回 False，不假装成功。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(poll)
+    return bool(predicate())
+
+
+def _manual_hint(root: Path) -> str:
+    """起不来的时候给用户照着敲的那一条。"""
+    prefix = f'cd /d "{root}" && ' if os.name == "nt" else f'cd "{root}" && '
+    exe = str(sys.executable)
+    if " " in exe:
+        exe = f'"{exe}"'
+    return f"{prefix}{exe} run_web.py --host {WEB_HOST} --port {web_port()}"
+
+
 def _restart_linux() -> tuple[bool, str]:
-    """Linux 上服务是 systemd 的 bitrader 单元；仓库里给它装了一条 NOPASSWD sudo。"""
+    """Linux 上服务是 systemd 的 bitrader 单元；仓库里给它装了一条 NOPASSWD sudo。
+
+    返回码非 0 就是失败：stdout / stderr 原样带走（systemctl 与 sudo 的报错都在里面），
+    不替它编原因。
+    """
     args = ["sudo", "-n", "systemctl", "restart", SERVICE_NAME]
     try:
         proc = subprocess.run(
@@ -716,27 +936,69 @@ def _restart_linux() -> tuple[bool, str]:
 
 
 def _restart_windows() -> tuple[bool, str]:
-    """Windows 上没有 systemd：起一个分离的垫片，等端口释放后拉起 run_web.py，
-    再让本进程优雅退出。垫片先等端口，是因为自己还没放手之前新进程绑不上。"""
+    """Windows 上没有 systemd：起一个分离的垫片，等端口释放后拉起 run_web.py。
+
+    三件事以前都缺，合起来就是「服务停死了还报成功」：日志写进了一个正被本进程写着的
+    文件（垫片 open 就 PermissionError）、垫片的 stderr 给了 DEVNULL（它死了没人知道）、
+    拉起之后没确认新进程真的在听就 return True 让老进程退出。现在：
+
+    1. 每次一个唯一日志文件，开不出来当场失败，什么都不动；
+    2. 垫片的 stdout / stderr 都指向那份日志，它说了什么都在里面；
+    3. 先等本进程放开端口，再等新进程绑上端口，两段都过才算重启成功。
+    """
     root = paths.project_root()
-    shim = [sys.executable, "-c", _WINDOWS_SHIM, str(WEB_PORT), str(root), sys.executable]
+    port = web_port()
+    log_path = _restart_log_path()
+    try:
+        handle = _open_restart_log(log_path)
+    except OSError as exc:
+        return False, (
+            f"重启没做成：这次的日志开不出来（{log_path}：{exc}）。"
+            "什么都没动，服务还在这个进程里跑着。"
+        )
+    shim = [
+        sys.executable,
+        "-c",
+        _WINDOWS_SHIM,
+        str(port),
+        str(root),
+        sys.executable,
+        str(log_path),
+    ]
     try:
         proc = subprocess.Popen(
             shim,
             cwd=str(root),
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
             creationflags=WINDOWS_DETACHED,
             close_fds=True,
         )
     except OSError as exc:
-        return False, f"拉新进程失败：{exc}"
+        handle.close()
+        return False, f"拉新进程失败：{exc}（日志 {log_path}）"
     pid = getattr(proc, "pid", "?")
+    try:
+        handle.close()  # 子进程手里有自己的那一份
+    except OSError:
+        pass
     _request_shutdown()
+    # 顺序不能反：本进程先放开端口，垫片才拉得起新进程，新进程才绑得上。
+    if not _wait_until(lambda: _port_free(port), RELEASE_TIMEOUT):
+        return False, (
+            f"重启没做成：等了 {RELEASE_TIMEOUT:.0f} 秒，{WEB_HOST}:{port} 还占在本进程手里，"
+            f"新进程没法绑上去（垫片 pid {pid} 一直在等）。日志 {log_path}{_port_note()}"
+        )
+    if not _wait_until(lambda: not _port_free(port), LISTEN_TIMEOUT):
+        return False, (
+            f"新进程没起来：{WEB_HOST}:{port} 放开之后 {LISTEN_TIMEOUT:.0f} 秒都没人接上"
+            f"{_port_note()}。垫片 pid {pid} 的日志在 {log_path}，新进程自己的输出也写在那儿。\n"
+            f"手动拉起：{_manual_hint(root)}"
+        )
     return True, (
-        f"已让垫片（pid {pid}）等 {WEB_HOST}:{WEB_PORT} 端口释放后拉起 run_web.py，"
-        "本进程随即优雅退出。"
+        f"服务已重新起来：{WEB_HOST}:{port} 有人在听（垫片 pid {pid}，日志 {log_path}）"
+        f"{_port_note()}。"
     )
 
 

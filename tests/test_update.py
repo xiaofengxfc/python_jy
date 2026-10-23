@@ -63,6 +63,8 @@ def _base_git(**overrides) -> _Git:
 def data_dir(monkeypatch, tmp_path):
     """状态文件写进临时目录，别碰真实数据目录。"""
     monkeypatch.setenv("BITRADER_DATA_DIR", str(tmp_path))
+    # 端口是模块级全局（启动路径会 set_web_port），别的测试文件可能设过它。
+    monkeypatch.setattr(updater, "_web_port", None)
     return tmp_path
 
 
@@ -359,7 +361,9 @@ def test_the_update_never_uses_force_reset_or_clean(monkeypatch):
 # ------------------------------------------------------------------ 状态与回滚
 
 def test_the_state_file_is_read_back_after_a_restart(monkeypatch):
-    monkeypatch.setattr("os.getpid", lambda: 999999)
+    # 收尾的判据是「记下的那个 pid 真的不在了」，光「不是我这个 pid」不算：
+    # 那是别人还活着的任务，任何进程读一次都不许把它收成 done。
+    monkeypatch.setattr(updater, "_pid_alive", lambda pid: False)
     updater.write_state(
         {
             "job_id": "abc12345",
@@ -489,6 +493,9 @@ def test_the_windows_restart_spawns_a_detached_process_then_exits_gracefully(mon
     monkeypatch.setattr(updater.sys, "platform", "win32")
     monkeypatch.setattr(updater.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(updater, "_request_shutdown", lambda *a, **k: shut.append("asked"))
+    # 端口两段确认（自己放开 → 新进程接上）在测试里直接算过：这里只验装配，
+    # 真等待的行为在 tests/test_update_hardening.py 里钉着。
+    monkeypatch.setattr(updater, "_wait_until", lambda fn, timeout, poll=0.0: True)
     ok, output = updater.restart_service()
     assert ok is True
     assert len(spawned) == 1
@@ -499,7 +506,8 @@ def test_the_windows_restart_spawns_a_detached_process_then_exits_gracefully(mon
     assert kwargs.get("shell") in (None, False)
     assert kwargs.get("creationflags")
     assert shut == ["asked"]
-    assert "8765" in output or "重启" in output
+    assert f"{updater.WEB_HOST}:" in output  # 报的是「哪个端口有人在听」
+    assert "日志" in output  # 出问题时有地方可查
 
 
 def test_the_shutdown_hook_is_preferred_over_a_signal(monkeypatch):

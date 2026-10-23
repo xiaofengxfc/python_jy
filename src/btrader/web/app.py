@@ -256,7 +256,7 @@ class OrderPayload(BaseModel):
     # 这一张单用几倍杠杆。不填就取设置里按市场记住的那个值
     # （trade.leverage[市场]）；合约超过 risk.max_leverage 按上限下单并在响应里说明。
     # 现货恒 1 倍，传了也忽略。
-    leverage: float | None = None
+    leverage: Any = None
     # Protective exits for a new entry (absolute prices). Omit to trade bare.
     stop_loss: float | None = None
     take_profit: float | None = None
@@ -273,7 +273,7 @@ class PreviewPayload(BaseModel):
     size: float
     price: float | None = None
     # 口径与下单一致：不填取设置值，超上限按上限报，现货恒 1。
-    leverage: float | None = None
+    leverage: Any = None
 
 
 class ConditionalPayload(BaseModel):

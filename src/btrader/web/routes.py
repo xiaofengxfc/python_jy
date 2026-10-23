@@ -2073,7 +2073,24 @@ def resolve_order_leverage(
     返回的第二项就是那句话，没改动时是空字符串。
     """
     if requested is not None:
+        # 布尔值先单独拦：pydantic 的 float 字段会把 true 悄悄变成 1.0，于是
+        # 「杠杆：是」这种写法按 1 倍静默放行。1.0 和 true 在盘面上不是一回事。
+        if isinstance(requested, bool):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"leverage 要的是倍数，不是开关：收到的是 {requested!r}"
+                    "（true / false 都不是倍数；现货恒 1，合约写 1 到 125 的整数）。"
+                ),
+            )
         _check_number_input("order", "leverage", requested)
+        try:
+            requested = float(requested)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail=f"leverage 要的是倍数，收到的是 {requested!r}",
+            ) from None
     if not market.is_futures:
         if requested is not None and float(requested) != 1.0:
             return 1.0, f"现货没有杠杆，按 1 倍下单（收到的是 {float(requested):g}x）。"

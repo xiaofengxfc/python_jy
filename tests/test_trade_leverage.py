@@ -306,6 +306,40 @@ def test_a_spot_order_takes_one_whatever_is_sent(tmp_path, monkeypatch):
     assert venue.fills, "单子本身要照常发出去"
 
 
+def test_a_boolean_leverage_is_refused_instead_of_becoming_one(tmp_path, monkeypatch):
+    """leverage: true 以前被 pydantic 变成 1.0 静默放行：true / false 都不是倍数。"""
+    venue, app = _served(tmp_path, monkeypatch, saved={"usdm": 3})
+    place = _endpoint(app, "/api/orders", "POST")
+
+    for value in (True, False):
+        with pytest.raises(HTTPException) as caught:
+            place(
+                OrderPayload(
+                    market="usdm", symbol=USDM, side="buy", order_type="market",
+                    size=0.002, leverage=value,
+                )
+            )
+        assert caught.value.status_code == 400
+        assert "倍数" in str(caught.value.detail), caught.value.detail
+    assert venue.fills == [], "被拒的请求不该发到交易所"
+    assert venue.leverage_calls == []
+
+
+def test_a_boolean_leverage_is_refused_on_the_preview_too(tmp_path, monkeypatch):
+    venue, app = _served(tmp_path, monkeypatch)
+    preview = _endpoint(app, "/api/orders/preview", "POST")
+
+    with pytest.raises(HTTPException) as caught:
+        preview(
+            PreviewPayload(
+                market="usdm", symbol=USDM, side="buy", order_type="limit",
+                size=0.002, price=80_000.0, leverage=True,
+            )
+        )
+    assert caught.value.status_code == 400
+    assert "倍数" in str(caught.value.detail)
+
+
 def test_a_preview_uses_the_saved_value_when_the_body_has_none(tmp_path, monkeypatch):
     """预览也要按同一套口径报倍数，界面上那行提示才不是假的。"""
     venue, app = _served(tmp_path, monkeypatch, saved={"usdm": 7})

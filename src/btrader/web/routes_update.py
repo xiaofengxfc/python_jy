@@ -40,6 +40,25 @@ def running_engines() -> list[str]:
     return busy
 
 
+def _busy_refusal() -> None:
+    """已经有一个更新在跑？两个 POST 都先过这一道。
+
+    git 工作树只有一份，两条流水线同时跑会互相踩；而且第二个任务会把第一个的
+    job_id 与步骤从盘上抹掉，界面上看是两个任务在两个 job_id 之间跳。
+    """
+    busy = updater.running_job()
+    if busy is None:
+        return
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"上一个更新还在跑（任务 {busy.get('job_id') or '?'}，pid {busy.get('pid')}，"
+            f"状态 {busy.get('state')}）：等它跑完再来——两条流水线同时动同一个工作树，"
+            "会互相把对方的提交和状态搅乱。"
+        ),
+    )
+
+
 def build_update_router() -> APIRouter:
     router = APIRouter()
 
@@ -51,6 +70,7 @@ def build_update_router() -> APIRouter:
     @router.post("/api/update/apply")
     def update_apply() -> dict[str, Any]:
         """一键更新。前置检查全过才建任务。"""
+        _busy_refusal()
         busy = running_engines()
         if busy:
             raise HTTPException(
@@ -76,7 +96,12 @@ def build_update_router() -> APIRouter:
         refused = updater.refusal(info)
         if refused is not None:
             raise HTTPException(status_code=refused[0], detail=refused[1])
-        return {"job_id": updater.start_job(updater.KIND_APPLY, info)}
+        try:
+            job_id = updater.start_job(updater.KIND_APPLY, info)
+        except updater.JobBusy as exc:
+            # 上面那道闸和这里之间还有窗口：锁里再判一次，谁先拿到锁谁跑。
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+        return {"job_id": job_id}
 
     @router.get("/api/update/status")
     def update_status(job_id: str = "") -> dict[str, Any]:
@@ -89,6 +114,7 @@ def build_update_router() -> APIRouter:
     @router.post("/api/update/rollback")
     def update_rollback(payload: RollbackPayload) -> dict[str, Any]:
         """回到上次更新之前的那个提交。只允许在 done 之后调用。"""
+        _busy_refusal()
         if not payload.confirm:
             raise HTTPException(
                 status_code=400,
@@ -105,11 +131,26 @@ def build_update_router() -> APIRouter:
                     f"还没有一次成功的更新（现在是 {state.get('state')}），没有可回滚的东西。"
                 ),
             )
-        target = state.get("from_sha")
+        target = str(state.get("from_sha") or "")
         if not target:
             raise HTTPException(
                 status_code=400, detail="上次更新没有记下起始提交，回滚不了。"
             )
-        return {"job_id": updater.start_job(updater.KIND_ROLLBACK, {"target": target})}
+        # 这段字符串会被拼进 git revert 的参数里，先确认它就是一个提交 SHA：
+        # 不校验的话 --force、HEAD~5 或者别的什么都会被原样传下去。
+        if not updater.is_commit_sha(target):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"上次更新记下的起始提交「{target}」不像一个提交 SHA"
+                    "（7–40 位十六进制）。为了不把错东西拼进 git 命令，这次不许回滚；"
+                    "真要退回去，请手动 git log 找到那个提交再处理。"
+                ),
+            )
+        try:
+            job_id = updater.start_job(updater.KIND_ROLLBACK, {"target": target})
+        except updater.JobBusy as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
+        return {"job_id": job_id}
 
     return router
