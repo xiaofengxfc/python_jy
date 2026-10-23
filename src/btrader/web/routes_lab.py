@@ -215,13 +215,13 @@ class LabController:
             f"【参考源码】\n{base_source[:4000]}\n"
             f"【改进要求】{payload.instruction or '给出一个稳健、可解释的趋势或均值回归策略'}"
         )
+        # 不给输出上限：一个完整的策略模块 3-6k 字符，模型得写到自己停。以前这里
+        # 固定 8000（更早是 2400），长策略被截成坏 JSON，报出来的是「没有可解析的
+        # JSON」。省略 max_tokens 就是让模型自己决定长度。
         answer = ctx.ai.ask(
             prompt,
             system=_generate_system(sorted(taken)),
             kind="ai_lab",
-            # 写代码比问答长：一个完整的策略模块 3-6k 字符，走专门的额度常量，
-            # 让 JSON 一次写完整。改额度只动 llm 里那两个常量，别在这里写数字。
-            max_tokens=llm.OUTPUT_TOKENS_CODE,
         )
         text = str(answer.get("text") or "")
         if not answer.get("ok") and not text.strip():
@@ -242,7 +242,7 @@ class LabController:
                 raise HTTPException(
                     status_code=502,
                     detail=(
-                        f"模型输出被截断（上限 {llm.OUTPUT_TOKENS_CODE} tokens），"
+                        "模型输出被截断（模型自己的输出上限用完了），"
                         "把改进要求写短一点再试"
                     ),
                 ) from exc

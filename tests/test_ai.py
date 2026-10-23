@@ -502,7 +502,7 @@ def test_cache_returns_the_same_answer_without_a_second_call(tmp_path, monkeypat
 
     def fake_request(spec, settings, key, system, prompt, **kwargs):
         calls.append(prompt)
-        return "答案", 7, "stop"
+        return "答案", _usage(4, 3), "stop"
 
     monkeypatch.setattr(service, "_request", fake_request)
     first = service.ask("问题", cache_key="kline|BTC|1h|1")
@@ -532,7 +532,7 @@ def test_a_cached_answer_is_not_served_to_a_different_model(tmp_path, monkeypatc
 
     def fake_request(spec, settings, key, system, prompt, **kwargs):
         calls.append(settings.model)
-        return f"来自 {settings.model}", 5, "stop"
+        return f"来自 {settings.model}", _usage(3, 2), "stop"
 
     old_model = LLMService(AISettings(enabled=True, provider="deepseek"))
     monkeypatch.setattr(old_model, "_request", fake_request)
@@ -555,7 +555,7 @@ def test_audit_tail_records_every_call(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(llm, "load_key", lambda: "sk-test")
     llm.reset_cache()
     service = LLMService(AISettings(enabled=True))
-    monkeypatch.setattr(service, "_request", lambda *args, **kwargs: ("好的", 5, "stop"))
+    monkeypatch.setattr(service, "_request", lambda *args, **kwargs: ("好的", _usage(3, 2), "stop"))
     service.ask("问题", kind="test")
     tail = llm.audit_tail(10)
     assert len(tail) == 1
@@ -573,7 +573,7 @@ def test_an_unwritable_audit_dir_does_not_break_the_call(tmp_path, monkeypatch) 
     monkeypatch.setattr(llm, "load_key", lambda: "sk-test")
     llm.reset_cache()
     service = LLMService(AISettings(enabled=True))
-    monkeypatch.setattr(service, "_request", lambda *args, **kwargs: ("答案", 5, "stop"))
+    monkeypatch.setattr(service, "_request", lambda *args, **kwargs: ("答案", _usage(3, 2), "stop"))
 
     def unwritable():
         raise OSError("[Errno 13] Permission denied: logs")
@@ -607,7 +607,7 @@ def test_an_unwritable_cache_dir_does_not_break_the_call(tmp_path, monkeypatch) 
 
     def fake_request(spec, settings, key, system, prompt, **kwargs):
         calls.append(prompt)
-        return "答案", 5, "stop"
+        return "答案", _usage(3, 2), "stop"
 
     monkeypatch.setattr(service, "_request", fake_request)
 
@@ -757,6 +757,15 @@ def _header(request, name: str) -> str:
     return ""
 
 
+def _usage(prompt_tokens: int, completion_tokens: int) -> dict:
+    """``ask()`` 里用量那一栏的形状：输入、输出分开，total 是两者之和。"""
+    return {
+        "input": prompt_tokens,
+        "output": completion_tokens,
+        "total": prompt_tokens + completion_tokens,
+    }
+
+
 def _service(tmp_path, monkeypatch, provider: str) -> LLMService:
     """An enabled service whose key, cache and audit trail are all throwaway."""
     monkeypatch.setenv("BITRADER_DATA_DIR", str(tmp_path))
@@ -800,7 +809,7 @@ def test_openai_request_has_the_documented_url_headers_and_payload(
     assert payload["model"] == "gpt-4o-mini"
     assert payload["stream"] is False
     assert payload["temperature"] == pytest.approx(0.2)
-    assert payload["max_tokens"] == llm.OUTPUT_TOKENS
+    assert "max_tokens" not in payload
     assert payload["messages"][0] == {"role": "system", "content": "你是分析师"}
     assert payload["messages"][-1] == {"role": "user", "content": "问题"}
 
@@ -814,11 +823,10 @@ def test_ask_can_override_output_tokens_per_call(tmp_path, monkeypatch) -> None:
     service = _service(tmp_path, monkeypatch, "openai")
     seen = _capture_request(monkeypatch, _COMPLETIONS["openai"])
 
-    result = service.ask("写一个策略", max_tokens=llm.OUTPUT_TOKENS_CODE)
+    result = service.ask("写一个策略", max_tokens=8000)
 
     assert result["ok"] is True
     payload = json.loads(seen[0].data.decode("utf-8"))
-    assert payload["max_tokens"] == llm.OUTPUT_TOKENS_CODE
     assert payload["max_tokens"] == 8000
 
 def test_anthropic_request_uses_its_own_headers_and_a_system_field(
@@ -843,7 +851,7 @@ def test_anthropic_request_uses_its_own_headers_and_a_system_field(
     # Anthropic takes the system prompt as a top-level field, not a message.
     assert payload["system"] == "你是分析师"
     assert payload["messages"] == [{"role": "user", "content": "问题"}]
-    assert payload["max_tokens"] == llm.OUTPUT_TOKENS
+    assert payload["max_tokens"] == llm.FALLBACK_MAX_TOKENS
 
 
 def test_ollama_request_is_local_and_sends_no_credentials(tmp_path, monkeypatch) -> None:
@@ -865,7 +873,7 @@ def test_ollama_request_is_local_and_sends_no_credentials(tmp_path, monkeypatch)
     payload = json.loads(request.data.decode("utf-8"))
     assert payload["stream"] is False
     assert payload["options"]["temperature"] == pytest.approx(0.2)
-    assert payload["options"]["num_predict"] == llm.OUTPUT_TOKENS
+    assert "num_predict" not in payload["options"]
     assert payload["messages"][0] == {"role": "system", "content": "你是分析师"}
 
 
@@ -973,7 +981,7 @@ def test_a_truncated_reasoning_model_says_the_budget_ran_out(tmp_path, monkeypat
     assert result["truncated"] is True
     assert "截断" in result["error"]
     assert "输出上限" in result["error"]
-    assert f"{llm.OUTPUT_TOKENS} tokens" in result["error"]
+    assert "供应商自身设定的上限" in result["error"]
     assert "重试一次" in result["error"]
     assert "设置" not in result["error"]
 
@@ -1012,16 +1020,19 @@ def test_an_empty_answer_without_a_reason_keeps_the_plain_message(tmp_path, monk
 
 
 # ------------------------------------- truncation stays visible to the caller
-def test_the_code_budget_is_its_own_constant_within_every_provider_cap() -> None:
-    """写代码的额度是单独的常量，不是调用点上的数字。
+def test_the_output_ceiling_is_only_a_fallback_for_providers_that_require_it() -> None:
+    """上限不再是「我们替模型定一个额度」。
 
-    2400 比问答默认的 4000 还小，正是实验室生成被截断的原因。8192 是 DeepSeek
-    和 Claude 3.5 Haiku 的上限，8000 卡在它下面一点。
+    OpenAI 兼容那一路根本不发 max_tokens（省略 = 模型自己停）；ollama 的
+    num_predict 同理。只有 Anthropic 这种必填的供应商才要一个兜底值，它的值要
+    足够大，让模型自己写完；模型的真上限比它小时再降到退一档的值重试。
     """
-    assert llm.OUTPUT_TOKENS == 4000
-    assert llm.OUTPUT_TOKENS_CODE == 8000
-    assert llm.OUTPUT_TOKENS_CODE > llm.OUTPUT_TOKENS
-    assert llm.OUTPUT_TOKENS_CODE <= 8192
+    assert llm.FALLBACK_MAX_TOKENS == 32000
+    assert llm.FALLBACK_MAX_TOKENS_RETRY == 8192
+    assert llm.FALLBACK_MAX_TOKENS > llm.FALLBACK_MAX_TOKENS_RETRY
+    # 旧的「输出额度」常量必须消失：留着就会被别处当成真上限继续用。
+    assert not hasattr(llm, "OUTPUT_TOKENS")
+    assert not hasattr(llm, "OUTPUT_TOKENS_CODE")
 
 
 def test_ask_marks_a_truncated_answer_and_says_what_to_do(tmp_path, monkeypatch) -> None:
@@ -1044,7 +1055,7 @@ def test_ask_marks_a_truncated_answer_and_says_what_to_do(tmp_path, monkeypatch)
         },
     )
 
-    result = service.ask("写一个策略", max_tokens=llm.OUTPUT_TOKENS_CODE)
+    result = service.ask("写一个策略", max_tokens=8000)
 
     assert result["ok"] is False
     assert result["finish"] == "length"
@@ -1073,7 +1084,7 @@ def test_ask_flags_a_truncated_answer_that_still_has_some_text(tmp_path, monkeyp
         },
     )
 
-    result = service.ask("写一个策略", max_tokens=llm.OUTPUT_TOKENS_CODE)
+    result = service.ask("写一个策略", max_tokens=8000)
 
     assert result["ok"] is True
     assert result["finish"] == "length"
@@ -1109,7 +1120,7 @@ def test_truncation_is_read_from_each_provider_field(
     service = _service(tmp_path, monkeypatch, provider)
     _capture_request(monkeypatch, payload)
 
-    result = service.ask("问题", max_tokens=llm.OUTPUT_TOKENS_CODE)
+    result = service.ask("问题", max_tokens=8000)
 
     assert result["truncated"] is True
     assert "截断" in result["error"]
@@ -1132,7 +1143,7 @@ def test_anthropic_max_tokens_with_an_empty_answer_says_the_budget_ran_out(
         {"content": [{"type": "text", "text": ""}], "stop_reason": "max_tokens"},
     )
 
-    result = service.ask("写一个策略", max_tokens=llm.OUTPUT_TOKENS_CODE)
+    result = service.ask("写一个策略", max_tokens=8000)
 
     assert result["ok"] is False
     assert result["truncated"] is True
@@ -1149,7 +1160,7 @@ def test_anthropic_max_tokens_counts_as_truncation(tmp_path, monkeypatch) -> Non
         {"content": [{"type": "text", "text": "半截"}], "stop_reason": "max_tokens"},
     )
 
-    result = service.ask("写一个策略", max_tokens=llm.OUTPUT_TOKENS_CODE)
+    result = service.ask("写一个策略", max_tokens=8000)
 
     assert result["ok"] is True
     assert result["finish"] == "max_tokens"
@@ -1186,7 +1197,7 @@ def test_a_truncated_answer_is_not_cached(tmp_path, monkeypatch) -> None:
 
     def fake_request(spec, settings, key, system, prompt, **kwargs):
         calls.append(prompt)
-        return "半截", 9, "length"
+        return "半截", _usage(4, 5), "length"
 
     monkeypatch.setattr(service, "_request", fake_request)
     first = service.ask("写一个策略", cache_key="lab|1")
@@ -1196,3 +1207,130 @@ def test_a_truncated_answer_is_not_cached(tmp_path, monkeypatch) -> None:
     assert second["cached"] is False
     assert len(calls) == 2
     assert llm.cache().get("lab|1", 600) is None
+
+
+# ------------------------------------- 输出上限：能省就不发，供应商必填时才兜底
+def test_openai_payload_carries_no_max_tokens(tmp_path, monkeypatch) -> None:
+    """上限交给模型自己决定。以前固定 4000，长回答从中间断掉，界面上只剩半截分析。"""
+    service = _service(tmp_path, monkeypatch, "openai")
+    seen = _capture_request(monkeypatch, _COMPLETIONS["openai"])
+
+    assert service.ask("问题")["ok"] is True
+
+    payload = json.loads(seen[0].data.decode("utf-8"))
+    assert set(payload) == {"model", "messages", "temperature", "stream"}, sorted(payload)
+
+
+def test_ollama_payload_carries_no_num_predict(tmp_path, monkeypatch) -> None:
+    """本地模型同样支持省略：不写 num_predict，让它自己停。"""
+    service = _service(tmp_path, monkeypatch, "ollama")
+    seen = _capture_request(monkeypatch, _COMPLETIONS["ollama"])
+
+    assert service.ask("问题")["ok"] is True
+
+    payload = json.loads(seen[0].data.decode("utf-8"))
+    assert "num_predict" not in payload["options"]
+    assert set(payload["options"]) == {"temperature"}
+
+
+def test_anthropic_payload_uses_the_fallback_ceiling(tmp_path, monkeypatch) -> None:
+    """max_tokens 是 Anthropic 的必填字段：给够大的兜底值，不是 4000。"""
+    service = _service(tmp_path, monkeypatch, "anthropic")
+    seen = _capture_request(monkeypatch, _COMPLETIONS["anthropic"])
+
+    assert service.ask("问题")["ok"] is True
+
+    payload = json.loads(seen[0].data.decode("utf-8"))
+    assert payload["max_tokens"] == llm.FALLBACK_MAX_TOKENS
+    assert payload["max_tokens"] == 32000
+
+
+_OVER_LIMIT_BODY = (
+    b'{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: 32000 '
+    b'> 8192, which is the maximum allowed number of output tokens for '
+    b'claude-3-5-haiku-20241022"}}'
+)
+
+
+def test_anthropic_over_the_model_limit_retries_once_with_8192(tmp_path, monkeypatch) -> None:
+    """兜底值比模型的真上限大时自动降一档重试，用户不该看到英文报错。"""
+    service = _service(tmp_path, monkeypatch, "anthropic")
+    seen: list[int] = []
+
+    def fake_urlopen(request, timeout=None):
+        payload = json.loads(request.data.decode("utf-8"))
+        seen.append(payload["max_tokens"])
+        if payload["max_tokens"] > llm.FALLBACK_MAX_TOKENS_RETRY:
+            raise urllib.error.HTTPError(
+                request.full_url, 400, "Bad Request", {}, io.BytesIO(_OVER_LIMIT_BODY)
+            )
+        return FakeResponse(_COMPLETIONS["anthropic"])
+
+    monkeypatch.setattr(llm.urllib.request, "urlopen", fake_urlopen)
+
+    result = service.ask("问题")
+
+    assert result["ok"] is True, result["error"]
+    assert result["text"] == "好的"
+    assert seen == [32000, llm.FALLBACK_MAX_TOKENS_RETRY], seen
+
+
+def test_an_over_limit_error_that_survives_the_fallback_is_reported_in_chinese(
+    tmp_path, monkeypatch
+) -> None:
+    """回退之后还被拒：只重试一次，给中文说明，不把供应商的英文原文甩给用户。"""
+    service = _service(tmp_path, monkeypatch, "anthropic")
+    seen: list[int] = []
+
+    def fake_urlopen(request, timeout=None):
+        payload = json.loads(request.data.decode("utf-8"))
+        seen.append(payload["max_tokens"])
+        raise urllib.error.HTTPError(
+            request.full_url, 400, "Bad Request", {}, io.BytesIO(_OVER_LIMIT_BODY)
+        )
+
+    monkeypatch.setattr(llm.urllib.request, "urlopen", fake_urlopen)
+
+    result = service.ask("问题")
+
+    assert result["ok"] is False
+    assert seen == [32000, llm.FALLBACK_MAX_TOKENS_RETRY], seen
+    assert "输出上限" in result["error"]
+    assert "maximum allowed number of output tokens" not in result["error"]
+
+
+def test_ask_reports_input_output_and_total_usage(tmp_path, monkeypatch) -> None:
+    """界面要能显示「本次 N tokens」：两边的用量都得带出来。"""
+    service = _service(tmp_path, monkeypatch, "anthropic")
+    _capture_request(monkeypatch, _COMPLETIONS["anthropic"])
+
+    result = service.ask("问题")
+
+    assert result["usage"] == {"input": 10, "output": 2, "total": 12}
+    assert result["tokens"] == 12
+
+
+def test_openai_usage_is_split_when_the_provider_gives_both(tmp_path, monkeypatch) -> None:
+    payload = {
+        "choices": [{"message": {"content": "好的"}}],
+        "usage": {"prompt_tokens": 30, "completion_tokens": 7, "total_tokens": 37},
+    }
+    service = _service(tmp_path, monkeypatch, "openai")
+    _capture_request(monkeypatch, payload)
+
+    result = service.ask("问题")
+
+    assert result["usage"] == {"input": 30, "output": 7, "total": 37}
+    assert result["tokens"] == 37
+
+
+def test_a_cache_hit_still_reports_the_usage(tmp_path, monkeypatch) -> None:
+    service = _service(tmp_path, monkeypatch, "anthropic")
+    _capture_request(monkeypatch, _COMPLETIONS["anthropic"])
+
+    first = service.ask("问题", cache_key="cand|BTC|1h|1")
+    second = service.ask("问题", cache_key="cand|BTC|1h|1")
+
+    assert second["cached"] is True
+    assert second["usage"] == first["usage"]
+    assert second["usage"]["total"] == 12

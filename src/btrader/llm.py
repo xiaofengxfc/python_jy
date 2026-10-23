@@ -85,14 +85,22 @@ DEFAULT_PROVIDER = "deepseek"
 USER_AGENT = "biTrader/0.5 (+desktop)"
 ACCEPT = "application/json"
 
-# 输出额度不开放给用户调。改额度只动下面这两个常量，别在调用点写数字。
-# 推理模型先把额度花在思考上：3000 时正文偶尔被截成空，4000 留够余量。
-# 问答、分析、简报这类普通回答用它。
-OUTPUT_TOKENS = 4000
-# 写代码这类长回答（策略实验室生成一个完整模块）用它。推理模型先花掉一部分
-# 额度思考，源码又长，2400 那种小额度会让 JSON 从中间断掉；DeepSeek 和
-# Claude 3.5 Haiku 的上限都是 8192，8000 各家都吃得下，别再往下砍。
-OUTPUT_TOKENS_CODE = 8000
+# 输出上限不再是「我们替模型定一个额度」。OpenAI 兼容协议里 max_tokens 是可选
+# 字段，省略就等于「由模型自己决定什么时候停」，所以那一路现在根本不发这个字段
+# （以前固定 4000：分析类回答常从中间断掉，界面上只剩半截内容，用户看不出是我
+# 们截的）。ollama 的 num_predict 同理，只有调用方显式要求时才写。
+
+# 下面两个只在「供应商必须填一个数」时用：Anthropic 的 max_tokens 是必填字段，
+# 省略直接 400。给一个够大的兜底值，模型自己会在写完时停。
+#
+# 历史原因（别删）：推理模型会先把输出额度花在思考上，额度给小了正文会被截成
+# 空——3000 时偶尔整段没有正文，这也是当初调到 4000 的原因；写策略代码那一路
+# 更甚，源码长、思考也长，2400 那种小额度会让 JSON 从中间断掉。
+FALLBACK_MAX_TOKENS = 32000
+# 模型的真上限比兜底值小时（Claude 3.5 Haiku、DeepSeek 都是 8192），供应商会回
+# 400「max_tokens 超过上限」。这种情况下自动降到这个数重试一次，别把英文报错
+# 甩给用户，也别让用户自己去猜该填多少。
+FALLBACK_MAX_TOKENS_RETRY = 8192
 # 同一根已收盘 K 线重复提问不该计费两次。缓存窗口固定，不给调。
 CACHE_SECONDS = 300.0
 CACHE_LIMIT = 500
@@ -151,31 +159,70 @@ class AIError(RuntimeError):
     itself is empty and the finish reason would otherwise be lost.
     """
 
-    def __init__(self, message: str, *, finish: str = "") -> None:
+    def __init__(self, message: str, *, finish: str = "", detail: str = "") -> None:
         super().__init__(message)
         self.finish = finish
+        # 供应商返回的原文。用来判断「是不是输出上限超了」，不进给用户看的文案。
+        self.detail = detail
 
 
-# --------------------------------------------------------------------- keyring
+# ----------------------------------------------------------------- 密钥的落点
+# 和交易所的 API Key 走同一个 store（core/secret_store）：桌面有系统密钥环就用
+# 密钥环；Debian/Ubuntu 服务器上没有 SecretService/DBus，就落到数据目录里的加密
+# 文件。以前这里直接 import keyring 就用，服务器上「AI 助手的 Key 存不进去」，
+# 报错还是一句英文——和交易所 Key 同一个坑，只是换了个地方。
+#
+# service 名保持 biTrader-ai：改了等于把已经存进去的 Key 弄丢。旧的系统密钥环里
+# 那一份不用迁移：探到密钥环可用时读的就是同一个 service，第一次读就拿回来了。
+_STORE: Any = None
+_STORE_LOCK = threading.Lock()
+
+
+def _store():
+    """当前生效的密钥存储（探一次，之后进程内复用）。"""
+    global _STORE
+    with _STORE_LOCK:
+        if _STORE is None:
+            from .core import secret_store
+
+            _STORE = secret_store.open_store()
+        return _STORE
+
+
+def reset_store() -> None:
+    """Test hook: 忘掉缓存的存储后端，下次调用重新探测。"""
+    global _STORE
+    with _STORE_LOCK:
+        _STORE = None
+
+
+def storage_info() -> dict[str, str]:
+    """AI 的 Key 存在哪儿，给设置页看（和凭据卡同一个口径）。"""
+    try:
+        from .core import secret_store
+
+        return secret_store.describe(_store())
+    except Exception as exc:  # 说明信息不该把状态接口弄挂
+        log.warning("读取 AI 密钥存储信息失败: %s", exc)
+        return {"kind": "none", "label": "不可用", "path": "", "detail": "读不到存储信息。"}
+
+
 def load_key() -> str:
     try:
-        import keyring
-
-        return keyring.get_password(KEYRING_SERVICE, KEYRING_USER) or ""
-    except Exception as exc:  # a broken keyring must not break the page
+        return _store().get_password(KEYRING_SERVICE, KEYRING_USER) or ""
+    except Exception as exc:  # 坏存储不能把页面弄挂
         log.warning("读取 AI 密钥失败: %s", exc)
         return ""
 
 
 def save_key(value: str) -> bool:
     try:
-        import keyring
-
+        store = _store()
         if value:
-            keyring.set_password(KEYRING_SERVICE, KEYRING_USER, value)
+            store.set_password(KEYRING_SERVICE, KEYRING_USER, value)
         else:
             try:
-                keyring.delete_password(KEYRING_SERVICE, KEYRING_USER)
+                store.delete_password(KEYRING_SERVICE, KEYRING_USER)
             except Exception:
                 pass
         return True
@@ -261,7 +308,13 @@ class _Cache:
             return entry
 
     def put(
-        self, key: str, text: str, tokens: int, finish: str = "", fingerprint: str = ""
+        self,
+        key: str,
+        text: str,
+        tokens: int,
+        finish: str = "",
+        fingerprint: str = "",
+        usage: dict[str, int] | None = None,
     ) -> None:
         with self._lock:
             self._entries[key] = {
@@ -273,6 +326,8 @@ class _Cache:
                 # 供应商/模型/温度/额度。同一句问题换了这些就是另一个问题，
                 # 命中时要靠它判断这条答案还能不能用。
                 "fingerprint": str(fingerprint or ""),
+                # 命中也要能报「本次多少 tokens」，所以用量跟着答案一起存。
+                "usage": dict(usage or {}),
             }
             self._flush()
 
@@ -390,6 +445,9 @@ class LLMService:
             "has_key": bool(key),
             "key_hint": mask_key(key),
             "configured": bool(key) or not spec["needs_key"],
+            # Key 存在哪儿：桌面上是系统密钥环，服务器上退化成数据目录里的加密
+            # 文件。设置页那张 AI 卡据此说明，和「API 凭据」卡同一口径。
+            "storage": storage_info(),
             "providers": [
                 {
                     "key": name,
@@ -427,13 +485,16 @@ class LLMService:
         # 「问的是谁、用多大额度」，否则换个模型后 5 分钟内还拿旧模型的答案。
         fingerprint = (
             f"{settings.provider}|{settings.model}"
-            f"|{float(settings.temperature):g}|{int(max_tokens or OUTPUT_TOKENS)}"
+            f"|{float(settings.temperature):g}|{int(max_tokens or 0)}"
         )
         result: dict[str, Any] = {
             "ok": False,
             "text": "",
             "cached": False,
             "tokens": 0,
+            # 实际用量：input / output 分开，total 是两者之和（= tokens）。
+            # 界面靠它显示「本次 N tokens」，也靠它算成本。
+            "usage": {"input": 0, "output": 0, "total": 0},
             "model": settings.model,
             "provider": settings.provider,
             "elapsed": 0.0,
@@ -456,11 +517,13 @@ class LLMService:
                 hit = None
             if hit:
                 cached_finish = str(hit.get("finish") or "")
+                hit_tokens = int(hit.get("tokens") or 0)
                 result.update(
                     ok=True,
                     text=str(hit.get("text") or ""),
                     cached=True,
-                    tokens=int(hit.get("tokens") or 0),
+                    tokens=hit_tokens,
+                    usage=_usage_from_stored(hit.get("usage"), hit_tokens),
                     # 命中缓存也要如实报 finish / truncated：调用方按它决定
                     # 「截断」还是「回答不合格」，缓存不该改变这个判断。
                     finish=cached_finish,
@@ -476,7 +539,7 @@ class LLMService:
             return result
         finish = ""
         try:
-            text, tokens, finish = self._request(
+            text, usage, finish = self._request(
                 spec, settings, key, system, prompt, max_tokens=max_tokens
             )
         except AIError as exc:
@@ -504,15 +567,17 @@ class LLMService:
             return result
 
         cache().count_call()
+        tokens = int(usage.get("total") or 0)
         truncated = is_truncated(finish)
         if cache_key and not truncated:
             # 被截断的回答不进缓存：它是一次「没写完」的结果，缓存下来只会
             # 让同样的半截答案在 5 分钟里反复命中。
-            cache().put(cache_key, text, tokens, finish, fingerprint)
+            cache().put(cache_key, text, tokens, finish, fingerprint, usage)
         result.update(
             ok=True,
             text=text,
             tokens=tokens,
+            usage=usage,
             finish=finish,
             # 被截断的回答也可能有正文——JSON 停在字符串中间。routes_lab 靠这个
             # 把「截断」和「模型答非所问」分开报，不能在这里丢掉。
@@ -547,20 +612,27 @@ class LLMService:
         prompt: str,
         *,
         max_tokens: int | None = None,
-    ) -> tuple[str, int, str]:
-        """Returns ``(text, tokens, finish)``.
+    ) -> tuple[str, dict[str, int], str]:
+        """Returns ``(text, usage, finish)``.
 
+        ``usage`` 是 ``{"input", "output", "total"}``，给界面报「本次 N tokens」。
         ``finish`` is the provider's finish reason, or "" when it does not say.
         Callers need it to tell "模型写完了但 JSON 坏了" from "被截断了".
+
+        输出上限：调用方显式传了 ``max_tokens`` 才发这个字段。没传时，能省的供应商
+        （OpenAI 兼容、ollama）干脆不发，让模型自己决定什么时候停；Anthropic 的
+        max_tokens 是必填字段，给 ``FALLBACK_MAX_TOKENS`` 兜底，被供应商以「超过
+        模型上限」拒掉时降到 ``FALLBACK_MAX_TOKENS_RETRY`` 重试一次。
         """
         style = spec["style"]
         base = settings.base_url.rstrip("/")
-        output_limit = int(max_tokens or OUTPUT_TOKENS)
+        explicit = int(max_tokens or 0)
         if style == "anthropic":
             url = f"{base}/v1/messages"
             payload = {
                 "model": settings.model,
-                "max_tokens": output_limit,
+                # 必填字段，不能省。
+                "max_tokens": explicit or FALLBACK_MAX_TOKENS,
                 "temperature": float(settings.temperature),
                 "messages": [{"role": "user", "content": prompt}],
             }
@@ -576,14 +648,15 @@ class LLMService:
             messages = ([{"role": "system", "content": system}] if system else []) + [
                 {"role": "user", "content": prompt}
             ]
+            options: dict[str, Any] = {"temperature": float(settings.temperature)}
+            if explicit:
+                # 不写就是「让模型自己停」（num_predict 默认无限）。
+                options["num_predict"] = explicit
             payload = {
                 "model": settings.model,
                 "messages": messages,
                 "stream": False,
-                "options": {
-                    "temperature": float(settings.temperature),
-                    "num_predict": output_limit,
-                },
+                "options": options,
             }
             headers = {"content-type": "application/json"}
         else:
@@ -595,9 +668,10 @@ class LLMService:
                 "model": settings.model,
                 "messages": messages,
                 "temperature": float(settings.temperature),
-                "max_tokens": output_limit,
                 "stream": False,
             }
+            if explicit:
+                payload["max_tokens"] = explicit
             headers = {
                 "content-type": "application/json",
                 "authorization": f"Bearer {key}",
@@ -610,6 +684,57 @@ class LLMService:
         headers.setdefault("user-agent", USER_AGENT)
         headers.setdefault("accept", ACCEPT)
 
+        try:
+            data = self._post(url, payload, headers, settings)
+        except AIError as exc:
+            retry_limit = int(payload.get("max_tokens") or 0)
+            if not (
+                style == "anthropic"
+                and retry_limit > FALLBACK_MAX_TOKENS_RETRY
+                and _rejects_output_limit(getattr(exc, "detail", ""))
+            ):
+                raise
+            # 模型的真上限比兜底值小。降一档重试一次，用户不该为这件事看到英文原文。
+            log.warning(
+                "%s 说输出上限超了（%s），降到 %s 重试一次：%s",
+                settings.provider,
+                retry_limit,
+                FALLBACK_MAX_TOKENS_RETRY,
+                getattr(exc, "detail", "")[:200],
+            )
+            payload["max_tokens"] = FALLBACK_MAX_TOKENS_RETRY
+            try:
+                data = self._post(url, payload, headers, settings)
+            except AIError as again:
+                if _rejects_output_limit(getattr(again, "detail", "")):
+                    raise AIError(
+                        f"{spec.get('label') or settings.provider}：这个模型允许的输出上限比 "
+                        f"{FALLBACK_MAX_TOKENS} 小，已经自动降到 "
+                        f"{FALLBACK_MAX_TOKENS_RETRY} 重试还是被拒。"
+                        "换个模型，或把要求写短一点。"
+                    ) from again
+                raise
+
+        text, usage = _extract(style, data)
+        finish = _finish_reason(style, data)
+        if not text:
+            # ollama 的上限在 options.num_predict 里，别只认 max_tokens。
+            ceiling = int(
+                payload.get("max_tokens")
+                or (payload.get("options") or {}).get("num_predict")
+                or 0
+            )
+            raise AIError(_empty_answer_text(style, data, ceiling), finish=finish)
+        return text, usage, finish
+
+    def _post(
+        self,
+        url: str,
+        payload: dict[str, Any],
+        headers: dict[str, str],
+        settings: AISettings,
+    ) -> Any:
+        """一次 HTTP 往返。失败的 ``AIError`` 带上供应商原文（``detail``）。"""
         body = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:
@@ -621,28 +746,37 @@ class LLMService:
                 detail = exc.read().decode("utf-8", "replace")[:300]
             except Exception:
                 pass
-            raise AIError(_http_error_text(exc.code, detail, settings.provider)) from exc
+            raise AIError(
+                _http_error_text(exc.code, detail, settings.provider), detail=detail
+            ) from exc
         except urllib.error.URLError as exc:
             raise AIError(f"连不上模型服务（{exc.reason}）：检查网络或代理设置。") from exc
         except TimeoutError as exc:
             raise AIError(f"模型超过 {settings.timeout:g} 秒没有响应。") from exc
 
         try:
-            data = json.loads(raw)
+            return json.loads(raw)
         except ValueError as exc:
             raise AIError("模型返回的不是 JSON，可能被代理或防火墙拦截了。") from exc
-
-        text, tokens = _extract(style, data)
-        finish = _finish_reason(style, data)
-        if not text:
-            raise AIError(_empty_answer_text(style, data, output_limit), finish=finish)
-        return text, tokens, finish
 
 
 # A 403 from the edge is not a 403 from the model: a WAF in front of an
 # OpenAI-compatible relay rejects clients by signature with a bare
 # "error code: 1010" page, and blaming the key sends the user to the wrong fix.
 _WAF_MARKERS = ("cloudflare", "error code: 1010", "error code: 1015", "error code: 1020")
+
+# 「max_tokens 超过模型上限」的各种说法（Anthropic 的原文是
+# "max_tokens: 32000 > 8192, which is the maximum allowed number of output
+# tokens for claude-3-5-haiku"）。只看这个判断要不要降一档重试，不拿它当文案。
+_LIMIT_MARKERS = ("max_tokens", "max output tokens", "output tokens")
+_LIMIT_WORDS = ("exceed", "too large", "greater", "maximum", ">", "larger")
+
+
+def _rejects_output_limit(detail: str) -> bool:
+    lowered = (detail or "").lower()
+    if not any(marker in lowered for marker in _LIMIT_MARKERS):
+        return False
+    return any(word in lowered for word in _LIMIT_WORDS)
 
 
 def _looks_like_waf_block(detail: str) -> bool:
@@ -715,8 +849,9 @@ def _empty_answer_text(style: str, data: Any, limit: int) -> str:
     别再把用户指到设置页去——那里没有「输出上限」这一项。
     """
     if is_truncated(_finish_reason(style, data)):
+        ceiling = f"（这次的上限 {limit} tokens）" if limit else "（供应商自身设定的上限）"
         return (
-            f"回答被输出上限截断了（上限 {limit} tokens）。"
+            f"回答被输出上限截断了{ceiling}。"
             "推理模型先花额度思考，正文就没额度了。"
             "重试一次，或把要求写短一点。"
         )
@@ -725,9 +860,28 @@ def _empty_answer_text(style: str, data: Any, limit: int) -> str:
     return "模型返回了空内容。"
 
 
-def _extract(style: str, data: Any) -> tuple[str, int]:
+def _usage_row(prompt_tokens: int, completion_tokens: int) -> dict[str, int]:
+    """用量统一成一种形状：输入、输出分开，total 是两者之和。"""
+    prompt_tokens = int(prompt_tokens or 0)
+    completion_tokens = int(completion_tokens or 0)
+    return {
+        "input": prompt_tokens,
+        "output": completion_tokens,
+        "total": prompt_tokens + completion_tokens,
+    }
+
+
+def _usage_from_stored(stored: Any, total: int) -> dict[str, int]:
+    """缓存里的用量。老条目没有 usage 字段，只能把 total 摊在合计上。"""
+    if isinstance(stored, dict) and ("input" in stored or "output" in stored):
+        return _usage_row(int(stored.get("input") or 0), int(stored.get("output") or 0))
+    return {"input": 0, "output": 0, "total": int(total or 0)}
+
+
+def _extract(style: str, data: Any) -> tuple[str, dict[str, int]]:
+    """正文 + 用量。用量按家的字段名各不相同，这里统一成 ``_usage_row``。"""
     if not isinstance(data, dict):
-        return "", 0
+        return "", _usage_row(0, 0)
     if style == "anthropic":
         blocks = data.get("content") or []
         text = "".join(
@@ -736,18 +890,28 @@ def _extract(style: str, data: Any) -> tuple[str, int]:
             if isinstance(block, dict) and block.get("type") == "text"
         )
         usage = data.get("usage") or {}
-        tokens = int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0)
-        return text.strip(), tokens
+        return text.strip(), _usage_row(
+            int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0)
+        )
     if style == "ollama":
         message = data.get("message") or {}
         text = str(message.get("content") or "")
-        tokens = int(data.get("prompt_eval_count") or 0) + int(data.get("eval_count") or 0)
-        return text.strip(), tokens
+        return text.strip(), _usage_row(
+            int(data.get("prompt_eval_count") or 0), int(data.get("eval_count") or 0)
+        )
     choices = data.get("choices") or []
     if choices and isinstance(choices[0], dict):
         message = choices[0].get("message") or {}
         text = str(message.get("content") or "")
         usage = data.get("usage") or {}
-        tokens = int(usage.get("total_tokens") or 0)
-        return text.strip(), tokens
-    return "", 0
+        prompt_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+        completion_tokens = int(
+            usage.get("completion_tokens") or usage.get("output_tokens") or 0
+        )
+        total = int(usage.get("total_tokens") or 0)
+        row = _usage_row(prompt_tokens, completion_tokens)
+        if total and not (prompt_tokens or completion_tokens):
+            # 只给合计的供应商（老接口常见）：分开的两项留空，别瞎猜比例。
+            row = {"input": 0, "output": 0, "total": total}
+        return text.strip(), row
+    return "", _usage_row(0, 0)

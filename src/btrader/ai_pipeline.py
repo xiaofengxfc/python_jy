@@ -213,9 +213,10 @@ def run(
             continue
         prompt = BUILDERS[stage](ctx, trace)
         started = clock()
-        # 不在这里给单段设上限：走 llm 的默认 OUTPUT_TOKENS（4000）。推理模型
-        # 先把额度花在思考上，段内预算太小时整段预算都被思考吃掉，回答直接截成空。
-        # 额度不进设置，真要改只改 llm 里的那两个常量。
+        # 不在这里给单段设上限：llm 那一路对支持省略的供应商根本不发 max_tokens，
+        # 模型自己决定写到哪儿停。以前固定 4000，推理模型先把额度花在思考上，
+        # 段内预算太小时整段预算都被思考吃掉，回答直接截成空。段内不再传额度，
+        # 想收紧只在这一处传 max_tokens。
         answer = llm.ask(prompt, system="", cache_key="", kind=f"ai_{stage}") or {}
         text = str(answer.get("text") or "").strip()
         ok = bool(answer.get("ok")) and bool(text)

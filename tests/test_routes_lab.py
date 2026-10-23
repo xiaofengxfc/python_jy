@@ -196,20 +196,23 @@ def test_generate_reports_truncation_with_its_own_message(tmp_path: Path):
         controller.generate(CandidateGeneratePayload())
 
     assert info.value.status_code == 502
-    assert info.value.detail == "模型输出被截断（上限 8000 tokens），把改进要求写短一点再试"
+    assert info.value.detail == "模型输出被截断（模型自己的输出上限用完了），把改进要求写短一点再试"
     assert "设置" not in info.value.detail
 
 
-def test_generate_asks_for_the_code_budget(tmp_path: Path):
-    """写代码走 OUTPUT_TOKENS_CODE，别再退回 2400 那种让 JSON 断掉的值。"""
+def test_generate_asks_for_no_output_ceiling_at_all(tmp_path: Path):
+    """生成不传 max_tokens：上限由模型自己决定。
+
+    以前这里写死一个额度（更早是 2400，后来 8000），长策略被截成坏 JSON，
+    报出来的是「没有可解析的 JSON」，让用户以为是模型不行。
+    """
     controller = make_controller(
         {"strategy_key": "gen_strategy", "code": SAFE_CODE}, tmp_path
     )
 
     controller.generate(CandidateGeneratePayload())
 
-    assert controller.get_state().ctx.ai.kwargs["max_tokens"] == llm.OUTPUT_TOKENS_CODE
-    assert controller.get_state().ctx.ai.kwargs["max_tokens"] == 8000
+    assert "max_tokens" not in controller.get_state().ctx.ai.kwargs
 
 
 def test_generate_succeeds_and_writes_the_candidate_to_disk(tmp_path: Path):
