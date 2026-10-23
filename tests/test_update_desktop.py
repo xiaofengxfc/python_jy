@@ -23,6 +23,20 @@ from fastapi import HTTPException
 from pathlib import Path
 
 from btrader import __version__ as APP_VERSION
+
+
+def _next_tag() -> str:
+    """比当前版本新一个 patch 的 tag。
+
+    以前这里写死 “v0.6.2” 当“有新版”，版本一抬到 0.6.2 这三条就假红——那不是行为坏了，
+    是测试把版本号抄死了。
+    """
+    major, minor, patch = (int(part) for part in APP_VERSION.split("."))
+    return f"v{major}.{minor}.{patch + 1}"
+
+
+NEWER_TAG = _next_tag()
+NEWER_VERSION = NEWER_TAG[1:]
 from btrader.core import updater
 from btrader.web import routes_update
 
@@ -139,14 +153,14 @@ def _http_error(code: int, headers: dict | None = None) -> urllib.error.HTTPErro
 def test_a_frozen_build_reads_releases_and_never_starts_a_subprocess(monkeypatch):
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     calls = _no_subprocess(monkeypatch)
-    _stub_release(monkeypatch, _release("v0.6.2", assets=[_exe_asset()]))
+    _stub_release(monkeypatch, _release(NEWER_TAG, assets=[_exe_asset()]))
     info = updater.collect_info()
     assert info["supported"] is False
     assert info["mode"] == "desktop"
     assert info["version"] == APP_VERSION
     desktop = info["desktop"]
-    assert desktop["latest"] == "0.6.2"
-    assert desktop["tag"] == "v0.6.2"
+    assert desktop["latest"] == NEWER_VERSION
+    assert desktop["tag"] == NEWER_TAG
     assert desktop["newer"] is True
     assert desktop["download_url"] == EXE_URL
     assert desktop["published_at"] == "2026-10-23T10:00:00Z"
@@ -159,7 +173,7 @@ def test_a_shell_launched_backend_counts_as_the_desktop_build(monkeypatch):
     updater.set_desktop_shell("--parent-pid 123")
     try:
         calls = _no_subprocess(monkeypatch)
-        _stub_release(monkeypatch, _release("v0.6.2", assets=[_exe_asset()]))
+        _stub_release(monkeypatch, _release(NEWER_TAG, assets=[_exe_asset()]))
         info = updater.collect_info()
         assert info["mode"] == "desktop"
         assert info["desktop"]["newer"] is True
@@ -172,7 +186,7 @@ def test_the_desktop_payload_only_reports_and_never_downloads(monkeypatch):
     """只给链接：不下载、不装、不建任务。"""
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     _no_subprocess(monkeypatch)
-    _stub_release(monkeypatch, _release("v0.6.2", assets=[_exe_asset()]))
+    _stub_release(monkeypatch, _release(NEWER_TAG, assets=[_exe_asset()]))
     info = updater.collect_info()
     assert set(info) >= {"supported", "mode", "version", "platform", "checked_at", "desktop"}
     assert info["platform"] in ("windows", "linux", "darwin")
@@ -190,7 +204,7 @@ def _desktop_tag(monkeypatch, tag: str) -> dict:
 
 
 def test_a_newer_remote_tag_is_newer(monkeypatch):
-    assert _desktop_tag(monkeypatch, "v0.6.2")["newer"] is True
+    assert _desktop_tag(monkeypatch, NEWER_TAG)["newer"] is True
 
 
 def test_the_same_version_is_not_newer(monkeypatch):
@@ -259,7 +273,7 @@ def test_a_timeout_is_reported_with_the_original_text(monkeypatch):
 
 
 def test_the_release_request_carries_a_user_agent_and_a_timeout(monkeypatch):
-    seen = _stub_urlopen(monkeypatch, payload=_release("v0.6.2"))
+    seen = _stub_urlopen(monkeypatch, payload=_release(NEWER_TAG))
     updater._latest_release()
     assert len(seen) == 1
     request, timeout = seen[0]
@@ -270,7 +284,7 @@ def test_the_release_request_carries_a_user_agent_and_a_timeout(monkeypatch):
 
 
 def test_the_release_answers_are_cached_for_five_minutes(monkeypatch):
-    seen = _stub_urlopen(monkeypatch, payload=_release("v0.6.2"))
+    seen = _stub_urlopen(monkeypatch, payload=_release(NEWER_TAG))
     first = updater._latest_release()
     second = updater._latest_release()
     assert first == second
@@ -282,7 +296,7 @@ def test_the_release_answers_are_cached_for_five_minutes(monkeypatch):
 def test_a_release_without_an_installer_says_so(monkeypatch):
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     _no_subprocess(monkeypatch)
-    _stub_release(monkeypatch, _release("v0.6.2"))
+    _stub_release(monkeypatch, _release(NEWER_TAG))
     desktop = updater.collect_info()["desktop"]
     assert desktop["download_url"] is None
     assert "没有挂安装包" in desktop["download_note"], desktop
@@ -304,10 +318,10 @@ def test_the_setup_installer_wins_whatever_the_upload_order(monkeypatch):
     实测（评审 P2-2）：以前取「第一个 .exe」，assets 顺序一换用户下到的就是目录版 exe——
     不建快捷方式、不写开始菜单，行为完全不同。
     """
-    portable = {"name": "biTrader-Portable-0.6.2.exe", "browser_download_url": PORTABLE_URL}
-    setup = {"name": "biTrader-Setup-0.6.2.exe", "browser_download_url": EXE_URL}
+    portable = {"name": f"biTrader-Portable-{NEWER_VERSION}.exe", "browser_download_url": PORTABLE_URL}
+    setup = {"name": f"biTrader-Setup-{NEWER_VERSION}.exe", "browser_download_url": EXE_URL}
     for assets in ([portable, setup], [setup, portable]):
-        desktop = _desktop_with_assets(monkeypatch, "v0.6.2", assets)
+        desktop = _desktop_with_assets(monkeypatch, NEWER_TAG, assets)
         assert desktop["download_url"] == EXE_URL, [a["name"] for a in assets]
         assert desktop["download_note"] == ""
 
@@ -315,7 +329,7 @@ def test_the_setup_installer_wins_whatever_the_upload_order(monkeypatch):
 def test_a_name_with_setup_beats_a_plain_exe(monkeypatch):
     desktop = _desktop_with_assets(
         monkeypatch,
-        "v0.6.2",
+        NEWER_TAG,
         [
             {"name": "installer.exe", "browser_download_url": "https://x/installer.exe"},
             {"name": "biTrader-SETUP-latest.EXE", "browser_download_url": EXE_URL},
@@ -328,10 +342,10 @@ def test_no_installer_at_all_says_how_many_exe_there_are(monkeypatch):
     """一个 Setup 都挑不出来就留空，并把「有几个 exe、自己挑」写清楚。"""
     desktop = _desktop_with_assets(
         monkeypatch,
-        "v0.6.2",
+        NEWER_TAG,
         [
-            {"name": "biTrader-Portable-0.6.2.exe", "browser_download_url": PORTABLE_URL},
-            {"name": "biTrader-CLI-0.6.2.exe", "browser_download_url": "https://x/cli.exe"},
+            {"name": f"biTrader-Portable-{NEWER_VERSION}.exe", "browser_download_url": PORTABLE_URL},
+            {"name": f"biTrader-CLI-{NEWER_VERSION}.exe", "browser_download_url": "https://x/cli.exe"},
         ],
     )
     assert desktop["download_url"] is None
@@ -351,7 +365,7 @@ def _endpoint(path: str, method: str = "GET"):
 def test_the_info_endpoint_skips_the_cache_when_refresh_is_one(monkeypatch):
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     _no_subprocess(monkeypatch)
-    seen = _stub_urlopen(monkeypatch, payload=_release("v0.6.2", assets=[_release_setup()]))
+    seen = _stub_urlopen(monkeypatch, payload=_release(NEWER_TAG, assets=[_release_setup()]))
     endpoint = _endpoint("/api/update/info")
     endpoint()
     endpoint()  # 缓存命中：不再问 GitHub
@@ -512,7 +526,7 @@ def test_the_card_says_when_github_was_actually_asked(monkeypatch):
     """缓存命中时 fetched_at 不许变，cached 要说是缓存——「查于 12:35」不能是假的。"""
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     _no_subprocess(monkeypatch)
-    seen = _stub_urlopen(monkeypatch, payload=_release("v0.6.2", assets=[_release_setup()]))
+    seen = _stub_urlopen(monkeypatch, payload=_release(NEWER_TAG, assets=[_release_setup()]))
     first = updater.collect_info()
     second = updater.collect_info()
     assert len(seen) == 1, "300 秒内只该问一次 GitHub"

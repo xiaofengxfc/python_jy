@@ -1,7 +1,7 @@
 {
   "name": "bitrader-shell",
   "private": true,
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "biTrader desktop shell",
   "main": "main.cjs",
   "scripts": {
