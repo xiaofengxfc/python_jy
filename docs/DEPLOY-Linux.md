@@ -239,17 +239,19 @@ curl -fsS https://api.ipify.org; echo
 ## 7. 更新与回滚
 
 升级不用重新部署，也不用登服务器敲 git：设置页那张「软件更新」卡就是这件事。它是**手动**的——
-只有你点「检查更新」「更新到最新」它才动，程序自己不会检查、也不会自己装。
+只有你点「检查更新」「立即更新」它才动，程序自己不会检查、也不会自己装。
 
 - **检查**：`GET /api/update/info` 比本地 HEAD 与远端分支（默认 `xf/main`）的提交 SHA，
   列出落后的条数与每条标题。远端读不到时 `remote_sha` 是 `null` 加一句为什么，不会显示「已是最新」。
 - **一键更新**：`POST /api/update/apply`，后台线程按顺序做四件事，每步的输出都显示在那张卡上：
   1. `git fetch --all --prune`，记下更新前的 SHA；
-  2. `git merge --ff-only <远端>/<分支>`——只做快进，不用 `reset --hard`，也不 `--force`；
+  2. `git merge --ff-only <远端>/<分支>`——只做快进，不改写历史，也不 `--force`；
   3. 用服务自己的 venv 跑 `pip install -r requirements.txt`；
   4. 重启服务：Linux 上是 `systemctl restart bitrader`，Windows 上拉起新进程后旧进程退出。
 - **前置检查**：自动交易 / AI 量化 / 执行台在跑 → 直接拒（409），不替你停引擎；工作树有未提交改动 →
   400；已经是最新 → 400；本地有提交又落后（分叉）→ 400 让你手动处理。
+  探针表（`routes.RUNNING_ENGINE_PROBES`）里只有「自动交易 / 执行台」和「AI 交易 / AI 量化」两项：
+  **回测、参数优化在跑不拦**——它们跑完就结束，重启丢掉的是那一次结果，不是钱。
 - **服务器上不跑 `npm run build`**：部署的是仓库里已经构建好的 `src/btrader/web/static/`，前端产物
   跟着 git 一起来。只有本机（Windows）更新时，如果装了 Node 且 `web/` 真有改动，才顺带 build 一次；
   服务器上没装 Node，跳过并在步骤里写明原因。
@@ -266,19 +268,25 @@ sudo journalctl -u bitrader -n 80 --no-pager
 
 ### 7.1 回滚
 
-- 卡片上的「回滚」：`POST /api/update/rollback {confirm: true}`，回到这次更新**之前**的那个 SHA，
+- 卡片上的「回滚」：`POST /api/update/rollback {confirm: true}`，回到这次更新**之前**的那个提交，
   依赖与重启照旧走一遍，步骤输出一样能看到。
 - 服务器上手动的等价做法：
 
 ```bash
 cd /opt/bitrader
 sudo -u bitrader git status                 # 工作树必须是干净的，否则先处理掉
-sudo -u bitrader git reset --hard <更新前的 SHA>
+sudo -u bitrader git revert --no-edit <更新前的提交>..HEAD   # 一条反向提交，把内容退回更新前
 sudo -u bitrader .venv/bin/pip install -r requirements.txt
 sudo systemctl restart bitrader
 ```
 
-回滚丢掉的是更新带上来的那些提交；数据目录 `/var/lib/bitrader`（SQLite、配置、策略、密钥）一个字节都不动。
+**为什么用 `revert` 而不是 `reset --hard`**：回滚只是把内容退回去，历史照样往前走——留下一条反向提交，
+谁都能看出「这里滚过一次」。`reset --hard` 是把分支指针往回掰、顺手清空工作区：本地没提交的改动
+（改了一半的策略、临时脚本）会一起消失，之后想再往前走还得强推一次历史。程序里那次回滚执行的就是
+`git revert`，手动操作照着来才和它对得上。
+
+回滚不删更新带上来的提交（它们是历史的一部分）；数据目录 `/var/lib/bitrader`（SQLite、配置、策略、密钥）
+一个字节都不动。
 
 ### 7.2 sudoers 允许了哪一条
 

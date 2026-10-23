@@ -341,20 +341,23 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   下单与预览取 `min(请求值, risk.max_leverage)`，请求体没带 leverage 就用这里记的值
   （`routes.resolve_order_leverage`），被收口时响应里的 `leverage_note` 说清楚是哪一条上限，
   不许静默改数；现货即使传 10 也按 1 下，`POST /api/settings/reset` 认 `trade` 段。
+  下单与预览的 `leverage` 声明成 `Any`，在 `resolve_order_leverage` 里先判类型：布尔值直接 400
+  ——`float` 字段会把 `true` 悄悄变成 1.0 按 1 倍放行，`leverage: true` 在盘面上不是「1 倍」的意思。
 - `favorites` / `recent_symbols`：去重、保序、上限 100（`SYMBOL_LIST_LIMIT`）。PUT 超过上限
   返回 400 并说清给了几个——静默截断会让第 101 个收藏点了没反应；只有手改 `config.json`
   写多了才在读盘时静默截断（整份配置得能打开）。写法按「币/计价」或「币/计价:结算币」判
   （`core.types.symbol_shape_error`），写不成交易对的当场 400；未知交易对**不拦**，换个市场
   之后它可能暂时不在列表里，收藏跨市场，两种写法都留着。
-- 数字字段一律只收有限数：`PUT /api/settings` 的 `risk` / `notify` / `ai` / `ai_auto` / `exec`
-  在 `setattr` 前后各过一遍 `math.isfinite`（`routes._check_number_input` / `_guard_finite`），
+- 数字字段一律只收有限数：`PUT /api/settings` 的 `risk` / `notify` / `ai` / `ai_auto` / `exec` /
+  `trade`（杠杆，按 `trade.leverage.<市场>` 点名）在 `setattr` 前后各过一遍 `math.isfinite`
+  （`routes._check_number_input` / `_guard_finite`），
   `save()` 用 `json.dump(allow_nan=False)`，读盘每一段都过 `config._coerce_block`。
   以前只有 `type(current)(value)`：`NaN` / `Infinity` 能写进 config.json，之后 `999999 > nan`
   恒为 False，每单上限、持仓上限、决策有效期这些闸全部静默失效；手改出来的 `NaN` 也让整份
   配置再也存不出去。盘上已有的 `NaN` 现在退回默认值并记一条 warning，整份配置照样读得开。
 - `POST /api/settings/reset`，body `{"section": "ai_auto"}`，返回重置后的设置。只动点名的
   那一段；`"all"` 也只覆盖 `RESETTABLE_SECTIONS`（risk / notify / ai / ai_auto / exec /
-  favorites / recent_symbols）。网络、市场、主题、周期这些顶层设置**不重置**：点一次「恢复
+  trade / favorites / recent_symbols）。网络、市场、主题、周期这些顶层设置**不重置**：点一次「恢复
   默认」把用户切好的市场一起换掉，比把参数留着更糟。未知段落 400 并列出可选的段落名。
 - `GET /api/tickers?market=&symbols=A,B` 返回 `{items: [{symbol, last, change_pct,
   quote_volume}]}`，`change_pct` 是百分数（1.23 = +1.23%）。一次最多 50 个（超了 400），
@@ -406,7 +409,8 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   或 AI 交易（含 AI 量化）在跑 → 409；工作树有没提交的改动（`git status --porcelain` 非空）
   → 400；`behind_by == 0` → 400；本地和远端各有新提交（分叉）→ 400 并说清要手动处理。
   探针表是 `routes.RUNNING_ENGINE_PROBES`，由 `build_router` 填一次——控制器建在那儿，
-  路由之间没有共享对象，别在 routes_update 里另建一套判断。
+  路由之间没有共享对象，别在 routes_update 里另建一套判断。表里只有这两项：**回测、参数优化
+  在跑不拦**（它们跑完就结束，重启丢的是一次结果），文档要如实这么写，别让人以为拦了。
 - 流水线：`git fetch --all --prune` → 记 `from_sha` → `git merge --ff-only <remote>/<branch>`
   → `pip install -r requirements.txt`（用 `sys.executable`）→ 只有本机有 npm 且 `web/`
   这次真的有改动才 `npm run build`（服务器没 npm，跳过并在该步 output 写明「服务器不需要
@@ -414,17 +418,43 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   `state=failed`、`error` 是那一步的**原始输出**，不替用户编原因。
 - 重启：Linux `subprocess.run(["sudo", "-n", "systemctl", "restart", "bitrader"])`（列表参数、
   不开 shell，仓库里装着这一条 NOPASSWD）；Windows 起一个分离的垫片，等 8765 端口释放后再拉起
-  `.venv\Scripts\python.exe run_web.py`，然后走 uvicorn 的 `should_exit` 优雅退出
-  （`web/__main__.py` 把 Server 的开关交给 `updater.set_shutdown_hook`）。
+  `.venv\Scripts\python.exe run_web.py`，然后走 uvicorn 的 `should_exit` 优雅退出。
+  两条启动路径（`python -m btrader.web` 与仓库根的 `run_web.py`）共用
+  `web/__main__.build_server` + `serve`，装配与 `updater.set_shutdown_hook` 都在里面；
+  谁要再写第三条启动路径，也得走它——自己拼一套 `uvicorn.Config/Server`，
+  「更新完重启时优雅退出」这个机制在真实进程里就等于不存在（t86 之前 `run_web.py`
+  正是这样，只剩 SIGINT 兜底）。
   **不许 `os._exit`**，Windows 上也不许 `os.kill(os.getpid(), SIGTERM)`——那在 Windows 上是
   TerminateProcess，硬切会把状态文件写坏。
+- 重启必须**确认真的起来了**，不许「拉起了就算成功」（t84 修的）。Windows 的垫片只做两件事：
+  等端口放开、拉起 `run_web.py`；日志每次一个唯一文件
+  （`<数据目录>/logs/restart-<时间>-<随机>.log`），由父进程开好当垫片的 stdout / stderr——
+  以前它自己 `open(<仓库>/.run_out.log)`，那个文件正被活着的进程写着（Windows 锁成只读），
+  open 就 `PermissionError`；stderr 又给了 DEVNULL，退出码没人看，于是「垫片死了」被当成
+  「重启成功」，服务就这么停死了。老进程这边等两段：先等自己放开端口（`RELEASE_TIMEOUT`），
+  再等新进程绑上端口（`LISTEN_TIMEOUT`），任何一段超时都算失败，`error` 里带垫片日志路径和
+  手动命令（`_manual_hint`）。Linux 那条是 `systemctl restart` 返回码非 0 即失败，stdout / stderr
+  原文照贴。
+- 端口跟着真实进程走，不写死：`web/__main__.build_server` 把 `--port` 交给
+  `updater.set_web_port()`，垫片与端口探测都用 `web_port()`；拿不到时按 8765 兜底，并在那一步的
+  输出里写明「按兜底值算」（t84 之前写死 8765：在 8799 上跑的实例，更新完重启必然
+  `Errno 10048` 端口被占，重启步看起来成功、其实没起来）。
+- 更新线程**不是 daemon**（`updater._spawn`）：重启那一步要等「自己放开端口 + 新进程绑上端口」
+  两段确认，daemon 线程会在 uvicorn 主线程退出时被直接掐掉，「到底起没起来」就没人知道，
+  状态又变成一句谎。代价是退出时得等这一轮更新跑完；每一步都有 timeout，不会无限挂着。
+- 一次只跑一个更新任务：`start_job` 在 `JOB_LOCK` 里先查 `running_job()`，撞上抛 `JobBusy`，
+  两个 POST 把它翻成 409「上一个更新还在跑」。`update-state.json` 的临时文件名带 pid 与随机后缀：
+  共用一个 `.tmp` 时两个写者会互相把半个 JSON 换上去。
 - 状态落盘在 `<数据目录>/update-state.json`（临时文件 + `os.replace`，原子写）。重启前先把
-  `state=running` + `restart_pending` 落到盘上；新进程读到「重启中且 pid 换了」就把状态收成
-  `done` 并补上「重启服务」这一步，否则前端刷新后看到一个永远转圈的 running。
+  `state=running` + `restart_pending` + 端口落到盘上；新进程读到「重启中、记下那个 pid 已经不在了」
+  就把状态收成 `done` 并补上「重启服务」这一步，否则前端刷新后看到一个永远转圈的 running。
+  收尾只认**记下的那个 pid**（`_heal_state`）：那个 pid 还活着就一个字都不改——以前任何别的
+  进程读一次状态就把活任务收成 done，还补一条根本没发生过的重启步骤；`restart_pending` 为假而
+  pid 不在了，说明上次断在半路，收成 failed 并说清断在哪一步。
 - 回滚不改写历史：`git revert --no-edit <from_sha>..HEAD` 把内容退回更新前那个提交，
   只允许在 `state == done` 且有 `from_sha` 时调用，同样走流水线 + 状态 + 重启。
-  **绝对不用** `git reset --hard` / `git clean` / 任何 `--force` / `shell=True`，
-  也不把用户输入拼进命令行（域名之类的参数一律列表传递）。
-- 测试在 `tests/test_update.py`，全部离线：git、GitHub、重启全是替身，
-  「两条远端都失败不报已是最新」「五种前置拒绝」「失败停在那一格且 error 是原文」
-  「重启后状态文件还能读成 done」「Windows 与 Linux 两条重启分支」都钉着。
+  `from_sha` 还必须像提交 SHA（`updater.is_commit_sha`，`^[0-9a-f]{7,40}$`），不合法 400，
+  `git revert` 之前再校验一次——它会被拼进命令行。
+- 测试全离线：`tests/test_update.py`（信息收集、五种前置、失败停在那一格、状态收尾、两条重启分支）
+  + `tests/test_update_hardening.py`（垫片日志写不了不能当成功、端口没人听要报 failed、
+  `JobBusy` 409、外部 pid 不许收尾、`from_sha` 校验、非 daemon 线程）。
