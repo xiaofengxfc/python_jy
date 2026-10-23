@@ -153,6 +153,8 @@ export interface OrderPreview {
    *  limits.cost.min。拿不到就是 null——不拿「最小数量 × 现价」凑一个数。 */
   min_amount?: number | null;
   min_notional?: number | null;
+  /** 杠杆被 risk.max_leverage 收口时后端给的说明（「不许静默改数」），原样显示。 */
+  leverage_note?: string | null;
   fee_estimate: number;
   fee_rate: number;
   slippage_bps: number;
@@ -378,6 +380,8 @@ export interface UpdateInfo {
   checked_at?: string | null;
   /** github（API 读到的提交列表）或 ls-remote（只问到 SHA，没有标题）。 */
   source?: string | null;
+  /** 后端跑在哪个平台（Linux / Windows）：手动命令按它给。 */
+  platform?: string | null;
   error?: string | null;
 }
 
@@ -397,6 +401,10 @@ export interface UpdateStatus {
   to_sha?: string | null;
   error?: string | null;
   job_id?: string | null;
+  /** 重启前的「等新进程接手」标记：还没收掉就说明在等，不当成普通的 running。 */
+  restart_pending?: boolean | null;
+  /** 后端跑在哪个平台（Linux / Windows）：手动命令按它给，别在 Linux 上教人跑 run_web.py。 */
+  platform?: string | null;
 }
 
 /** 执行台最后用过的那三项，存在设置的 exec 里。不是风控：真上限在 risk 与

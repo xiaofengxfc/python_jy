@@ -186,6 +186,23 @@ export default function SettingsPage({ settings, settingsError = "", onSaved }: 
   const [updateManual, setUpdateManual] = useState(false);
   /** 轮询的代次：换一次任务或重新进页面就作废上一轮的循环。 */
   const updateWatch = useRef(0);
+  /** 差距读不到就写「—」：拿 0 顶上去，读起来像「没有差距」，而真相是「数不出差距」。 */
+  const countText = (value: number | null | undefined) =>
+    typeof value === "number" && Number.isFinite(value) ? String(value) : "—";
+
+  /** 后端没给 platform 时按 UA 兜底：启动时算一次，UA 不会中途变。 */
+  const [uaPlatform] = useState<"linux" | "windows">(() =>
+    /windows|win32/i.test(navigator.userAgent) ? "windows" : "linux",
+  );
+
+  /** 轮询的中止开关：离开这个页面就 abort，别在后台一直读。 */
+  const updateAbort = useRef<AbortController | null>(null);
+
+  useEffect(() => () => {
+    // 卸载即停：正在读进度、正在等 /api/health 回来的循环都要停得住。
+    updateAbort.current?.abort();
+    updateWatch.current += 1;
+  }, []);
 
   const loadUpdate = useCallback(async () => {
     setUpdateBusy("info");
@@ -207,17 +224,19 @@ export default function SettingsPage({ settings, settingsError = "", onSaved }: 
 
   /** 服务重启期间 /api/tickers 那类请求都会断，只问 /api/health：200 就说明回来了。
    *  一分钟还没回来就停在这里，把手动命令交给用户，不自己编原因。 */
-  const waitForService = async (token: number): Promise<boolean> => {
+  const waitForService = async (token: number, signal: AbortSignal): Promise<boolean> => {
     for (let tick = 0; tick < 60; tick += 1) {
       await new Promise((resolve) => window.setTimeout(resolve, 1000));
-      if (updateWatch.current !== token) return false;
+      if (signal.aborted || updateWatch.current !== token) return false;
       try {
-        const response = await fetch("/api/health");
+        const response = await fetch("/api/health", { signal });
         if (response.ok) return true;
       } catch {
+        if (signal.aborted) return false;
         // 还没起来，接着等。
       }
     }
+    if (signal.aborted) return false;
     setUpdateManual(true);
     setUpdateNote("60 秒没等到服务回来，用下面的命令手动重启。");
     setUpdateBusy("");
@@ -227,20 +246,29 @@ export default function SettingsPage({ settings, settingsError = "", onSaved }: 
   /** 一秒一步地读进度，直到任务落地；中途读不到就去等 /api/health。 */
   const watchUpdate = useCallback(
     async (label: string, jobId: string) => {
+      // 每轮任务一个新开关：卸载或开始下一次更新就把上一轮彻底停掉。
+      updateAbort.current?.abort();
+      const controller = new AbortController();
+      updateAbort.current = controller;
+      const signal = controller.signal;
       const token = ++updateWatch.current;
       for (let tick = 0; tick < 900; tick += 1) {
         await new Promise((resolve) => window.setTimeout(resolve, 1000));
-        if (updateWatch.current !== token) return;
+        if (signal.aborted || updateWatch.current !== token) return;
         let status: UpdateStatus | null = null;
         try {
-          status = await api<UpdateStatus>(`/api/update/status?${query({ job_id: jobId })}`);
+          status = await api<UpdateStatus>(`/api/update/status?${query({ job_id: jobId })}`, {
+            signal,
+          });
         } catch {
+          if (signal.aborted) return;
           // 读不到就是服务正在重启：等它回来再接着读同一个任务。
           setUpdateNote("服务正在重启，等 /api/health 回来…");
-          const back = await waitForService(token);
+          const back = await waitForService(token, signal);
           if (!back) return;
           continue;
         }
+        if (signal.aborted) return;
         if (status && Array.isArray(status.steps)) setUpdateJob(status);
         const state = String(status?.state ?? "");
         if (!UPDATE_FINAL_STATES.includes(state)) continue;
@@ -263,7 +291,7 @@ export default function SettingsPage({ settings, settingsError = "", onSaved }: 
   /** 立即更新：落后才可点，点了先问一次。 */
   const startUpdate = async () => {
     if (!update) return;
-    const behind = update.behind_by ?? 0;
+    const behind = countText(update.behind_by);
     const ok = window.confirm(
       `即将把本机更新到远端 ${update.remote_short ?? "最新提交"}（落后 ${behind} 个提交）。\n\n` +
         "第一步会检查有没有自动交易 / AI 量化 / 执行台在跑：在跑就直接拒绝，不替你停。" +
@@ -311,16 +339,35 @@ export default function SettingsPage({ settings, settingsError = "", onSaved }: 
       setUpdateError(caught instanceof Error ? caught.message : String(caught));
     }
   };
+  /** 手动命令按平台给：后端在 info / status 里给 platform；没给就按 navigator.userAgent 兜底。
+   *  Linux 上是看服务状态与日志，Windows 上才是那条重启命令。 */
+  const manualPlatform = useMemo<"linux" | "windows">(() => {
+    const given = String(update?.platform ?? updateJob?.platform ?? "").toLowerCase();
+    if (given.includes("win")) return "windows";
+    if (given.includes("linux")) return "linux";
+    return uaPlatform;
+  }, [update?.platform, updateJob?.platform, uaPlatform]);
+
+  /** 状态文件里 restart_pending 还没收掉：说明在等新进程接手，别一概当成普通的 running。 */
+  const restartPending = Boolean(
+    updateJob?.restart_pending && !UPDATE_FINAL_STATES.includes(String(updateJob?.state ?? "")),
+  );
+
   /** 落后才能更新：领先（本地有没推的提交）和分叉都不许点。 */
   const canUpdate = Boolean(
-    update && (update.behind_by ?? 0) > 0 && (update.ahead_by ?? 0) === 0 && !update.error,
+    update &&
+      typeof update.behind_by === "number" &&
+      update.behind_by > 0 &&
+      update.ahead_by === 0 &&
+      !update.error,
   );
 
   /** 本地新 / 已分叉各自说清（读不到远端时由上面那条 error banner 负责贴原话）。 */
   const updateBlock = useMemo(() => {
     if (!update || update.error) return "";
-    const ahead = update.ahead_by ?? 0;
-    const behind = update.behind_by ?? 0;
+    const ahead = typeof update.ahead_by === "number" ? update.ahead_by : null;
+    const behind = typeof update.behind_by === "number" ? update.behind_by : null;
+    if (ahead == null || behind == null) return "";
     if (ahead > 0 && behind > 0) {
       return `已分叉，需要手动处理：本地领先 ${ahead} 个、落后 ${behind} 个提交（先把本地提交 push 或 rebase 掉，再回来更新）。`;
     }
@@ -1715,7 +1762,7 @@ export default function SettingsPage({ settings, settingsError = "", onSaved }: 
                 <div className="deploy-row">
                   <span>差距</span>
                   <b>
-                    落后 {update.behind_by ?? 0} 个 / 领先 {update.ahead_by ?? 0} 个
+                    落后 {countText(update.behind_by)} 个 / 领先 {countText(update.ahead_by)} 个
                   </b>
                 </div>
                 <div className="deploy-row">
@@ -1774,11 +1821,19 @@ export default function SettingsPage({ settings, settingsError = "", onSaved }: 
             {!update && !updateError && (
               <div className="hint">正在读本地与 GitHub 的提交…</div>
             )}
-            {update && !update.error && !updateBlock && (update.behind_by ?? 0) === 0 && (
+            {update && !update.error && !updateBlock && update.behind_by === 0 && (
               <div className="hint">本地和远端是同一个提交。</div>
             )}
 
             {updateNote && <div className="banner ok">{updateNote}</div>}
+
+            {/* 后端已经把「重启中、等新进程接手」写到状态文件里：这时不能按普通的
+                running 画，否则界面就是一个永远不动、也不说在等什么的进度条。 */}
+            {restartPending && (
+              <div className="hint">
+                正在等新进程起来…（旧进程已经退出，新进程接手后会接着把剩下的步骤写进这里，页面不用刷新）
+              </div>
+            )}
 
             {/* 每步跑完才写一条；失败的原文原样贴出来，不截断也不转述。 */}
             {updateJob?.steps && updateJob.steps.length > 0 && (
@@ -1816,8 +1871,16 @@ export default function SettingsPage({ settings, settingsError = "", onSaved }: 
 
             {updateManual && (
               <>
-                <div className="hint">手动重启命令（在仓库根目录执行）</div>
-                <pre className="deploy-log">.venv\Scripts\python.exe run_web.py --host 127.0.0.1 --port 8765</pre>
+                <div className="hint">
+                  {manualPlatform === "linux"
+                    ? "手动命令（在服务器上执行，先看服务状态，不行再看日志）"
+                    : "手动重启命令（在仓库根目录执行）"}
+                </div>
+                {manualPlatform === "linux" ? (
+                  <pre className="deploy-log">{"sudo systemctl status bitrader && sudo journalctl -u bitrader -n 50"}</pre>
+                ) : (
+                  <pre className="deploy-log">.venv\Scripts\python.exe run_web.py --host 127.0.0.1 --port 8765</pre>
+                )}
               </>
             )}
 

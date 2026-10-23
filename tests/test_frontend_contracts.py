@@ -1386,7 +1386,8 @@ def test_the_update_card_calls_the_four_endpoints() -> None:
 def test_the_update_button_needs_something_to_update() -> None:
     """落后才可点：behind_by 是 0 时按钮点不动。"""
     card = _update_card_source()
-    assert "(update.behind_by ?? 0) > 0" in card, "没按 behind_by 收口"
+    assert "typeof update.behind_by === \"number\" &&" in card, "没按 behind_by 收口（读不到时也不许放行）"
+    assert "update.behind_by > 0" in card
     assert "disabled={!canUpdate" in card, "按钮没跟 canUpdate 走"
 
 
@@ -1431,3 +1432,88 @@ def test_the_update_confirms_say_what_they_do() -> None:
     rollback = rollback[: rollback.index(");") + 2]
     assert "回到更新前的提交" in rollback
     assert "rollback" in rollback.lower() or "/api/update/rollback" in rest
+
+# ---------------------------------------------------------------- t85 收口说明与更新卡收尾
+
+
+def test_the_leverage_note_from_the_server_is_shown() -> None:
+    """后端 leverage_note 写着「不许静默改数」：预览要显示，成交后也要留着。"""
+    src = _order_ticket_source()
+    assert "leverage_note" in src, "后端给的收口说明一个字都没引用"
+    assert 'const leverageHint = leverageNotice || preview?.leverage_note || "";' in src
+    assert "setLeverageNotice(" in src, "成交回执里的 leverage_note 没留下来"
+    assert "setLeverageNotice(result.leverage_note" in src, "下单回执里的说明没取"
+    assert "setLeverageNotice(" in src and src.count("setLeverageNotice(") >= 2, "上一单的说明没清"
+    assert "{leverageTip}" in src, "算了不显示等于没做"
+    assert "const leverageTip = leverageHint || maxLeverageHint;" in src
+    assert "leverage_note.slice(" not in src, "说明被截断了"
+    types = (UI_DIR / "types.ts").read_text(encoding="utf-8")
+    assert "leverage_note" in types, "OrderPreview 上没有这个字段"
+
+
+def test_the_unknown_leverage_cap_says_so_instead_of_nothing() -> None:
+    """读不到 risk.max_leverage 就按「不知道上限」处理，给中性提示，不静默。"""
+    src = _order_ticket_source()
+    assert "maxLeverageState" in src
+    assert src.count('setMaxLeverageState("unknown")') >= 2, "只有一条路记「不知道」"
+    assert "风控上限还没读到" in src, "读不到就什么都不说"
+    assert 'if (maxLeverageState !== "unknown") return "";' in src
+    assert "|| maxLeverageHint" in src, "中性提示没接进那条提示里"
+    hook = src[src.index("const loadTradeSettings = useCallback(") :]
+    hook = hook[: hook.index("  }, []);")]
+    assert "catch {" in hook, "读设置的路径没有兜底分支"
+    assert 'setMaxLeverageState("unknown")' in hook, "抛出异常时又静默了"
+
+
+def test_the_leverage_cap_follows_the_settings_page() -> None:
+    """设置页改了 risk.max_leverage，下单框要跟着变，不是挂载时读一次就定住。"""
+    src = _order_ticket_source()
+    assert "const loadTradeSettings = useCallback(" in src
+    assert "[loadTradeSettings, market]" in src, "换市场/重进面板不重读设置"
+    assert 'window.addEventListener("focus", refresh)' in src, "从设置页回来不重读"
+    assert 'document.addEventListener("visibilitychange", refresh)' in src
+    assert 'window.removeEventListener("focus", refresh)' in src, "监听没拆"
+    assert 'document.removeEventListener("visibilitychange", refresh)' in src
+
+
+def test_the_update_polling_stops_when_the_page_unmounts() -> None:
+    """更新要重启服务，轮询会一直转：卸载即停，重启期间的重试也要停得住。"""
+    card = _update_card_source()
+    assert "new AbortController()" in card, "轮询没有可中止的开关"
+    assert "updateAbort.current?.abort()" in card, "卸载时没停"
+    assert card.count("signal.aborted") >= 2, "读进度与等 /api/health 两个循环都得看中止标记"
+    assert "signal: controller.signal" in card or "signal," in card, "请求没带 signal"
+    assert "useEffect(() => () => {" in card, "没有卸载清理"
+
+
+def test_the_manual_restart_command_follows_the_platform() -> None:
+    """手动命令按平台给：后端给 platform 就用，没给就按 navigator.userAgent 兜底。"""
+    card = _update_card_source()
+    assert "platform" in card, "没看后端给的平台"
+    assert "navigator.userAgent" in card, "后端没给时没兜底"
+    assert "sudo systemctl status bitrader && sudo journalctl -u bitrader -n 50" in card, "Linux 上给了 Windows 的命令"
+    types = (UI_DIR / "types.ts").read_text(encoding="utf-8")
+    assert types.count("platform?: string | null;") >= 2, "UpdateInfo / UpdateStatus 都没这个字段"
+
+
+def test_the_update_rows_do_not_show_an_unknown_gap_as_zero() -> None:
+    """ahead_by / behind_by 是 null 时数不出差距：显示「—」，别拿 0 冒充「没有差距」。"""
+    card = _update_card_source()
+    assert "const countText = (value: number | null | undefined) =>" in card
+    assert "update.behind_by ??" not in card, "还有地方拿 0 顶替未知"
+    assert "update.ahead_by ??" not in card
+    assert "countText(update.behind_by)" in card and "countText(update.ahead_by)" in card
+    assert "落后 {countText(update.behind_by)} 个 / 领先 {countText(update.ahead_by)} 个" in card
+    # 未知时不许说「已是最新」，也不许判分叉
+    assert "update.behind_by === 0" in card
+    assert "if (ahead == null || behind == null) return \"\";" in card
+
+
+def test_the_restart_pending_is_shown_as_waiting() -> None:
+    """状态里 restart_pending 还在：说明在等新进程起来，别一概按 running 画。"""
+    card = _update_card_source()
+    assert "restart_pending" in card
+    assert "正在等新进程起来" in card
+    assert "UPDATE_FINAL_STATES.includes(String(updateJob?.state" in card, "done 之后还挂着旧标记时别乱说在等"
+    types = (UI_DIR / "types.ts").read_text(encoding="utf-8")
+    assert "restart_pending?: boolean | null;" in types, "UpdateStatus 上没有这个字段"

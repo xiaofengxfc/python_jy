@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, query } from "../api";
 import { fmt, fmtPrice, parseNumber } from "../format";
 import { createSectionSaver } from "../settingsAutoSave";
@@ -114,25 +114,50 @@ export default function OrderTicket({
   const [leverageText, setLeverageText] = useState("1");
   /** risk.max_leverage：只用来提示「超过会按上限处理」，不替用户改数。 */
   const [maxLeverage, setMaxLeverage] = useState<number | null>(null);
+  /** 上限的读取状态：读不到就是「不知道上限」，不拿 1 倍冒充。 */
+  const [maxLeverageState, setMaxLeverageState] = useState<"loading" | "known" | "unknown">(
+    "loading",
+  );
+  /** 上一次下单回执里的 leverage_note：留着，直到下一次下单。 */
+  const [leverageNotice, setLeverageNotice] = useState("");
 
-  useEffect(() => {
-    let cancelled = false;
-    void api<{ settings?: { trade?: TradeSettings; risk?: { max_leverage?: number } } }>(
-      "/api/settings",
-    )
-      .then((data) => {
-        if (cancelled) return;
-        setLeverageByMarket(data?.settings?.trade?.leverage ?? {});
-        const cap = data?.settings?.risk?.max_leverage;
-        setMaxLeverage(typeof cap === "number" && Number.isFinite(cap) ? cap : null);
-      })
-      .catch(() => {
-        // 读不到就按 1 倍：栏还在，用户能自己填，不挡下单。
-      });
-    return () => {
-      cancelled = true;
-    };
+  /** 读一遍设置：这个市场记住的杠杆 + risk.max_leverage。 */
+  const loadTradeSettings = useCallback(async () => {
+    try {
+      const data = await api<{
+        settings?: { trade?: TradeSettings; risk?: { max_leverage?: number } };
+      }>("/api/settings");
+      setLeverageByMarket(data?.settings?.trade?.leverage ?? {});
+      const cap = data?.settings?.risk?.max_leverage;
+      if (typeof cap === "number" && Number.isFinite(cap)) {
+        setMaxLeverage(cap);
+        setMaxLeverageState("known");
+      } else {
+        setMaxLeverage(null);
+        setMaxLeverageState("unknown");
+      }
+    } catch {
+      // 读不到就说读不到：栏还在、能下单，但别装自己知道上限。
+      setMaxLeverage(null);
+      setMaxLeverageState("unknown");
+    }
   }, []);
+
+  // 打开面板读一次；换市场再读一次（上限与那个市场记住的倍数都以设置为准）。
+  useEffect(() => {
+    void loadTradeSettings();
+  }, [loadTradeSettings, market]);
+
+  // 设置页改完回来（窗口拿回焦点 / 页面重新可见）再读一次，上限跟着变。
+  useEffect(() => {
+    const refresh = () => void loadTradeSettings();
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+    };
+  }, [loadTradeSettings]);
 
   // 换市场（现货↔合约）就换成那个市场记住的倍数；没记过就是 1。
   useEffect(() => {
@@ -159,6 +184,16 @@ export default function OrderTicket({
     return Number.isFinite(parsed) && parsed >= 1 ? parsed : 1;
   }, [leverageText]);
 
+  /** 上限读不到时的一句中性提示：说清「不知道上限、后端会收口」，别装知道。 */
+  const maxLeverageHint = useMemo(() => {
+    if (market === "spot") return "";
+    if (maxLeverageState !== "unknown") return "";
+    return "风控上限还没读到（设置没取回来）：先按你要的倍数下单，后端会按 risk.max_leverage 收口并在回执里说明。";
+  }, [market, maxLeverageState]);
+
+  /** 后端把收口结果写在 leverage_note 里：预览显示，成交后留着，直到下一次下单。 */
+  const leverageHint = leverageNotice || preview?.leverage_note || "";
+
   const leverageNote = useMemo(() => {
     if (market === "spot") return "";
     if (leverageValue > MAX_LEVERAGE) {
@@ -169,6 +204,10 @@ export default function OrderTicket({
     }
     return "";
   }, [market, leverageValue, maxLeverage]);
+
+  /** 风控那一片那条提示：后端的收口说明优先，其次是「上限读不到」的中性提示。
+   *  本地「超过 125 按 125」那条留在杠杆栏里，别在同一屏说两遍。 */
+  const leverageTip = leverageHint || maxLeverageHint;
 
   // A click on the ladder fills the limit price; the parent clears the signal
   // so the same price can be picked again.
@@ -391,10 +430,12 @@ export default function OrderTicket({
 
     setBusy(true);
     setFlash(null);
+    setLeverageNotice("");
     try {
       const result = await api<{
         order: Record<string, unknown>;
         warnings?: string[];
+        leverage_note?: string | null;
       }>("/api/orders", {
         method: "POST",
         body: JSON.stringify({
@@ -432,6 +473,8 @@ export default function OrderTicket({
           ? { tone: "warn", text: `${filledText}。${warnings.join("；")}` }
           : { tone: "ok", text: filledText },
       );
+      // 杠杆被收口时后端在回执里说清是撞了哪一条上限：留在面板上，不随 flash 一起消失。
+      setLeverageNotice(result.leverage_note ? String(result.leverage_note) : "");
       if (sizeMode === "quote") writeLastQuote(String(amount));
       setSize("");
       setStopLoss("");
@@ -923,6 +966,12 @@ export default function OrderTicket({
           )}
           {/* 低于最小值当场说清楚：别让用户点一次提交才知道交易所会拒。 */}
           {minimumWarning && <div className="flash err">{minimumWarning}</div>}
+          {/* 杠杆被风控收口：后端 leverage_note 原样显示；上限读不到时给中性提示。 */}
+          {leverageTip && (
+            <div className="protect-hint">
+              <span className="faint">{leverageTip}</span>
+            </div>
+          )}
           {previewError ? (
             <div className="verdict bad">无法预览：{previewError}</div>
           ) : preview ? (
