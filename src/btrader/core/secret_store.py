@@ -18,6 +18,11 @@ NoKeyringError，界面上表现为「API Key 存不进去」，报错还是一�
 文件后端的边界写在设置页上：钥匙由本机 machine-id 派生，所以同一台机器上的
 别的系统用户读不到，把文件拷到别的机器上也解不开。反过来说，本机 root 读得到，
 这一点不如系统密钥环，所以能探测到密钥环就优先用密钥环。
+
+文件读不出（截断、被改坏、换了 machine-id）不等于「库是空的」：读接口回空并落一条
+warning，写接口（set/delete）拒绝并在动手之前把旧文件改名成 secrets.bin.bad-<时间戳>
+留档。文件后端的一次写入是「读整份 → 改一条 → 写回整份」，把读失败当空库，等于一次
+正常保存就把里面所有密钥一起清掉，界面还报保存成功。
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ import logging
 import os
 import platform
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +41,15 @@ from .. import APP_NAME
 from .. import paths
 
 log = logging.getLogger(__name__)
+
+class ReadError(RuntimeError):
+    """密钥文件在，但读不出来：被截断、被改坏、换了 machine-id、或者权限不对。
+
+    这是一个必须让调用方看见的错误，不能咽成「空库」——文件后端的写入是
+    「读整份 → 改一条 → 写回整份」，把读失败当空库就等于用一份只含新值的文件把
+    原来的全部密钥盖掉。文件真的不存在才是合法的空库（那时返回 {}）。
+    """
+
 
 KIND_KEYRING = "keyring"
 KIND_FILE = "file"
@@ -87,14 +102,27 @@ class FileSecretBackend:
 
     # ---------------------------------------------------------- 读写接口
     def get_password(self, service: str, username: str) -> str:
-        return self._read_all().get(_slot(service, username), "")
+        try:
+            return self._read_all().get(_slot(service, username), "")
+        except ReadError as exc:
+            # 读路径不抛、也不动磁盘：界面看到「这个 Key 读不出来」是按空处理的，
+            # 但文件还在、那里面别的 Key 也还在，留档是写接口的事。
+            log.warning("%s（这次按空处理，文件和里面的其它密钥都没有动）", exc)
+            return ""
 
     def set_password(self, service: str, username: str, value: str) -> None:
-        data = self._read_all()
+        try:
+            data = self._read_all()
+        except ReadError as exc:
+            # 读不出就绝不写：写下去等于把里面其它的 Key 一起清掉。先留档再抛。
+            backup = self._quarantine()
+            raise ReadError(self._refusal(exc, backup)) from exc
         data[_slot(service, username)] = value
         self._write_all(data)
 
     def delete_password(self, service: str, username: str) -> None:
+        # 删除也是「读整份 → 改一条 → 写回整份」：读不出时一样不许动磁盘。
+        # 这里不自动留档：删除本来就没想改文件，留档交给真正要写的那一路。
         data = self._read_all()
         if data.pop(_slot(service, username), None) is not None:
             self._write_all(data)
@@ -129,13 +157,14 @@ class FileSecretBackend:
         return AESGCM(key)
 
     def _read_all(self) -> dict[str, str]:
+        """读整份密钥表。文件不存在 = 合法空库；文件在但读不出 = ReadError。"""
         try:
             raw = self._path.read_bytes()
         except FileNotFoundError:
             return {}
         except OSError as exc:
-            log.warning("读取密钥文件失败 %s：%s", self._path, exc)
-            return {}
+            # 文件在、但读不动（权限、坏盘）：也不能当空库，否则下一次保存就把它盖掉。
+            raise ReadError(f"密钥文件 {self._path} 读不出：{exc}") from exc
         try:
             box = json.loads(raw.decode("utf-8"))
             salt = base64.b64decode(box["salt"])
@@ -144,12 +173,46 @@ class FileSecretBackend:
             plain = self._cipher(salt).decrypt(nonce, blob, None)
             data = json.loads(plain.decode("utf-8"))
         except Exception as exc:
-            # 换了机器、从旧机器拷回来、手改坏了，都是这一条：回空，不崩。
-            log.warning(
-                "密钥文件解不开（多半是换了机器，或者文件坏了）%s：%s", self._path, exc
-            )
-            return {}
-        return data if isinstance(data, dict) else {}
+            # 换了机器、从旧机器拷回来、被截断、被手改坏，都是这一条。
+            raise ReadError(
+                f"密钥文件 {self._path} 读不出（多半是换了机器，或者文件被截断/改坏）：{exc}"
+            ) from exc
+        if not isinstance(data, dict):
+            raise ReadError(f"密钥文件 {self._path} 读不出：解出来的不是一张表，不敢改写。")
+        return data
+
+    def _refusal(self, exc: Exception, backup: Path) -> str:
+        """拒绝写入时给用户看的那句话：备份到哪了、这次到底做了什么。"""
+        return (
+            f"原有密钥文件读不出，已备份到 {backup}，本次没有写入。原因：{exc}。"
+            "不覆盖是因为一次保存要把整份密钥写回去：读不出来还写，等于把里面其它的 "
+            "Key 一起清掉。请先看备份里那些 Key 还有没有用（同一台机器换过 "
+            "machine-id、文件被截断或手改过都会这样），确认之后重新保存即可。"
+        )
+
+    def _quarantine(self) -> Path:
+        """把读不出的旧文件改名留档，返回备份路径。
+
+        就地改名而不是复制：文件可能正坏在盘上，复制等于把坏块再写一遍；改名是原子的，
+        半途断电也不会两头都不完整。权限跟着原件走（600），目录不动（700）。
+        """
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup = self._path.with_name(f"{self._path.name}.bad-{stamp}")
+        serial = 1
+        while backup.exists():  # 同一秒里撞了两次就加序号，别把上一份备份再盖掉
+            serial += 1
+            backup = self._path.with_name(f"{self._path.name}.bad-{stamp}-{serial}")
+        try:
+            os.replace(self._path, backup)
+        except OSError as exc:
+            raise ReadError(
+                f"原有密钥文件读不出（{self._path}）：{exc}。"
+                "也没能把它改名留档，所以本次没有写入，原文件保持原样。"
+            ) from exc
+        _chmod(backup, 0o600)
+        _chmod(self._path.parent, 0o700)
+        log.warning("密钥文件读不出，已改名留档到 %s（原文件内容没被动过）", backup)
+        return backup
 
     def _write_all(self, data: dict[str, str]) -> None:
         salt = os.urandom(16)

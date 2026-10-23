@@ -207,6 +207,14 @@ def storage_info() -> dict[str, str]:
         return {"kind": "none", "label": "不可用", "path": "", "detail": "读不到存储信息。"}
 
 
+_LAST_ERROR = ""
+
+
+def last_error() -> str:
+    """最近一次保存失败的原因（后端原话）。没失败过就是空串。"""
+    return _LAST_ERROR
+
+
 def load_key() -> str:
     try:
         return _store().get_password(KEYRING_SERVICE, KEYRING_USER) or ""
@@ -216,6 +224,13 @@ def load_key() -> str:
 
 
 def save_key(value: str) -> bool:
+    """返回是否写成功，绝不抛给界面。
+
+    失败原因同时记进 ``last_error()``：密钥文件读不出时后端说的是「原有密钥文件
+    读不出，已备份到 X，本次没有写入」，这句话得原样给用户看，不能换成
+    「密钥环不可用」那种我们自己编的解释。
+    """
+    global _LAST_ERROR
     try:
         store = _store()
         if value:
@@ -225,9 +240,11 @@ def save_key(value: str) -> bool:
                 store.delete_password(KEYRING_SERVICE, KEYRING_USER)
             except Exception:
                 pass
+        _LAST_ERROR = ""
         return True
     except Exception as exc:
         log.warning("保存 AI 密钥失败: %s", exc)
+        _LAST_ERROR = str(exc)
         return False
 
 

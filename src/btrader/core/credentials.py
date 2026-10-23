@@ -83,7 +83,8 @@ class CredentialStore:
             key = self._backend.get_password(service, "api_key") or ""
             secret = self._backend.get_password(service, "api_secret") or ""
         except Exception as exc:  # keyring backends can raise many things
-            log.warning("读取系统密钥环失败: %s", exc)
+            # 读不出来就是「没有这个 Key」，但不能因此认为库里是空的：写的时候会拒。
+            log.warning("读取密钥失败（%s）: %s", service, exc)
             return Credentials()
         return Credentials(key, secret)
 
@@ -92,8 +93,11 @@ class CredentialStore:
             self._backend.set_password(service, "api_key", creds.api_key)
             self._backend.set_password(service, "api_secret", creds.api_secret)
             return True
+        except secret_store.ReadError:
+            # 「原有密钥文件读不出」不是一个可以咽掉的失败：调用方要把它原话给用户看。
+            raise
         except Exception as exc:
-            log.warning("写入系统密钥环失败: %s", exc)
+            log.warning("写入密钥失败（%s）: %s", service, exc)
             return False
 
     def load(self, network: Network, market: MarketType, platform: str = "binance") -> Credentials:
@@ -124,6 +128,11 @@ class CredentialStore:
     def save(
         self, network: Network, market: MarketType, creds: Credentials, platform: str = "binance"
     ) -> bool:
+        """返回是否写成功。
+
+        「原有密钥文件读不出」会抛 ``secret_store.ReadError``（不是返回 False）：
+        那次写入被拒绝了，原文件已经留档，用户得知道原因，不能看到一句「保存成功」。
+        """
         if self._backend is None:
             return False
         return self._write(self._service(network, market, platform), creds)
@@ -143,5 +152,8 @@ class CredentialStore:
             for name in ("api_key", "api_secret"):
                 try:
                     self._backend.delete_password(service, name)
+                except secret_store.ReadError as exc:
+                    # 删不掉是因为整份文件读不出：文件没动，所以里面别的 Key 也没丢。
+                    log.warning("删除密钥失败（%s）: %s", service, exc)
                 except Exception:
                     pass

@@ -139,6 +139,9 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   先过 `_venue_symbol` 补齐再往下走，别在各自的函数里各猜一次。反过来 `/api/symbols` 按市场类型过滤：
   ccxt 的 `load_markets()` 一次把现货与三种合约全取回来，只按报价过滤会让 600 条合约混进现货列表
   （1461 项里真正能交易的现货只有 861）。
+  整串**最多一个冒号**：结算币段里再带冒号（`BTC/USDT:USDT:USDT`）判写法错并说清该写成什么，
+  交割的 `-YYMMDD` 后缀照旧能过。这条判定只有 `core.types.symbol_shape_error` 一份，
+  `_check_symbol_shape`（下单与预览、`/api/tickers`）和收藏/最近交易对都先过它，别各写一份。
 - 合约的 24 小时 ticker 响应里没有 `bidPrice/askPrice`（只有现货有），ccxt 的 unified `bid/ask`
   因此是 None，别用 `float(raw.get("bid") or 0.0)` 把它压成 0——那样界面是「有最新价但没有买卖价」。
   取价顺序：unified → 原始 payload → 盘口顶档（`rest.ticker_bid_ask`），都没有才留 0，前端按 0 判空。
@@ -334,6 +337,12 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   写多了才在读盘时静默截断（整份配置得能打开）。写法按「币/计价」或「币/计价:结算币」判
   （`core.types.symbol_shape_error`），写不成交易对的当场 400；未知交易对**不拦**，换个市场
   之后它可能暂时不在列表里，收藏跨市场，两种写法都留着。
+- 数字字段一律只收有限数：`PUT /api/settings` 的 `risk` / `notify` / `ai` / `ai_auto` / `exec`
+  在 `setattr` 前后各过一遍 `math.isfinite`（`routes._check_number_input` / `_guard_finite`），
+  `save()` 用 `json.dump(allow_nan=False)`，读盘每一段都过 `config._coerce_block`。
+  以前只有 `type(current)(value)`：`NaN` / `Infinity` 能写进 config.json，之后 `999999 > nan`
+  恒为 False，每单上限、持仓上限、决策有效期这些闸全部静默失效；手改出来的 `NaN` 也让整份
+  配置再也存不出去。盘上已有的 `NaN` 现在退回默认值并记一条 warning，整份配置照样读得开。
 - `POST /api/settings/reset`，body `{"section": "ai_auto"}`，返回重置后的设置。只动点名的
   那一段；`"all"` 也只覆盖 `RESETTABLE_SECTIONS`（risk / notify / ai / ai_auto / exec /
   favorites / recent_symbols）。网络、市场、主题、周期这些顶层设置**不重置**：点一次「恢复

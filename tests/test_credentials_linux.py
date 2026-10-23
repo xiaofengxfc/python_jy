@@ -16,6 +16,7 @@ Debian/Ubuntu 服务器（systemd 跑后端、没有图形界面）没有 DBus �
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import threading
@@ -28,6 +29,8 @@ from btrader import llm
 from btrader.core import secret_store
 from btrader.core.credentials import CredentialStore, Credentials
 from btrader.core.types import MarketType, Network
+from fastapi import HTTPException
+
 from btrader.web import routes as routes_mod
 
 FAIL_MESSAGE = (
@@ -139,6 +142,7 @@ def test_the_file_mode_really_is_600_on_a_posix_box(monkeypatch, tmp_path):
 
 # ------------------------------------------------------- 二、坏文件不许崩
 def test_a_corrupt_file_returns_empty_credentials_instead_of_raising(monkeypatch, tmp_path):
+    """读回空、不抛异常；但**不许**把「读不出」当成空库接着覆盖（t75）。"""
     target = _use_fail_keyring(monkeypatch, tmp_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(b"\x00\x01 not json at all \xff")
@@ -146,7 +150,10 @@ def test_a_corrupt_file_returns_empty_credentials_instead_of_raising(monkeypatch
     store = CredentialStore()
     creds = store.load(Network.TESTNET, MarketType.SPOT)
     assert not creds.is_set
-    # 坏文件之后还要能继续用：保存重建一份
+    # 这一次保存必须被拒：拒绝之后旧文件已经留档，再保存才重建一份
+    with pytest.raises(secret_store.ReadError):
+        store.save(Network.TESTNET, MarketType.SPOT, Credentials("key-abcdefgh", "s" * 12))
+    assert list(target.parent.glob("secrets.bin.bad-*"))
     assert store.save(Network.TESTNET, MarketType.SPOT, Credentials("key-abcdefgh", "s" * 12))
     assert store.load(Network.TESTNET, MarketType.SPOT).api_key == "key-abcdefgh"
 
@@ -162,6 +169,202 @@ def test_the_file_cannot_be_decrypted_on_another_machine(tmp_path):
 
     elsewhere = secret_store.FileSecretBackend(path=path, machine="machine-b")
     assert not elsewhere.get_password("svc", "api_key")
+
+# ============================================ 二之二、读不出 ≠ 空库（t75，P0）
+# 改前：_read_all 三条失败路都 return {}，而 set_password 是「读整份 → 改一条 → 写回整份」。
+# 于是把 secrets.bin 截一半、或者 machine-id 变了之后，一次正常保存就把交易所 Key 和
+# AI Key 一起清掉，界面还报「保存成功」。现在：读不出 = ReadError，写入拒绝，旧文件留一份
+# secrets.bin.bad-<时间戳> 备份。文件不存在才是合法的空库。
+def _seed_two_keys(path: Path, machine: str = "machine-a") -> bytes:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    backend = secret_store.FileSecretBackend(path=path, machine=machine)
+    backend.set_password("svc", "api_key", "key-abcdefgh")
+    backend.set_password("svc", "api_secret", "secret-123456")
+    return path.read_bytes()
+
+
+def _truncate(path: Path) -> bytes:
+    good = path.read_bytes()
+    half = good[: len(good) // 2]
+    path.write_bytes(half)
+    return half
+
+
+def test_a_truncated_file_refuses_to_be_overwritten(tmp_path):
+    """截一半之后保存：抛错、旧文件改成 .bad-*、原字节一个不少。"""
+    path = tmp_path / "secrets.bin"
+    _seed_two_keys(path)
+    half = _truncate(path)
+
+    backend = secret_store.FileSecretBackend(path=path, machine="machine-a")
+    with pytest.raises(secret_store.ReadError) as caught:
+        backend.set_password("svc", "api_key", "new-key-ffff")
+
+    message = str(caught.value)
+    backups = sorted(tmp_path.glob("secrets.bin.bad-*"))
+    assert len(backups) == 1, backups
+    assert backups[0].name in message  # 报错里说清备份到哪了
+    assert "读不出" in message
+    assert "本次没有写入" in message
+    assert backups[0].read_bytes() == half  # 坏文件的字节原样留档
+    # 拒绝覆盖：原路径上没有被写进新的一份
+    assert not path.exists()
+    assert not list(tmp_path.glob("secrets.bin.tmp*"))
+
+
+def test_the_next_save_after_a_backup_starts_a_clean_file(tmp_path):
+    """留档之后下一次保存重新起一份：只装新写的那个 Key，备份还在。"""
+    path = tmp_path / "secrets.bin"
+    _seed_two_keys(path)
+    half = _truncate(path)
+    backend = secret_store.FileSecretBackend(path=path, machine="machine-a")
+    with pytest.raises(secret_store.ReadError):
+        backend.set_password("svc", "api_key", "new-key-ffff")
+
+    backend.set_password("svc", "api_key", "new-key-ffff")
+    assert backend.get_password("svc", "api_key") == "new-key-ffff"
+    assert backend.get_password("svc", "api_secret") == ""
+    backups = sorted(tmp_path.glob("secrets.bin.bad-*"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == half
+
+
+def test_a_changed_machine_id_goes_down_the_same_path(tmp_path):
+    """machine-id 变了就是「解不开」：读回空、保存拒绝、留档。"""
+    path = tmp_path / "secrets.bin"
+    _seed_two_keys(path, machine="machine-a")
+    moved = secret_store.FileSecretBackend(path=path, machine="machine-b")
+
+    assert moved.get_password("svc", "api_key") == ""
+    with pytest.raises(secret_store.ReadError):
+        moved.set_password("svc", "api_key", "key-from-the-new-box")
+    assert list(tmp_path.glob("secrets.bin.bad-*"))
+
+
+def test_reading_a_broken_file_warns_and_leaves_the_file_alone(tmp_path, caplog):
+    """读路径只落 warning，不许动磁盘（留档是写路径的事）。"""
+    path = tmp_path / "secrets.bin"
+    _seed_two_keys(path)
+    _truncate(path)
+    backend = secret_store.FileSecretBackend(path=path, machine="machine-a")
+
+    with caplog.at_level(logging.WARNING, logger=secret_store.__name__):
+        assert backend.get_password("svc", "api_key") == ""
+
+    assert any("读不出" in record.getMessage() for record in caplog.records)
+    assert path.exists()
+    assert not list(tmp_path.glob("secrets.bin.bad-*"))
+
+
+def test_an_empty_file_is_not_a_missing_file(tmp_path):
+    """0 字节的文件 = 读不出；文件不存在 = 合法的空库。两者不能混。"""
+    empty = tmp_path / "empty" / "secrets.bin"
+    empty.parent.mkdir(parents=True, exist_ok=True)
+    empty.write_bytes(b"")
+    broken = secret_store.FileSecretBackend(path=empty, machine="machine-a")
+    assert broken.get_password("svc", "api_key") == ""
+    with pytest.raises(secret_store.ReadError):
+        broken.set_password("svc", "api_key", "k-1")
+
+    missing = tmp_path / "missing" / "secrets.bin"
+    fresh = secret_store.FileSecretBackend(path=missing, machine="machine-a")
+    assert fresh.get_password("svc", "api_key") == ""
+    fresh.set_password("svc", "api_key", "k-1")
+    assert fresh.get_password("svc", "api_key") == "k-1"
+    assert not list(missing.parent.glob("secrets.bin.bad-*"))
+
+
+def test_deleting_a_key_from_a_broken_file_is_refused_too(tmp_path):
+    """删除也是「读整份 → 改 → 写回」：读不出就不许动磁盘。"""
+    path = tmp_path / "secrets.bin"
+    _seed_two_keys(path)
+    half = _truncate(path)
+    backend = secret_store.FileSecretBackend(path=path, machine="machine-a")
+
+    with pytest.raises(secret_store.ReadError):
+        backend.delete_password("svc", "api_key")
+    assert path.read_bytes() == half
+    assert not list(tmp_path.glob("secrets.bin.bad-*"))
+
+
+def test_the_backup_is_asked_for_600_and_the_directory_stays_700(monkeypatch, tmp_path):
+    """备份文件的权限要和原件一样。"""
+    recorded: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        secret_store,
+        "_chmod",
+        lambda path, mode: recorded.append((Path(path).name, mode)),
+    )
+    path = tmp_path / "secrets.bin"
+    _seed_two_keys(path)
+    _truncate(path)
+    backend = secret_store.FileSecretBackend(path=path, machine="machine-a")
+    with pytest.raises(secret_store.ReadError):
+        backend.set_password("svc", "api_key", "k-2")
+
+    assert any(".bad-" in name and mode == 0o600 for name, mode in recorded), recorded
+
+
+def test_the_credentials_store_surfaces_the_refusal(monkeypatch, tmp_path):
+    """CredentialStore.save 不再把拒绝吞成 False：调用方拿得到那句话。"""
+    target = _use_fail_keyring(monkeypatch, tmp_path)
+    store = CredentialStore()
+    assert store.save(
+        Network.TESTNET, MarketType.SPOT, Credentials("key-abcdefgh", "secret-1234")
+    )
+    _truncate(target)
+
+    with pytest.raises(secret_store.ReadError) as caught:
+        store.save(
+            Network.TESTNET, MarketType.SPOT, Credentials("key-new-0000", "secret-5678")
+        )
+    assert "读不出" in str(caught.value)
+    # 读路径照旧回空凭据，不抛
+    assert not store.load(Network.TESTNET, MarketType.SPOT).is_set
+
+
+def test_the_save_api_shows_the_backend_message(monkeypatch, tmp_path):
+    """界面看到的是后端那句话：不是「保存成功」，也不是我们编的解释。"""
+    target = _use_fail_keyring(monkeypatch, tmp_path)
+    store = CredentialStore()
+    store.save(Network.TESTNET, MarketType.SPOT, Credentials("key-abcdefgh", "secret-1234"))
+    _truncate(target)
+
+    class _Ctx:
+        network = Network.TESTNET
+        market_type = MarketType.USDM
+        platform = "binance"
+        credentials = store
+        creds = Credentials()
+
+    state = SimpleNamespace(
+        ctx=_Ctx(),  # type: ignore[arg-type]
+        locks={market: threading.RLock() for market in MarketType},
+        account_lock=threading.RLock(),
+    )
+    endpoint = None
+    for route in routes_mod.build_router(lambda: state).routes:
+        if getattr(route, "path", "") == "/api/credentials" and "POST" in getattr(
+            route, "methods", ()
+        ):
+            endpoint = route.endpoint
+            break
+    assert endpoint is not None
+
+    with pytest.raises(HTTPException) as caught:
+        endpoint(
+            routes_mod.CredentialsPayload(
+                market=MarketType.SPOT.value,
+                network=Network.TESTNET.value,
+                api_key="key-new-0000",
+                api_secret="secret-5678",
+                verify=False,
+            )
+        )
+    assert caught.value.status_code == 500
+    detail = str(caught.value.detail)
+    assert "读不出" in detail, detail
+    assert ".bad-" in detail, detail
 
 
 # --------------------------------------------- 三、能用的密钥环优先，探针不留痕
@@ -330,3 +533,34 @@ def test_the_ai_status_reports_where_the_key_lives(monkeypatch, tmp_path):
     assert status["storage"]["kind"] == "file"
     assert "本机文件存储" in status["storage"]["label"]
     assert status["storage"]["detail"]
+
+
+def test_the_ai_key_api_surfaces_the_refusal(monkeypatch, tmp_path):
+    """AI 卡保存时也给后端原话：不是「密钥环不可用」那句替用户猜的。"""
+    target = _use_fail_keyring(monkeypatch, tmp_path)
+    _reset_ai_store(monkeypatch)
+    assert llm.save_key(AI_KEY) is True
+    _truncate(target)
+    _reset_ai_store(monkeypatch)
+
+    class _Ctx:
+        network = Network.TESTNET
+        ai = llm.LLMService(llm.AISettings(enabled=True, provider="deepseek"))
+
+    state = SimpleNamespace(
+        ctx=_Ctx(),  # type: ignore[arg-type]
+        locks={market: threading.RLock() for market in MarketType},
+        account_lock=threading.RLock(),
+    )
+    endpoint = None
+    for route in routes_mod.build_router(lambda: state).routes:
+        if getattr(route, "path", "") == "/api/ai/key":
+            endpoint = route.endpoint
+            break
+    assert endpoint is not None
+
+    with pytest.raises(HTTPException) as caught:
+        endpoint(routes_mod.AIKeyPayload(key="sk-new-0000"))
+    detail = str(caught.value.detail)
+    assert "读不出" in detail, detail
+    assert ".bad-" in detail, detail

@@ -79,7 +79,7 @@ fi
 say "切换域名：$DOMAIN → 127.0.0.1:$PORT"
 
 # ---------------------------------------------------------------- 3. 公网 IP
-# IP 跳转那一段需要它；拿不到就不写那两段，证书不受影响
+# IP 跳转那一段需要它；拿不到就不写那一段，证书不受影响
 PUBLIC_IP=""
 if command -v curl >/dev/null 2>&1; then
   PUBLIC_IP="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)"
@@ -88,10 +88,13 @@ if [[ "$PUBLIC_IP" =~ $IPV4_RE ]]; then
   note "本机公网 IP：$PUBLIC_IP"
 else
   PUBLIC_IP=""
-  note "查不到本机公网 IP：跳过「IP 访问 301 到域名」那两段，证书不受影响"
+  note "查不到本机公网 IP：跳过「IP 访问 301 到域名」那一段，证书不受影响"
 fi
 
 # ---------------------------------------------------------------- 4. Caddyfile
+# 不直接往 /etc/caddy/Caddyfile 里写：先写同目录的临时文件，validate 过了再原子改名。
+# 直接写的话，validate 失败时那个坏文件已经落在盘上，只要本次没有备份（第一次跑、
+# 或者本来就没有 Caddyfile），就没人把它收回来——下一次 Caddy reload 直接失败。
 if [ -f "$CADDYFILE" ]; then
   # 备份留在 Caddyfile 旁边，不用 /tmp：服务是 PrivateTmp=yes，sudo 出去的进程
   # 继承同一套私有 /tmp，那条路径在服务重启后就没了，写在提示里等于骗人。
@@ -102,6 +105,11 @@ else
   install -d -m 755 /etc/caddy
 fi
 [ -d /var/log/caddy ] || install -d -m 755 /var/log/caddy
+
+# 临时文件建在同一个目录里（同一个文件系统，mv 才是原子改名），名字以点开头，
+# 不会被 Caddy 当成配置读；mktemp 用 O_EXCL 建，撞名不会覆盖别人的东西。
+STAGE="$(mktemp "/etc/caddy/.Caddyfile.new.XXXXXX")"
+trap 'rm -f "$STAGE"' EXIT
 
 {
   printf '# 由 set-domain.sh 生成。别手改：下次点「签发证书」会重写这一份。\n'
@@ -119,24 +127,35 @@ fi
   printf '\t}\n'
   printf '}\n'
   if [ -n "$PUBLIC_IP" ]; then
-    printf '\n# 用 http(s)://IP 打开的人 301 到域名（证书签不了 IP）\n'
+    # 只写 http://IP。不写 https://IP：ACME 不给 IP 签证书，那个站点块永远
+    # 拿不到证书、根本不会生效，写进配置只会让人以为「IP 也能开 HTTPS」。
+    printf '\n# 用 http://IP 打开的人 301 到域名。IP 拿不到证书，所以不做 https://IP\n'
     printf 'http://%s {\n\tredir https://%s{uri} 301\n}\n' "$PUBLIC_IP" "$DOMAIN"
-    printf 'https://%s {\n\tredir https://%s{uri} 301\n}\n' "$PUBLIC_IP" "$DOMAIN"
   fi
-} > "$CADDYFILE"
-chmod 644 "$CADDYFILE"
-note "已写入 $CADDYFILE"
+} > "$STAGE"
+chmod 644 "$STAGE"
+note "已生成新配置，先校验再说"
 
 # ---------------------------------------------------------------- 5. 校验
 # 校验不过是这里最危险的一步：Caddyfile 语法坏掉 caddy 就起不来，
-# 连原来的入口一起没了。所以 validate 失败必须还原。
-if ! "$CADDY_BIN" validate --config "$CADDYFILE"; then
+# 连原来的入口一起没了。现在校验的是临时文件，$CADDYFILE 一个字节都还没动，所以：
+#   * 本来有备份：磁盘上还是上一份能用的，报错里指一下备份在哪；
+#   * 本来没有备份（第一次跑）：删掉临时文件，磁盘上不留坏配置。
+# 以前是直接写 $CADDYFILE 再校验，没备份时那个坏文件就留在 /etc/caddy 里，
+# 下一次 Caddy reload 直接失败。
+if ! "$CADDY_BIN" validate --config "$STAGE" --adapter caddyfile; then
+  rm -f "$STAGE"
   if [ -n "$BACKUP" ]; then
-    cp -a "$BACKUP" "$CADDYFILE"
-    note "caddy validate 没通过，已还原上一份 Caddyfile"
+    die "caddy validate 没通过（上面是它自己的输出）。$CADDYFILE 没有被改过，还是上一份能用的（备份在 $BACKUP）"
   fi
-  die "caddy validate 没通过（上面是它自己的输出），Caddyfile 已还原"
+  die "caddy validate 没通过（上面是它自己的输出）。$CADDYFILE 没有写入，磁盘上没留下坏文件"
 fi
+
+# 校验过了才换上去：同一个目录里的 mv 是原子改名，Caddy 不会读到半个文件。
+mv -f "$STAGE" "$CADDYFILE"
+chmod 644 "$CADDYFILE"
+trap - EXIT
+note "已写入 $CADDYFILE"
 
 # ---------------------------------------------------------------- 6. reload
 if ! systemctl reload caddy 2>/dev/null; then

@@ -2,7 +2,7 @@
 #
 # 三段各自独立，按你的情况保留或删掉：
 #   1. 站点块：域名 + 自动 HTTPS（Caddy 自己申请、续期证书）
-#   2. IP 跳转：用 http(s)://IP 打开的人 301 到域名
+#   2. IP 跳转：用 http://IP 打开的人 301 到域名（IP 拿不到证书，不做 https://IP）
 #   3. WebSocket：行情推送走 /ws，说明为什么不用单独配置
 # 没有域名时用第 4 段（只监听回环 + SSH 隧道）先验证，再回来开站点块。
 
@@ -24,12 +24,10 @@ trade.example.com {
 
 # ---------------------------------------------------------------- 2. IP 跳转
 # 把 REPLACE_WITH_SERVER_IP 换成服务器公网 IP。没有域名就把这一段删掉。
-# 证书只能签给域名，用 IP 访问永远拿不到 HTTPS，所以这里只做 301 跳转。
+# 只写 http://IP：ACME 不给 IP 签证书，用 IP 访问永远拿不到 HTTPS，所以不开
+# https://IP —— 那个站点块在 Caddy 里永远拿不到证书，写了也不会生效。
+# 用 IP 打开的人会被 301 到域名，HTTPS 走域名那一块。
 http://REPLACE_WITH_SERVER_IP {
-	redir https://trade.example.com{uri} 301
-}
-
-https://REPLACE_WITH_SERVER_IP {
 	redir https://trade.example.com{uri} 301
 }
 
