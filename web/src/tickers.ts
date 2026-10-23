@@ -43,35 +43,93 @@ export function symbolFitsMarket(market: string, symbol: string): boolean {
   return market !== "spot" && marketForSymbol(text) === market;
 }
 
-/** 一次最多问 50 个：后端 /api/tickers 超过 50 就 400，整批涨跌幅全没。
- *  当前交易对、收藏、最近用过排在前面，它们在窗口里；列表里没问到的行留空。 */
+/** 后端 /api/tickers 一次只收 50 个（超了 400），列表 300 行就得分成 6 批。 */
 const MAX_SYMBOLS = 50;
+const MAX_BATCHES = 6;
+
+/** 结果按市场缓存 10 秒：面板每 2 秒轮询一次，6 个请求不能每次都重发。
+ *  缓存只存「问到的那一批交易对」；过期整批重来——行情是快照，半新半旧比留空更糟。 */
+const CACHE_TTL_MS = 10_000;
+
+interface TickerCacheEntry {
+  at: number;
+  quotes: Record<string, TickerQuote>;
+}
+
+const cache = new Map<string, TickerCacheEntry>();
+/** 同一市场同时只跑一个批次序列：撞上的调用方共用这一份，不另起 6 个请求。
+ *  序列被中止（组件卸载）之后不再复用，下一次调用重新开一个。 */
+const inflight = new Map<string, { task: Promise<Record<string, TickerQuote>>; cancelled: () => boolean }>();
+
+export interface LoadTickerOptions {
+  /** 组件卸载 / 面板关掉时中止后面的批次，别让请求在后台继续跑。 */
+  signal?: AbortSignal;
+}
 
 /** GET /api/tickers?market=&symbols=a,b,c → { symbol: quote }。
- *  接口没上、网络断了、返回形状不对，都返回空表：拿不到就不显示涨跌幅，不报错、不拿 0 顶。 */
+ *
+ *  接口一次只收 50 个，所以按 50 一批串行问、最多 6 批（覆盖列表的 300 行）。
+ *  顺序沿用调用方给的：当前交易对、收藏、最近用过在最前面，第一屏一定有数。
+ *  某一批失败只让那一批的行留空，已经拿到的照旧返回；
+ *  拿不到就留空，不报错、不拿 0 顶。 */
 export async function loadTickers(
   market: string,
   symbols: string[],
+  options: LoadTickerOptions = {},
 ): Promise<Record<string, TickerQuote>> {
   const usable = symbols.filter((item) => symbolFitsMarket(market, item));
-  const wanted = Array.from(new Set(usable)).slice(0, MAX_SYMBOLS);
+  const wanted = Array.from(new Set(usable)).slice(0, MAX_SYMBOLS * MAX_BATCHES);
   if (!wanted.length) return {};
+  const cached = cache.get(market);
+  if (cached && Date.now() - cached.at < CACHE_TTL_MS) return { ...cached.quotes };
+  const running = inflight.get(market);
+  if (running && !running.cancelled()) return running.task;
+  const signal = options.signal;
+  const task = fetchBatches(market, wanted, signal);
+  const entry = { task, cancelled: () => Boolean(signal?.aborted) };
+  inflight.set(market, entry);
   try {
-    const data = await api<{ items?: TickerQuote[] }>(
-      `/api/tickers?${query({ market, symbols: wanted.join(",") })}`,
-    );
-    const out: Record<string, TickerQuote> = {};
-    for (const item of data?.items ?? []) {
-      if (item && typeof item.symbol === "string" && item.symbol) out[item.symbol] = item;
-    }
-    return out;
-  } catch (caught) {
-    // 整批失败（多半是写法与市场对不上、或者一次问了太多）：名字照常显示，
-    // 涨幅那格留空。原因留一条到 console，别让「整列空白」没法查。
-    console.warn(
-      `[tickers] ${market} 的批量涨幅读不到（${wanted.length} 个交易对）：`,
-      caught instanceof Error ? caught.message : caught,
-    );
-    return {};
+    return await task;
+  } finally {
+    // 只清自己那一条：中途被新一轮顶掉时别把新的删了。
+    if (inflight.get(market) === entry) inflight.delete(market);
   }
+}
+
+async function fetchBatches(
+  market: string,
+  wanted: string[],
+  signal?: AbortSignal,
+): Promise<Record<string, TickerQuote>> {
+  const merged: Record<string, TickerQuote> = {};
+  const batches = Math.min(MAX_BATCHES, Math.ceil(wanted.length / MAX_SYMBOLS));
+  let failures = 0;
+  for (let index = 0; index < batches; index += 1) {
+    // 面板关掉、页面切走之后别再发后面的批次。
+    if (signal?.aborted) break;
+    const chunk = wanted.slice(index * MAX_SYMBOLS, (index + 1) * MAX_SYMBOLS);
+    try {
+      const data = await api<{ items?: TickerQuote[] }>(
+        `/api/tickers?${query({ market, symbols: chunk.join(",") })}`,
+        signal ? { signal } : undefined,
+      );
+      for (const item of data?.items ?? []) {
+        if (item && typeof item.symbol === "string" && item.symbol) merged[item.symbol] = item;
+      }
+    } catch (caught) {
+      // 被中止不是失败：调用方已经不要这批了，别再往 console 里刷一条。
+      if (signal?.aborted) break;
+      // 只让这一批的行留空：前面批次拿到的结果不清空，清空等于整列白掉。
+      failures += 1;
+      console.warn(
+        `[tickers] ${market} 第 ${index + 1}/${batches} 批失败（${chunk.length} 个交易对）：`,
+        caught instanceof Error ? caught.message : String(caught),
+      );
+    }
+  }
+  // 被中止的是半份快照，没失败才写缓存；全批失败也不写，让下一次还能重试。
+  if (!signal?.aborted && (failures < batches || Object.keys(merged).length > 0)) {
+    cache.set(market, { at: Date.now(), quotes: merged });
+  }
+  return merged;
 }

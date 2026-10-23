@@ -15,6 +15,8 @@ interface Props {
   quotes?: Record<string, TickerQuote>;
   /** 点星标加/取消收藏。 */
   onToggleFavorite?: (symbol: string) => void;
+  /** 面板开着才有人在看这些涨幅：页面据此决定要不要定时刷新、关掉时中止在跑的请求。 */
+  onOpenChange?: (open: boolean) => void;
 }
 
 const RECENT_LIMIT = 8;
@@ -28,6 +30,7 @@ export default function SymbolPicker({
   recent = [],
   quotes = {},
   onToggleFavorite,
+  onOpenChange,
 }: Props) {
   const [open, setOpen] = useState(false);
   const [term, setTerm] = useState("");
@@ -35,6 +38,10 @@ export default function SymbolPicker({
   const inputRef = useRef<HTMLInputElement | null>(null);
 
   const current = symbols.find((item) => item.symbol === value);
+
+  useEffect(() => {
+    onOpenChange?.(open);
+  }, [open, onOpenChange]);
 
   useEffect(() => {
     if (!open) return;

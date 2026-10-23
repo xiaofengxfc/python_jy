@@ -905,9 +905,11 @@ def test_the_24h_change_is_formatted_in_one_place_for_three_views() -> None:
     assert "export function changeTone" in tickers
     assert 'return value > 0 ? "up" : "down";' in tickers
     # 接口形状与降级：读不到就返回空表，界面不显示、也不报错
-    assert "/api/tickers?${query({ market, symbols: wanted.join(\",\") })}" in tickers
-    assert "    return {};" in tickers
-    # 后端一次最多收 50 个，前端不能一把塞 300 条进去（超了 400，整批都没了）
+    assert "/api/tickers?${query({ market, symbols: chunk.join(\",\") })}" in tickers
+    # 空表兜底：没有可问的交易对就返回空表（分批之后每批自己 catch，不再是一个大 try）
+    assert "if (!wanted.length) return {};" in tickers
+    # 后端一次最多收 50 个，前端不能一把塞 300 条进去（超了 400，整批都没了）：
+    # 50 一批、最多 6 批，串行发（见 test_the_ticker_batches_cover_the_whole_list）
     assert "const MAX_SYMBOLS = 50;" in tickers
 
     picker = (UI_DIR / "components" / "SymbolPicker.tsx").read_text(encoding="utf-8")
@@ -1215,7 +1217,7 @@ def test_a_favorite_from_another_market_is_shown_but_not_sent() -> None:
     assert "-\\d{6}" in src, "交割的到期日没切掉"
     page = (UI_DIR / "pages" / "TradingPage.tsx").read_text(encoding="utf-8")
     assert "favorites={favorites}" in page and "recent={recent}" in page, "收藏和最近用过要照常显示"
-    assert "loadTickers(market, wanted)" in page, "批量请求要带上市场"
+    assert "loadTickers(market, quotesWanted, { signal: controller.signal })" in page, "批量请求要带上市场与中止信号"
 
 
 def test_a_failed_batch_leaves_the_change_blank_and_says_why_in_the_console() -> None:
@@ -1246,3 +1248,68 @@ def test_the_panel_resizer_is_a_real_click_target_inside_the_panel() -> None:
     assert "z-index:" in block, "把手要压在内层内容之上"
     panel = css[css.index("\n.panel {") : css.index("\n.panel.collapsed {")]
     assert "overflow: hidden;" in panel, "列表滚动靠它，别为了把手改成 visible"
+
+
+def test_the_ticker_batches_cover_the_whole_list() -> None:
+    """300 行列表要问全：50 个一批、最多 6 批，串行发。
+
+    后端 /api/tickers 一次只收 50 个（超了 400），以前只发一批，于是 300 行里后 250 行
+    全年 24 小时涨幅那一格是空的。这里钉住批数与分批边界，也钉住「别一次并发打 6 个」。
+    """
+    src = (UI_DIR / "tickers.ts").read_text(encoding="utf-8")
+    assert "const MAX_SYMBOLS = 50;" in src, "单批上限变了？后端就是 50"
+    assert "const MAX_BATCHES = 6;" in src, "最多 6 批 = 300 行"
+    assert "slice(0, MAX_SYMBOLS * MAX_BATCHES)" in src, "截断要按 6 批算，不是 50 个"
+    assert "const batches = Math.min(MAX_BATCHES, Math.ceil(wanted.length / MAX_SYMBOLS));" in src
+    assert "wanted.slice(index * MAX_SYMBOLS, (index + 1) * MAX_SYMBOLS)" in src, "分批边界不对"
+    assert "Promise.all" not in src, "别并发打 6 个请求"
+
+
+def test_the_ticker_cache_lists_ten_seconds_per_market() -> None:
+    """结果按市场缓存 10 秒：面板每 2 秒轮询一次，不能每次都重发 6 个请求。"""
+    src = (UI_DIR / "tickers.ts").read_text(encoding="utf-8")
+    assert "const CACHE_TTL_MS = 10_000;" in src
+    assert "const cache = new Map<string, TickerCacheEntry>();" in src, "缓存要按市场分"
+    assert "Date.now() - cached.at < CACHE_TTL_MS" in src, "没看时间戳就返回缓存"
+    assert "cache.set(market," in src, "拿到了不写缓存，等于每次都重发"
+    assert "const inflight = new Map<string," in src, "同一市场要串成一个序列"
+
+
+def test_a_closed_page_stops_the_remaining_batches() -> None:
+    """面板关掉 / 组件卸载：中止后面的批次，别让请求在后台继续跑。"""
+    src = (UI_DIR / "tickers.ts").read_text(encoding="utf-8")
+    assert "signal?: AbortSignal;" in src
+    assert "if (signal?.aborted) break;" in src, "批次之间没检查中止标志"
+    assert "if (!signal?.aborted && (failures < batches" in src, "被中止的半份快照不该写缓存"
+    page = (UI_DIR / "pages" / "TradingPage.tsx").read_text(encoding="utf-8")
+    assert "const controller = new AbortController();" in page
+    assert "loadTickers(market, quotesWanted, { signal: controller.signal })" in page
+    assert "quotesAbort.current?.abort();" in page, "卸载 / 关面板没有中止"
+    assert "symbols.slice(0, 300)" in page, "只问前 50 个的话，后 250 行永远空着"
+    # 当前交易对、收藏、最近用过仍排在最前面，第一屏一定有数
+    assert "() => [symbol, ...favorites, ...recent, ...symbols.slice(0, 300)" in page
+    # 面板关掉之后一条都不再发：定时刷新只在面板开着时挂
+    assert "if (!pickerOpen) {" in page and "window.setInterval(refreshQuotes, 20000)" in page
+    assert "onOpenChange={setPickerOpen}" in page
+    picker = (UI_DIR / "components" / "SymbolPicker.tsx").read_text(encoding="utf-8")
+    assert "onOpenChange?: (open: boolean) => void;" in picker
+    assert "onOpenChange?.(open);" in picker, "面板开关状态没透出去"
+    # 中止是调用方不要了，不是失败：别往 console 里刷一条原因
+    assert "if (signal?.aborted) break;" in src
+
+
+def test_one_failed_batch_leaves_only_its_rows_blank() -> None:
+    """某一批失败只让那一批的行留空，已经拿到的结果不清空。"""
+    src = (UI_DIR / "tickers.ts").read_text(encoding="utf-8")
+    assert "第 ${index + 1}/${batches} 批失败" in src, "失败要写清是第几批、共几批"
+    assert "chunk.length" in src, "要写清这批问了多少个"
+    assert "merged[item.symbol] = item;" in src, "结果要合并到同一张表里，别每批一张"
+    # 批内的 catch 只记一条日志，不许 return / 清空
+    head = src.index("async function fetchBatches(")
+    body = src[head:]
+    catch_start = body.index("} catch (caught) {")
+    catch_end = body.index("}\n  }", catch_start)
+    caught = body[catch_start:catch_end]
+    assert "return" not in caught, "批失败就整批返回，前面拿到的全丢了"
+    assert "merged" not in caught, "批失败时动了已拿到的结果"
+    assert "console.warn" in caught, "失败不留原因，整列空白没法查"

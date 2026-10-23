@@ -124,6 +124,8 @@ export default function TradingPage({
   const [symbols, setSymbols] = useState<SymbolInfo[]>([]);
   /** 24 小时行情：只问看得见的那批交易对。接口没上时是空对象，涨跌幅整列不显示。 */
   const [quotes, setQuotes] = useState<Record<string, TickerQuote>>({});
+  /** 选择器面板开着吗（它自己管开关，这里只用来决定要不要定时刷新涨幅）。 */
+  const [pickerOpen, setPickerOpen] = useState(false);
   const [timeframe, setTimeframe] = useState(settings?.timeframe || "15m");
   /** Every indicator switched on, with its parameters. Several may be stacked
    * at once; MA is the default because trend context is what most traders look
@@ -540,26 +542,44 @@ export default function TradingPage({
     );
   };
 
+  // 选择器窗口是 300 行：连同当前交易对、收藏、最近用过一起问，最多 6 批 × 50 个。
+  // 顺序就是优先级——当前交易对、收藏、最近用过排在最前面，第一屏一定有数。
+  const quotesWanted = useMemo(
+    () => [symbol, ...favorites, ...recent, ...symbols.slice(0, 300).map((item) => item.symbol)],
+    [symbol, favorites, recent, symbols],
+  );
+  /** 在跑的那一串批次请求：切页面、关面板时把它掐掉，别让剩下几批在后台继续跑。 */
+  const quotesAbort = useRef<AbortController | null>(null);
+  const refreshQuotes = useCallback(() => {
+    quotesAbort.current?.abort();
+    const controller = new AbortController();
+    quotesAbort.current = controller;
+    void loadTickers(market, quotesWanted, { signal: controller.signal }).then((map) => {
+      if (!controller.signal.aborted) setQuotes(map);
+    });
+  }, [market, quotesWanted]);
+
+  // 进页面先拉一次；页面切走（卸载）时中止还没发的批次。
+  // 先等交易对列表到手：列表还空着时只凑得出当前交易对和几个收藏，
+  // 那样等于白花一次请求，真正那 6 批随后还要重来一遍。
   useEffect(() => {
-    const wanted = [
-      symbol,
-      ...favorites,
-      ...recent,
-      ...symbols.slice(0, 50).map((item) => item.symbol),
-    ];
-    let cancelled = false;
-    const load = () => {
-      void loadTickers(market, wanted).then((map) => {
-        if (!cancelled) setQuotes(map);
-      });
-    };
-    load();
-    const timer = window.setInterval(load, 20000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [market, symbol, symbols, favorites, recent]);
+    if (!symbols.length) return;
+    refreshQuotes();
+    return () => quotesAbort.current?.abort();
+  }, [refreshQuotes, symbols.length]);
+
+  // 面板开着才定时刷新。关掉面板之后一条 /api/tickers 都不再发，在跑的批次当场中止。
+  const pickerOpenRef = useRef(false);
+  useEffect(() => {
+    const was = pickerOpenRef.current;
+    pickerOpenRef.current = pickerOpen;
+    if (!pickerOpen) {
+      if (was) quotesAbort.current?.abort();
+      return;
+    }
+    const timer = window.setInterval(refreshQuotes, 20000);
+    return () => window.clearInterval(timer);
+  }, [pickerOpen, refreshQuotes]);
 
   const current = useMemo(
     () => symbols.find((item) => item.symbol === symbol),
@@ -651,6 +671,7 @@ export default function TradingPage({
               recent={recent}
               quotes={quotes}
               onToggleFavorite={toggleFavorite}
+              onOpenChange={setPickerOpen}
             />
 
             <div className="price-line">
