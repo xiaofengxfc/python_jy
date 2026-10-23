@@ -166,6 +166,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     server = uvicorn.Server(config)
 
+    # 在线更新的最后一步要重启：让 updater 拿到这个 Server 的退出开关，
+    # 走 uvicorn 自己的优雅退出，而不是硬切。
+    from ..core import updater as _updater
+
+    _updater.set_shutdown_hook(lambda: setattr(server, "should_exit", True))
+
     if args.parent_pid:
         threading.Thread(
             target=_watch_parent,
