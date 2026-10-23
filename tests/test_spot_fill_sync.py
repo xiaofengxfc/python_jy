@@ -219,3 +219,137 @@ def test_float_noise_in_the_ledger_does_not_cost_a_step(tmp_path):
         assert amount == pytest.approx(0.00042)
     finally:
         db.close()
+
+# ------------------------- 成交那一刻就把账本同步掉，别等 5 秒轮询
+def test_a_fill_is_booked_the_moment_the_order_returns(tmp_path, monkeypatch):
+    """买完立刻读账本：面板要马上把这一行从「钱包余额」变回「平仓」。
+
+    账本只由 5 秒轮询去写，实测成交之后十几秒那一对还没轮到，于是界面把程序刚
+    买的仓位画成「卖出 / 预填整笔余额」，不带 size 的平仓也会 400。下单接口在
+    返回之前当场同步这一对。
+    """
+    venue = FakeVenue(
+        balances={
+            MarketType.SPOT: {"USDT": 10_000.0, "BTC": 0.0},
+            MarketType.USDM: {"USDT": 10_000.0},
+            MarketType.COINM: {"BTC": 0.2},
+        }
+    )
+    venue._last[SPOT_SYMBOL] = 100.0
+    settings = _settings()
+    db = Database(tmp_path / "place.db")
+
+    class _Ctx:
+        def __init__(self) -> None:
+            self.settings = settings
+            self.network = Network.TESTNET
+            self.market_type = MarketType.SPOT
+            self.trading = TradingService(
+                settings, venue, RiskManager(settings.risk), db, notifier=None
+            )
+            self.account = AccountService(
+                rest_for=lambda market: venue,
+                chart_rest_for=lambda market: venue,
+                db=db,
+                network=Network.TESTNET,
+            )
+
+        def rest_for(self, market):
+            return venue
+
+        def quote_rest(self, market):
+            return venue
+
+    ctx = _Ctx()
+    state = _State(
+        ctx=ctx,
+        locks={market: threading.RLock() for market in MarketType},
+        account_lock=threading.RLock(),
+    )
+    monkeypatch.setattr(web_app, "_state", state, raising=False)
+    place = _endpoint(web_app.create_app(), "/api/orders")
+    try:
+        result = place(
+            web_app.OrderPayload(
+                market=MarketType.SPOT.value,
+                symbol=SPOT_SYMBOL,
+                side="buy",
+                order_type="market",
+                size_mode="quote",
+                size=50.0,
+            )
+        )
+        assert result["ok"] is True
+        # 接口返回的这一刻，账本里就该有这一对——不用等下一轮轮询。
+        books = ctx.trading._live_ledger()["books"]
+        assert books[SPOT_SYMBOL]["contracts"] == pytest.approx(0.5)
+    finally:
+        db.close()
+
+
+def test_only_a_fill_counts_as_a_fill():
+    """挂着没成交的单不算成交：委托量不等于成交量，别拿它去触发同步。
+
+    替身交易所只会立刻成交，构造不出「挂着」的单，所以这里直接验判据本身。
+    """
+    assert web_app._filled_amount({"filled": 0.5, "amount": 0.5, "status": "closed"}) == 0.5
+    assert web_app._filled_amount({"filled": 0.0, "amount": 0.5, "status": "open"}) == 0.0
+    # 没有 unified 的 filled，退回币安原始字段
+    assert web_app._filled_amount({"executedQty": "0.2", "status": "FILLED"}) == 0.2
+    # 只有委托量、状态还不是成交 → 不算
+    assert web_app._filled_amount({"amount": 0.5, "status": "open"}) == 0.0
+    assert web_app._filled_amount({"amount": 0.5}) == 0.0
+    assert web_app._filled_amount({}) == 0.0
+    assert web_app._filled_amount(None) == 0.0
+
+# ------------------------- 平完之后账本要跟着归零，面板不能停在旧数量
+def test_closing_a_spot_position_books_the_exit(tmp_path, monkeypatch):
+    """卖掉之后账本还是旧数量：面板上那一行会一直显示「还持有 0.5」。"""
+    venue = FakeVenue(
+        balances={
+            MarketType.SPOT: {"USDT": 10_000.0, "BTC": 3.0},
+            MarketType.USDM: {"USDT": 10_000.0},
+            MarketType.COINM: {"BTC": 0.2},
+        }
+    )
+    venue._last[SPOT_SYMBOL] = 100.0
+    venue.fills.append(_fill("t-1", "buy", 0.5))
+    settings = _settings()
+    db = Database(tmp_path / "close-books.db")
+
+    class _Ctx:
+        def __init__(self) -> None:
+            self.settings = settings
+            self.network = Network.TESTNET
+            self.market_type = MarketType.SPOT
+            self.trading = TradingService(
+                settings, venue, RiskManager(settings.risk), db, notifier=None
+            )
+            self.account = AccountService(
+                rest_for=lambda market: venue,
+                chart_rest_for=lambda market: venue,
+                db=db,
+                network=Network.TESTNET,
+            )
+
+        def rest_for(self, market):
+            return venue
+
+        def quote_rest(self, market):
+            return venue
+
+    ctx = _Ctx()
+    state = _State(
+        ctx=ctx,
+        locks={market: threading.RLock() for market in MarketType},
+        account_lock=threading.RLock(),
+    )
+    monkeypatch.setattr(web_app, "_state", state, raising=False)
+    close = _endpoint(web_app.create_app(), "/api/positions/close")
+    try:
+        result = close(ClosePayload(market=MarketType.SPOT.value, symbol=SPOT_SYMBOL))
+        assert result["size"] == pytest.approx(0.5)
+        books = ctx.trading._live_ledger()["books"]
+        assert abs(books.get(SPOT_SYMBOL, {}).get("contracts") or 0.0) <= 1e-12
+    finally:
+        db.close()

@@ -559,6 +559,40 @@ def _minimum_order(spec: Any, price: float) -> tuple[float | None, float | None]
     return min_amount, (min_cost if min_cost > 0 else None)
 
 
+def _book_the_fill(state: _State, market: MarketType, symbol: str, order: dict[str, Any] | None) -> None:
+    """成交之后立刻把这一对的账本刷新一次。
+
+    成交同步是 5 秒一轮的。不在这里补一次，界面会连着十几秒把程序刚买的仓位画成
+    「钱包余额 / 卖出（预填整笔余额）」，不带 size 的现货平仓也会以「账本里没有
+    这一对」400 掉；平仓之后同样会停在旧数量上。一次签名请求换一个立刻正确的手感。
+    失败只记日志：账没同步不该让一张已经成交的单变成 500。
+    """
+    if _filled_amount(order) <= 0:
+        return
+    try:
+        state.ctx.trading.sync_symbol_fills(market, symbol)
+    except Exception as exc:  # noqa: BLE001 - 成交已经发生，别在这里翻车
+        log.warning("成交后同步账本失败（%s %s）：%s", market.value, symbol, exc)
+
+def _filled_amount(order: dict[str, Any] | None) -> float:
+    """这张单实际成交了多少（基础币）。挂单没成交就是 0。"""
+    if not isinstance(order, dict):
+        return 0.0
+    for key in ("filled", "executedQty", "amount"):
+        value = order.get(key)
+        if value is None:
+            continue
+        try:
+            amount = abs(float(value))
+        except (TypeError, ValueError):
+            continue
+        if key == "amount" and order.get("status") not in ("closed", "filled"):
+            # amount 是委托量，不一定成交；只有状态已是成交时才拿它兜底。
+            return 0.0
+        return amount
+    return 0.0
+
+
 def _is_reducing(
     state: _State,
     market: MarketType,
@@ -1134,6 +1168,12 @@ def create_app() -> FastAPI:
         # 借市场没了，这一步要显式做，否则刚下的单在缓存里最多还是 10 秒前的账。
         state.ctx.account.invalidate()
 
+        # 成交账本是 5 秒一轮同步的：刚成交那一笔还没进账本，面板于是把程序自己买的
+        # 仓位画成「钱包余额 / 卖出（预填整笔余额）」，不带 size 的平仓也会以
+        # 「账本里没有这一对」400 掉。这里当场把这一对同步一次（一次签名请求），
+        # 账本立刻是新的。失败只记日志：账没同步不该让一张已经成交的单变成 500。
+        _book_the_fill(state, mt, payload.symbol, result.order)
+
         return {
             "ok": True,
             "order": result.order,
@@ -1272,6 +1312,8 @@ def create_app() -> FastAPI:
         except Exception as exc:
             log.exception("平仓失败")
             raise HTTPException(status_code=500, detail=str(exc)) from exc
+        # 平完之后账本要跟着变成「已经不持有了」，否则面板上那一行还是刚才的数量。
+        _book_the_fill(state, mt, symbol, result.order)
         return {
             "ok": True,
             "order": result.order,
