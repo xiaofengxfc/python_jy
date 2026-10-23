@@ -405,6 +405,11 @@ export interface UpdateStatus {
   restart_pending?: boolean | null;
   /** 后端跑在哪个平台（Linux / Windows）：手动命令按它给，别在 Linux 上教人跑 run_web.py。 */
   platform?: string | null;
+  /** 这次任务真跑的端口与地址（重启前落盘）：手动命令按它拼，别写死 8765。 */
+  port?: number | null;
+  host?: string | null;
+  /** 任务种类：apply / rollback。 */
+  kind?: string | null;
 }
 
 /** 执行台最后用过的那三项，存在设置的 exec 里。不是风控：真上限在 risk 与

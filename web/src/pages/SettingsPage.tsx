@@ -288,6 +288,36 @@ export default function SettingsPage({ settings, settingsError = "", onSaved }: 
     [loadUpdate],
   );
 
+  /** 挂载就无条件读一次盘上的状态：更新失败、服务刚回来时，用户打开设置页的第一件事就是
+   *  看「到底停在哪一步」。只在点过「立即更新」之后才有东西看，等于让人在最需要的那一刻看空白。
+   *  还在跑（比如刷新页面撞上更新中）才接着轮询同一个任务。 */
+  const loadUpdateStatus = useCallback(async () => {
+    let status: UpdateStatus | null = null;
+    try {
+      status = await api<UpdateStatus>("/api/update/status");
+    } catch {
+      // 读不到就说读不到：卡片照常显示「正在读…」，不编一个状态出来。
+      return null;
+    }
+    if (!status) return null;
+    setUpdateJob(status);
+    const state = String(status.state ?? "");
+    if (state && !UPDATE_FINAL_STATES.includes(state)) {
+      if (status.job_id) {
+        void watchUpdate(status.kind === "rollback" ? "回滚" : "更新", String(status.job_id));
+      }
+      return status;
+    }
+    if (state === "failed" || state === "error" || state === "cancelled" || state === "stopped") {
+      setUpdateNote("上一次更新停在失败的那一步，原文贴在下面。");
+    }
+    return status;
+  }, [watchUpdate]);
+
+  useEffect(() => {
+    void loadUpdateStatus();
+  }, [loadUpdateStatus]);
+
   /** 立即更新：落后才可点，点了先问一次。 */
   const startUpdate = async () => {
     if (!update) return;
@@ -347,6 +377,61 @@ export default function SettingsPage({ settings, settingsError = "", onSaved }: 
     if (given.includes("linux")) return "linux";
     return uaPlatform;
   }, [update?.platform, updateJob?.platform, uaPlatform]);
+
+  /** 盘上那个任务是失败收场的：这时候用户最需要的就是手动命令与原文，不用再等 60 秒。 */
+  const jobStopped = Boolean(
+    updateJob && ["failed", "error", "cancelled", "stopped"].includes(String(updateJob.state ?? "")),
+  );
+
+  /** 后端失败输出里那条「手动拉起：…」：带的是这个进程真实的地址与端口，比前端自己拼的准。 */
+  const backendManual = useMemo(() => {
+    const texts: string[] = [];
+    for (const step of updateJob?.steps ?? []) if (step.output) texts.push(String(step.output));
+    if (updateJob?.error) texts.push(String(updateJob.error));
+    let found = "";
+    for (const text of texts) {
+      for (const line of text.split(/\r?\n/)) {
+        const at = line.indexOf("手动拉起：");
+        if (at >= 0) found = line.slice(at + "手动拉起：".length).trim() || found;
+      }
+    }
+    return found;
+  }, [updateJob]);
+
+  /** 这次任务真在哪个端口跑：状态里记着（重启前落盘）。没有就按 8765 兜底，并在界面上写明。 */
+  const updatePort =
+    typeof updateJob?.port === "number" && Number(updateJob.port) > 0 ? Number(updateJob.port) : null;
+  const updateHost = String(updateJob?.host ?? "").trim() || "127.0.0.1";
+
+  /** 手动命令：后端给的优先；没有就按平台拼，端口取状态里记的那个。 */
+  const manualCommand = useMemo(() => {
+    if (backendManual) return { text: backendManual, fallback: false };
+    if (manualPlatform === "linux") {
+      return {
+        text: "sudo systemctl status bitrader && sudo journalctl -u bitrader -n 50",
+        fallback: false,
+      };
+    }
+    const port = updatePort ?? 8765;
+    return {
+      text: `.venv\\Scripts\\python.exe run_web.py --host ${updateHost} --port ${port}`,
+      fallback: updatePort == null,
+    };
+  }, [backendManual, manualPlatform, updateHost, updatePort]);
+
+  /** 什么时候把手动命令摆出来：等了 60 秒没回来，或者盘上那个任务是失败收场。 */
+  const showManual = updateManual || jobStopped;
+
+  /** 状态里那段现场（失败任务在重启之后只剩这一份记忆）：有任务就画出来。 */
+  const jobTrace = useMemo(() => {
+    if (!updateJob || !String(updateJob.state ?? "")) return null;
+    return {
+      state: String(updateJob.state),
+      from: String(updateJob.from_sha ?? "").slice(0, 7) || "—",
+      to: String(updateJob.to_sha ?? "").slice(0, 7) || "—",
+      port: updatePort == null ? "—" : String(updatePort),
+    };
+  }, [updateJob, updatePort]);
 
   /** 状态文件里 restart_pending 还没收掉：说明在等新进程接手，别一概当成普通的 running。 */
   const restartPending = Boolean(
@@ -1827,6 +1912,31 @@ export default function SettingsPage({ settings, settingsError = "", onSaved }: 
 
             {updateNote && <div className="banner ok">{updateNote}</div>}
 
+            {/* 盘上这个任务的现场：刷新页面也读得到（失败的任务在重启之后只剩这一份记忆）。 */}
+            {jobTrace && (
+              <>
+                <div className="hint">盘上这次任务的现场（刷新页面也读得到）</div>
+                <div className="update-steps">
+                  <div className="update-step">
+                    <span className="faint">状态</span>
+                    <b>{jobTrace.state}</b>
+                  </div>
+                  <div className="update-step">
+                    <span className="faint">起始提交</span>
+                    <b>{jobTrace.from}</b>
+                  </div>
+                  <div className="update-step">
+                    <span className="faint">目标提交</span>
+                    <b>{jobTrace.to}</b>
+                  </div>
+                  <div className="update-step">
+                    <span className="faint">端口</span>
+                    <b>{jobTrace.port}</b>
+                  </div>
+                </div>
+              </>
+            )}
+
             {/* 后端已经把「重启中、等新进程接手」写到状态文件里：这时不能按普通的
                 running 画，否则界面就是一个永远不动、也不说在等什么的进度条。 */}
             {restartPending && (
@@ -1869,17 +1979,18 @@ export default function SettingsPage({ settings, settingsError = "", onSaved }: 
               </>
             )}
 
-            {updateManual && (
+            {/* 手动命令：后端给的那条带真实端口，优先用它；自己拼的那条端口取状态里记的。 */}
+            {showManual && (
               <>
                 <div className="hint">
                   {manualPlatform === "linux"
                     ? "手动命令（在服务器上执行，先看服务状态，不行再看日志）"
                     : "手动重启命令（在仓库根目录执行）"}
+                  {backendManual ? "——这条是后端给的，端口是这次真跑的那个" : ""}
                 </div>
-                {manualPlatform === "linux" ? (
-                  <pre className="deploy-log">{"sudo systemctl status bitrader && sudo journalctl -u bitrader -n 50"}</pre>
-                ) : (
-                  <pre className="deploy-log">.venv\Scripts\python.exe run_web.py --host 127.0.0.1 --port 8765</pre>
+                <pre className="deploy-log">{manualCommand.text}</pre>
+                {manualCommand.fallback && (
+                  <div className="hint">这条命令里的端口按默认 8765 算：状态里没记下这次跑的端口。</div>
                 )}
               </>
             )}

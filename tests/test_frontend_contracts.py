@@ -1415,7 +1415,7 @@ def test_the_update_card_survives_the_restart() -> None:
     card = _update_card_source()
     assert "/api/health" in card, "没等 /api/health"
     assert "60" in card and "秒" in card
-    assert r".venv\Scripts\python.exe run_web.py --host 127.0.0.1 --port 8765" in card
+    assert "手动拉起：" in card, "60 秒没回来要给手动命令（优先用后端给的那条）"
     assert "已更新完成，当前提交" in card
 
 
@@ -1558,3 +1558,54 @@ def test_each_market_keeps_its_own_leverage_cap_hint() -> None:
     assert "setCapByMarket((prev) => ({ ...prev, [target]: { state, cap } }))" in hook
     assert 'remember("known", cap)' in hook
     assert hook.count('remember("unknown", null)') >= 2, "只有一条路记「不知道」"
+
+# ---------------------------------------------------------------- t92 更新失败详情与真实端口、未成交不说成交
+
+
+def test_the_update_status_is_read_as_soon_as_the_page_opens() -> None:
+    """重启失败、服务刚回来时打开设置页：挂载就要无条件读一次盘上的状态。
+
+    只在点过「立即更新」之后才有东西看，等于让人在最需要的那一刻看空白。
+    """
+    card = _update_card_source()
+    assert 'api<UpdateStatus>("/api/update/status")' in card, "挂载那次没读盘上的状态（不带 job_id 的那条）"
+    assert "const loadUpdateStatus = useCallback(" in card, "没有单独那次「读盘上的状态」"
+    assert "void loadUpdateStatus();" in card, "没有在挂载时读一次"
+    assert "!UPDATE_FINAL_STATES.includes(state)" in card, "不是「还在跑才进轮询」"
+    assert "void watchUpdate(" in card, "正在跑的任务没有接着轮询"
+    assert "上一次更新停在失败的那一步" in card, "读回一个失败任务时不说一句"
+
+
+def test_a_failed_job_on_disk_is_shown_in_full() -> None:
+    """失败任务的 error 与每步输出整段显示，连同 from_sha / to_sha / port 一起画出来。"""
+    card = _update_card_source()
+    assert "{updateJob.error}" in card, "失败原因的后端原话没显示"
+    assert "{step.output}" in card, "失败那一步的原始输出没显示"
+    assert "updateJob.error.slice(" not in card, "把失败原因截断了"
+    assert "step.output.slice(" not in card, "把步骤输出截断了"
+    assert "updateJob.from_sha" in card and "updateJob.to_sha" in card, "起始 / 目标提交没画"
+    assert "updateJob?.port" in card, "端口没从状态里读"
+    assert "{jobTrace.state}" in card and "{jobTrace.port}" in card, "现场那几行没渲染"
+
+
+def test_the_manual_restart_command_takes_the_real_port() -> None:
+    """手动命令：后端给的那条优先；自己拼的端口取状态里记的；只有拿不到才落 8765 并写明。"""
+    card = _update_card_source()
+    assert "手动拉起：" in card, "后端给的命令没取"
+    assert "const backendManual = useMemo(" in card, "没有从失败输出里抠那条命令"
+    assert "const updatePort =" in card and "updateJob?.port" in card, "端口没从状态里取"
+    assert "run_web.py --host ${updateHost} --port ${port}" in card, "自己拼的那条没跟着状态里的端口走"
+    assert "8765" in card and "按默认" in card, "落到 8765 时没写明是兜底值"
+    assert "run_web.py --host 127.0.0.1 --port 8765" not in card, "端口还写死 8765"
+
+
+def test_an_unfilled_order_is_not_reported_as_filled() -> None:
+    """限价单刚受理（filled 0、status open）不是「买入成功」：按回执说「已挂单，等待成交」。"""
+    src = _order_ticket_source()
+    assert "order.filled" in src, "没看回执里的 filled"
+    assert "order.status" in src, "没看回执状态"
+    assert "filledQty > 0" in src, "没按 filled 分档"
+    assert "已挂单，等待成交" in src, "未成交也要说清挂上去了、还没成交"
+    assert "已提交，状态未知" in src, "状态读不懂就要照实说不知道"
+    assert "买入成功" not in src and "卖出成功" not in src, "受理还写成「成功」"
+    assert "买入成交" in src and "卖出成交" in src, "成交那一档也要说人话"

@@ -472,7 +472,12 @@ export default function OrderTicket({
         }),
       });
       const order = result.order ?? {};
-      const filled = Number(order.average ?? order.price ?? referencePrice);
+      // 回执先说人话：filled > 0 才算成交。限价单刚受理时 filled 是 0、status 是 open，
+      // 那不是「成交」，是「挂上去了、还没成交」——把受理写成成交，人就以为钱已经换成了币。
+      const filledQty = Number(order.filled ?? 0);
+      const orderStatus = String(order.status ?? "").toLowerCase();
+      const price = Number(order.average ?? order.price ?? referencePrice);
+      const quantity = Number(order.amount ?? 0) > 0 ? Number(order.amount) : filledQty;
       const guard = [
         opening && stop > 0 ? `止损 ${fmtPrice(stop)}` : "",
         opening && target > 0 ? `止盈 ${fmtPrice(target)}` : "",
@@ -480,13 +485,20 @@ export default function OrderTicket({
         .filter(Boolean)
         .join(" · ");
       const warnings = result.warnings ?? [];
+      const resting = ["open", "new", "pending", "accepted"].includes(orderStatus);
       const filledText =
-        (side === "buy" ? "买入成功：" : "卖出成功：") +
-        `${fmt(Number(order.amount ?? 0), 6)} ${base} @ ${fmtPrice(filled)}` +
-        (guard ? `（${guard}）` : "");
+        filledQty > 0
+          ? `${side === "buy" ? "买入成交" : "卖出成交"}：${fmt(filledQty, 6)} ${base} @ ${fmtPrice(price)}` +
+            (guard ? `（${guard}）` : "")
+          : resting
+            ? `已挂单，等待成交：${fmt(quantity, 6)} ${base} @ ${fmtPrice(price)}` +
+              (guard ? `（${guard}）` : "") +
+              "——交易所还没成交，成交之后才出现在持仓与成交记录里"
+            : `已提交，状态未知（回执状态 ${orderStatus || "没给出"}）：${fmt(quantity, 6)} ${base} @ ${fmtPrice(price)}` +
+              "——去交易所或持仓里核实一下，别当已成交";
       setFlash(
-        warnings.length
-          ? { tone: "warn", text: `${filledText}。${warnings.join("；")}` }
+        warnings.length || filledQty <= 0
+          ? { tone: "warn", text: warnings.length ? `${filledText}。${warnings.join("；")}` : filledText }
           : { tone: "ok", text: filledText },
       );
       // 杠杆被收口时后端在回执里说清是撞了哪一条上限：留在面板上，不随 flash 一起消失。
