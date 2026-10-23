@@ -164,6 +164,7 @@ def symbol_shape_error(symbol: str) -> str:
     """写法自洽返回空串，否则返回一句中文说明（说明里带上该写的样子）。
 
     现货是 ``BASE/QUOTE``，合约是 ``BASE/QUOTE:SETTLE``（交割再多一段 -YYMMDD）。
+    整串最多一个冒号：结算币段里不许再出现冒号（``BTC/USDT:USDT:USDT`` 是写错）。
     这里只判「写得像不像交易对」，不判市场对不对：收藏是跨市场的，同一个列表里
     两种写法都合法；市场与写法的对应关系由 web 层的 ``_check_symbol_shape`` 判，
     那条路要 400 给用户看，所以它自己带文案。
@@ -176,6 +177,14 @@ def symbol_shape_error(symbol: str) -> str:
         return "缺少交易对。"
     if any(char.isspace() for char in text):
         return f"交易对里不能有空格：「{text}」。"
+    # 整串最多一个冒号。结算币段里再冒一个冒号不是「另一种写法」，是写错了：
+    # 放过它的话 BTC/USDT:USDT:USDT 会一路进收藏、进 /api/tickers，到交易所那层才炸。
+    if text.count(":") > 1:
+        return (
+            f"交易对写法不对：「{text}」里的冒号只能有一个，冒号后面写结算币。"
+            "现货写 BTC/USDT，U 本位合约写 BTC/USDT:USDT，币本位写 BTC/USD:BTC，"
+            "交割再带到期日，例如 BTC/USD:BTC-250926。"
+        )
     pair, colon, settle = text.partition(":")
     base, _, quote = pair.partition("/")
     if not base or not quote or "/" in quote or "/" in settle:

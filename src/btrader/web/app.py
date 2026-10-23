@@ -33,6 +33,7 @@ from ..core.types import (
     market_for_symbol,
     split_symbol,
     symbol_is_contract,
+    symbol_shape_error,
 )
 from ..engine.trading import OrderRejected, OrderRequest
 from ..exchange.symbols import format_amount, load_symbols
@@ -500,15 +501,12 @@ def _check_symbol_shape(market: MarketType, symbol: str) -> str:
     写法的地方，这里只负责说清该写哪一种。返回去掉首尾空白的写法，调用方直接用它。
     """
     text = (symbol or "").strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="缺少交易对。")
+    # 写法本身先过 core.types 那唯一一份判定：空、空格、缺币/计价、结算币里再带冒号
+    # （BTC/USDT:USDT:USDT）都在这里拦掉，这儿只补「这个市场该不该带结算币」。
+    problem = symbol_shape_error(text)
+    if problem:
+        raise HTTPException(status_code=400, detail=problem)
     base, quote, _settle = split_symbol(text)
-    _, slash, rest = text.partition("/")
-    if not slash or not base or not quote or "/" in rest:
-        raise HTTPException(
-            status_code=400,
-            detail=f"交易对写法不对：「{text}」要写成「币/计价」，例如 BTC/USDT。",
-        )
     contract_shape = symbol_is_contract(text)
     if contract_shape and not market.is_futures:
         raise HTTPException(

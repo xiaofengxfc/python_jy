@@ -25,6 +25,7 @@ from btrader.core.types import (
     market_for_symbol,
     split_symbol,
     symbol_is_contract,
+    symbol_shape_error,
 )
 from btrader.engine.account import AccountService
 from btrader.engine.risk import RiskManager
@@ -83,6 +84,56 @@ def test_an_empty_symbol_does_not_pass_for_a_contract() -> None:
     """空符号不许被判成合约（会不会被当成现货由调用方自己拦）。"""
     assert split_symbol("") == ("", "", "")
     assert market_for_symbol("") is MarketType.SPOT
+
+
+# ------------------------------------------- 写法校验：冒号只能有一个
+# 量测复核抓的一条：BTC/USDT:USDT:USDT 在 symbol_shape_error 里返回 ""（写得像），
+# 于是它进得了收藏、进得了 /api/tickers，到交易所那一层才炸。结算币段里再出现冒号
+# 不是「另一种写法」，是写错了——real 符号整串最多一个冒号。
+
+
+@pytest.mark.parametrize(
+    "symbol",
+    [
+        "BTC/USDT:USDT:USDT",
+        "BTC/USD:BTC:USDT",
+        "BTC/USDT:USDT:USDT-250926",
+        "BTC/USDT::USDT",
+    ],
+)
+def test_a_second_colon_is_a_shape_error(symbol: str) -> None:
+    """两个冒号判写法错，并说清该写成什么。"""
+    problem = symbol_shape_error(symbol)
+    assert problem, f"{symbol} 不该通过写法校验"
+    assert "冒号" in problem
+    # 文案要能照着改：四种合法写法至少点出合约与币本位这两种
+    assert "BTC/USDT:USDT" in problem
+    assert "BTC/USD:BTC" in problem
+
+
+@pytest.mark.parametrize(
+    "symbol",
+    ["BTC//USDT", "BTC/USDT:", ":USDT", ":", "BTC/", "/USDT", "BTC/USDT:-250926"],
+)
+def test_empty_segments_are_shape_errors(symbol: str) -> None:
+    """空段与只有冒号：都不是交易对。"""
+    assert symbol_shape_error(symbol), f"{symbol} 不该通过写法校验"
+
+
+@pytest.mark.parametrize(
+    "symbol",
+    [
+        "BTC/USDT",              # 现货
+        "BTC/USDT:USDT",         # U 本位永续
+        "BTC/USD:BTC",           # 币本位永续
+        "BTC/USD:BTC-250926",    # 币本位交割：到期日要能过
+        "BTC/USDT:USDT-250926",  # U 本位交割同样
+        "  btc/usdt:usdt  ",     # 前后空格要去掉；大小写混写不拦（交易所符号本身不区分大小写）
+    ],
+)
+def test_the_legal_spellings_still_pass(symbol: str) -> None:
+    """补齐合法写法：改坏一处校验最容易顺手把交割合约一起拒了。"""
+    assert symbol_shape_error(symbol) == ""
 
 
 # ------------------------------------------- 不带 market 的入口走对客户端
