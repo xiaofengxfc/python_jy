@@ -1,7 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api, query } from "../api";
 import { fmt, fmtPrice, parseNumber } from "../format";
-import type { OrderPreview, OrderType, Protection, Side, SizeMode } from "../types";
+import { createSectionSaver } from "../settingsAutoSave";
+import type {
+  OrderPreview,
+  OrderType,
+  Protection,
+  Side,
+  SizeMode,
+  TradeSettings,
+} from "../types";
 
 interface Props {
   market: string;
@@ -31,6 +39,10 @@ interface Flash {
 /** Last size the user actually typed, remembered across symbol switches so
  * the common case (trade 100 USDT of something else) is one click away. */
 const LAST_QUOTE_KEY = "bitrader.order.quote";
+
+/** 杠杆只收 1–125 的整数（交易所给的上限）。真闸是 risk.max_leverage，
+ *  这里只是输入框自己的边界，超了提示一句，不改用户填的数。 */
+const MAX_LEVERAGE = 125;
 
 function readLastQuote(): string {
   try {
@@ -94,6 +106,69 @@ export default function OrderTicket({
   const requestId = useRef(0);
 
   const live = network === "mainnet";
+
+  /** 杠杆按市场记：settings.trade.leverage = {"usdm": 10, "coinm": 5}。
+   *  改动即存（500ms 攒一次），刷新页面还在。 */
+  const tradeSaver = useRef(createSectionSaver("trade"));
+  const [leverageByMarket, setLeverageByMarket] = useState<Record<string, number>>({});
+  const [leverageText, setLeverageText] = useState("1");
+  /** risk.max_leverage：只用来提示「超过会按上限处理」，不替用户改数。 */
+  const [maxLeverage, setMaxLeverage] = useState<number | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void api<{ settings?: { trade?: TradeSettings; risk?: { max_leverage?: number } } }>(
+      "/api/settings",
+    )
+      .then((data) => {
+        if (cancelled) return;
+        setLeverageByMarket(data?.settings?.trade?.leverage ?? {});
+        const cap = data?.settings?.risk?.max_leverage;
+        setMaxLeverage(typeof cap === "number" && Number.isFinite(cap) ? cap : null);
+      })
+      .catch(() => {
+        // 读不到就按 1 倍：栏还在，用户能自己填，不挡下单。
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // 换市场（现货↔合约）就换成那个市场记住的倍数；没记过就是 1。
+  useEffect(() => {
+    const stored = Number(leverageByMarket[market]);
+    setLeverageText(String(Number.isFinite(stored) && stored >= 1 ? stored : 1));
+  }, [market, leverageByMarket]);
+
+  // 离开下单框时把还没写的杠杆补上。
+  useEffect(() => () => tradeSaver.current.flush(), []);
+
+  const changeLeverage = (raw: string) => {
+    setLeverageText(raw);
+    const trimmed = raw.trim();
+    const parsed = Math.trunc(Number(trimmed));
+    if (!trimmed || !Number.isFinite(parsed) || parsed < 1 || parsed > MAX_LEVERAGE) return;
+    const next = { ...leverageByMarket, [market]: parsed };
+    setLeverageByMarket(next);
+    tradeSaver.current.queue({ leverage: next });
+  };
+
+  /** 输入框里那个整数，非法时按 1（不夹到 risk 上限：那是后端收口的事）。 */
+  const leverageValue = useMemo(() => {
+    const parsed = Math.trunc(Number(leverageText));
+    return Number.isFinite(parsed) && parsed >= 1 ? parsed : 1;
+  }, [leverageText]);
+
+  const leverageNote = useMemo(() => {
+    if (market === "spot") return "";
+    if (leverageValue > MAX_LEVERAGE) {
+      return `杠杆只收 1 到 ${MAX_LEVERAGE} 的整数，超过按 ${MAX_LEVERAGE} 倍收口。`;
+    }
+    if (maxLeverage != null && leverageValue > maxLeverage) {
+      return `上限 ${maxLeverage} 倍，超过会按上限处理`;
+    }
+    return "";
+  }, [market, leverageValue, maxLeverage]);
 
   // A click on the ladder fills the limit price; the parent clears the signal
   // so the same price can be picked again.
@@ -208,6 +283,8 @@ export default function OrderTicket({
             size_mode: sizeMode,
             size: amount,
             price: orderType === "limit" ? referencePrice : null,
+            // 杠杆只对合约有意义：现货不发这个字段。
+            ...(market === "spot" ? {} : { leverage: leverageValue }),
           }),
         });
         if (id !== requestId.current) return;
@@ -221,7 +298,7 @@ export default function OrderTicket({
     }, 220);
 
     return () => window.clearTimeout(timer);
-  }, [market, symbol, side, orderType, sizeMode, size, referencePrice]);
+  }, [market, symbol, side, orderType, sizeMode, size, referencePrice, leverageValue]);
 
   /** Ask the assistant whether this order makes sense right now. Deliberately
    * separate from the submit path: it must be possible to ignore it, and it
@@ -330,6 +407,8 @@ export default function OrderTicket({
           price: orderType === "limit" ? referencePrice : null,
           stop_loss: opening && stop > 0 ? stop : null,
           take_profit: opening && target > 0 ? target : null,
+          // 杠杆只对合约有意义：现货不发这个字段。
+          ...(market === "spot" ? {} : { leverage: leverageValue }),
           // Only mainnet needs it, and only this panel can honestly assert the
           // user was asked — it is the one that showed the dialog.
           confirm_live: live,
@@ -396,6 +475,8 @@ export default function OrderTicket({
           trigger: level,
           direction: triggerDirection,
           reduce_only: side === "sell" && positionQty > 0,
+          // 条件单也是真委托，合约侧同样按这里的倍数开。
+          ...(market === "spot" ? {} : { leverage: leverageValue }),
           confirm_live: live,
         }),
       });
@@ -619,6 +700,32 @@ export default function OrderTicket({
             )}
           </div>
         </div>
+
+        {/* 杠杆：现货没有借币这回事，整栏不显示。整数 1–125，改动即记到设置里。 */}
+        {market !== "spot" && (
+          <div className="field">
+            <label className="field-label" htmlFor="leverage-input">
+              <span>杠杆</span>
+              <em>倍数，只对合约生效</em>
+            </label>
+            <input
+              id="leverage-input"
+              className="input"
+              type="number"
+              inputMode="numeric"
+              min={1}
+              max={MAX_LEVERAGE}
+              step={1}
+              value={leverageText}
+              onChange={(event) => changeLeverage(event.target.value)}
+            />
+            {leverageNote && (
+              <div className="protect-hint">
+                <span className="faint">{leverageNote}</span>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Step 3.5 — protective exits. They are sent with the entry and the
             venue holds them as reduce-only stop orders, so they survive this

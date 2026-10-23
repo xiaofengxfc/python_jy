@@ -4,7 +4,8 @@ import type { AppSettings } from "./types";
 /** 改动即存：连点几个输入框只打一次接口，不要每敲一个字写一次盘。 */
 export const SAVE_DEBOUNCE_MS = 500;
 
-export type SettingsSection = "ai_auto" | "exec";
+/** trade 是下单框按市场记住的杠杆（settings.trade.leverage）。 */
+export type SettingsSection = "ai_auto" | "exec" | "trade";
 
 /** 一段设置攒 500ms 再写盘。同一段只排一个定时器，后来的改动覆盖前面的。
  *  存不上不抛：这些参数是运行配置，写盘失败不该把正在填的表单打断。 */

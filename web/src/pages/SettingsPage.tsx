@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, query } from "../api";
 import { TIMEFRAMES } from "../format";
 import SymbolFallbackNote from "../components/SymbolFallbackNote";
@@ -15,6 +15,8 @@ import type {
   PlatformOption,
   RiskState,
   SymbolInfo,
+  UpdateInfo,
+  UpdateStatus,
 } from "../types";
 
 interface Props {
@@ -51,6 +53,9 @@ const RISK_FIELDS: [keyof AppSettings["risk"], string, string][] = [
 const PCT_FIELDS: [keyof AppSettings["risk"], string, string][] = [
   ["max_order_pct", "单笔上限比例", "% 本金"],
 ];
+
+/** 更新任务的终态：这几个一出现就不会再变，轮询到此为止。 */
+const UPDATE_FINAL_STATES = ["done", "ok", "success", "failed", "error", "cancelled", "stopped"];
 
 export default function SettingsPage({ settings, settingsError = "", onSaved }: Props) {
   const [draft, setDraft] = useState<AppSettings | null>(settings);
@@ -170,6 +175,160 @@ export default function SettingsPage({ settings, settingsError = "", onSaved }: 
     }
   };
 
+  /** 软件更新：读本地与 GitHub 的差距、一键更新、逐步进度、回滚。
+   *  更新最后一步是重启服务，重启那几十秒里轮询会断，所以读不到状态时先去等 /api/health。 */
+  const [update, setUpdate] = useState<UpdateInfo | null>(null);
+  const [updateError, setUpdateError] = useState("");
+  const [updateBusy, setUpdateBusy] = useState<"" | "info" | "apply" | "rollback">("");
+  const [updateJob, setUpdateJob] = useState<UpdateStatus | null>(null);
+  const [updateNote, setUpdateNote] = useState("");
+  /** 60 秒没等到服务回来：把手动命令显示出来。 */
+  const [updateManual, setUpdateManual] = useState(false);
+  /** 轮询的代次：换一次任务或重新进页面就作废上一轮的循环。 */
+  const updateWatch = useRef(0);
+
+  const loadUpdate = useCallback(async () => {
+    setUpdateBusy("info");
+    try {
+      const info = await api<UpdateInfo>("/api/update/info");
+      setUpdate(info);
+      setUpdateError("");
+    } catch (caught) {
+      setUpdate(null);
+      setUpdateError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setUpdateBusy("");
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadUpdate();
+  }, [loadUpdate]);
+
+  /** 服务重启期间 /api/tickers 那类请求都会断，只问 /api/health：200 就说明回来了。
+   *  一分钟还没回来就停在这里，把手动命令交给用户，不自己编原因。 */
+  const waitForService = async (token: number): Promise<boolean> => {
+    for (let tick = 0; tick < 60; tick += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, 1000));
+      if (updateWatch.current !== token) return false;
+      try {
+        const response = await fetch("/api/health");
+        if (response.ok) return true;
+      } catch {
+        // 还没起来，接着等。
+      }
+    }
+    setUpdateManual(true);
+    setUpdateNote("60 秒没等到服务回来，用下面的命令手动重启。");
+    setUpdateBusy("");
+    return false;
+  };
+
+  /** 一秒一步地读进度，直到任务落地；中途读不到就去等 /api/health。 */
+  const watchUpdate = useCallback(
+    async (label: string, jobId: string) => {
+      const token = ++updateWatch.current;
+      for (let tick = 0; tick < 900; tick += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 1000));
+        if (updateWatch.current !== token) return;
+        let status: UpdateStatus | null = null;
+        try {
+          status = await api<UpdateStatus>(`/api/update/status?${query({ job_id: jobId })}`);
+        } catch {
+          // 读不到就是服务正在重启：等它回来再接着读同一个任务。
+          setUpdateNote("服务正在重启，等 /api/health 回来…");
+          const back = await waitForService(token);
+          if (!back) return;
+          continue;
+        }
+        if (status && Array.isArray(status.steps)) setUpdateJob(status);
+        const state = String(status?.state ?? "");
+        if (!UPDATE_FINAL_STATES.includes(state)) continue;
+        if (state === "failed" || state === "error" || state === "cancelled" || state === "stopped") {
+          setUpdateNote(`${label}停在失败的那一步，原文贴在下面。`);
+        } else {
+          const to = status?.to_sha ? String(status.to_sha).slice(0, 7) : "";
+          setUpdateNote(to ? `已更新完成，当前提交 ${to}` : "已更新完成。");
+        }
+        setUpdateBusy("");
+        await loadUpdate();
+        return;
+      }
+      setUpdateNote("等了十几分钟还没结束，刷新页面看结果。");
+      setUpdateBusy("");
+    },
+    [loadUpdate],
+  );
+
+  /** 立即更新：落后才可点，点了先问一次。 */
+  const startUpdate = async () => {
+    if (!update) return;
+    const behind = update.behind_by ?? 0;
+    const ok = window.confirm(
+      `即将把本机更新到远端 ${update.remote_short ?? "最新提交"}（落后 ${behind} 个提交）。\n\n` +
+        "第一步会检查有没有自动交易 / AI 量化 / 执行台在跑：在跑就直接拒绝，不替你停。" +
+        "然后连远端、快进合并、装依赖、重启服务。重启期间页面会断几秒到几十秒；" +
+        "任何一步失败就停在那一步，原样输出贴在卡里。确认继续？",
+    );
+    if (!ok) return;
+    setUpdateBusy("apply");
+    setUpdateNote("正在更新…");
+    setUpdateJob(null);
+    setUpdateManual(false);
+    try {
+      const result = await api<{ job_id: string }>("/api/update/apply", {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      await watchUpdate("更新", String(result?.job_id ?? ""));
+    } catch (caught) {
+      setUpdateBusy("");
+      setUpdateError(caught instanceof Error ? caught.message : String(caught));
+    }
+  };
+
+  /** 回滚：回到这次更新之前的那个提交。 */
+  const rollbackUpdate = async () => {
+    const from = updateJob?.from_sha
+      ? String(updateJob.from_sha).slice(0, 7)
+      : update?.current_short ?? "更新前的那一个";
+    const ok = window.confirm(
+      `回滚就是回到更新前的提交 ${from}：更新带上来的那些提交在这个目录里就没有了（本地未提交的改动不动，因为更新要求工作树本来就干净）。\n\n回滚同样会重启服务几秒到几十秒，失败会停在那一步并把原样输出贴出来。确认回滚？`,
+    );
+    if (!ok) return;
+    setUpdateBusy("rollback");
+    setUpdateNote("正在回滚…");
+    setUpdateJob(null);
+    setUpdateManual(false);
+    try {
+      const result = await api<{ job_id: string }>("/api/update/rollback", {
+        method: "POST",
+        body: JSON.stringify({ confirm: true }),
+      });
+      await watchUpdate("回滚", String(result?.job_id ?? ""));
+    } catch (caught) {
+      setUpdateBusy("");
+      setUpdateError(caught instanceof Error ? caught.message : String(caught));
+    }
+  };
+  /** 落后才能更新：领先（本地有没推的提交）和分叉都不许点。 */
+  const canUpdate = Boolean(
+    update && (update.behind_by ?? 0) > 0 && (update.ahead_by ?? 0) === 0 && !update.error,
+  );
+
+  /** 本地新 / 已分叉各自说清（读不到远端时由上面那条 error banner 负责贴原话）。 */
+  const updateBlock = useMemo(() => {
+    if (!update || update.error) return "";
+    const ahead = update.ahead_by ?? 0;
+    const behind = update.behind_by ?? 0;
+    if (ahead > 0 && behind > 0) {
+      return `已分叉，需要手动处理：本地领先 ${ahead} 个、落后 ${behind} 个提交（先把本地提交 push 或 rebase 掉，再回来更新）。`;
+    }
+    if (ahead > 0 && behind === 0) {
+      return `本地比远端新，先 push（领先 ${ahead} 个提交）：这些提交还没上 GitHub，更新没有可拉的东西。`;
+    }
+    return "";
+  }, [update]);
   /** 重新读服务端设置。进页面就读一次：别处改过的值必须先看到，再允许保存。 */
   const loadSettings = useCallback(async () => {
     try {
@@ -1522,6 +1681,149 @@ export default function SettingsPage({ settings, settingsError = "", onSaved }: 
                 80 端口对外可达；IP 不能直接签证书。
               </div>
             )}
+          </div>
+        </div>
+
+        {/* 软件更新：读 GitHub 上的最新提交，落后才可点更新。更新会重启服务，
+            轮询断了就等 /api/health 回来；重启那一步是唯一会把服务弄挂的地方，
+            所以 60 秒没回来就停下把手动命令交出去。 */}
+        <div className="card">
+          <div className="card-head">
+            <span className="card-title">软件更新</span>
+            <span className="spacer" />
+            <span className="faint" style={{ fontSize: "var(--fs-12)" }}>
+              {update?.current_short ? `当前 ${update.current_short}` : "还没读到"}
+            </span>
+          </div>
+          <div className="card-body stack">
+            {updateError && <div className="banner warn">{updateError}</div>}
+
+            {update && (
+              <div className="deploy-rows">
+                <div className="deploy-row">
+                  <span>当前提交</span>
+                  <b className="num">{update.current_short ?? "—"}</b>
+                </div>
+                <div className="deploy-row">
+                  <span>分支</span>
+                  <b>{update.branch ?? "—"}</b>
+                </div>
+                <div className="deploy-row">
+                  <span>远端最新</span>
+                  <b className="num">{update.remote_short ?? "读不到"}</b>
+                </div>
+                <div className="deploy-row">
+                  <span>差距</span>
+                  <b>
+                    落后 {update.behind_by ?? 0} 个 / 领先 {update.ahead_by ?? 0} 个
+                  </b>
+                </div>
+                <div className="deploy-row">
+                  <span>上次检查</span>
+                  <b>
+                    {update.checked_at ?? "—"}
+                    {update.source ? `（来源：${update.source}）` : ""}
+                  </b>
+                </div>
+              </div>
+            )}
+
+            {/* error 是后端原话：两条路都读不到时它非空，这时候一句「已是最新」都不能说。 */}
+            {update?.error && <div className="banner warn">{update.error}</div>}
+            {updateBlock && <div className="banner warn">{updateBlock}</div>}
+
+            {update?.commits && update.commits.length > 0 && (
+              <>
+                <div className="hint">远端最新的提交（最多 10 条）</div>
+                <pre className="deploy-log">
+                  {update.commits
+                    .slice(0, 10)
+                    .map((item) => `${item.short}  ${item.title}`)
+                    .join("\n")}
+                </pre>
+              </>
+            )}
+
+            <div className="row" style={{ gap: 8 }}>
+              <button
+                type="button"
+                className="btn-sm"
+                disabled={updateBusy !== ""}
+                onClick={() => void loadUpdate()}
+              >
+                {updateBusy === "info" ? "检查中…" : "检查更新"}
+              </button>
+              <button
+                type="button"
+                className="btn-sm primary"
+                disabled={!canUpdate || updateBusy !== ""}
+                onClick={() => void startUpdate()}
+              >
+                {updateBusy === "apply" ? "正在更新…" : "立即更新"}
+              </button>
+              <button
+                type="button"
+                className="btn-sm"
+                disabled={updateBusy !== ""}
+                onClick={() => void rollbackUpdate()}
+              >
+                {updateBusy === "rollback" ? "正在回滚…" : "回滚"}
+              </button>
+            </div>
+
+            {!update && !updateError && (
+              <div className="hint">正在读本地与 GitHub 的提交…</div>
+            )}
+            {update && !update.error && !updateBlock && (update.behind_by ?? 0) === 0 && (
+              <div className="hint">本地和远端是同一个提交。</div>
+            )}
+
+            {updateNote && <div className="banner ok">{updateNote}</div>}
+
+            {/* 每步跑完才写一条；失败的原文原样贴出来，不截断也不转述。 */}
+            {updateJob?.steps && updateJob.steps.length > 0 && (
+              <>
+                <div className="hint">进度（失败的那一步原文贴在下面）</div>
+                <div className="update-steps">
+                  {updateJob.steps.map((step) => (
+                    <div key={step.name} className="update-step">
+                      <span className={step.ok ? "num up" : "num down"}>
+                        {step.ok ? "✓" : "✗"}
+                      </span>
+                      <b>{step.name}</b>
+                      <span className="faint" style={{ fontSize: "var(--fs-12)" }}>
+                        {step.seconds != null ? `${Number(step.seconds).toFixed(1)} 秒` : ""}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+            {updateJob?.steps
+              ?.filter((step) => !step.ok)
+              .map((step) => (
+                <div key={`${step.name}-output`}>
+                  <div className="hint">{step.name} 的原始输出</div>
+                  <pre className="deploy-log">{step.output}</pre>
+                </div>
+              ))}
+            {updateJob?.error && (
+              <>
+                <div className="hint">任务失败的原因（后端原话）</div>
+                <pre className="deploy-log">{updateJob.error}</pre>
+              </>
+            )}
+
+            {updateManual && (
+              <>
+                <div className="hint">手动重启命令（在仓库根目录执行）</div>
+                <pre className="deploy-log">.venv\Scripts\python.exe run_web.py --host 127.0.0.1 --port 8765</pre>
+              </>
+            )}
+
+            <div className="hint">
+              更新只用快进合并，不会 --force、也不会 reset --hard；工作树不干净或自动交易在跑时后端直接拒绝。
+            </div>
           </div>
         </div>
       </div>

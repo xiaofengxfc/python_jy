@@ -350,6 +350,55 @@ export interface DeployResult {
   message: string;
 }
 
+/** 下单框按市场记住的杠杆，存在设置的 trade 里：{"usdm": 10, "coinm": 5}。
+ *  只是「上次用过的倍数」，真上限仍是 risk.max_leverage，接口按上限收口。 */
+export interface TradeSettings {
+  leverage?: Record<string, number>;
+}
+
+/** GET /api/update/info：本地与 GitHub 的差距。读不到就是 error 非空、remote_sha 为 null，
+ *  这时界面上一个字都不许说「已是最新」。 */
+export interface UpdateCommit {
+  sha: string;
+  short: string;
+  title: string;
+  date: string;
+}
+
+export interface UpdateInfo {
+  current_sha?: string | null;
+  current_short?: string | null;
+  branch?: string | null;
+  remote_url?: string | null;
+  remote_sha?: string | null;
+  remote_short?: string | null;
+  ahead_by?: number | null;
+  behind_by?: number | null;
+  commits?: UpdateCommit[];
+  checked_at?: string | null;
+  /** github（API 读到的提交列表）或 ls-remote（只问到 SHA，没有标题）。 */
+  source?: string | null;
+  error?: string | null;
+}
+
+/** 一键更新的一步：跑完才写。output 是命令的原文，失败时原样贴出来。 */
+export interface UpdateStep {
+  name: string;
+  ok: boolean;
+  output: string;
+  seconds?: number | null;
+}
+
+/** GET /api/update/status：当前（或最后一次）更新任务的进度。 */
+export interface UpdateStatus {
+  state: string;
+  steps?: UpdateStep[];
+  from_sha?: string | null;
+  to_sha?: string | null;
+  error?: string | null;
+  job_id?: string | null;
+}
+
 /** 执行台最后用过的那三项，存在设置的 exec 里。不是风控：真上限在 risk 与
  *  AITrader 的闸里，改这三项动不了任何一条闸。 */
 export interface ExecSettings {
@@ -529,6 +578,8 @@ export interface AppSettings {
   ai_auto?: AIAutoSettings;
   /** 执行台最后用过的那三项：仓位比例 / 杠杆 / 轮询。 */
   exec?: ExecSettings;
+  /** 下单框按市场记住的杠杆。只存合约市场，现货恒 1、不入库。 */
+  trade?: TradeSettings;
   /** 收藏的交易对。跟账户走（存后端），不写 localStorage。 */
   favorites?: string[];
   /** 最近用过的交易对，后端记，界面上最多显示 8 条。 */

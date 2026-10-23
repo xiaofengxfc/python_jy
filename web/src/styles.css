@@ -4309,3 +4309,21 @@ main.main > .stage-bar:not(.page-head) {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+
+/* 软件更新那张卡：一步步的进度。每步的原文输出沿用 .deploy-log（等宽、可滚）。 */
+.update-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: var(--fs-13);
+}
+
+.update-step {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.update-step > b {
+  font-weight: 500;
+}

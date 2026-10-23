@@ -1313,3 +1313,121 @@ def test_one_failed_batch_leaves_only_its_rows_blank() -> None:
     assert "return" not in caught, "批失败就整批返回，前面拿到的全丢了"
     assert "merged" not in caught, "批失败时动了已拿到的结果"
     assert "console.warn" in caught, "失败不留原因，整列空白没法查"
+
+
+# ---------------------------------------------------------------- t79 杠杆与在线更新
+
+
+def _order_ticket_source() -> str:
+    return (UI_DIR / "components" / "OrderTicket.tsx").read_text(encoding="utf-8")
+
+
+def _update_card_source() -> str:
+    """设置页「软件更新」那一块：状态、四个请求、整张卡的 JSX。"""
+    page = (UI_DIR / "pages" / "SettingsPage.tsx").read_text(encoding="utf-8")
+    start = page.index("const [update, setUpdate] = useState<UpdateInfo | null>(null);")
+    end = page.index("const loadSettings = useCallback(", start)
+    title = '<span className="card-title">软件更新</span>'
+    assert title in page, "状态有了，卡片呢"
+    return page[start:end] + page[page.index(title) :]
+
+
+def test_the_order_ticket_shows_leverage_only_on_futures() -> None:
+    """杠杆栏只在合约上出现：现货没有借币这回事，整栏不显示。"""
+    src = _order_ticket_source()
+    assert "{market !== \"spot\" && (" in src, "杠杆栏没有按市场收死"
+    assert 'id="leverage-input"' in src
+    assert "min={1}" in src and "max={MAX_LEVERAGE}" in src and "step={1}" in src
+    assert "const MAX_LEVERAGE = 125;" in src, "整数 1–125，上限写在常量里"
+    assert "杠杆" in src
+
+
+def test_the_leverage_is_saved_to_the_trade_section() -> None:
+    """初值取 settings.trade.leverage[market]，改动即存（createSectionSaver("trade")）。"""
+    src = _order_ticket_source()
+    assert 'createSectionSaver("trade")' in src
+    assert "trade?.leverage" in src, "没读设置的 trade 段"
+    assert "queue({ leverage:" in src, "改动没落盘"
+    assert "String(Number.isFinite" in src or "Number.isFinite" in src, "拿不到就当 1"
+    saver = (UI_DIR / "settingsAutoSave.ts").read_text(encoding="utf-8")
+    assert '"trade"' in saver, "SettingsSection 里没有 trade"
+    types = (UI_DIR / "types.ts").read_text(encoding="utf-8")
+    assert "export interface TradeSettings" in types and "trade?: TradeSettings;" in types
+
+
+def test_both_order_bodies_carry_leverage() -> None:
+    """下单预览与下单两个 body 都带 leverage；现货不发这个字段。"""
+    src = _order_ticket_source()
+    field = '...(market === "spot" ? {} : { leverage: leverageValue }),'
+    assert src.count(field) >= 2, f"只有 {src.count(field)} 个 body 带了杠杆"
+    preview = src.index('"/api/orders/preview"')
+    submit = src.index('api<{', src.index("const send = async"))
+    assert field in src[:submit], "预览的 body 没带杠杆"
+    assert field in src[submit:], "下单的 body 没带杠杆"
+
+
+def test_the_over_limit_leverage_is_announced_not_clamped() -> None:
+    """超过 risk.max_leverage 只说一句「上限 X 倍」，不偷偷改成上限值。"""
+    src = _order_ticket_source()
+    assert "倍，超过会按上限处理" in src
+    assert "leverageValue > maxLeverage" in src, "没跟 risk.max_leverage 比"
+    assert "max_leverage" in src, "没读 risk.max_leverage"
+    assert "Math.min(leverage" not in src and "Math.min(parsed" not in src, "偷偷夹到上限了"
+
+
+def test_the_update_card_calls_the_four_endpoints() -> None:
+    """软件更新卡：读信息、立即更新、轮询进度、回滚。"""
+    card = _update_card_source()
+    for path in ("/api/update/info", "/api/update/apply", "/api/update/status", "/api/update/rollback"):
+        assert path in card, f"{path} 没被调用"
+    assert "{ confirm: true }" in card, "回滚要显式确认"
+
+
+def test_the_update_button_needs_something_to_update() -> None:
+    """落后才可点：behind_by 是 0 时按钮点不动。"""
+    card = _update_card_source()
+    assert "(update.behind_by ?? 0) > 0" in card, "没按 behind_by 收口"
+    assert "disabled={!canUpdate" in card, "按钮没跟 canUpdate 走"
+
+
+def test_the_update_card_spells_out_the_three_blocked_states() -> None:
+    """三种不可更新状态：本地新、已分叉、error 非空（贴后端原话）。"""
+    card = _update_card_source()
+    assert "本地比远端新，先 push" in card
+    assert "已分叉，需要手动处理" in card
+    assert "ahead_by" in card and "behind_by" in card
+    assert "{update.error}" in card, "后端原话没原样显示"
+
+
+def test_the_update_steps_are_rendered_verbatim() -> None:
+    """每步 {name, ok, output, seconds}：失败那步的 output 原文贴进 pre，不截断不转述。"""
+    card = _update_card_source()
+    assert "step.name" in card and "step.ok" in card and "step.seconds" in card
+    assert "{step.output}" in card, "步骤输出没原样渲染"
+    assert "<pre" in card and 'className="deploy-log"' in card, "输出要放在可滚的 pre 里"
+    assert "step.output.slice(" not in card, "截断了输出"
+    assert "updateJob?.steps" in card or "steps.map(" in card, "没有逐步列出"
+
+
+def test_the_update_card_survives_the_restart() -> None:
+    """更新会重启服务：轮询断了就等 /api/health 回来，60 秒没回来给手动命令。"""
+    card = _update_card_source()
+    assert "/api/health" in card, "没等 /api/health"
+    assert "60" in card and "秒" in card
+    assert r".venv\Scripts\python.exe run_web.py --host 127.0.0.1 --port 8765" in card
+    assert "已更新完成，当前提交" in card
+
+
+def test_the_update_confirms_say_what_they_do() -> None:
+    """更新与回滚各有一道二次确认，写清是否会停服务、失败停在哪一步。"""
+    card = _update_card_source()
+    assert "window.confirm(" in card
+    first = card[card.index("window.confirm("):]
+    first = first[: first.index(");") + 2]
+    for word in ("自动交易", "停", "失败", "步"):
+        assert word in first, f"确认文案里少了「{word}」"
+    rest = card[card.index("window.confirm(") + len(first):]
+    rollback = rest[rest.index("window.confirm("):]
+    rollback = rollback[: rollback.index(");") + 2]
+    assert "回到更新前的提交" in rollback
+    assert "rollback" in rollback.lower() or "/api/update/rollback" in rest
