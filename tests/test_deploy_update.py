@@ -8,6 +8,7 @@ updater 实际做的事一一对上（fetch / ff-only merge / pip install / 重�
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -69,7 +70,7 @@ def test_the_dry_run_shows_a_second_nopasswd_rule_for_one_restart():
     restarts = [line for line in rules if "systemctl" in line]
     assert len(restarts) == 1, rules
     rule = restarts[0]
-    assert rule.rstrip().endswith("systemctl restart bitrader"), rule
+    assert rule.rstrip().endswith(" ".join(_updater_restart_tokens())), rule
     # 只授这一条：没有通配符、没有分号，systemctl 的别的子命令都进不来
     assert "*" not in rule, rule
     assert ";" not in rule, rule
@@ -98,7 +99,7 @@ def test_the_sudoers_check_still_rolls_back_on_a_syntax_error():
 
 def test_the_unit_file_explains_why_one_restart_is_allowed():
     text = SERVICE.read_text(encoding="utf-8")
-    assert "systemctl restart bitrader" in text
+    assert " ".join(_updater_restart_tokens()) in text
     assert "Restart=always" in text
     assert "NOPASSWD" in text
 
@@ -110,7 +111,7 @@ def test_the_update_section_covers_every_step_the_updater_takes():
         "git fetch",
         "--ff-only",
         "pip install",
-        "systemctl restart bitrader",
+        " ".join(_updater_restart_tokens()),
         "journalctl -u bitrader",
         "npm",
         "回滚",
@@ -193,3 +194,135 @@ def test_agents_describes_the_shutdown_wiring_that_actually_runs():
     start = text.index("两条启动路径")
     block = text[start : start + 400]
     assert "set_shutdown_hook" in block
+
+# ------------------------------------------- t91：sudoers 与重启命令逐字对齐
+
+UPDATER = ROOT / "src" / "btrader" / "core" / "updater.py"
+
+
+def _updater_restart_tokens() -> list[str]:
+    """从 core/updater.py 里读出那条重启命令的命令词（`sudo -n` 之后那一串）。
+
+    断言不抄一份字面量：sudoers 的判据是「和代码真会敲的那条一模一样」。抄一份就等于
+    同一个命令有两处各写一半——代码加了 `--no-block`、sudoers 忘改，sudo 直接拒，
+    而界面显示的是「服务已重启」。
+    """
+    text = UPDATER.read_text(encoding="utf-8")
+    match = re.search(r'\[\s*"sudo"\s*,\s*"-n"\s*,\s*([^\]]+)\]', text)
+    assert match, "core/updater.py 里找不到那条 sudo -n 重启命令"
+    tokens: list[str] = []
+    for literal, name in re.findall(r'"([^"]+)"|([A-Za-z_]\w*)', match.group(1)):
+        if literal:
+            tokens.append(literal)
+            continue
+        const = re.search(rf'^{name}\s*=\s*"([^"]+)"', text, re.M)
+        assert const, f"认不出 updater 里的常量 {name}，sudoers 没法比对"
+        tokens.append(const.group(1))
+    # match 抓的是 sudo -n 之后那一段，第一个命令词必须就是 systemctl
+    assert tokens and tokens[0].endswith("systemctl"), tokens
+    return tokens
+
+
+def _sudoers_restart_rules(out: str) -> list[str]:
+    """dry-run 输出里真正的 systemctl 授权行（注释不是授权）。"""
+    return [
+        line.strip()
+        for line in out.splitlines()
+        if "NOPASSWD:" in line and "systemctl" in line and not line.strip().startswith("#")
+    ]
+
+
+def test_the_sudoers_rule_is_the_command_the_updater_actually_runs():
+    """逐字一致：少一个 `--no-block` 就被 sudo 拒，而那一步看起来是成功的。"""
+    command = _updater_restart_tokens()
+    rules = _sudoers_restart_rules(_dry_run())
+    assert len(rules) == 1, rules
+    granted = rules[0].split("NOPASSWD:")[1].split()
+    assert granted[0].startswith("/"), rules[0]
+    assert Path(granted[0]).name == command[0], rules[0]
+    assert granted[1:] == command[1:], (
+        f"sudoers 授的是 {' '.join(granted[1:])}，代码里敲的是 {' '.join(command[1:])}"
+    )
+
+
+def test_the_grant_is_still_only_that_one_restart():
+    """对齐之后仍然是「一条命令、无通配、无分号」：start / stop / 别的单元都进不来。"""
+    command = _updater_restart_tokens()
+    rules = _sudoers_restart_rules(_dry_run())
+    assert len(rules) == 1, rules
+    rule = rules[0]
+    for forbidden in ("*", "?", ";", "systemctl start", "systemctl stop", "systemctl disable"):
+        assert forbidden not in rule, rule
+    granted = rule.split("NOPASSWD:")[1].split()
+    # 一条命令，一个参数都不多不少
+    assert Path(granted[0]).name == command[0], granted
+    assert granted[1:] == command[1:], granted
+
+
+def test_the_unit_file_comment_shows_the_same_rule():
+    """unit 文件里那句注释也要跟着改，否则下一个人照着注释改回旧命令。"""
+    text = SERVICE.read_text(encoding="utf-8")
+    shown = [line for line in text.splitlines() if "NOPASSWD:" in line]
+    assert shown, text
+    command = " ".join(_updater_restart_tokens())
+    assert any(line.split("NOPASSWD:")[1].strip().endswith(command) for line in shown), shown
+
+
+def test_the_deploy_doc_shows_the_same_rule():
+    """§7.2 抄的那份 sudoers 内容要和代码一致（不然用户照着核对会以为没授）。"""
+    text = DEPLOY_DOC.read_text(encoding="utf-8")
+    shown = [line for line in text.splitlines() if "NOPASSWD:" in line and "systemctl" in line]
+    assert shown, text
+    command = " ".join(_updater_restart_tokens())
+    assert any(line.split("NOPASSWD:")[1].strip().endswith(command) for line in shown), shown
+
+
+def test_the_program_restart_is_not_described_as_blocking_on_linux():
+    """`--no-block` 的意义要写出来：老进程不等重启结果，确认在新进程里做。"""
+    text = DEPLOY_DOC.read_text(encoding="utf-8")
+    start = text.index("## 7. 更新与回滚")
+    block = text[start : text.index("### 7.1", start)]
+    assert "--no-block" in block, block
+    assert "TimeoutStopSec" in block, block
+    assert "logs/restart-" in block, block
+
+
+def test_the_update_section_lists_the_six_steps_the_pipeline_runs():
+    """§7 写的是「四件事」，实际六步：更新卡片上就是六格。"""
+    text = DEPLOY_DOC.read_text(encoding="utf-8")
+    start = text.index("## 7. 更新与回滚")
+    block = text[start : text.index("### 7.1", start)]
+    assert "四件事" not in block, "§7 还写着四件事"
+    assert "六步" in block or "六件事" in block, block[:400]
+    numbered = [
+        match.group(1)
+        for match in re.finditer(r"^\s*(\d+)\.\s", block, re.M)
+    ]
+    assert numbered == ["1", "2", "3", "4", "5", "6"], numbered
+    for needle in ("git fetch", "--ff-only", "pip install", "npm", "health"):
+        assert needle in block, needle
+
+
+def test_the_agents_update_section_does_not_hardcode_the_port():
+    """§11 不许再写死端口：同节后文说「端口跟着真实进程走」，两处自相矛盾。"""
+    text = AGENTS.read_text(encoding="utf-8")
+    start = text.index("## 11. 在线更新")
+    block = text[start:]
+    offenders = [
+        line.strip()
+        for line in block.splitlines()
+        if "8765" in line and "兜底" not in line
+    ]
+    assert offenders == [], f"§11 里还写死了端口：{offenders}"
+    assert "web_port()" in block, block[-400:]
+
+
+def test_the_agents_update_section_documents_the_lock_and_the_late_confirmation():
+    """更新锁与「重启确认在新进程里做」都要写进 §11（t88 的缺口）。"""
+    text = AGENTS.read_text(encoding="utf-8")
+    start = text.index("## 11. 在线更新")
+    block = text[start:]
+    assert "update.lock" in block, "没写更新锁"
+    assert "文件锁" in block, "没写锁是两层"
+    assert "_heal_state" in block and "api/health" in block, "没写重启确认在新进程里做"
+    assert "TimeoutStopSec" in block, "没写为什么不能在老进程里等"

@@ -282,8 +282,11 @@ install_service() {
 #     脚本以 root:root 装到 /usr/local/lib/bitrader/（bitrader 改不了它），sudoers 授这一个脚本；
 #     脚本自己校验域名、写坏就还原（见 deploy/set-domain.sh 的注释）。
 #     sudoers 没法表达「只允许一个合法域名参数」，所以那一步的保险在脚本里。
-#   * 「一键更新」拉完代码要重启服务：只授 `<systemctl 绝对路径> restart bitrader` 这一条，
-#     start / stop / 别的单元一条都不给。没有它，更新完代码服务还是旧进程。
+#   * 「一键更新」拉完代码要重启服务：只授 `<systemctl 绝对路径> --no-block restart bitrader`
+#     这一条，start / stop / 别的单元一条都不给。没有它，更新完代码服务还是旧进程。
+#     `--no-block` 是程序里那条命令的一部分（core/updater.py::_restart_linux）：重启交给 systemd
+#     就返回，不等本进程退出——老进程等 systemctl，systemctl 等老进程退出，而 TimeoutStopSec=20
+#     一到 systemd 就 SIGKILL，两边互锁。sudoers 按命令逐字匹配，少一个参数就被拒。
 install_domain_helper() {
   CURRENT_STEP="9/11 域名切换脚本与 sudoers"
   say "$CURRENT_STEP"
@@ -330,10 +333,11 @@ install_domain_helper() {
   if [ -n "$systemctl_bin" ]; then
     sudo_lines+=(
       "# 2) 一键更新：代码拉完、依赖装完后重启本服务。"
-      "#    只允许 restart 这一个子命令、只对 $SERVICE 这一个单元：start / stop / 其它单元都不给。"
-      "$APP_USER ALL=(root) NOPASSWD: $systemctl_bin restart $SERVICE"
+      "#    只允许「--no-block restart」这一个子命令、只对 $SERVICE 这一个单元：start / stop / 其它单元都不给。"
+      "#    --no-block 必须写上：程序敲的就是这一条（core/updater.py::_restart_linux），sudoers 少一个参数就拒。"
+      "$APP_USER ALL=(root) NOPASSWD: $systemctl_bin --no-block restart $SERVICE"
     )
-    granted="${granted:+$granted 与 }$systemctl_bin restart $SERVICE"
+    granted="${granted:+$granted 与 }$systemctl_bin --no-block restart $SERVICE"
   fi
   if [ "${#sudo_lines[@]}" -le 1 ]; then
     note "没有要写的 sudo 权限（没有 Caddy，也探测不到 systemctl），跳过 $SUDOERS_FILE"

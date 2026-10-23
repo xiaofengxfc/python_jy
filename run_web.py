@@ -34,9 +34,7 @@ def main() -> int:
     # 装配走 web/__main__.build_server，和 `python -m btrader.web` 共用同一份：
     # 在线更新最后一步要重启，updater 拿到的 should_exit 就是这里这个 Server 的。
     # 自己再拼一套 uvicorn.Config/Server，那个机制在真实进程里就等于不存在。
-    #
-    # 仍然传 app 对象而不是导出字符串：uvicorn 的 reloader 会另起一个解释器，
-    # 拿不到上面那段 sys.path 修正。
+# 这里不开 reload：本脚本是给「改完自己重启一次」用的，没有热重载。
     server = build_server(create_app(), host=args.host, port=args.port, access_log=True)
     return serve(server)
 

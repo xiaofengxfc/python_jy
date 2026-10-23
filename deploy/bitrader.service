@@ -8,12 +8,18 @@ Wants=network-online.target
 StartLimitIntervalSec=300
 StartLimitBurst=5
 # Restart=always 管的是「进程自己崩了」，管不了「代码换了要重新起」：更新是先 git 拉新代码，
-# 再让 root 做一次 systemctl restart bitrader —— 旧进程收 SIGTERM 正常退出（下面 TimeoutStopSec），
-# systemd 按 ExecStart 把新代码拉起来。这条 restart 只有 root 能做，而服务以 bitrader 跑，
-# 于是 deploy/install.sh 在 sudoers 里单授了一条（就这一条，别的命令都没有）：
-#   bitrader ALL=(root) NOPASSWD: /usr/bin/systemctl restart bitrader
-# 只允许 restart 这一个子命令、只对 bitrader 这一个单元。别放宽成 systemctl 通配：
+# 再让 root 做一次 systemctl --no-block restart bitrader —— 旧进程收 SIGTERM 正常退出（下面
+# TimeoutStopSec），systemd 按 ExecStart 把新代码拉起来。这条 restart 只有 root 能做，而服务
+# 以 bitrader 跑，于是 deploy/install.sh 在 sudoers 里单授了一条（就这一条，别的命令都没有）：
+#   bitrader ALL=(root) NOPASSWD: /usr/bin/systemctl --no-block restart bitrader
+# 只允许「--no-block restart」这一个子命令、只对 bitrader 这一个单元。别放宽成 systemctl 通配：
 # 那等于把整台机器的服务管理权交给程序用户。
+#
+# --no-block 不是装饰：默认的 restart 要等本单元停完才返回，而本单元正是发这条命令的进程——
+# 老进程等 systemctl、systemctl 等老进程退出，卡到 TimeoutStopSec=20 被 SIGKILL 硬切，
+# pip/git 那种跑到一半的收尾也没了。--no-block 把重启交给 systemd 就返回。
+# 代价是「到底起来没有」不能在本进程里问，改成新进程自检（core/updater.py::_heal_state 打
+# /api/health）：见 docs/DEPLOY-Linux.md §7。
 
 [Service]
 Type=simple

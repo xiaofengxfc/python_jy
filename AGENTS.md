@@ -416,9 +416,11 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   这次真的有改动才 `npm run build`（服务器没 npm，跳过并在该步 output 写明「服务器不需要
   构建，产物跟着仓库走」）→ 重启。每步记 `name/ok/output/seconds`，任一步失败立刻停、
   `state=failed`、`error` 是那一步的**原始输出**，不替用户编原因。
-- 重启：Linux `subprocess.run(["sudo", "-n", "systemctl", "restart", "bitrader"])`（列表参数、
-  不开 shell，仓库里装着这一条 NOPASSWD）；Windows 起一个分离的垫片，等 8765 端口释放后再拉起
-  `.venv\Scripts\python.exe run_web.py`，然后走 uvicorn 的 `should_exit` 优雅退出。
+- 重启：Linux `subprocess.run(["sudo", "-n", "systemctl", "--no-block", "restart", "bitrader"])`
+  （列表参数、不开 shell，仓库里装着这一条 NOPASSWD，sudoers 里那一行与这条命令**逐字一致**，
+  `--no-block` 也算在内——差一个参数就是 `a password is required`，而那一步看起来仍像成功）；
+  Windows 起一个分离的垫片，等本进程放开端口后再拉起 `.venv\Scripts\python.exe run_web.py`，
+  然后走 uvicorn 的 `should_exit` 优雅退出。端口跟着真实进程走，见下面那条，别在代码或文档里写死。
   两条启动路径（`python -m btrader.web` 与仓库根的 `run_web.py`）共用
   `web/__main__.build_server` + `serve`，装配与 `updater.set_shutdown_hook` 都在里面；
   谁要再写第三条启动路径，也得走它——自己拼一套 `uvicorn.Config/Server`，
@@ -433,21 +435,37 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   open 就 `PermissionError`；stderr 又给了 DEVNULL，退出码没人看，于是「垫片死了」被当成
   「重启成功」，服务就这么停死了。老进程这边等两段：先等自己放开端口（`RELEASE_TIMEOUT`），
   再等新进程绑上端口（`LISTEN_TIMEOUT`），任何一段超时都算失败，`error` 里带垫片日志路径和
-  手动命令（`_manual_hint`）。Linux 那条是 `systemctl restart` 返回码非 0 即失败，stdout / stderr
-  原文照贴。
+  手动命令（`_manual_hint`）。Linux 那条只看 `sudo -n systemctl --no-block restart` 的返回码
+  （非 0 即失败，stdout / stderr 原文照贴）——它**立刻返回**，真正的确认在新进程里做。
+- 为什么 Linux 不能在老进程里等重启（t88 的结论，别再改回去）：默认的 `systemctl restart` 要等本
+  单元停完才返回，而本单元就是发命令的那个进程——老进程等 systemctl、systemctl 等老进程退出，
+  互锁到 `TimeoutStopSec=20` 被 SIGKILL 硬切；而流水线前面几步最坏能跑 2000 秒以上（pip、构建、
+  git 都可能慢），在老进程里等重启等于自杀，还会把「重启真的成功了吗」这个判断一起带走。所以改用
+  `--no-block`：把重启交给 systemd 就返回，确认挪到新进程——新进程读到「重启中」时自己打一次
+  `/api/health`，2xx 才把这一步收成 `done`，超期收成 `failed` 并说清等到什么时候。
+- 端口通了不等于服务起来了：只 `connect_ex` 会被「绑了 0.3 秒就关」的进程骗过（端口探测刚通过、
+  进程已经死了），所以判据是 `/api/health` 回 2xx。端口探测只用来决定「可以开始问 health 了」。
 - 端口跟着真实进程走，不写死：`web/__main__.build_server` 把 `--port` 交给
   `updater.set_web_port()`，垫片与端口探测都用 `web_port()`；拿不到时按 8765 兜底，并在那一步的
   输出里写明「按兜底值算」（t84 之前写死 8765：在 8799 上跑的实例，更新完重启必然
   `Errno 10048` 端口被占，重启步看起来成功、其实没起来）。
-- 更新线程**不是 daemon**（`updater._spawn`）：重启那一步要等「自己放开端口 + 新进程绑上端口」
-  两段确认，daemon 线程会在 uvicorn 主线程退出时被直接掐掉，「到底起没起来」就没人知道，
+- 更新线程**不是 daemon**（`updater._spawn`）：Windows 那条重启要等「自己放开端口 + 新进程绑上
+  端口」两段确认，daemon 线程会在 uvicorn 主线程退出时被直接掐掉，「到底起没起来」就没人知道，
   状态又变成一句谎。代价是退出时得等这一轮更新跑完；每一步都有 timeout，不会无限挂着。
-- 一次只跑一个更新任务：`start_job` 在 `JOB_LOCK` 里先查 `running_job()`，撞上抛 `JobBusy`，
-  两个 POST 把它翻成 409「上一个更新还在跑」。`update-state.json` 的临时文件名带 pid 与随机后缀：
-  共用一个 `.tmp` 时两个写者会互相把半个 JSON 换上去。
+- 一次只跑一个更新任务，锁是两层：`JOB_LOCK` 管本进程（`start_job` 里先查 `running_job()`，
+  撞上抛 `JobBusy`，两个 POST 把它翻成 409「上一个更新还在跑」）；进程内锁管不了多 worker、
+  也管不了两个实例共享同一个数据目录，所以外面还有一层文件锁 `<数据目录>/update.lock`
+  （`updater.acquire_update_lock`：`os.open(O_CREAT|O_EXCL)` 建文件，建不出来就是别人握着，
+  接口翻成 409。**不用 `flock`**：Windows 上根本没有 `fcntl`，两套机制只会让一台机器能用、
+  另一台静默失效。锁文件里写 `pid` / `job_id` / `at`，pid 已经不在了的残留锁算没有、可以接管——
+  否则一次断电就把更新永久锁死）。只有进程内锁时，三个进程共用一份数据目录，实测三轮全部
+  3/3 都建成了任务，还有一轮 `os.replace` 撞 WinError 5、状态根本没落盘（t88 评审）。
+  `update-state.json` 的临时文件名带 pid 与随机后缀：共用一个 `.tmp` 时两个写者会互相把半个
+  JSON 换上去。
 - 状态落盘在 `<数据目录>/update-state.json`（临时文件 + `os.replace`，原子写）。重启前先把
   `state=running` + `restart_pending` + 端口落到盘上；新进程读到「重启中、记下那个 pid 已经不在了」
-  就把状态收成 `done` 并补上「重启服务」这一步，否则前端刷新后看到一个永远转圈的 running。
+  时先自己确认（`/api/health` 2xx 才算重启成），成了就把状态收成 `done` 并补上「重启服务」这一步，
+  超期收成 `failed`；否则前端刷新后看到一个永远转圈的 running。
   收尾只认**记下的那个 pid**（`_heal_state`）：那个 pid 还活着就一个字都不改——以前任何别的
   进程读一次状态就把活任务收成 done，还补一条根本没发生过的重启步骤；`restart_pending` 为假而
   pid 不在了，说明上次断在半路，收成 failed 并说清断在哪一步。

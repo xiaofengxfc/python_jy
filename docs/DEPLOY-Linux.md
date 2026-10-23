@@ -243,27 +243,48 @@ curl -fsS https://api.ipify.org; echo
 
 - **检查**：`GET /api/update/info` 比本地 HEAD 与远端分支（默认 `xf/main`）的提交 SHA，
   列出落后的条数与每条标题。远端读不到时 `remote_sha` 是 `null` 加一句为什么，不会显示「已是最新」。
-- **一键更新**：`POST /api/update/apply`，后台线程按顺序做四件事，每步的输出都显示在那张卡上：
-  1. `git fetch --all --prune`，记下更新前的 SHA；
-  2. `git merge --ff-only <远端>/<分支>`——只做快进，不改写历史，也不 `--force`；
-  3. 用服务自己的 venv 跑 `pip install -r requirements.txt`；
-  4. 重启服务：Linux 上是 `systemctl restart bitrader`，Windows 上拉起新进程后旧进程退出。
+- **一键更新**：`POST /api/update/apply`，后台线程按顺序做六步，每步的输出都显示在那张卡上：
+  1. `git fetch --all --prune`；
+  2. 记下更新前的 SHA（回滚要用它）；
+  3. `git merge --ff-only <远端>/<分支>`——只做快进，不改写历史，也不 `--force`；
+  4. 用服务自己的 venv 跑 `pip install -r requirements.txt`；
+  5. 只有本机装了 Node 且 `web/` 这次真有改动，才跑 `npm run build`（服务器没 Node，跳过并写明原因）；
+  6. 重启服务，并确认新进程真的起来了（见下一段）。
 - **前置检查**：自动交易 / AI 量化 / 执行台在跑 → 直接拒（409），不替你停引擎；工作树有未提交改动 →
   400；已经是最新 → 400；本地有提交又落后（分叉）→ 400 让你手动处理。
   探针表（`routes.RUNNING_ENGINE_PROBES`）里只有「自动交易 / 执行台」和「AI 交易 / AI 量化」两项：
   **回测、参数优化在跑不拦**——它们跑完就结束，重启丢掉的是那一次结果，不是钱。
+- **重启算不算成功，由新进程回答**。Linux 上程序跑的是 `sudo -n systemctl --no-block restart bitrader`：
+  `--no-block` 让 systemctl 把重启交给 systemd 就返回，老进程**不等**结果。为什么不在这里等：默认的
+  restart 要等本单元停完才返回，而本单元就是发命令的那个进程；老进程等 systemctl、systemctl 等老进程
+  退出，卡住之后 `TimeoutStopSec=20` 一到就被 SIGKILL 硬切——而流水线前面几步最坏能跑 2000 秒以上，
+  在老进程里等重启等于自己杀自己。于是确认挪到新进程：新进程起来读到「重启中」，自己打一次
+  `/api/health`，回 2xx 才把这一步收成 done，超期收成 failed。
+  **端口能连上不算成功**：只 `connect_ex` 会被「绑上 0.3 秒就关」的进程骗过，必须 `/api/health` 2xx。
 - **服务器上不跑 `npm run build`**：部署的是仓库里已经构建好的 `src/btrader/web/static/`，前端产物
   跟着 git 一起来。只有本机（Windows）更新时，如果装了 Node 且 `web/` 真有改动，才顺带 build 一次；
   服务器上没装 Node，跳过并在步骤里写明原因。
-- **失败就停在那一步**（`state=failed`），屏幕上贴的是那条命令的**原始输出**（git / pip 自己说的话），
-  不替你编原因。
+- **失败就停在那一步**（`state=failed`）：哪一步非 0 退出就停在哪一步，后面的步骤不再跑，服务也就
+  停在那一步的状态上（重启没做成 = 还在跑旧代码，代码没拉成功 = 服务没动过）。屏幕上贴的是那条命令的
+  **原始输出**（git / pip / systemctl 自己说的话），不替你编原因。
 
-日志看两处：
+日志看三处：
 
 ```bash
 # 1) 设置页那张「软件更新」卡的步骤输出：每步一条，带耗时和原始输出
-# 2) 服务自己的日志
+# 2) 服务自己的日志（Linux 上重启与启动失败都在这里）
 sudo journalctl -u bitrader -n 80 --no-pager
+# 3) 重启垫片的日志：每次一个唯一文件，路径写在失败那一步的输出里
+ls -t /var/lib/bitrader/logs/restart-*.log | head -n 3
+```
+
+`<数据目录>/logs/restart-<时间>-<随机>.log` 是 Windows 上「拉起新进程」那个垫片的输出（Linux 上
+没有垫片，服务日志进 journald）。重启那一步失败时，卡上会连路径和手动命令一起给出来：
+
+```bash
+cd /opt/bitrader
+sudo systemctl restart bitrader          # 手动重启一次，等它起来
+sudo systemctl status bitrader --no-pager
 ```
 
 ### 7.1 回滚
@@ -300,12 +321,18 @@ sudo cat /etc/sudoers.d/bitrader
 #    域名写法与写坏回滚由 /usr/local/lib/bitrader/set-domain.sh 自己把关（sudoers 没法只允许一个合法参数）
 bitrader ALL=(root) NOPASSWD: /usr/local/lib/bitrader/set-domain.sh
 # 2) 一键更新：代码拉完、依赖装完后重启本服务。
-#    只允许 restart 这一个子命令、只对 bitrader 这一个单元：start / stop / 其它单元都不给。
-bitrader ALL=(root) NOPASSWD: /usr/bin/systemctl restart bitrader
+#    只允许「--no-block restart」这一个子命令、只对 bitrader 这一个单元：start / stop / 其它单元都不给。
+#    --no-block 必须写上：程序敲的就是这一条（core/updater.py::_restart_linux），sudoers 少一个参数就拒。
+bitrader ALL=(root) NOPASSWD: /usr/bin/systemctl --no-block restart bitrader
 ```
 
+这一行与程序里那条命令**逐字一致**，`--no-block` 也算在内：sudoers 按命令匹配，少一个参数就是
+`sudo: a password is required`，而那一步看起来仍然像成功。`tests/test_deploy_update.py` 直接从
+`core/updater.py` 读那条命令再和这里比对，改一处忘一处会被它抓住。
+
 `systemctl` 的路径是装的时候探测出来的（Debian / Ubuntu 一般是 `/usr/bin/systemctl`）；探测不到就不写
-这一条并打印一句提示，那种机器上更新完自己敲一次 `systemctl restart bitrader`。
+这一条并打印一句提示，那种机器上更新完自己敲一次 `systemctl restart bitrader`（手动敲不必带
+`--no-block`：那是给「本进程要被自己重启」这种情况用的，你在终端里等它重启完正好）。
 
 这条 sudo 跟「代码换了要重新起进程」有关：`Restart=always` 管的是进程自己崩了，它不会加载新代码。
 t81 之前的安装没有这一条，重跑一次 `sudo bash deploy/install.sh --domain <你的域名>` 就补上（重复跑是幂等的）。

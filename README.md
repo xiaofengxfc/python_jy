@@ -370,7 +370,7 @@ sudo bash deploy/install.sh --domain trade.example.com        # 真装
 这一步是手动点的，程序不会自己更新；失败停在那一步并贴命令的原始输出，也能一键回滚到更新前的提交。
 更新前只拦两种在跑的东西：自动交易（含执行台部署）和 AI 交易（含 AI 量化）；**回测、参数优化在跑不拦**，
 它们跑完就结束，重启丢的是那一次结果。
-细节、回滚步骤和 sudoers 里多授的那条 `systemctl restart bitrader` 见
+细节、回滚步骤和 sudoers 里多授的那条 `systemctl --no-block restart bitrader` 见
 [docs/DEPLOY-Linux.md](docs/DEPLOY-Linux.md) 第 7 节。
 
 ## 项目结构
