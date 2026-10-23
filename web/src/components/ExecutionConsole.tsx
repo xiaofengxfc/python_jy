@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, query } from "../api";
 import { TIMEFRAMES, fmt } from "../format";
-import type { AutoStatus, Strategy } from "../types";
+import { createSectionSaver, resetSection } from "../settingsAutoSave";
+import type { AppSettings, AutoStatus, ExecSettings, Strategy } from "../types";
 
 /** 执行台：把一个已批准的策略挂上去，按自己的节奏把仓位拉到目标值。
  *
@@ -14,6 +15,22 @@ interface Props {
   market: string;
   symbol: string;
   timeframe: string;
+  /** 设置的 exec 段：仓位比例 / 杠杆 / 轮询。默认 1 / 1 / 10。 */
+  settings?: AppSettings | null;
+  onSettingsChange?: (patch: Partial<AppSettings>) => void;
+}
+
+/** 后端 ExecSettings 的默认值（`core/config.py` 的 1 / 1 / 10），恢复默认时兜底用。 */
+const DEFAULT_EXEC: ExecSettings = { position_pct: 1, leverage: 1, poll_seconds: 10 };
+
+function readExec(settings: AppSettings | null | undefined): ExecSettings {
+  const exec = settings?.exec;
+  if (!exec) return { ...DEFAULT_EXEC };
+  return {
+    position_pct: Number.isFinite(exec.position_pct) ? exec.position_pct : DEFAULT_EXEC.position_pct,
+    leverage: Number.isFinite(exec.leverage) ? exec.leverage : DEFAULT_EXEC.leverage,
+    poll_seconds: Number.isFinite(exec.poll_seconds) ? exec.poll_seconds : DEFAULT_EXEC.poll_seconds,
+  };
 }
 
 const STATE_LABEL: Record<string, string> = {
@@ -24,12 +41,58 @@ const STATE_LABEL: Record<string, string> = {
   warn: "提醒",
 };
 
-export default function ExecutionConsole({ strategies, market, symbol, timeframe }: Props) {
+export default function ExecutionConsole({
+  strategies,
+  market,
+  symbol,
+  timeframe,
+  settings,
+  onSettingsChange,
+}: Props) {
   const [status, setStatus] = useState<AutoStatus | null>(null);
   const [strategyKey, setStrategyKey] = useState("");
-  const [positionPct, setPositionPct] = useState(1);
-  const [leverage, setLeverage] = useState(1);
-  const [pollSeconds, setPollSeconds] = useState(10);
+  /** 三项都跟设置走，改一下 500ms 后落盘——刷新之后还是上次的值。 */
+  const [exec, setExec] = useState<ExecSettings>(() => readExec(settings));
+  const loadedExec = useRef(false);
+  const saver = useMemo(() => createSectionSaver("exec"), []);
+  const { position_pct: positionPct, leverage, poll_seconds: pollSeconds } = exec;
+
+  useEffect(() => {
+    // 只认第一份到手的设置：之后的更新是「自己刚存的」，拿它回填会把正在敲的
+    // 数字顶掉（输入框被 500ms 前的值覆盖）。
+    if (loadedExec.current) return;
+    if (!settings?.exec) return;
+    loadedExec.current = true;
+    setExec(readExec(settings));
+  }, [settings]);
+
+  useEffect(() => () => saver.flush(), [saver]);
+
+  const patchExec = (values: Partial<ExecSettings>) => {
+    setExec((current) => ({ ...current, ...values }));
+    saver.queue(values as Record<string, unknown>);
+  };
+
+  /** 恢复默认：只重置 exec 这一段，市场、交易对、主题都不动。 */
+  const resetExec = async () => {
+    const ok = window.confirm(
+      "恢复执行台的默认值？（仓位比例 100%、杠杆 1、轮询 10 秒）\n\n" +
+        "只重置这三项，市场、交易对、主题和策略都不动。",
+    );
+    if (!ok) return;
+    saver.cancel();
+    setError("");
+    setNotice("");
+    try {
+      const next = await resetSection("exec");
+      setExec(readExec(next));
+      loadedExec.current = true;
+      onSettingsChange?.({ exec: next.exec });
+      setNotice("执行台默认值已恢复。");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    }
+  };
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -119,6 +182,15 @@ export default function ExecutionConsole({ strategies, market, symbol, timeframe
       <div className="card-head">
         <span className="card-title">执行台</span>
         <span className="spacer" />
+        <button
+          type="button"
+          className="btn-sm"
+          disabled={running || busy !== ""}
+          title="只重置这三项，不动市场与主题"
+          onClick={() => void resetExec()}
+        >
+          恢复默认
+        </button>
         <span className={`state-chip ${running ? "running" : "stopped"}`}>
           {running ? "运行中" : "已停止"}
         </span>
@@ -160,7 +232,11 @@ export default function ExecutionConsole({ strategies, market, symbol, timeframe
               step={5}
               disabled={running}
               value={Math.round(positionPct * 100)}
-              onChange={(event) => setPositionPct(Number(event.target.value) / 100)}
+              onChange={(event) => {
+                const next = Number(event.target.value);
+                if (!Number.isFinite(next) || next < 1) return;
+                patchExec({ position_pct: next / 100 });
+              }}
             />
           </div>
           <div className="field">
@@ -177,7 +253,11 @@ export default function ExecutionConsole({ strategies, market, symbol, timeframe
               step={1}
               disabled={running}
               value={leverage}
-              onChange={(event) => setLeverage(Number(event.target.value))}
+              onChange={(event) => {
+                const next = Number(event.target.value);
+                if (!Number.isFinite(next) || next < 1) return;
+                patchExec({ leverage: next });
+              }}
             />
           </div>
           <div className="field">
@@ -193,7 +273,11 @@ export default function ExecutionConsole({ strategies, market, symbol, timeframe
               step={1}
               disabled={running}
               value={pollSeconds}
-              onChange={(event) => setPollSeconds(Number(event.target.value))}
+              onChange={(event) => {
+                const next = Number(event.target.value);
+                if (!Number.isFinite(next) || next < 1) return;
+                patchExec({ poll_seconds: next });
+              }}
             />
           </div>
         </div>

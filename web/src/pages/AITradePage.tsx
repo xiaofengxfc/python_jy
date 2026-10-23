@@ -14,12 +14,15 @@ import type {
   SymbolInfo,
 } from "../types";
 import MetricGrid from "../components/MetricGrid";
+import { createSectionSaver, resetSection } from "../settingsAutoSave";
 
 /** 全自动 AI 交易：一次决策走完整条流水线，人只负责开关和上限。 */
 
 interface Props {
   settings: AppSettings | null;
   health: Health | null;
+  /** 让侧栏和设置页也看到刚存的运行配置。 */
+  onSettingsChange?: (patch: Partial<AppSettings>) => void;
 }
 
 const STATE_LABEL: Record<string, string> = {
@@ -74,7 +77,7 @@ function clockText(value: number | undefined): string {
   return date.toLocaleTimeString("zh-CN", { hour12: false });
 }
 
-export default function AITradePage({ settings, health }: Props) {
+export default function AITradePage({ settings, health, onSettingsChange }: Props) {
   const [status, setStatus] = useState<AITraderStatus | null>(null);
   const [account, setAccount] = useState<Account | null>(null);
   const [risk, setRisk] = useState<RiskState | null>(null);
@@ -181,18 +184,40 @@ export default function AITradePage({ settings, health }: Props) {
   }, [refreshAccount]);
 
   /* -------------------------------------------------------------- actions */
-  const patch = (values: Partial<AIAutoSettings>) =>
-    setAuto((current) => ({ ...current, ...values }));
+  /** 运行配置改动即存：界面先变，500ms 后写进 config.json 的 ai_auto。
+   *  以前只有「深度」会存，金额上限改完一刷新就回去了。 */
+  const saver = useMemo(() => createSectionSaver("ai_auto"), []);
+  useEffect(() => () => saver.flush(), [saver]);
 
-  const saveDepth = async (value: string) => {
+  const patch = (values: Partial<AIAutoSettings>) => {
+    setAuto((current) => ({ ...current, ...values }));
+    saver.queue(values as Record<string, unknown>);
+  };
+
+  const saveDepth = (value: string) => {
     setDepth(value);
+    saver.queue({ depth: value });
+  };
+
+  /** 恢复默认：只重置 ai_auto 这一段，市场、交易对、主题都不动。 */
+  const resetAuto = async () => {
+    const ok = window.confirm(
+      "恢复 AI 交易的运行配置默认值？\n\n" +
+        "只重置这一段（单笔 / 持仓上限、决策深度等），市场、交易对、主题和 API Key 都不动。",
+    );
+    if (!ok) return;
+    saver.cancel();
+    setError("");
+    setNotice("");
     try {
-      await api("/api/settings", {
-        method: "PUT",
-        body: JSON.stringify({ ai_auto: { depth: value } }),
-      });
-    } catch {
-      // 存不上就只在这次启动里生效，不挡流程。
+      const next = await resetSection("ai_auto");
+      const restored = { ...FALLBACK_AUTO, ...(next.ai_auto ?? {}) };
+      setAuto(restored);
+      setDepth(restored.depth || "standard");
+      onSettingsChange?.({ ai_auto: next.ai_auto });
+      setNotice("运行配置已恢复默认。");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
     }
   };
 
@@ -339,6 +364,15 @@ export default function AITradePage({ settings, health }: Props) {
             <span className="faint" style={{ fontSize: "var(--fs-12)"}}>
               {MARKET_LABELS[market] ?? market}
             </span>
+            <button
+              type="button"
+              className="btn-sm"
+              disabled={running || busy !== ""}
+              title="只重置运行配置，不动市场与主题"
+              onClick={() => void resetAuto()}
+            >
+              恢复默认
+            </button>
           </div>
           <div className="card-body form-grid">
             <div className="field">
@@ -491,7 +525,7 @@ export default function AITradePage({ settings, health }: Props) {
               />
             </div>
             <div className="hint" style={{ gridColumn: "1 / -1" }}>
-              上限在启动时生效。改完要重新启动一次。
+              上限在启动时生效。改完要重新启动一次；改动会自己存下来，刷新之后还在。
             </div>
           </div>
         </section>

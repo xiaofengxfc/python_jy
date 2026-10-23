@@ -24,6 +24,8 @@ import StageBar from "../components/StageBar";
 interface Props {
   settings: AppSettings | null;
   health: Health | null;
+  /** 让侧栏看到执行台刚存的那三项。 */
+  onSettingsChange?: (patch: Partial<AppSettings>) => void;
   onNavigate: (page: "lab") => void;
 }
 
@@ -49,7 +51,7 @@ function stageOf(candidate: Candidate | null): string {
   return "generate";
 }
 
-export default function AIQuantPage({ settings, health, onNavigate }: Props) {
+export default function AIQuantPage({ settings, health, onSettingsChange, onNavigate }: Props) {
   const [candidates, setCandidates] = useState<Candidate[]>([]);
   const [selected, setSelected] = useState<Candidate | null>(null);
   const [code, setCode] = useState("");
@@ -484,6 +486,8 @@ export default function AIQuantPage({ settings, health, onNavigate }: Props) {
           market={market}
           symbol={symbol}
           timeframe={timeframe}
+          settings={settings}
+          onSettingsChange={onSettingsChange}
         />
       </div>
     </>

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState, type PointerEvent as ReactPointerEvent } from "react";
 import type { ReactNode } from "react";
 import { api, query } from "../api";
 import { fmt, fmtPrice, ledgerBasisNote, parseNumber } from "../format";
@@ -7,6 +7,19 @@ import NewsPanel from "./NewsPanel";
 import ProtectionDialog from "./ProtectionDialog";
 import Table from "./Table";
 import TradeDetailDialog from "./TradeDetailDialog";
+
+/** 底部面板的默认高度：208 只能看见一行半，三级标题都在框外。 */
+const PANEL_DEFAULT_HEIGHT = 320;
+const PANEL_MIN_HEIGHT = 140;
+/** 面板高度是界面偏好，不进 config.json：它不是交易参数，换台机器没必要跟着。 */
+const PANEL_HEIGHT_KEY = "biTrader.bottomPanelHeight";
+
+function storedPanelHeight(): number {
+  const raw = window.localStorage.getItem(PANEL_HEIGHT_KEY);
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < PANEL_MIN_HEIGHT) return PANEL_DEFAULT_HEIGHT;
+  return Math.round(value);
+}
 
 interface Props {
   account: Account | null;
@@ -64,6 +77,30 @@ export default function BottomTabs({
     onTabChange?.(next);
   };
   const [collapsed, setCollapsed] = useState(false);
+  /** 面板高度，拖拉改，双击回默认（见 panel-resizer）。图表高度不跟着变：
+   *  它自己走 clamp()，面板变高只是让页面变长。 */
+  const [panelHeight, setPanelHeight] = useState<number>(storedPanelHeight);
+  useEffect(() => {
+    window.localStorage.setItem(PANEL_HEIGHT_KEY, String(panelHeight));
+  }, [panelHeight]);
+
+  const startResize = (event: ReactPointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const startY = event.clientY;
+    const startHeight = panelHeight;
+    const move = (moveEvent: PointerEvent) => {
+      // 往上拖 = 面板变高；下限挡住折叠，上限留出图表那一屏。
+      const next = startHeight - (moveEvent.clientY - startY);
+      const ceiling = Math.max(PANEL_MIN_HEIGHT, Math.round(window.innerHeight * 0.8));
+      setPanelHeight(Math.min(Math.max(next, PANEL_MIN_HEIGHT), ceiling));
+    };
+    const stop = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", stop);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", stop);
+  };
   const [walletOpen, setWalletOpen] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   // Per-position exit size in base coins; empty means "the whole position".
@@ -117,6 +154,11 @@ export default function BottomTabs({
       ),
     );
 
+  /** 现货同一交易对会出两行（账本行 + 自有余额行），数量框和忙碌标记都得按「行」记。
+   *  只按 symbol 记的话两行共用一个输入框：在钱包行填 1，账本行也跟着显示 1，
+   *  点哪一行的按钮都按同一个数量走。 */
+  const rowKey = (position: Position) => `${position.symbol}|${position.origin ?? "ledger"}`;
+
   /** 钱包余额的默认卖出量：整笔余额。买来的持仓留空，空值在 close() 里表示全平。
    *  现货的「持仓」就是钱包余额，不带 size 全平等于清空钱包，所以钱包行必须显式给数量。 */
   const defaultCloseSize = (position: Position) =>
@@ -131,10 +173,10 @@ export default function BottomTabs({
     );
 
   const close = (position: Position) => {
-    const typed = parseNumber(closeSizes[position.symbol] ?? defaultCloseSize(position));
+    const typed = parseNumber(closeSizes[rowKey(position)] ?? defaultCloseSize(position));
     const held = Math.abs(position.contracts);
     const size = typed > 0 ? Math.min(typed, held) : undefined;
-    return run(`close:${position.symbol}`, async () => {
+    return run(`close:${rowKey(position)}`, async () => {
       await api("/api/positions/close", {
         method: "POST",
         body: JSON.stringify({
@@ -151,7 +193,7 @@ export default function BottomTabs({
       // 下一帧又回到默认：钱包行给最新余额，账本行留空（空 = 全平）。
       setCloseSizes((current) => {
         const next = { ...current };
-        delete next[position.symbol];
+        delete next[rowKey(position)];
         return next;
       });
     });
@@ -162,8 +204,8 @@ export default function BottomTabs({
    *  所以钱包行按钮写「卖出」、数量框预填整笔余额；买来的持仓仍然是「平仓」。 */
   const positionRow = (position: Position) => {
     const wallet = position.origin === "wallet";
-    const typedClose = parseNumber(closeSizes[position.symbol] ?? defaultCloseSize(position));
-    const closing = busy === `close:${position.symbol}`;
+    const typedClose = parseNumber(closeSizes[rowKey(position)] ?? defaultCloseSize(position));
+    const closing = busy === `close:${rowKey(position)}`;
     const actionLabel = wallet
       ? closing
         ? "卖出中…"
@@ -230,11 +272,11 @@ export default function BottomTabs({
       autoComplete="off"
       aria-label={`${wallet ? "卖出数量" : "平仓数量"} ${position.symbol}`}
       placeholder={fmt(closeHint(position), 6)}
-      value={closeSizes[position.symbol] ?? defaultCloseSize(position)}
+      value={closeSizes[rowKey(position)] ?? defaultCloseSize(position)}
       onChange={(event) =>
         setCloseSizes((current) => ({
           ...current,
-          [position.symbol]: event.target.value,
+          [rowKey(position)]: event.target.value,
         }))
       }
     />,
@@ -267,7 +309,18 @@ export default function BottomTabs({
     <>
       <div
         className={`panel${collapsed ? " collapsed" : ""}${tab === "ai" ? " ai-panel" : ""}`}
+        style={collapsed ? undefined : { flexBasis: panelHeight }}
       >
+        {/* 上沿的分隔条：上下拖动改高度，双击回默认。见 styles.css 的 .panel-resizer。 */}
+        <div
+          className="panel-resizer"
+          role="separator"
+          aria-orientation="horizontal"
+          aria-label="调整面板高度"
+          title="拖动调整高度，双击恢复默认"
+          onPointerDown={startResize}
+          onDoubleClick={() => setPanelHeight(PANEL_DEFAULT_HEIGHT)}
+        />
         <div className="tabs" role="tablist">
           {TABS.map(([key, label]) => (
             <button

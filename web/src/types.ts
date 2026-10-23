@@ -314,6 +314,15 @@ export interface AIAnalysis {
 /* 三个页面（AI 交易、AI 量化、策略实验室）共用这几份形状。字段一律可选：
    后端升级前后互不匹配时，界面要能降级显示，而不是白屏。 */
 
+/** 执行台最后用过的那三项，存在设置的 exec 里。不是风控：真上限在 risk 与
+ *  AITrader 的闸里，改这三项动不了任何一条闸。 */
+export interface ExecSettings {
+  /** 0 到 1 的比例，1 = 全部可用余额（不是百分数）。 */
+  position_pct: number;
+  leverage: number;
+  poll_seconds: number;
+}
+
 /** AI 交易自己的运行配置，存在设置的 ai_auto 里。 */
 export interface AIAutoSettings {
   enabled: boolean;
@@ -482,6 +491,8 @@ export interface AppSettings {
   ai: AISettings;
   /** AI 交易的运行配置。默认关闭；没有单独的实盘总闸，主网启动时再确认一次。 */
   ai_auto?: AIAutoSettings;
+  /** 执行台最后用过的那三项：仓位比例 / 杠杆 / 轮询。 */
+  exec?: ExecSettings;
   /** 收藏的交易对。跟账户走（存后端），不写 localStorage。 */
   favorites?: string[];
   /** 最近用过的交易对，后端记，界面上最多显示 8 条。 */

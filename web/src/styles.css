@@ -1712,7 +1712,15 @@ input[type="range"].input:focus {
     padding: 8px 11px 9px;
   }
 
-  .ai-prejudge {
+  /* 分析正文的抬头：左边说这是什么，右边是「放大」。 */
+.ai-textbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px 2px;
+}
+
+.ai-prejudge {
     display: none !important;
   }
 
@@ -1888,12 +1896,15 @@ input[type="range"].input:focus {
   color: var(--text);
 }
 
-/* Bottom panel of the trading page: fixed height, own scroll. Every tab uses
-   the same height; AI is scrollable inside instead of resizing the chart. */
+/* Bottom panel of the trading page: its own height, own scroll. Every tab uses
+   the same height, and the height is dragged from the top edge (BottomTabs
+   writes flexBasis inline, remembers it in localStorage). The chart above keeps
+   its own clamp() height: a taller panel makes the page longer, not the candles
+   shorter. Default 320 shows the headings a 208 panel cut off. */
 .panel {
   display: flex;
   flex-direction: column;
-  flex: 0 0 208px;
+  flex: 0 0 320px;
   min-height: 0;
   border-radius: var(--radius);
   background: var(--bg);
@@ -1951,7 +1962,36 @@ input[type="range"].input:focus {
 /* The AI tab keeps the same panel height as the tables. Its body scrolls
    instead of stealing vertical space from the chart above. */
 .panel.ai-panel:not(.collapsed) {
-  flex-basis: 208px;
+  flex-basis: 320px;
+}
+
+/* 上沿的分隔条：双击回默认，上下拖动改高度（见 BottomTabs 的 startResize）。
+   6px 的把手，视觉上只是一条线，鼠标移上去才亮。 */
+.panel-resizer {
+  flex: 0 0 6px;
+  margin-top: -6px;
+  background: transparent;
+  cursor: row-resize;
+  touch-action: none;
+  position: relative;
+}
+
+.panel-resizer::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 2px;
+  width: 42px;
+  height: 2px;
+  margin-left: -21px;
+  border-radius: 999px;
+  background: var(--border-strong);
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.panel-resizer:hover::after {
+  opacity: 1;
 }
 
 .panel.ai-panel .panel-body > .card {
@@ -4214,4 +4254,12 @@ main.main > .stage-bar:not(.page-head) {
 .cand-empty {
   padding: 12px 0;
   font-size: var(--fs-13);
+}
+
+/* 浮窗里的分析正文不设 max-height：放大就是为了不用在小框里滚。
+   必须排在 .ai-text 之后，否则被它的 240px 压住。 */
+.ai-text.ai-text-floating {
+  max-height: none;
+  overflow: visible;
+  padding: 0 14px 12px;
 }

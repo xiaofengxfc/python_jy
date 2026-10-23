@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api";
+import FloatingWindow from "./FloatingWindow";
 import MarkdownText from "./MarkdownText";
 import type { AIAnalysis, AILevel, AIStatus } from "../types";
 
@@ -48,6 +49,8 @@ export default function AIPanel({
   /** Second opinion on the headlines, in the same card as the chart read. */
   const [news, setNews] = useState<{ text: string; overall: number } | null>(null);
   const [review, setReview] = useState("");
+  /** 分析正文放大到浮窗里看：底部面板再高也放不下整篇。 */
+  const [expanded, setExpanded] = useState(false);
 
   useEffect(() => {
     api<AIStatus>("/api/ai/status")
@@ -62,6 +65,7 @@ export default function AIPanel({
     setNews(null);
     setReview("");
     setError("");
+    setExpanded(false);
     onLevels([], "");
     // `onLevels` is stable in the parent; re-running on it would clear on every
     // render.
@@ -145,7 +149,8 @@ export default function AIPanel({
   }
 
   return (
-    <div className="card">
+    <>
+      <div className="card">
       <div className="card-head">
         <span className="card-title">AI 分析</span>
         <span className="spacer" />
@@ -202,6 +207,13 @@ export default function AIPanel({
               ? `（入 ${analysis.usage.input} / 出 ${analysis.usage.output}）`
               : ""}
           </div>
+          <div className="ai-textbar">
+            <span className="faint" style={{ fontSize: "var(--fs-12)" }}>分析正文</span>
+            <span className="spacer" />
+            <button type="button" className="link-btn" onClick={() => setExpanded(true)}>
+              放大
+            </button>
+          </div>
           <MarkdownText text={analysis.text} />
           {levels.length > 0 && (
             <div className="ai-levels">
@@ -248,6 +260,22 @@ export default function AIPanel({
           <MarkdownText text={review} />
         </div>
       )}
-    </div>
+      </div>
+
+      {/* 浮窗里正文不设 max-height：放大就是为了不用在小框里滚。 */}
+      <FloatingWindow
+        title={`AI 分析 · ${symbol}`}
+        open={expanded}
+        onClose={() => setExpanded(false)}
+        storageKey="biTrader.aiAnalysisWindow"
+        defaultRect={{ x: 140, y: 90, w: 760, h: 640 }}
+        minWidth={420}
+        minHeight={320}
+      >
+        <div className="ai-text ai-text-floating">
+          <MarkdownText text={analysis?.text ?? ""} />
+        </div>
+      </FloatingWindow>
+    </>
   );
 }

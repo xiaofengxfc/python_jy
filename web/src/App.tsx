@@ -173,11 +173,18 @@ export default function App() {
             onSettingsChange={handleSettingsChange}
           />
         )}
-        {page === "ai-trade" && <AITradePage settings={settings} health={health} />}
+        {page === "ai-trade" && (
+          <AITradePage
+            settings={settings}
+            health={health}
+            onSettingsChange={handleSettingsChange}
+          />
+        )}
         {page === "ai-quant" && (
           <AIQuantPage
             settings={settings}
             health={health}
+            onSettingsChange={handleSettingsChange}
             onNavigate={(next) => go(next)}
           />
         )}

@@ -288,6 +288,14 @@ export default function OrderTicket({
     return "";
   };
 
+  /** 填够数就把话说完：低于最小值的提示不用等到点提交才出现。
+   *  提交那一步仍然拦一次（send / submitConditional），这里只是让它先看得见。 */
+  const minimumWarning = useMemo(() => {
+    const amount = parseNumber(size);
+    if (!symbol || !(amount > 0)) return "";
+    return minimumProblem(amount);
+  }, [symbol, size, preview, sizeMode, referencePrice, base, quote]);
+
   const send = async () => {
     const amount = parseNumber(size);
     if (!symbol) return setFlash({ tone: "err", text: "请先选择交易对。" });
@@ -366,6 +374,9 @@ export default function OrderTicket({
     const level = parseNumber(trigger);
     if (amount <= 0) return setFlash({ tone: "err", text: "请填写数量或金额。" });
     if (level <= 0) return setFlash({ tone: "err", text: "请填写触发价。" });
+    // 触发单成交时也是市价单，最小量与最小名义额一样管得住它。
+    const tooSmall = minimumProblem(amount);
+    if (tooSmall) return setFlash({ tone: "err", text: tooSmall });
     setConditionalBusy(true);
     setFlash(null);
     try {
@@ -803,6 +814,8 @@ export default function OrderTicket({
               </strong>
             </div>
           )}
+          {/* 低于最小值当场说清楚：别让用户点一次提交才知道交易所会拒。 */}
+          {minimumWarning && <div className="flash err">{minimumWarning}</div>}
           {previewError ? (
             <div className="verdict bad">无法预览：{previewError}</div>
           ) : preview ? (

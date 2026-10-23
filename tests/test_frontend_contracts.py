@@ -502,10 +502,12 @@ def test_wallet_balance_rows_sell_instead_of_closing() -> None:
     """
     panel = (UI_DIR / "components" / "BottomTabs.tsx").read_text(encoding="utf-8")
 
-    # 输入框里显示的和真正发出去的 size 用的是同一个默认值
-    assert "value={closeSizes[position.symbol] ?? defaultCloseSize(position)}" in panel
+    # 输入框里显示的和真正发出去的 size 用的是同一个默认值。键按「行」记
+    # （rowKey = symbol + origin）：现货同一对会同时出账本行与自有余额行，
+    # 只按 symbol 记的话两行共用一个输入框。
+    assert "value={closeSizes[rowKey(position)] ?? defaultCloseSize(position)}" in panel
     assert (
-        "const typed = parseNumber(closeSizes[position.symbol] ?? defaultCloseSize(position));"
+        "const typed = parseNumber(closeSizes[rowKey(position)] ?? defaultCloseSize(position));"
         in panel
     ), "钱包行点了卖出却没把余额带进请求"
 
@@ -672,7 +674,7 @@ def test_selling_a_wallet_row_keeps_the_balance_prefilled() -> None:
     空串把钱包行的默认值顶掉了，所以成交后要删键而不是写空串。
     """
     source = (UI_DIR / "components" / "BottomTabs.tsx").read_text(encoding="utf-8")
-    assert "delete next[position.symbol];" in source
+    assert "delete next[rowKey(position)];" in source
     assert '[position.symbol]: ""' not in source, "成交后又把数量写成空串了"
 
 
@@ -984,3 +986,134 @@ def test_the_close_box_shows_how_much_would_actually_be_closed() -> None:
     assert "placeholder={fmt(Math.abs(position.contracts), 6)}" not in tabs
     # 钱包行还是预填整笔余额
     assert 'position.origin === "wallet" ? plainAmount(Math.abs(position.contracts)) : "";' in tabs
+
+
+def test_a_fill_refreshes_the_panel_with_a_live_read() -> None:
+    """成交回执之后用 refresh=1 现读，把面板从「钱包余额」追到账本口径。
+
+    缓存里那一行成交后最长 10 秒还是钱包余额，面板会把刚买的持仓画成「卖出 / 预填整笔余额」。
+    下单成交、撤单、平仓三条路都要追。
+    """
+    page = (UI_DIR / "pages" / "TradingPage.tsx").read_text(encoding="utf-8")
+    assert "refresh: freshPair && symbol ? 1 : undefined" in page, "现读那一读没带 refresh=1"
+    assert "const refreshAfterFill" in page
+    assert 'row.origin === "ledger"' in page, "没等这一对变成账本行就收工"
+    assert "onFilled={() => void refreshAfterFill()}" in page, "下单框成交后没追"
+    assert "void refreshAfterFill();" in page, "撤单/平仓之后没追"
+    tabs = (UI_DIR / "components" / "BottomTabs.tsx").read_text(encoding="utf-8")
+    assert "onChanged?.();" in tabs, "撤单 / 平仓 / 卖出都要走 run() 才能触发追新"
+
+
+def test_the_order_ticket_blocks_below_the_minimum_before_sending() -> None:
+    """最小下单量 / 最小名义额在本地拦下来，提示写清是多少，不发给交易所拒。
+
+    预览多返回 min_amount / min_notional；缺字段或 null 就当没有（不猜、不拦）。
+    """
+    ticket = (UI_DIR / "components" / "OrderTicket.tsx").read_text(encoding="utf-8")
+    assert "const minimumProblem = (amount: number): string =>" in ticket
+    assert "preview?.min_amount ?? null" in ticket and "preview?.min_notional ?? null" in ticket
+    assert "if (!minAmount && !minNotional) return \"\";" in ticket, "缺字段时要当没有"
+    assert "最小下单数量" in ticket and "最小下单金额" in ticket, "提示里没说清最小是多少"
+    # 两条提交路径（市价/限价、触发单）都拦一次
+    assert ticket.count("const tooSmall = minimumProblem(amount);") == 2
+    assert 'if (tooSmall) return setFlash({ tone: "err", text: tooSmall });' in ticket
+    # 不用点提交就能看见
+    assert "const minimumWarning = useMemo" in ticket
+    assert '{minimumWarning && <div className="flash err">{minimumWarning}</div>}' in ticket
+
+
+def test_the_spot_unrealized_pnl_says_which_basis_it_uses() -> None:
+    """现货浮盈按账本算：持仓面板与资产页都要说一句，别当成钱包余额的盈亏。"""
+    fmt_ts = (UI_DIR / "format.ts").read_text(encoding="utf-8")
+    assert "export function ledgerBasisNote" in fmt_ts
+    assert 'if (position.unrealized_basis !== "ledger") return "";' in fmt_ts
+    assert "账本口径 " in fmt_ts
+    for name in ("components/BottomTabs.tsx", "pages/PortfolioPage.tsx"):
+        src = (UI_DIR / name).read_text(encoding="utf-8")
+        assert "ledgerBasisNote(position)" in src, f"{name} 没说浮盈是账本口径"
+
+
+def test_a_spot_pair_can_be_two_rows_at_once() -> None:
+    """现货同一交易对两行：账本行（平仓）与自有余额行（卖出），数量框互不串。
+
+    后端把 `contracts` 拆成账本数量与自有余额之后，两行会同时出现。数量框以前按
+    symbol 记，两行共用一个输入：在钱包行填 1，账本行也跟着显示 1，点哪一行都按这个数走。
+    """
+    tabs = (UI_DIR / "components" / "BottomTabs.tsx").read_text(encoding="utf-8")
+    assert "const rowKey = (position: Position)" in tabs, "数量框要按行记，不能只按 symbol"
+    assert "${position.symbol}|${position.origin" in tabs
+    assert "closeSizes[rowKey(position)]" in tabs
+    assert "closeSizes[position.symbol]" not in tabs, "两行会共用一个输入框"
+    assert "run(`close:${rowKey(position)}`" in tabs, "忙碌标记也要按行"
+    # origin 决定按钮文案：账本行平仓、自有余额行卖出
+    assert 'const wallet = position.origin === "wallet";' in tabs
+    assert '"卖出"' in tabs and '"平仓"' in tabs
+    # 自有余额行预填差额（defaultCloseSize 只给 wallet 行数量），账本行占位用账本数量
+    assert 'position.origin === "wallet" ? plainAmount(Math.abs(position.contracts)) : ""' in tabs
+    assert "placeholder={fmt(closeHint(position), 6)}" in tabs
+    # 两组分开渲染：账本行进持仓表，自有余额行进收起的那一组
+    assert 'positions.filter((item) => item.origin !== "wallet")' in tabs
+    assert 'positions.filter((item) => item.origin === "wallet")' in tabs
+    assert "另有 {walletPositions.length} 项钱包余额" in tabs
+
+
+def test_the_bottom_panel_height_is_dragged_and_remembered() -> None:
+    """底部面板高度可拖、双击回默认、记在 localStorage；图表高度不许跟着变。"""
+    tabs = (UI_DIR / "components" / "BottomTabs.tsx").read_text(encoding="utf-8")
+    assert "const PANEL_DEFAULT_HEIGHT = 320;" in tabs, "默认高度要抬到能看三级标题"
+    assert "const PANEL_HEIGHT_KEY = " in tabs
+    assert "biTrader.bottomPanelHeight" in tabs
+    assert "window.localStorage.setItem(PANEL_HEIGHT_KEY" in tabs
+    assert "style={collapsed ? undefined : { flexBasis: panelHeight }}" in tabs
+    assert 'className="panel-resizer"' in tabs
+    assert "onPointerDown={startResize}" in tabs
+    assert "onDoubleClick={() => setPanelHeight(PANEL_DEFAULT_HEIGHT)}" in tabs, "双击要回默认"
+    assert 'window.addEventListener("pointermove", move)' in tabs
+    # 高度不进 config.json：那里没有这个键
+    assert "config.json" in tabs.split("storageKey")[0] or "不进 config.json" in tabs
+    css = (UI_DIR / "styles.css").read_text(encoding="utf-8")
+    assert ".panel-resizer {" in css and "cursor: row-resize" in css
+    assert "flex: 0 0 320px;" in css, "面板默认高度还是 208"
+    # 图表高度仍是自己的 clamp()，与面板无关
+    assert ".trading-main > .card:nth-child(2)" in css
+    assert "height: clamp(420px, calc(100vh - 330px), 780px)" in css, "图表高度被面板带跑了"
+
+
+def test_the_ai_analysis_can_open_in_a_floating_window() -> None:
+    """分析正文给一个「放大」，开成可拖可关的浮窗，浮窗里不设 max-height。"""
+    panel = (UI_DIR / "components" / "AIPanel.tsx").read_text(encoding="utf-8")
+    assert 'import FloatingWindow from "./FloatingWindow";' in panel
+    assert "放大" in panel
+    assert "onClick={() => setExpanded(true)}" in panel
+    assert "open={expanded}" in panel and "onClose={() => setExpanded(false)}" in panel
+    assert "storageKey=" in panel
+    assert 'className="ai-text ai-text-floating"' in panel
+    css = (UI_DIR / "styles.css").read_text(encoding="utf-8")
+    assert ".ai-text-floating {" in css and "max-height: none" in css
+
+
+def test_the_run_config_saves_itself_and_can_go_back_to_defaults() -> None:
+    """AI 交易与执行台的运行配置：改动即存（防抖 500ms）+ 恢复默认（只重置这一段）。"""
+    saver = (UI_DIR / "settingsAutoSave.ts").read_text(encoding="utf-8")
+    assert "export const SAVE_DEBOUNCE_MS = 500;" in saver
+    assert "window.setTimeout(() => void flush(), SAVE_DEBOUNCE_MS)" in saver
+    assert 'await api("/api/settings", {' in saver
+    assert 'body: JSON.stringify({ [section]: body })' in saver
+    assert '"/api/settings/reset"' in saver
+    assert 'method: "POST", body: JSON.stringify({ section })' in saver
+    # 回执是 {ok, section, settings}：直接当 AppSettings 用会拿到 undefined，界面就退回前端兜底值。
+    assert "result.settings ?? result" in saver
+    page = (UI_DIR / "pages" / "AITradePage.tsx").read_text(encoding="utf-8")
+    assert 'createSectionSaver("ai_auto")' in page
+    assert "saver.queue(" in page, "AI 交易的运行配置没存"
+    assert 'resetSection("ai_auto")' in page
+    assert "恢复默认" in page
+    assert "只重置这一段" in page and "主题" in page, "二次确认要写清只重置运行配置"
+    window = (UI_DIR / "components" / "ExecutionConsole.tsx").read_text(encoding="utf-8")
+    assert 'createSectionSaver("exec")' in window
+    assert "settings?: AppSettings | null;" in window, "执行台没读设置的 exec 段"
+    assert "readExec(settings)" in window
+    assert 'resetSection("exec")' in window
+    assert "恢复默认" in window
+    types = (UI_DIR / "types.ts").read_text(encoding="utf-8")
+    assert "export interface ExecSettings" in types and "exec?: ExecSettings;" in types
