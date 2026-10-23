@@ -1185,3 +1185,64 @@ def test_the_deploy_card_explains_where_the_public_ip_came_from() -> None:
     assert "A 记录" in card, "没说要指到这个地址"
     assert "cert_expires" in card, "没显示证书到期时间"
     assert "placeholder=" in card, "没有域名输入框"
+
+
+def test_the_ticker_batch_only_asks_for_the_current_market() -> None:
+    """批量涨幅只问「与当前市场同写法」的交易对。
+
+    收藏与最近用过是跨市场的（现货写法 [BTC/USDT, ETH/USDT] 在 usdm 下也留着），
+    以前原样拼进 /api/tickers；后端按市场收死写法，一个不对就整批 400，
+    于是 300 行涨幅、收藏、最近用过全空，可标题那处涨幅还单独显示着。
+    """
+    src = (UI_DIR / "tickers.ts").read_text(encoding="utf-8")
+    assert "export function symbolFitsMarket(" in src, "没有按市场判写法的函数"
+    assert "symbols.filter((item) => symbolFitsMarket(market, item))" in src, "拼请求前没筛"
+    assert src.index("symbolFitsMarket(market, item)") < src.index("await api<"), "筛选要排在发请求之前"
+
+
+def test_a_favorite_from_another_market_is_shown_but_not_sent() -> None:
+    """别的市场的收藏照常显示在列表里，只是不参与批量请求。
+
+    现货写法一个冒号都没有；合约是一个冒号 + 结算币（USDT/USDC 归 U 本位，其余归币本位，
+    交割的 -YYMMDD 先切掉）；BTC/USDT:USDT:USDT 这种多段写法谁都不算。
+    """
+    src = (UI_DIR / "tickers.ts").read_text(encoding="utf-8")
+    assert "const colons = " in src and "colons > 1" in src, "多段写法没挡"
+    assert 'if (!colons) return market === "spot";' in src, "现货/合约的分界不对"
+    assert 'return market !== "spot" && marketForSymbol(text) === market;' in src, "合约没按结算币对市场"
+    assert "export function marketForSymbol(" in src
+    assert "USDT" in src and "USDC" in src and "coinm" in src
+    assert "-\\d{6}" in src, "交割的到期日没切掉"
+    page = (UI_DIR / "pages" / "TradingPage.tsx").read_text(encoding="utf-8")
+    assert "favorites={favorites}" in page and "recent={recent}" in page, "收藏和最近用过要照常显示"
+    assert "loadTickers(market, wanted)" in page, "批量请求要带上市场"
+
+
+def test_a_failed_batch_leaves_the_change_blank_and_says_why_in_the_console() -> None:
+    """整批仍然失败时：名字还在、涨幅留空、console 留一条原因；标题涨幅不受影响。"""
+    src = (UI_DIR / "tickers.ts").read_text(encoding="utf-8")
+    assert "console.warn" in src, "整批失败一句话都不留，查都没法查"
+    assert "return {};" in src, "失败要返回空表，不能抛到界面"
+    picker = (UI_DIR / "components" / "SymbolPicker.tsx").read_text(encoding="utf-8")
+    assert "quotes[symbol]?.change_pct ?? null" in picker, "拿不到涨幅要留空"
+    assert 'className="picker-pct faint"' in picker, "留空要留成空格子"
+    page = (UI_DIR / "pages" / "TradingPage.tsx").read_text(encoding="utf-8")
+    assert "const changePct = ticker?.change_pct ?? null;" in page, "标题的涨幅要单独取"
+
+
+def test_the_panel_resizer_is_a_real_click_target_inside_the_panel() -> None:
+    """拖拽把手要真的按得到：整块落在 .panel 的可见区内，别再挂到裁剪外面。
+
+    实测过：把手 top=725、面板 top=731（负 margin 顶出去 6px），.panel 又是
+    overflow: hidden，整块被裁掉，elementFromPoint 落到 trading-main 上，
+    真鼠标拖 150px 面板一动不动；合成事件绕过命中测试才「能拖」。
+    """
+    css = (UI_DIR / "styles.css").read_text(encoding="utf-8")
+    start = css.index("\n.panel-resizer {")
+    block = css[start : css.index("\n.panel-resizer::after {")]
+    assert "margin-top: -" not in block, "把手又被负 margin 顶到 overflow 外面了"
+    assert "flex: 0 0 12px;" in block or "flex: 0 0 10px;" in block, "可点高度不够"
+    assert "cursor: row-resize;" in block
+    assert "z-index:" in block, "把手要压在内层内容之上"
+    panel = css[css.index("\n.panel {") : css.index("\n.panel.collapsed {")]
+    assert "overflow: hidden;" in panel, "列表滚动靠它，别为了把手改成 visible"

@@ -1966,21 +1966,25 @@ input[type="range"].input:focus {
 }
 
 /* 上沿的分隔条：双击回默认，上下拖动改高度（见 BottomTabs 的 startResize）。
-   6px 的把手，视觉上只是一条线，鼠标移上去才亮。 */
+   它必须是面板里「看得见也点得到」的一块。以前是 6px + margin-top: -6px，
+   悬在面板上沿外面，而 .panel 是 overflow: hidden（列表滚动要用），整条被裁掉：
+   面板 top 731、把手 top 725，elementFromPoint 落在下面的 .trading-main 上，
+   真鼠标拖 150px 面板纹丝不动（合成事件绕过命中测试才「能拖」）。
+   现在 12px 高、整块落在面板内、z-index 压在内层内容之上，视觉仍只是一条线。 */
 .panel-resizer {
-  flex: 0 0 6px;
-  margin-top: -6px;
+  flex: 0 0 12px;
   background: transparent;
   cursor: row-resize;
   touch-action: none;
   position: relative;
+  z-index: 2;
 }
 
 .panel-resizer::after {
   content: "";
   position: absolute;
   left: 50%;
-  top: 2px;
+  top: 5px;
   width: 42px;
   height: 2px;
   margin-left: -21px;
