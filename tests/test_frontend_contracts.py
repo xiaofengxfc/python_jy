@@ -1440,7 +1440,7 @@ def test_the_leverage_note_from_the_server_is_shown() -> None:
     """后端 leverage_note 写着「不许静默改数」：预览要显示，成交后也要留着。"""
     src = _order_ticket_source()
     assert "leverage_note" in src, "后端给的收口说明一个字都没引用"
-    assert 'const leverageHint = leverageNotice || preview?.leverage_note || "";' in src
+    assert 'const leverageHint = leverageNoticeText || preview?.leverage_note || "";' in src
     assert "setLeverageNotice(" in src, "成交回执里的 leverage_note 没留下来"
     assert "setLeverageNotice(result.leverage_note" in src, "下单回执里的说明没取"
     assert "setLeverageNotice(" in src and src.count("setLeverageNotice(") >= 2, "上一单的说明没清"
@@ -1455,14 +1455,14 @@ def test_the_unknown_leverage_cap_says_so_instead_of_nothing() -> None:
     """读不到 risk.max_leverage 就按「不知道上限」处理，给中性提示，不静默。"""
     src = _order_ticket_source()
     assert "maxLeverageState" in src
-    assert src.count('setMaxLeverageState("unknown")') >= 2, "只有一条路记「不知道」"
+    assert src.count('remember("unknown", null)') >= 2, "只有一条路记「不知道」"
     assert "风控上限还没读到" in src, "读不到就什么都不说"
     assert 'if (maxLeverageState !== "unknown") return "";' in src
     assert "|| maxLeverageHint" in src, "中性提示没接进那条提示里"
     hook = src[src.index("const loadTradeSettings = useCallback(") :]
-    hook = hook[: hook.index("  }, []);")]
+    hook = hook[: hook.index("  }, [market]);")]
     assert "catch {" in hook, "读设置的路径没有兜底分支"
-    assert 'setMaxLeverageState("unknown")' in hook, "抛出异常时又静默了"
+    assert 'remember("unknown", null)' in hook, "抛出异常时又静默了"
 
 
 def test_the_leverage_cap_follows_the_settings_page() -> None:
@@ -1517,3 +1517,44 @@ def test_the_restart_pending_is_shown_as_waiting() -> None:
     assert "UPDATE_FINAL_STATES.includes(String(updateJob?.state" in card, "done 之后还挂着旧标记时别乱说在等"
     types = (UI_DIR / "types.ts").read_text(encoding="utf-8")
     assert "restart_pending?: boolean | null;" in types, "UpdateStatus 上没有这个字段"
+
+
+def test_the_leverage_note_belongs_to_one_ticket_only() -> None:
+    """上一条回执说明只对刚才那张票有效：换市场 / 换交易对 / 改杠杆 / 改数量都要清掉。
+
+    usdm 那张票的「这次按 10x 下单」留在现货票上，等于给一张没发生的单作证；
+    数量从 100 改成 500 之后那句「按 10x 下单」也一样在骗人。
+    """
+    src = _order_ticket_source()
+    assert "const ticketKey = (quantity: string) =>" in src, "没有「这张票」的记号"
+    ticket = src[src.index("const ticketKey = (quantity: string) =>") :]
+    ticket = ticket[: ticket.index(";")]
+    for part in ("${market}", "${symbol}", "${leverageValue}", "${quantity}"):
+        assert part in ticket, f"票的记号没算上 {part}"
+    assert "const ticket = ticketKey(size);" in src
+    assert "leverageNotice.ticket === ticket" in src, "上一条说明没跟票对号"
+    assert "const leverageNoticeText =" in src
+    assert "const leverageTip = leverageHint || maxLeverageHint;" in src
+    # 提交开始时照旧先清（下一单失败也别把上一条留在屏上）
+    assert src.count("setLeverageNotice(") >= 2, "提交开始与回执落地这两处都要动它"
+    assert 'ticket: ticketKey("")' in src, "记账用的还是没清空的那张票，说明刚落地就被自己擦掉"
+    # 现货不显示杠杆栏，换过去同样得作废
+    assert '"spot"' in ticket or "market" in ticket
+
+
+def test_each_market_keeps_its_own_leverage_cap_hint() -> None:
+    """上限读数按市场各记一份：切市场先回到「还在读」，别拿 usdm 的结果去说 coinm。"""
+    src = _order_ticket_source()
+    assert "capByMarket" in src
+    assert "const capReading = capByMarket[market];" in src, "读数没按市场取"
+    assert "const maxLeverage = capReading?.cap ?? null;" in src
+    assert 'const maxLeverageState: "loading" | "known" | "unknown" = capReading?.state ?? "loading";' in src, (
+        "新市场没有「还在读」这一档：上一次的读数会直接顶着用"
+    )
+    assert 'if (maxLeverageState !== "unknown") return "";' in src
+    hook = src[src.index("const loadTradeSettings = useCallback(") :]
+    hook = hook[: hook.index("  }, [market]);")]
+    assert "const target = market;" in hook, "读数没记在发起这次读的市场名下"
+    assert "setCapByMarket((prev) => ({ ...prev, [target]: { state, cap } }))" in hook
+    assert 'remember("known", cap)' in hook
+    assert hook.count('remember("unknown", null)') >= 2, "只有一条路记「不知道」"

@@ -112,17 +112,26 @@ export default function OrderTicket({
   const tradeSaver = useRef(createSectionSaver("trade"));
   const [leverageByMarket, setLeverageByMarket] = useState<Record<string, number>>({});
   const [leverageText, setLeverageText] = useState("1");
+  /** risk.max_leverage 是全局一个数，但读数按市场各记一份：切市场先回到「还在读」，
+   *  别拿 usdm 那次读到的结果去说 coinm。 */
+  const [capByMarket, setCapByMarket] = useState<
+    Record<string, { state: "known" | "unknown"; cap: number | null }>
+  >({});
+  const capReading = capByMarket[market];
   /** risk.max_leverage：只用来提示「超过会按上限处理」，不替用户改数。 */
-  const [maxLeverage, setMaxLeverage] = useState<number | null>(null);
-  /** 上限的读取状态：读不到就是「不知道上限」，不拿 1 倍冒充。 */
-  const [maxLeverageState, setMaxLeverageState] = useState<"loading" | "known" | "unknown">(
-    "loading",
+  const maxLeverage = capReading?.cap ?? null;
+  /** 上限的读取状态：读不到就是「不知道上限」，不拿 1 倍冒充。新市场还没读就是 loading。 */
+  const maxLeverageState: "loading" | "known" | "unknown" = capReading?.state ?? "loading";
+  /** 上一次下单回执里的 leverage_note：只对当时那张票有效，见 leverageNoticeText。 */
+  const [leverageNotice, setLeverageNotice] = useState<{ text: string; ticket: string } | null>(
+    null,
   );
-  /** 上一次下单回执里的 leverage_note：留着，直到下一次下单。 */
-  const [leverageNotice, setLeverageNotice] = useState("");
 
-  /** 读一遍设置：这个市场记住的杠杆 + risk.max_leverage。 */
+  /** 读一遍设置：这个市场记住的杠杆 + risk.max_leverage（记在发起这次读的市场名下）。 */
   const loadTradeSettings = useCallback(async () => {
+    const target = market;
+    const remember = (state: "known" | "unknown", cap: number | null) =>
+      setCapByMarket((prev) => ({ ...prev, [target]: { state, cap } }));
     try {
       const data = await api<{
         settings?: { trade?: TradeSettings; risk?: { max_leverage?: number } };
@@ -130,18 +139,15 @@ export default function OrderTicket({
       setLeverageByMarket(data?.settings?.trade?.leverage ?? {});
       const cap = data?.settings?.risk?.max_leverage;
       if (typeof cap === "number" && Number.isFinite(cap)) {
-        setMaxLeverage(cap);
-        setMaxLeverageState("known");
+        remember("known", cap);
       } else {
-        setMaxLeverage(null);
-        setMaxLeverageState("unknown");
+        remember("unknown", null);
       }
     } catch {
       // 读不到就说读不到：栏还在、能下单，但别装自己知道上限。
-      setMaxLeverage(null);
-      setMaxLeverageState("unknown");
+      remember("unknown", null);
     }
-  }, []);
+  }, [market]);
 
   // 打开面板读一次；换市场再读一次（上限与那个市场记住的倍数都以设置为准）。
   useEffect(() => {
@@ -184,6 +190,15 @@ export default function OrderTicket({
     return Number.isFinite(parsed) && parsed >= 1 ? parsed : 1;
   }, [leverageText]);
 
+  /** 一张「票」的记号：市场 + 交易对 + 杠杆 + 数量。任一项变了，上一条回执说明就作废——
+   *  别把 usdm 的「这次按 10x 下单」留在现货票上，也别留在改过的数量上。
+   *  现货不显示杠杆栏，换过去记号一样对不上，照样作废。 */
+  const ticketKey = (quantity: string) => `${market}|${symbol}|${leverageValue}|${quantity}`;
+  const ticket = ticketKey(size);
+  /** 只有票没变时才认那条说明。 */
+  const leverageNoticeText =
+    leverageNotice && leverageNotice.ticket === ticket ? leverageNotice.text : "";
+
   /** 上限读不到时的一句中性提示：说清「不知道上限、后端会收口」，别装知道。 */
   const maxLeverageHint = useMemo(() => {
     if (market === "spot") return "";
@@ -191,8 +206,9 @@ export default function OrderTicket({
     return "风控上限还没读到（设置没取回来）：先按你要的倍数下单，后端会按 risk.max_leverage 收口并在回执里说明。";
   }, [market, maxLeverageState]);
 
-  /** 后端把收口结果写在 leverage_note 里：预览显示，成交后留着，直到下一次下单。 */
-  const leverageHint = leverageNotice || preview?.leverage_note || "";
+  /** 后端把收口结果写在 leverage_note 里：预览显示，成交后留着，
+   *  直到下一次下单、或者这张票被改动（见 leverageNoticeText）。 */
+  const leverageHint = leverageNoticeText || preview?.leverage_note || "";
 
   const leverageNote = useMemo(() => {
     if (market === "spot") return "";
@@ -430,7 +446,7 @@ export default function OrderTicket({
 
     setBusy(true);
     setFlash(null);
-    setLeverageNotice("");
+    setLeverageNotice(null);
     try {
       const result = await api<{
         order: Record<string, unknown>;
@@ -474,7 +490,8 @@ export default function OrderTicket({
           : { tone: "ok", text: filledText },
       );
       // 杠杆被收口时后端在回执里说清是撞了哪一条上限：留在面板上，不随 flash 一起消失。
-      setLeverageNotice(result.leverage_note ? String(result.leverage_note) : "");
+      // 这一单成功后会清空数量框，所以记账用清空后的那张票，否则说明刚落地就被自己擦掉。
+      setLeverageNotice(result.leverage_note ? { text: String(result.leverage_note), ticket: ticketKey("") } : null);
       if (sizeMode === "quote") writeLastQuote(String(amount));
       setSize("");
       setStopLoss("");
