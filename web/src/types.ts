@@ -686,6 +686,9 @@ export interface BacktestResult {
   params: Record<string, unknown>;
   equity: EquityPoint[];
   trades: BacktestTrade[];
+  /** 这次回测算不进去的成本与极端情况（拿不到资金费历史、币本位最小量按张…）。
+   *  后端每一条都要显示出来，别让用户以为全算过了。 */
+  warnings?: string[];
   /** Where the run came from: "btrader" for a normal run, "cand:<id>" for a candidate. */
   source?: string;
 }

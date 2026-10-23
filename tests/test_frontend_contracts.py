@@ -726,3 +726,117 @@ def test_order_ticket_refuses_orders_below_the_venue_minimums() -> None:
     # 预检必须在 fetch 之前：否则单已经发出去了才提示
     assert ticket.index("const tooSmall = minimumProblem(amount);") < ticket.index('api<{\n        order: Record<string, unknown>;')
     assert "交易所最低" in ticket, "下单框要显示交易所的最低下单额度"
+
+
+def test_a_slow_strategy_source_cannot_overwrite_the_newer_one() -> None:
+    """连着点两条策略，慢回来的那条不能盖掉新选中的那条。
+
+    读源码是异步的：先点 bollinger（慢 4.5 秒）再点 ma_cross，旧回执落地后编辑器
+    显示的是 bollinger 的源码和文件名，而「保存」PUT 的是当前选中的 ma_cross——
+    A 的代码被写进 B 的文件。无头浏览器实测：左边高亮 ma_cross，栏头写着「布林带回归」，
+    代码是 key = "bollinger"。修法是每次读源码发一个号，回执对不上号就丢掉。
+    """
+    editor = (UI_DIR / "components" / "StrategyEditor.tsx").read_text(encoding="utf-8")
+    assert "const loadSeq = useRef(0);" in editor
+    assert "const id = ++loadSeq.current;" in editor
+    guard = editor.index("if (id !== loadSeq.current) return;")
+    assert guard < editor.index("setDetail(data);"), "回执要先对号再落地"
+    assert guard < editor.index("setError(caught instanceof Error"), "过期回执的报错也不该弹"
+    assert "if (id === loadSeq.current) setBusy(\"\");" in editor, "旧回执不该把新的加载态清掉"
+
+
+def test_a_slow_ai_status_cannot_flip_the_state_chip() -> None:
+    """AI 交易状态轮询重叠时，旧响应不能盖掉新响应。
+
+    后端慢的时候上一条还没回来下一条已经发出：实测页面先显示「已停止」（新回执），
+    6 秒后旧的「运行中」落地把它盖回去，两秒后才被下一轮纠正——自动交易停着，
+    界面说在跑。同样的竞态在回测进度、执行台上都存在，这里先按状态那一处收口。
+    """
+    page = (UI_DIR / "pages" / "AITradePage.tsx").read_text(encoding="utf-8")
+    assert "const statusSeq = useRef(0);" in page
+    assert "const id = ++statusSeq.current;" in page
+    assert page.index("if (id !== statusSeq.current) return;") < page.index("setStatus(next);")
+
+
+def test_ai_filter_table_reads_the_keys_the_backend_sends() -> None:
+    """AI 过滤那张表读的键，得是 ai.filter_trades 真的塞进 judged 里的。
+
+    judged 的每一行是 {**trade.as_dict(), "verdict": ..., "reason": ...}——
+    所以除了 TradeRecord 的字段，只多 verdict / reason 两个。表里读的键要是超出这两个集合，
+    那几列就永远是空的（成交明细当初就是这么坏掉的）。kept 也必须是数量：后端把 kept_count
+    改名发出去，换成数组的话界面那一格会把列表渲染出来。
+    """
+    ai_source = (ROOT / "src" / "btrader" / "ai.py").read_text(encoding="utf-8")
+    block = ai_source.split("judged: list[dict[str, Any]] = []", 1)[1].split("if progress:", 1)[0]
+    sniffed = set(re.findall(r'"([a-z_]+)":', block))
+    assert {"verdict", "reason"} <= sniffed, f"judged 行的字段变了：{sorted(sniffed)}"
+
+    allowed = _trade_record_keys() | sniffed
+    page = (UI_DIR / "pages" / "BacktestPage.tsx").read_text(encoding="utf-8")
+    judged_block = page.split("rows={aiFilter.judged", 1)[1].split("empty=", 1)[0]
+    used = set(re.findall(r"item\.([a-z_]+)", judged_block))
+    assert used, "AI 过滤表一个字段都没读，说明这一块被改坏了"
+    assert used <= allowed, f"AI 过滤表读了后端不给的字段：{sorted(used - allowed)}"
+
+    routes = (ROOT / "src" / "btrader" / "web" / "routes.py").read_text(encoding="utf-8")
+    assert '"kept": judged["kept_count"]' in routes, "kept 要发数量，别把 kept 数组发出去"
+    assert "kept: number;" in (UI_DIR / "types.ts").read_text(encoding="utf-8")
+
+
+def test_portfolio_page_shows_a_placeholder_before_the_first_snapshot() -> None:
+    """资产页第一次读回来之前不能把账户画成 0。
+
+    /api/portfolio 走整钱包现读，实测要 5 秒上下；这段时间 data 是 null，以前每个
+    数字都落到 fmt(undefined ?? 0) —— 总权益 0.00 / 可用余额 0.00 / 成交 0 /「还没有成交记录」，
+    而账户里其实有 4,999.65 USDT 和 34 笔成交。无头浏览器实测：1.2 秒时全是 0，9 秒后真数字。
+    修法是没数据时显示「—」和「正在读取账户…」，别拿 0 冒充。
+    """
+    page = (UI_DIR / "pages" / "PortfolioPage.tsx").read_text(encoding="utf-8")
+    assert "const loading = data === null;" in page
+    for metric in ("data?.equity", "data?.cash", "data?.realized_pnl"):
+        guarded = f'{{loading ? "—" : fmt({metric} ?? 0, 2)}}'
+        assert guarded in page, f"{metric} 没走加载占位"
+        assert f"{{fmt({metric} ?? 0, 2)}}" not in page, f"{metric} 还会画成 0"
+    assert page.count("正在读取账户…") >= 3, "空列表在加载时也要说在读取，不能写「还没有」"
+    assert "成交 {loading ? \"—\" : trades.length}" in page
+    assert "全部委托 {loading ? \"—\" : orders.length}" in page
+
+
+def test_backtest_page_exposes_funding_and_liquidation_costs() -> None:
+    """回测页要能开关资金费与强平，并把结果说清楚。
+
+    后端把这两样算成真成本之后，界面如果还写着「不会强平、也不算资金费」，
+    用户会以为关掉就是默认口径。所以：三个请求字段要发出去、两个指标要显示、
+    现货下置灰并说明原因、成交明细要认得出强平、后端给的 warnings 不能吞。
+    """
+    engine = (ROOT / "src" / "btrader" / "backtest" / "engine.py").read_text(encoding="utf-8")
+    for key in ("funding_paid", "liquidations"):
+        assert f'metrics["{key}"]' in engine, f"后端不再算 {key} 了，界面也要跟着改"
+    routes = (ROOT / "src" / "btrader" / "web" / "routes.py").read_text(encoding="utf-8")
+    for field in ("funding: bool = True", "liquidate: bool = True", "maintenance_margin_rate: float"):
+        assert field in routes, f"请求字段 {field} 不见了"
+
+    page = (UI_DIR / "pages" / "BacktestPage.tsx").read_text(encoding="utf-8")
+    # 三个控件都在（现货是置灰，不是藏起来）
+    for control in ('id="bt-funding"', 'id="bt-liquidate"', 'id="bt-mmr"'):
+        assert control in page, f"参数区少了 {control}"
+    assert page.count('disabled={config.market === "spot"}') >= 2, "现货下资金费与强平要置灰"
+    assert "config.market === \"spot\" || !config.liquidate || config.leverage <= 1" in page, (
+        "维持保证金率只在强平打开且杠杆 > 1 时可用"
+    )
+    assert "现货没有资金费率，杠杆恒为 1 也不会强平" in page, "现货下要说清为什么不生效"
+    # 三个字段真的发出去
+    assert 'funding: config.market === "spot" ? false : config.funding,' in page
+    assert 'liquidate: config.market === "spot" ? false : config.liquidate,' in page
+    assert "maintenance_margin_rate: config.maintenance_margin_rate," in page
+    # 两个指标有格子：资金费是钱（带符号），强平是次数
+    assert '["funding_paid", "资金费", "money"],' in page
+    assert '["liquidations", "强平", "int"],' in page
+    assert "kind === \"money\"" in page, "资金费要按金额画并留正负号"
+    # 成交明细认得出强平
+    assert 'liquidation: "强平",' in page
+    assert "<ReasonLabel reason={trade.exit_reason} />" in page
+    # warnings 不吞
+    assert "result.warnings" in page
+    assert 'className="banner warn"' in page
+    assert "warnings?: string[];" in (UI_DIR / "types.ts").read_text(encoding="utf-8")

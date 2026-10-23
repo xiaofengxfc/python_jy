@@ -47,6 +47,9 @@ export default function PortfolioPage({ onEquity, defaultMarket = "" }: Props) {
   }, [load]);
 
   const positions = data?.positions ?? [];
+  /** 第一次读回来之前 data 是 null。这时候把数字画成 0 会让人以为账户空了：
+   *  整钱包现读要 5 秒上下，期间「总权益 0.00 / 成交 0 / 还没有成交记录」全是假的。 */
+  const loading = data === null;
   const orders = data?.orders ?? [];
   const trades = data?.trades ?? [];
   const quote = data?.quote_asset ?? "USDT";
@@ -117,35 +120,34 @@ export default function PortfolioPage({ onEquity, defaultMarket = "" }: Props) {
           <div className="metric">
             <span className="metric-label">总权益</span>
             <span className="metric-value num">
-              {fmt(data?.equity ?? 0, 2)}
+              {loading ? "—" : fmt(data?.equity ?? 0, 2)}
               <span className="faint" style={{ fontSize: "var(--fs-12)", marginLeft: 4 }}>{quote}</span>
             </span>
           </div>
           <div className="metric">
             <span className="metric-label">可用余额</span>
-            <span className="metric-value num">{fmt(data?.cash ?? 0, 2)}</span>
+            <span className="metric-value num">{loading ? "—" : fmt(data?.cash ?? 0, 2)}</span>
           </div>
           <div className="metric">
             <span className="metric-label">持仓市值</span>
-            <span className="metric-value num">{fmt(holdings, 2)}</span>
+            <span className="metric-value num">{loading ? "—" : fmt(holdings, 2)}</span>
           </div>
           <div className="metric">
             <span className="metric-label">浮动盈亏</span>
             <span className={`metric-value num ${unrealized >= 0 ? "up" : "down"}`}>
-              {fmt(unrealized, 2)}
+              {loading ? "—" : fmt(unrealized, 2)}
             </span>
           </div>
           <div className="metric">
             <span className="metric-label">已实现盈亏</span>
             <span className={`metric-value num ${(data?.realized_pnl ?? 0) >= 0 ? "up" : "down"}`}>
-              {fmt(data?.realized_pnl ?? 0, 2)}
+              {loading ? "—" : fmt(data?.realized_pnl ?? 0, 2)}
             </span>
           </div>
           <div className="metric">
             <span className="metric-label">累计收益率</span>
             <span className={`metric-value num ${up ? "up" : "down"}`}>
-              {returnPct >= 0 ? "+" : ""}
-              {returnPct.toFixed(2)}%
+              {loading ? "—" : (returnPct >= 0 ? "+" : "") + returnPct.toFixed(2) + "%"}
             </span>
           </div>
         </div>
@@ -156,7 +158,7 @@ export default function PortfolioPage({ onEquity, defaultMarket = "" }: Props) {
               <span className="card-title">权益曲线</span>
               <span className="spacer" />
               <span className="faint" style={{ fontSize: "var(--fs-12)"}}>
-                初始 {fmt(data?.starting_balance ?? 0, 2)}
+                初始 {loading ? "—" : fmt(data?.starting_balance ?? 0, 2)}
               </span>
             </div>
             <div className="card-body">
@@ -188,7 +190,7 @@ export default function PortfolioPage({ onEquity, defaultMarket = "" }: Props) {
                   ))}
                 </div>
               ) : (
-                <div className="empty">暂无持仓</div>
+                <div className="empty">{loading ? "正在读取账户…" : "暂无持仓"}</div>
               )}
             </div>
           </div>
@@ -198,7 +200,7 @@ export default function PortfolioPage({ onEquity, defaultMarket = "" }: Props) {
           <div className="card-head">
             <span className="card-title">当前持仓</span>
             <span className="spacer" />
-            <span className="faint" style={{ fontSize: "var(--fs-12)"}}>{positions.length} 个</span>
+            <span className="faint" style={{ fontSize: "var(--fs-12)"}}>{loading ? "—" : `${positions.length} 个`}</span>
           </div>
           <Table
             headers={["交易对", "方向", "数量", "开仓价", "最新价", "浮动盈亏", "市值"]}
@@ -222,7 +224,7 @@ export default function PortfolioPage({ onEquity, defaultMarket = "" }: Props) {
               </span>,
               fmt(Math.abs(position.quote_value), 2),
             ])}
-            empty="当前没有持仓"
+            empty={loading ? "正在读取账户…" : "当前没有持仓"}
           />
         </div>
 
@@ -236,14 +238,14 @@ export default function PortfolioPage({ onEquity, defaultMarket = "" }: Props) {
                 aria-pressed={ledger === "trades"}
                 onClick={() => setLedger("trades")}
               >
-                成交 {trades.length}
+                成交 {loading ? "—" : trades.length}
               </button>
               <button
                 type="button"
                 aria-pressed={ledger === "orders"}
                 onClick={() => setLedger("orders")}
               >
-                全部委托 {orders.length}
+                全部委托 {loading ? "—" : orders.length}
               </button>
             </div>
           </div>
@@ -262,7 +264,7 @@ export default function PortfolioPage({ onEquity, defaultMarket = "" }: Props) {
                 fmt(trade.fee, 4),
                 new Date(trade.timestamp).toLocaleString("zh-CN", { hour12: false }),
               ])}
-              empty="还没有成交记录"
+              empty={loading ? "正在读取账户…" : "还没有成交记录"}
             />
           ) : (
             <Table
@@ -279,7 +281,7 @@ export default function PortfolioPage({ onEquity, defaultMarket = "" }: Props) {
                 <StatusLabel status={order.status} />,
                 new Date(order.timestamp).toLocaleString("zh-CN", { hour12: false }),
               ])}
-              empty="还没有委托记录"
+              empty={loading ? "正在读取账户…" : "还没有委托记录"}
             />
           )}
         </div>

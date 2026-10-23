@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useImperativeHandle, useMemo, useState } from "react";
+import { useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import type { Ref } from "react";
 import CodeMirror from "@uiw/react-codemirror";
 import { python } from "@codemirror/lang-python";
@@ -111,9 +111,15 @@ export default function StrategyEditor({
     [strategies, selected],
   );
 
+  /** 每次读源码给一个号。用户连着点两条策略时，先发出去的那条可能后回来——
+   *  不回执对号的话，编辑器会显示上一条策略的源码（连同文件名），而「保存」写的是
+   *  现在选中的那一条：A 的代码被写进 B 的文件。慢网络下几秒就能撞上。 */
+  const loadSeq = useRef(0);
+
   const load = useCallback(
     async (key: string) => {
       if (!key) return;
+      const id = ++loadSeq.current;
       setBusy("load");
       setError("");
       setNotice("");
@@ -124,14 +130,16 @@ export default function StrategyEditor({
         const data = await api<SourceDetail>(
           `/api/strategies/${encodeURIComponent(key)}/source`,
         );
+        if (id !== loadSeq.current) return;
         setDetail(data);
         setCode(data.code);
         setOriginal(data.code);
         setNewKey(key === "my_strategy" ? "my_strategy_v2" : `${key}_v2`);
       } catch (caught) {
+        if (id !== loadSeq.current) return;
         setError(caught instanceof Error ? caught.message : String(caught));
       } finally {
-        setBusy("");
+        if (id === loadSeq.current) setBusy("");
       }
     },
     [],

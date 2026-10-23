@@ -22,7 +22,7 @@ const TABS: [Tab, string][] = [
   ["history", "历史记录"],
 ];
 
-const METRIC_LABELS: [string, string, "pct" | "num" | "int"][] = [
+const METRIC_LABELS: [string, string, "pct" | "num" | "int" | "money"][] = [
   ["total_return", "总收益", "pct"],
   ["annual_return", "年化收益", "pct"],
   ["max_drawdown", "最大回撤", "pct"],
@@ -31,6 +31,9 @@ const METRIC_LABELS: [string, string, "pct" | "num" | "int"][] = [
   ["profit_factor", "盈亏比", "num"],
   ["trades", "成交笔数", "int"],
   ["fee_paid", "手续费", "num"],
+  // 资金费与强平是这轮新算的真实成本：前者是钱（收钱为负、付出为正），后者是次数。
+  ["funding_paid", "资金费", "money"],
+  ["liquidations", "强平", "int"],
 ];
 
 const SERIES_COLORS = ["#2563eb", "#0f766e", "#b45309", "#7c3aed"];
@@ -50,6 +53,12 @@ interface Config {
   allow_short: boolean;
   stop_loss_pct: number;
   take_profit_pct: number;
+  /** 算不算永续资金费。现货没有这项，后端按市场收死。 */
+  funding: boolean;
+  /** 杠杆 > 1 时算不算强平。现货杠杆恒 1，没有强平。 */
+  liquidate: boolean;
+  /** 维持保证金率，只在强平打开且杠杆 > 1 时起作用。 */
+  maintenance_margin_rate: number;
 }
 
 interface Compared {
@@ -97,6 +106,9 @@ export default function BacktestPage({ onEditStrategy }: Props) {
     allow_short: true,
     stop_loss_pct: 0,
     take_profit_pct: 0,
+    funding: true,
+    liquidate: true,
+    maintenance_margin_rate: 0.005,
   });
 
   const [result, setResult] = useState<BacktestResult | null>(null);
@@ -287,6 +299,11 @@ export default function BacktestPage({ onEditStrategy }: Props) {
     allow_short: config.market === "spot" ? false : config.allow_short,
     stop_loss_pct: config.stop_loss_pct,
     take_profit_pct: config.take_profit_pct,
+    // 现货没有资金费、也没有强平（杠杆恒 1），后端同样按市场收死；
+    // 这里照 allow_short 的老办法，先把做不到的事别发出去。
+    funding: config.market === "spot" ? false : config.funding,
+    liquidate: config.market === "spot" ? false : config.liquidate,
+    maintenance_margin_rate: config.maintenance_margin_rate,
     save: true,
     ...extra,
   });
@@ -753,7 +770,7 @@ export default function BacktestPage({ onEditStrategy }: Props) {
                   <div className="field">
                     <label className="field-label" htmlFor="bt-lev">
                       <span>杠杆</span>
-                      <em>不模拟强平</em>
+                      <em>杠杆 &gt; 1 才判强平</em>
                     </label>
                     <input
                       id="bt-lev"
@@ -765,8 +782,8 @@ export default function BacktestPage({ onEditStrategy }: Props) {
                       onChange={(event) => patch({ leverage: Number(event.target.value) })}
                     />
                     <div className="hint">
-                      回测按「仓位比例 × 杠杆」放大下单量，不会因保证金不足被强平，
-                      也不算资金费和维持保证金。所以高杠杆的收益和回撤都偏乐观。
+                      回测按「仓位比例 × 杠杆」放大下单量。强平开着就按下面的维持保证金率判定，
+                      打穿按触发价成交、账户亏光归零。
                     </div>
                   </div>
                 )}
@@ -804,6 +821,65 @@ export default function BacktestPage({ onEditStrategy }: Props) {
                 </div>
               </div>
 
+              <label className={config.market === "spot" ? "check faint" : "check"}>
+                <input
+                  id="bt-funding"
+                  type="checkbox"
+                  checked={config.market === "spot" ? false : config.funding}
+                  disabled={config.market === "spot"}
+                  onChange={(event) => patch({ funding: event.target.checked })}
+                />
+                {config.market === "spot"
+                  ? "算资金费（现货没有资金费率，这项不生效）"
+                  : "算资金费（永续每 8 小时结算一次；关掉就和不算成本的老口径一样）"}
+              </label>
+              <label className={config.market === "spot" ? "check faint" : "check"}>
+                <input
+                  id="bt-liquidate"
+                  type="checkbox"
+                  checked={config.market === "spot" ? false : config.liquidate}
+                  disabled={config.market === "spot"}
+                  onChange={(event) => patch({ liquidate: event.target.checked })}
+                />
+                {config.market === "spot"
+                  ? "算强平（现货杠杆恒 1，爆不了仓）"
+                  : "算强平（杠杆 > 1 时按维持保证金率判定；关掉就和不算成本的老口径一样）"}
+              </label>
+              <div className="field" style={{ maxWidth: 220 }}>
+                <label className="field-label" htmlFor="bt-mmr">
+                  <span>维持保证金率</span>
+                  <em>0～0.1，小数</em>
+                </label>
+                <input
+                  id="bt-mmr"
+                  className="input"
+                  type="number"
+                  min={0}
+                  max={0.1}
+                  step={0.001}
+                  value={config.maintenance_margin_rate}
+                  disabled={
+                    config.market === "spot" || !config.liquidate || config.leverage <= 1
+                  }
+                  onChange={(event) =>
+                    patch({ maintenance_margin_rate: Number(event.target.value) })
+                  }
+                />
+                <div className="hint">
+                  {config.market === "spot"
+                    ? "现货不借贷、不强平，这一行在现货下不用改。"
+                    : !config.liquidate
+                      ? "强平关着，这一行不影响结果。"
+                      : config.leverage <= 1
+                        ? "杠杆是 1 时不会强平，这一行不影响结果。"
+                        : "币安 BTCUSDT 永续是 0.005；别的交易对档位不同，要准就自己填。"}
+                </div>
+              </div>
+              {config.market === "spot" && (
+                <div className="hint">
+                  现货没有资金费率，杠杆恒为 1 也不会强平：上面这三项在现货下都不生效，后端也按市场收死。
+                </div>
+              )}
               <label className={config.market === "spot" ? "check faint" : "check"}>
                 <input
                   type="checkbox"
@@ -882,6 +958,20 @@ export default function BacktestPage({ onEditStrategy }: Props) {
               </div>
             ) : result ? (
               <>
+                {/* 后端算不进去的成本（拿不到资金费历史、币本位最小量按张折算不了…）
+                    都在 warnings 里，一条都不能吞掉：数字看着更漂亮，用户却不知道漏算了什么。 */}
+                {Boolean(result.warnings?.length) && (
+                  <div className="banner warn" role="status">
+                    <div>
+                      <b>这次回测有 {result.warnings!.length} 条要说明：</b>
+                      {result.warnings!.map((item) => (
+                        <div key={item} className="faint">
+                          {item}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
                 <div className="metrics">
                   {METRIC_LABELS.map(([key, label, kind]) => {
                     const value = result.metrics[key] ?? 0;
@@ -890,10 +980,20 @@ export default function BacktestPage({ onEditStrategy }: Props) {
                       kind === "pct"
                         ? `${fmt(value * 100, 2)}%`
                         : kind === "int"
-                          ? fmt(Math.round(value), 0)
-                          : fmt(value, 2);
+                          ? // 强平次数是整数；0 次也要老老实实显示 0，不能画成 —。
+                            fmt(Math.round(value), 0)
+                          : kind === "money"
+                            ? // 资金费是钱：付出为正、收钱为负，正负号要留着。
+                              `${value > 0 ? "+" : ""}${fmt(value, 2)}`
+                            : fmt(value, 2);
                     const tone =
-                      key === "max_drawdown" || key === "fee_paid"
+                      key === "funding_paid"
+                        ? value > 0
+                          ? "down"
+                          : value < 0
+                            ? "up"
+                            : ""
+                        : key === "max_drawdown" || key === "fee_paid"
                         ? "down"
                         : key === "total_return" || key === "annual_return"
                           ? value >= 0
@@ -966,7 +1066,7 @@ export default function BacktestPage({ onEditStrategy }: Props) {
                     </span>
                   </div>
                   <Table
-                    headers={["开仓时间", "平仓时间", "方向", "开仓价", "平仓价", "数量", "盈亏"]}
+                    headers={["开仓时间", "平仓时间", "方向", "开仓价", "平仓价", "数量", "盈亏", "退出"]}
                     rightFrom={3}
                     rows={result.trades.slice(-60).reverse().map((trade) => {
                       const at = (value: number) =>
@@ -982,6 +1082,7 @@ export default function BacktestPage({ onEditStrategy }: Props) {
                         // qty 带符号，做空是负数，表里显示绝对值。
                         fmt(Math.abs(trade.qty), 6),
                         <span className={trade.pnl >= 0 ? "up" : "down"}>{fmt(trade.pnl, 2)}</span>,
+                        <ReasonLabel reason={trade.exit_reason} />,
                       ];
                     })}
                     empty="策略在这段时间内没有成交"
@@ -1153,6 +1254,26 @@ export default function BacktestPage({ onEditStrategy }: Props) {
       </div>
     </>
   );
+}
+
+/** 一笔成交是怎么平掉的。强平要一眼看见，别混在「信号」里。 */
+function ReasonLabel({ reason }: { reason: string }) {
+  const map: Record<string, string> = {
+    signal: "信号",
+    stop_loss: "止损",
+    take_profit: "止盈",
+    liquidation: "强平",
+    end_of_data: "数据结束",
+  };
+  const text = map[reason] ?? (reason || "—");
+  if (reason === "liquidation") {
+    return (
+      <span className="down" style={{ fontWeight: 600 }}>
+        {text}
+      </span>
+    );
+  }
+  return <span className="faint">{text}</span>;
 }
 
 function OptimizeTable({

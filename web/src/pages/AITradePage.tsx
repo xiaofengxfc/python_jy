@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, query } from "../api";
 import { MARKET_LABELS, TIMEFRAMES, fmt, fmtPrice } from "../format";
 import type {
@@ -127,11 +127,19 @@ export default function AITradePage({ settings, health }: Props) {
   }, [market]);
 
   /* -------------------------------------------------------------- polling */
+  /** 轮询会重叠：后端慢的时候上一条还没回来，下一条已经发出去了。
+   *  不给回执对号的话，先发后到的旧状态会把新状态盖回去——「已停止」闪成「运行中」，
+   *  自动交易明明停着，界面说在跑。 */
+  const statusSeq = useRef(0);
+
   const refresh = useCallback(async () => {
+    const id = ++statusSeq.current;
     try {
       const next = await api<AITraderStatus>("/api/ai/trader/status?since=0");
+      if (id !== statusSeq.current) return;
       setStatus(next);
     } catch (caught) {
+      if (id !== statusSeq.current) return;
       setError(caught instanceof Error ? caught.message : String(caught));
     }
   }, []);
