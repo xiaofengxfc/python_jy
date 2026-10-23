@@ -840,3 +840,147 @@ def test_backtest_page_exposes_funding_and_liquidation_costs() -> None:
     assert "result.warnings" in page
     assert 'className="banner warn"' in page
     assert "warnings?: string[];" in (UI_DIR / "types.ts").read_text(encoding="utf-8")
+
+
+def test_the_three_ai_pages_also_explain_a_cross_market_fallback() -> None:
+    """AI 交易 / AI 量化 / 策略实验室换市场时也不能静默换掉交易对。
+
+    这三页的标的初值取自 settings.last_symbol。设置里存的是现货写法（BTC/USDT）时,
+    合约市场的列表里没有这一项，代码就退到列表第一项，一个字都不说 —— 和交易页以前
+    一样的毛病。三处共用 components/SymbolFallbackNote.tsx 那一行，可用时不出现。
+    """
+    note = (UI_DIR / "components" / "SymbolFallbackNote.tsx").read_text(encoding="utf-8")
+    assert "市场不可用，已切到" in note
+
+    for rel in ("pages/AITradePage.tsx", "pages/AIQuantPage.tsx", "pages/StrategyLabPage.tsx"):
+        page = (UI_DIR / rel).read_text(encoding="utf-8")
+        assert 'import SymbolFallbackNote from "../components/SymbolFallbackNote";' in page, rel
+        assert "<SymbolFallbackNote" in page, f"{rel} 退回时不说一句"
+        assert "const symbolRef = useRef(symbol);" in page, f"{rel} 的退回判定用的是旧值"
+        assert (
+            "setSymbolFallback(known || !to || to === from ? null : { from, to });" in page
+        ), f"{rel} 没有在退回时算出说明"
+        assert "setSymbolFallback(null);" in page, f"{rel} 手动选了之后说明不会消失"
+        assert "市场不可用，已切到" not in page, f"{rel} 又自己写了一套文案"
+
+
+def test_the_view_lives_in_the_url_hash() -> None:
+    """刷新不该弹回交易页：视图存在 URL hash 里，后退前进也要跟得上。
+
+    以前 const [page, setPage] = useState<PageKey>("trading") 纯内存，按 F5 必回交易页。
+    现在首屏从 hash 读、换页写 hash，hash 认不出来回交易页，且不许用整页 reload。
+    """
+    app = (UI_DIR / "App.tsx").read_text(encoding="utf-8")
+    assert "const [page, setPage] = useState<PageKey>(pageFromHash);" in app
+    assert "function pageFromHash(): PageKey" in app
+    for key in ("trading", "ai-trade", "ai-quant", "portfolio", "backtest", "strategy", "lab", "settings"):
+        assert f'"{key}",' in app, f"PAGE_KEYS 少了 {key}"
+    # 认不出来的 hash 回交易页
+    assert 'PAGE_KEYS.find((key) => key === raw) ?? "trading"' in app
+    # 前进后退：hashchange 与 popstate 都要听
+    assert 'window.addEventListener("hashchange", sync)' in app
+    assert 'window.addEventListener("popstate", sync)' in app
+    # 换页写 hash（进历史），首屏归一化用 replace 不塞历史
+    assert "window.location.hash = want;" in app
+    assert "window.history.replaceState(null, \"\", `#/${clean}`);" in app
+    # 侧栏与页面内部跳转都要走 go，不能直接 setPage 绕过 hash
+    assert "onPick={go}" in app
+    assert "onNavigate={(next) => go(next)}" in app
+    assert "location.reload(" not in app
+
+
+def test_the_24h_change_is_formatted_in_one_place_for_three_views() -> None:
+    """24 小时涨幅三处同款：+1.23% / -0.45%，涨 up、跌 down，null 留空不显示 0。
+
+    格式只有 web/src/tickers.ts 一份：fmtChangePct / changeTone。选择器行、收藏与最近用过、
+    交易页标题都调它，别再各写一遍 toFixed(2)。数据走 GET /api/tickers，拿不到就整列不显示。
+    """
+    tickers = (UI_DIR / "tickers.ts").read_text(encoding="utf-8")
+    assert "export function fmtChangePct" in tickers
+    assert "value > 0 ? \"+\" : \"\"" in tickers
+    assert "value.toFixed(2)" in tickers
+    assert "if (value == null || !Number.isFinite(value)) return \"\";" in tickers
+    assert "export function changeTone" in tickers
+    assert 'return value > 0 ? "up" : "down";' in tickers
+    # 接口形状与降级：读不到就返回空表，界面不显示、也不报错
+    assert "/api/tickers?${query({ market, symbols: wanted.join(\",\") })}" in tickers
+    assert "    return {};" in tickers
+    # 后端一次最多收 50 个，前端不能一把塞 300 条进去（超了 400，整批都没了）
+    assert "const MAX_SYMBOLS = 50;" in tickers
+
+    picker = (UI_DIR / "components" / "SymbolPicker.tsx").read_text(encoding="utf-8")
+    assert 'import { changeTone, fmtChangePct } from "../tickers";' in picker
+    assert "fmtChangePct(quotes[symbol]?.change_pct ?? null)" in picker
+    assert "changeTone(quotes[symbol]?.change_pct ?? null)" in picker
+
+    page = (UI_DIR / "pages" / "TradingPage.tsx").read_text(encoding="utf-8")
+    assert 'import { changeTone, fmtChangePct, loadTickers } from "../tickers";' in page
+    assert "const changePct = ticker?.change_pct ?? null;" in page, "读不到涨幅时不能压成 0"
+    assert "{fmtChangePct(changePct)}" in page
+    assert "toFixed(2)}%" not in page, "标题又自己写了一遍格式"
+
+
+def test_favorites_come_from_settings_with_a_star_toggle() -> None:
+    """收藏不再写死：读 settings.favorites，星标增删，收藏在上、「最近用过」最多 8 条。
+
+    口径是跟账户走，所以不写 localStorage；空的时候要说明怎么加。
+    """
+    picker = (UI_DIR / "components" / "SymbolPicker.tsx").read_text(encoding="utf-8")
+    assert "const FAVORITES" not in picker, "写死的收藏还在"
+    assert "favorites?: string[];" in picker and "recent?: string[];" in picker
+    assert "onToggleFavorite?: (symbol: string) => void;" in picker
+    assert 'aria-pressed={favorited(symbol)}' in picker
+    assert 'className={`picker-star${favorited(symbol) ? " on" : ""}`}' in picker
+    assert "还没有收藏，点右侧星标添加" in picker
+    assert "最近用过" in picker
+    assert "const RECENT_LIMIT = 8;" in picker
+    assert "localStorage" not in picker, "收藏不能写进 localStorage"
+
+    page = (UI_DIR / "pages" / "TradingPage.tsx").read_text(encoding="utf-8")
+    assert "settings?.favorites ?? []" in page
+    assert "settings?.recent_symbols ?? []" in page
+    assert 'api("/api/settings", { method: "PUT", body: JSON.stringify({ favorites: next }) })' in page
+    assert "onToggleFavorite={toggleFavorite}" in page
+    assert "favorites={favorites}" in page and "quotes={quotes}" in page
+    assert "const RECENT_LIMIT = 8;" in page
+
+    types = (UI_DIR / "types.ts").read_text(encoding="utf-8")
+    assert "favorites?: string[];" in types
+    assert "recent_symbols?: string[];" in types
+    assert "export interface TickerQuote {" in types
+
+
+def test_recent_symbols_go_back_to_the_account_too() -> None:
+    """「最近用过」也存后端（settings.recent_symbols），刷新还在，不写 localStorage。"""
+    page = (UI_DIR / "pages" / "TradingPage.tsx").read_text(encoding="utf-8")
+    assert "settings?.recent_symbols ?? []" in page
+    assert "recent_symbols: next" in page
+    assert 'body: JSON.stringify({ recent_symbols: next })' in page
+    assert "const RECENT_LIMIT = 8;" in page
+
+
+def test_two_stars_clicked_at_once_both_stick() -> None:
+    """连点两个星标不能只剩一个：setState 还没重渲染时要读 ref 里的最新值。"""
+    page = (UI_DIR / "pages" / "TradingPage.tsx").read_text(encoding="utf-8")
+    assert "const favoritesRef = useRef(favorites);" in page
+    assert "favoritesRef.current = favorites;" in page
+    assert "const recentRef = useRef(recent);" in page
+    assert "const current = favoritesRef.current;" in page
+    assert "favoritesRef.current = next;" in page
+    assert "recentRef.current.filter((item) => item !== pair)" in page
+
+
+def test_the_close_box_shows_how_much_would_actually_be_closed() -> None:
+    """现货账本行的「平仓数量」占位要用账本数量，不能用钱包余额。
+
+    实测（t49，测试网真单）：钱包里有自己充的 1 ETH，程序又买了 0.0025，持仓表数量列是钱包事实
+    1.002500、数量框占位也写 1.002500，但点「平仓」只卖掉账本那 0.0025 —— 界面说的和后端做的
+    不是一回事。钱包行照旧预填整笔余额（那是「卖出」的语义）。
+    """
+    tabs = (UI_DIR / "components" / "BottomTabs.tsx").read_text(encoding="utf-8")
+    assert "const closeHint = (position: Position) =>" in tabs
+    assert "position.origin === \"wallet\" ? position.contracts : position.ledger_size || position.contracts" in tabs
+    assert "placeholder={fmt(closeHint(position), 6)}" in tabs
+    assert "placeholder={fmt(Math.abs(position.contracts), 6)}" not in tabs
+    # 钱包行还是预填整笔余额
+    assert 'position.origin === "wallet" ? plainAmount(Math.abs(position.contracts)) : "";' in tabs

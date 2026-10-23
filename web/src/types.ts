@@ -267,6 +267,8 @@ export interface AIStatus extends AISettings {
   has_key: boolean;
   key_hint: string;
   configured: boolean;
+  /** Key 存在哪儿：系统密钥环 / 本机文件存储（服务器上没有 SecretService 时）。 */
+  storage: CredentialStorage;
   providers: AIProviderInfo[];
   calls_today: number;
   audit: AIAuditItem[];
@@ -284,6 +286,13 @@ export interface AIAuditItem {
   text?: string;
 }
 
+/** 一次调用实际花掉的 token（供应商回报的用量）。合计就是 tokens。 */
+export interface AIUsage {
+  input: number;
+  output: number;
+  total: number;
+}
+
 /** Result of one multi-timeframe analysis. */
 export interface AIAnalysis {
   ok: boolean;
@@ -295,6 +304,8 @@ export interface AIAnalysis {
   price: number;
   cached: boolean;
   tokens: number;
+  /** 输入/输出分开的用量。老后端没有这个字段，界面要能不看它。 */
+  usage?: AIUsage;
   elapsed: number;
   model: string;
 }
@@ -471,6 +482,19 @@ export interface AppSettings {
   ai: AISettings;
   /** AI 交易的运行配置。默认关闭；没有单独的实盘总闸，主网启动时再确认一次。 */
   ai_auto?: AIAutoSettings;
+  /** 收藏的交易对。跟账户走（存后端），不写 localStorage。 */
+  favorites?: string[];
+  /** 最近用过的交易对，后端记，界面上最多显示 8 条。 */
+  recent_symbols?: string[];
+}
+
+/** GET /api/tickers 的一项：24 小时行情。change_pct 是百分数（+1.23 表示涨 1.23%），
+ *  可能为 null（交易所没给或读不到），界面上留空，不拿 0 冒充。 */
+export interface TickerQuote {
+  symbol: string;
+  last: number | null;
+  change_pct: number | null;
+  quote_volume: number | null;
 }
 
 /** 凭证区顶部的交易所下拉项。enabled=false 的只占位，选了也下不了单。 */
@@ -567,6 +591,18 @@ export interface CredentialItem {
   configured: boolean;
   masked: string;
   current: boolean;
+}
+
+/**
+ * 密钥存在哪儿。桌面是系统密钥环（Windows 凭据管理器 / macOS 钥匙串），
+ * Debian/Ubuntu 服务器上没有 SecretService/DBus，退化成数据目录里的加密文件。
+ * kind: "keyring" | "file" | "none"
+ */
+export interface CredentialStorage {
+  kind: string;
+  label: string;
+  detail: string;
+  path: string;
 }
 
 export interface NewsItem {

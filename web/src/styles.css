@@ -1102,6 +1102,12 @@ input[type="range"].input:focus {
   margin: 6px 0 0;
 }
 
+/* 两列表单网格里的那一份：占满整行。留在「交易对」那一格里，
+   168px 的窄格里这句话会折成三行，把下面的字段挤下去。 */
+.form-grid > .symbol-note {
+  grid-column: 1 / -1;
+}
+
 /* ------------------------------------------------------ pair picker */
 .picker {
   position: relative;
@@ -1211,6 +1217,48 @@ input[type="range"].input:focus {
   font-weight: 500;
 }
 
+/* 收藏 / 最近用过 / 24 小时涨幅 / 星标（t63）：都在选择器里，别把颜色和字号写死在组件里。 */
+.picker-section {
+  padding: 8px 10px 2px;
+  font-size: var(--fs-12);
+  color: var(--text-2);
+}
+.picker-chips button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.picker-pct {
+  font-size: var(--fs-12);
+  font-variant-numeric: tabular-nums;
+}
+.picker-star {
+  border: 0;
+  background: transparent;
+  color: var(--text-2);
+  font-size: var(--fs-13);
+  line-height: 1;
+  padding: 0 2px;
+  cursor: pointer;
+}
+.picker-star.on {
+  color: var(--warn, #d97706);
+}
+.picker-option-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  padding: 0;
+  cursor: pointer;
+}
 .picker-empty {
   padding: 20px 8px;
   color: var(--text-3);
@@ -2174,6 +2222,33 @@ input[type="range"].input:focus {
 
 .cred-others > span.on {
   color: var(--up);
+}
+
+/* 密钥存放说明：桌面是系统密钥环，服务器退化成数据目录里的加密文件。 */
+.storage-note {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 6px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: var(--fs-12);
+  color: var(--text-3);
+}
+
+.storage-note .storage-label {
+  font-size: var(--fs-12-5);
+  color: var(--text-2);
+}
+
+.storage-note.warn {
+  border-color: var(--warn);
+  color: var(--text-2);
+}
+
+.storage-note.warn .storage-label {
+  color: var(--warn);
 }
 
 /* ------------------------------------------------------- log panel */

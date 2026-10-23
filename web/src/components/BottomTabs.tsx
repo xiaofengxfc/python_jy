@@ -122,6 +122,14 @@ export default function BottomTabs({
   const defaultCloseSize = (position: Position) =>
     position.origin === "wallet" ? plainAmount(Math.abs(position.contracts)) : "";
 
+  /** 数量框里该显示多少。钱包行是整笔余额；账本行只平账本那部分——contracts 是钱包事实，
+   *  `1\` 个自己充的 ETH 混在里面的时候写 1.002500 会让人以为一次平掉全部。实测就是：占位
+   *  写 1.002500，点「平仓」只卖掉 0.0025。 */
+  const closeHint = (position: Position) =>
+    Math.abs(
+      position.origin === "wallet" ? position.contracts : position.ledger_size || position.contracts,
+    );
+
   const close = (position: Position) => {
     const typed = parseNumber(closeSizes[position.symbol] ?? defaultCloseSize(position));
     const held = Math.abs(position.contracts);
@@ -221,7 +229,7 @@ export default function BottomTabs({
       inputMode="decimal"
       autoComplete="off"
       aria-label={`${wallet ? "卖出数量" : "平仓数量"} ${position.symbol}`}
-      placeholder={fmt(Math.abs(position.contracts), 6)}
+      placeholder={fmt(closeHint(position), 6)}
       value={closeSizes[position.symbol] ?? defaultCloseSize(position)}
       onChange={(event) =>
         setCloseSizes((current) => ({

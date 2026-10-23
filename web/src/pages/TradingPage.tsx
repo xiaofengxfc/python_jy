@@ -3,7 +3,8 @@ import { api, query } from "../api";
 import { MARKET_LABELS, TIMEFRAMES, TIMEFRAME_MS, fmtCompact, fmtPrice } from "../format";
 import { foldTick } from "../liveCandle";
 import { useMarketStream } from "../hooks/useMarketStream";
-import type { Account, AILevel, AppSettings, Candle, Health, SymbolInfo } from "../types";
+import { changeTone, fmtChangePct, loadTickers } from "../tickers";
+import type { Account, AILevel, AppSettings, Candle, Health, SymbolInfo, TickerQuote } from "../types";
 import AIPanel from "../components/AIPanel";
 import BottomTabs, { type BottomTab } from "../components/BottomTabs";
 import SymbolFallbackNote from "../components/SymbolFallbackNote";
@@ -33,7 +34,12 @@ interface Props {
   onMarketChange: (market: string) => void;
   onAccountChange: (equity: number) => void;
   onNavigate?: (page: "lab" | "backtest") => void;
+  /** 收藏、最近用过存后端（settings.favorites / recent_symbols），状态由 App 拿着。 */
+  onSettingsChange?: (patch: Partial<AppSettings>) => void;
 }
+
+/** 「最近用过」保留几条。 */
+const RECENT_LIMIT = 8;
 
 const FEE_RATE = 0.0004;
 
@@ -111,10 +117,13 @@ export default function TradingPage({
   settings,
   onMarketChange,
   onAccountChange,
+  onSettingsChange,
 }: Props) {
   const [market, setMarket] = useState(settings?.market_type || "spot");
   const [symbol, setSymbol] = useState("");
   const [symbols, setSymbols] = useState<SymbolInfo[]>([]);
+  /** 24 小时行情：只问看得见的那批交易对。接口没上时是空对象，涨跌幅整列不显示。 */
+  const [quotes, setQuotes] = useState<Record<string, TickerQuote>>({});
   const [timeframe, setTimeframe] = useState(settings?.timeframe || "15m");
   /** Every indicator switched on, with its parameters. Several may be stacked
    * at once; MA is the default because trend context is what most traders look
@@ -498,6 +507,60 @@ export default function TradingPage({
     return () => window.clearInterval(timer);
   }, [refreshAccount]);
 
+  const favorites = useMemo(() => settings?.favorites ?? [], [settings?.favorites]);
+  const recent = useMemo(() => settings?.recent_symbols ?? [], [settings?.recent_symbols]);
+
+  /** 收藏跟账户走：先改本地（界面立刻响应），再存后端。存不上不回滚——下一次读设置会纠正。
+   *  连点两个星标时 setState 还没重渲染，读闭包里的 favorites 会把前一次覆盖掉（实测两只点
+   *  只留下一只），所以「当前值」走 ref，点一下就立刻更新。 */
+  const favoritesRef = useRef(favorites);
+  favoritesRef.current = favorites;
+  const recentRef = useRef(recent);
+  recentRef.current = recent;
+
+  const toggleFavorite = (pair: string) => {
+    const current = favoritesRef.current;
+    const next = current.includes(pair)
+      ? current.filter((item) => item !== pair)
+      : [...current, pair];
+    favoritesRef.current = next;
+    onSettingsChange?.({ favorites: next });
+    void api("/api/settings", { method: "PUT", body: JSON.stringify({ favorites: next }) }).catch(
+      () => {},
+    );
+  };
+
+  /** 最近用过也跟账户走（settings.recent_symbols），刷新还在。 */
+  const rememberRecent = (pair: string) => {
+    const next = [pair, ...recentRef.current.filter((item) => item !== pair)].slice(0, RECENT_LIMIT);
+    recentRef.current = next;
+    onSettingsChange?.({ recent_symbols: next });
+    void api("/api/settings", { method: "PUT", body: JSON.stringify({ recent_symbols: next }) }).catch(
+      () => {},
+    );
+  };
+
+  useEffect(() => {
+    const wanted = [
+      symbol,
+      ...favorites,
+      ...recent,
+      ...symbols.slice(0, 50).map((item) => item.symbol),
+    ];
+    let cancelled = false;
+    const load = () => {
+      void loadTickers(market, wanted).then((map) => {
+        if (!cancelled) setQuotes(map);
+      });
+    };
+    load();
+    const timer = window.setInterval(load, 20000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [market, symbol, symbols, favorites, recent]);
+
   const current = useMemo(
     () => symbols.find((item) => item.symbol === symbol),
     [symbols, symbol],
@@ -506,7 +569,8 @@ export default function TradingPage({
   const base = current?.base ?? symbol.split("/")[0] ?? "";
   const quote = current?.quote ?? "USDT";
   const lastPrice = ticker?.last || candles[candles.length - 1]?.c || 0;
-  const changePct = ticker?.change_pct ?? 0;
+  /** 涨跌幅以 ticker 为准；读不到就是 null —— 界面上留空，不拿 0 冒充「平盘」。 */
+  const changePct = ticker?.change_pct ?? null;
   const high = ticker?.high || restTicker?.high || 0;
   const low = ticker?.low || restTicker?.low || 0;
   const volume = ticker?.quote_volume ?? ticker?.base_volume ?? 0;
@@ -577,20 +641,28 @@ export default function TradingPage({
               value={symbol}
               onChange={(value) => {
                 picked.current.symbol = true;
-    setSymbol(value);
+                setSymbol(value);
                 setPickedPrice(null);
                 setSymbolFallback(null);
+                rememberRecent(value);
               }}
               loading={symbols.length === 0}
+              favorites={favorites}
+              recent={recent}
+              quotes={quotes}
+              onToggleFavorite={toggleFavorite}
             />
 
             <div className="price-line">
               <span className="price num">{hasQuote ? fmtPrice(lastPrice) : "—"}</span>
               {hasQuote ? (
-                <span className={`change num ${changePct >= 0 ? "up" : "down"}`}>
-                  {changePct >= 0 ? "+" : ""}
-                  {changePct.toFixed(2)}%
-                </span>
+                fmtChangePct(changePct) ? (
+                  <span className={`change num ${changeTone(changePct)}`}>
+                    {fmtChangePct(changePct)}
+                  </span>
+                ) : (
+                  <span className="change num faint">—</span>
+                )
               ) : (
                 <span className="change num faint">—</span>
               )}

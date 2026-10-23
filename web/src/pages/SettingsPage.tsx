@@ -7,6 +7,7 @@ import type {
   AIStatus,
   AppSettings,
   CredentialItem,
+  CredentialStorage,
   NotifyStatus,
   PlatformOption,
   RiskState,
@@ -61,6 +62,8 @@ export default function SettingsPage({ settings, settingsError = "", onSaved }: 
   const [platform, setPlatform] = useState(settings?.platform ?? "binance");
   const [platformBusy, setPlatformBusy] = useState(false);
   const [credentials, setCredentials] = useState<CredentialItem[]>([]);
+  /** 当前用的是系统密钥环还是本机加密文件：服务器上要让人一眼看出这事。 */
+  const [credStorage, setCredStorage] = useState<CredentialStorage | null>(null);
   const [credentialsError, setCredentialsError] = useState("");
   const [saving, setSaving] = useState(false);
   const [flash, setFlash] = useState<{ tone: "ok" | "err"; text: string } | null>(null);
@@ -232,10 +235,13 @@ export default function SettingsPage({ settings, settingsError = "", onSaved }: 
     try {
       // Always name the network: the tab the user is looking at decides which
       // keys are shown, and 主网 must never display 测试网 的 key.
-      const data = await api<{ network: string; items: CredentialItem[] }>(
-        `/api/credentials?network=${encodeURIComponent(network)}`,
-      );
+      const data = await api<{
+        network: string;
+        items: CredentialItem[];
+        storage: CredentialStorage;
+      }>(`/api/credentials?network=${encodeURIComponent(network)}`);
       setCredentials(data.items);
+      setCredStorage(data.storage ?? null);
       setCredentialsError("");
     } catch (error) {
       setCredentialsError(error instanceof Error ? error.message : String(error));
@@ -614,8 +620,13 @@ export default function SettingsPage({ settings, settingsError = "", onSaved }: 
             </div>
           </div>
           <div className="card-body hint">
-            密钥保存在系统凭据库（Windows 凭据管理器 / macOS 钥匙串），不会写入配置文件。
-            建议在币安只勾选「读取」和「交易」权限，关闭「提现」，并绑定 IP 白名单。
+            {credStorage ? (
+              <div className={`storage-note${credStorage.kind === "keyring" ? "" : " warn"}`}>
+                <span className="storage-label">存放位置：{credStorage.label}</span>
+                <span>{credStorage.detail}</span>
+              </div>
+            ) : null}
+            密钥不会写入配置文件。建议在币安只勾选「读取」和「交易」权限，关闭「提现」，并绑定 IP 白名单。
           </div>
         </div>
 
@@ -751,8 +762,17 @@ export default function SettingsPage({ settings, settingsError = "", onSaved }: 
                   {aiBusy === "test" ? "测试中…" : "测试连通"}
                 </button>
               </div>
+              {aiStatus?.storage ? (
+                <div
+                  className={`storage-note${aiStatus.storage.kind === "keyring" ? "" : " warn"}`}
+                  style={{ marginTop: 8 }}
+                >
+                  <span className="storage-label">存放位置：{aiStatus.storage.label}</span>
+                  <span>{aiStatus.storage.detail}</span>
+                </div>
+              ) : null}
               <span className="field-hint">
-                存在系统凭据库（Windows 凭据管理器 / macOS 钥匙串），不写进配置文件。
+                不写进配置文件。
                 {aiStatus?.provider_help ? ` ${aiStatus.provider_help}` : ""}
                 {aiStatus && aiStatus.needs_key && !aiStatus.has_key ? " 该供应商需要 Key。" : ""}
               </span>

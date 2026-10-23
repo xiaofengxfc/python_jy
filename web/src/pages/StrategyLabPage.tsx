@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, query } from "../api";
+import SymbolFallbackNote from "../components/SymbolFallbackNote";
 import { TIMEFRAMES, fmt } from "../format";
 import type {
   AppSettings,
@@ -80,6 +81,11 @@ export default function StrategyLabPage({ settings, health, onNavigate }: Props)
   const [symbols, setSymbols] = useState<SymbolInfo[]>([]);
   const [market, setMarket] = useState(settings?.market_type ?? "spot");
   const [symbol, setSymbol] = useState(settings?.last_symbol ?? "BTC/USDT");
+  /** 切市场后那一对不在列表里、只能换掉时说明一句；可用时保持 null。 */
+  const [symbolFallback, setSymbolFallback] = useState<{ from: string; to: string } | null>(null);
+  // 当前选中的那一对：effect 只在换市场时跑，靠 ref 读最新值，别把它写进依赖。
+  const symbolRef = useRef(symbol);
+  symbolRef.current = symbol;
   const [timeframe, setTimeframe] = useState(settings?.timeframe ?? "1h");
 
   const [tab, setTab] = useState<"generate" | "optimize">("generate");
@@ -158,11 +164,16 @@ export default function StrategyLabPage({ settings, health, onNavigate }: Props)
       .then((data) => {
         const items = data.items ?? [];
         setSymbols(items);
-        setSymbol((current) =>
-          items.some((item) => item.symbol === current)
-            ? current
-            : (items.find((item) => item.symbol === "BTC/USDT") ?? items[0])?.symbol ?? "",
-        );
+        // 设置里那一对是另一个市场的写法时，这里只能退到列表里能用的那一项。
+        // 退回要说一句（和交易页、回测页、设置页共用 SymbolFallbackNote），
+        // 否则用户以为自己选的对被吞了。
+        const from = symbolRef.current;
+        const known = items.some((item) => item.symbol === from);
+        const to = known
+          ? from
+          : (items.find((item) => item.symbol === "BTC/USDT") ?? items[0])?.symbol ?? "";
+        setSymbol(to);
+        setSymbolFallback(known || !to || to === from ? null : { from, to });
       })
       .catch(() => setSymbols([]));
   }, [market]);
@@ -446,7 +457,10 @@ export default function StrategyLabPage({ settings, health, onNavigate }: Props)
           className="select"
           aria-label="交易对"
           value={symbol}
-          onChange={(event) => setSymbol(event.target.value)}
+          onChange={(event) => {
+            setSymbol(event.target.value);
+            setSymbolFallback(null);
+          }}
         >
           {symbols.map((item) => (
             <option key={item.symbol} value={item.symbol}>
@@ -471,6 +485,12 @@ export default function StrategyLabPage({ settings, health, onNavigate }: Props)
           回测和优化都用这一组标的
         </span>
       </div>
+
+      <SymbolFallbackNote
+        from={symbolFallback?.from ?? ""}
+        to={symbolFallback?.to ?? ""}
+        market={market}
+      />
 
       <StageBar stages={STAGES} current={stage} />
 

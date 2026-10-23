@@ -24,8 +24,27 @@ export type PageKey =
   | "lab"
   | "settings";
 
+const PAGE_KEYS: PageKey[] = [
+  "trading",
+  "ai-trade",
+  "ai-quant",
+  "portfolio",
+  "backtest",
+  "strategy",
+  "lab",
+  "settings",
+];
+
+/** 当前视图存在 URL 的 hash 里（#/strategy、#/settings…）。
+ *  以前只有内存里的 state，按一下 F5 就弹回交易页，后退也回不去。 */
+function pageFromHash(): PageKey {
+  if (typeof window === "undefined") return "trading";
+  const raw = (window.location.hash.replace(/^#\/?/, "").split(/[?#/]/)[0] ?? "").trim();
+  return PAGE_KEYS.find((key) => key === raw) ?? "trading";
+}
+
 export default function App() {
-  const [page, setPage] = useState<PageKey>("trading");
+  const [page, setPage] = useState<PageKey>(pageFromHash);
   const [health, setHealth] = useState<Health | null>(null);
   const [healthError, setHealthError] = useState("");
   const [market, setMarket] = useState("spot");
@@ -91,7 +110,36 @@ export default function App() {
     };
   }, []);
 
+  /** 换页：state 和 hash 一起改。改 hash 会进浏览历史，后退/前进才跟得上。 */
+  const go = useCallback((next: PageKey) => {
+    setPage(next);
+    const want = `#/${next}`;
+    if (window.location.hash !== want) window.location.hash = want;
+  }, []);
+
+  // 刷新、后退、前进都走 hash：hash 变了就跟着换页；认不出来的 hash 回交易页。
+  useEffect(() => {
+    // 首屏把 hash 归一化（用 replace，别在历史里多塞一条）。
+    const clean = pageFromHash();
+    if (clean !== page || !window.location.hash) {
+      window.history.replaceState(null, "", `#/${clean}`);
+    }
+    const sync = () => setPage(pageFromHash());
+    window.addEventListener("hashchange", sync);
+    window.addEventListener("popstate", sync);
+    return () => {
+      window.removeEventListener("hashchange", sync);
+      window.removeEventListener("popstate", sync);
+    };
+    // 只在挂载时注册一次；page 只用来判断首屏要不要归一化。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const handleAccountChange = useCallback((value: number) => setEquity(value), []);
+  const handleSettingsChange = useCallback(
+    (patch: Partial<AppSettings>) => setSettings((current) => (current ? { ...current, ...patch } : current)),
+    [],
+  );
   const handleLogCounts = useCallback((errors: number) => setLogErrors(errors), []);
 
   // Inside the Electron shell the OS frame is gone, so the app draws its own
@@ -103,7 +151,7 @@ export default function App() {
       <TitleBar />
       <Sidebar
         page={page}
-        onPick={setPage}
+        onPick={go}
         onOpenLog={() => setLogOpen(true)}
         connected={health !== null && healthError === ""}
         network={health?.network ?? "testnet"}
@@ -122,6 +170,7 @@ export default function App() {
             settings={settings}
             onMarketChange={setMarket}
             onAccountChange={handleAccountChange}
+            onSettingsChange={handleSettingsChange}
           />
         )}
         {page === "ai-trade" && <AITradePage settings={settings} health={health} />}
@@ -129,7 +178,7 @@ export default function App() {
           <AIQuantPage
             settings={settings}
             health={health}
-            onNavigate={(next) => setPage(next)}
+            onNavigate={(next) => go(next)}
           />
         )}
         {page === "portfolio" && <PortfolioPage
@@ -140,7 +189,7 @@ export default function App() {
           <BacktestPage
             onEditStrategy={(key) => {
               setStrategyFocus(key);
-              setPage("strategy");
+              go("strategy");
             }}
           />
         )}
@@ -151,7 +200,7 @@ export default function App() {
             health={health}
             onNavigate={(next, key) => {
               if (key) setStrategyFocus(key);
-              setPage(next);
+              go(next);
             }}
           />
         )}

@@ -197,7 +197,10 @@ export default function AIPanel({
           <div className="ai-meta faint">
             {analysis.timeframes.join(" · ")} · 现价 {analysis.price.toFixed(2)}
             {analysis.cached ? " · 缓存结果" : ""}
-            {analysis.tokens ? ` · ${analysis.tokens} tokens` : ""}
+            {analysis.tokens ? ` · 本次 ${analysis.tokens} tokens` : ""}
+            {analysis.usage && analysis.usage.total > 0
+              ? `（入 ${analysis.usage.input} / 出 ${analysis.usage.output}）`
+              : ""}
           </div>
           <MarkdownText text={analysis.text} />
           {levels.length > 0 && (
