@@ -36,6 +36,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from .. import __version__ as APP_VERSION
 from .. import paths
 
 log = logging.getLogger(__name__)
@@ -47,6 +48,14 @@ GITHUB_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/commits
 GITHUB_PER_PAGE = 20
 GITHUB_TIMEOUT = 10.0
 USER_AGENT = "biTrader-updater"
+# 桌面端只查 Releases：没有 .git、没有 venv、没有 npm，服务器那套一步都做不了。
+GITHUB_RELEASES = (
+    f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
+)
+# 未认证的 GitHub API 每小时只给 60 次：同一个进程里问过就记 5 分钟。
+RELEASE_CACHE_SECONDS = 300.0
+# 只认 v?X.Y.Z 三段纯数字。别的写法不猜：拿字符串比版本会把 0.6.10 判成比 0.6.9 旧。
+VERSION_RE = re.compile(r"^[vV]?(\d+)\.(\d+)\.(\d+)$")
 
 SERVICE_NAME = "bitrader"
 WEB_PORT = 8765  # 拿不到真实端口时的兜底
@@ -385,10 +394,191 @@ def _counts(repo, remote_sha: str, remote: str, branch: str) -> tuple[int | None
     return None, None, reason or "本地没有远端那几个提交，数不出差距"
 
 
-def collect_info(repo=None) -> dict[str, Any]:
-    """本地与 GitHub 的差距。读不到远端就说读不到，绝不说「已是最新」。"""
+def is_desktop_build() -> bool:
+    """这个进程是不是桌面端：PyInstaller 冻结包，或者 Electron 壳拉起来的后端。
+
+    判据就这两条，别另写一套：壳参数那条路由 set_desktop_shell 在启动时喂过。
+    """
+    if getattr(sys, "frozen", False):
+        return True
+    return bool(desktop_shell_reason())
+
+
+class ReleaseError(RuntimeError):
+    """问不到 Releases。message 已经是给人看的中文，原样带给界面。"""
+
+
+def _rate_limit_note(value: Any) -> str:
+    """把 X-RateLimit-Reset 的 epoch 秒说成人话；读不出来就空串。"""
+    try:
+        stamp = int(str(value).strip())
+    except (TypeError, ValueError):
+        return ""
+    if stamp <= 0:
+        return ""
+    try:
+        when = datetime.fromtimestamp(stamp).astimezone()
+    except (OverflowError, OSError, ValueError):
+        return ""
+    wait = max(1, int(round((stamp - time.time()) / 60.0)))
+    return f"，额度要到 {when:%H:%M} 才回来（约 {wait} 分钟后）"
+
+
+def _error_body(exc: urllib.error.HTTPError) -> str:
+    """HTTP 错误正文（GitHub 会说清是哪一条）。读不出来就退回状态说明。"""
+    try:
+        body = exc.read()
+    except Exception:  # pragma: no cover - 读不回来不影响报错
+        return str(exc.reason or exc)
+    text = body.decode("utf-8", "replace") if isinstance(body, bytes) else str(body)
+    text = text.strip()
+    return text[:400] or str(exc.reason or exc)
+
+
+# 进程内缓存：{"at": 时间戳, "payload": GitHub 的回包}
+_release_cache: dict[str, Any] = {"at": 0.0, "payload": None}
+
+
+def _latest_release(force: bool = False) -> dict[str, Any]:
+    """GitHub Releases 里最新那一条（原样回包）。
+
+    force=True 跳过缓存（界面上「再查一次」用）。失败一律抛 ReleaseError，文案分三档：
+    没发过 Release（404）、限流（403，带额度回来的时间）、其它照贴原文。
+    """
+    cached = _release_cache.get("payload")
+    if (
+        not force
+        and isinstance(cached, dict)
+        and time.time() - float(_release_cache.get("at") or 0.0) < RELEASE_CACHE_SECONDS
+    ):
+        return cached
+    request = urllib.request.Request(
+        GITHUB_RELEASES,
+        headers={"Accept": "application/vnd.github+json", "User-Agent": USER_AGENT},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=GITHUB_TIMEOUT) as response:
+            raw = response.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise ReleaseError(
+                "这个仓库还没有发布过 Release（GitHub 回 404）：发一个 tag 之后这里才会有内容。"
+            ) from None
+        if exc.code == 403:
+            note = _rate_limit_note((exc.headers or {}).get("X-RateLimit-Reset"))
+            raise ReleaseError(
+                f"GitHub 限流了（403，未认证请求每小时 60 次）{note}。"
+                f"原话：{_error_body(exc)}"
+            ) from None
+        raise ReleaseError(f"问不到 GitHub Releases（HTTP {exc.code}）：{_error_body(exc)}") from None
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+        # 超时、DNS、断网：原文照贴，不替用户编原因。
+        raise ReleaseError(f"问不到 GitHub Releases：{exc}") from None
+    try:
+        payload = json.loads(raw)
+    except ValueError as exc:
+        raise ReleaseError(f"GitHub Releases 的回包读不懂：{exc}") from None
+    if not isinstance(payload, dict):
+        raise ReleaseError(f"GitHub Releases 的回包不是一条 Release：{raw[:200]}")
+    _release_cache.update({"at": time.time(), "payload": payload})
+    return payload
+
+
+def _version_tuple(text: Any) -> tuple[int, int, int] | None:
+    """v0.6.10 → (0, 6, 10)。只认 v?X.Y.Z，别的读不懂返回 None（不猜、不补位）。"""
+    match = VERSION_RE.match(str(text or "").strip())
+    if not match:
+        return None
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
+
+def _release_asset_url(release: dict[str, Any]) -> str | None:
+    """Release 里第一个 .exe 安装包的下载地址；没挂安装包就是 None。"""
+    assets = release.get("assets")
+    if not isinstance(assets, list):
+        return None
+    for asset in assets:
+        if not isinstance(asset, dict):
+            continue
+        name = str(asset.get("name") or "")
+        url = str(asset.get("browser_download_url") or "")
+        if url and name.lower().endswith(".exe"):
+            return url
+    return None
+
+
+def desktop_update_info(force: bool = False) -> dict[str, Any]:
+    """桌面端的更新信息：只查 GitHub Releases，一个 git 子进程都不起。
+
+    桌面端没有 .git、没有 .venv、没有 npm，服务器那套 fetch → merge → pip → build → 重启
+    一步都做不了。这里只回答三件事：远端最新是哪个版本、你的是不是旧了、安装包在哪儿。
+    **只报不装**：没有代码签名，静默升级会被 SmartScreen 拦。
+
+    newer 一定是三元组比出来的：读不懂就看不出新旧，那时给 None 并附 error——
+    绝不说「已是最新」。
+    """
+    current = str(APP_VERSION)
+    desktop: dict[str, Any] = {
+        "current": current,
+        "latest": None,
+        "tag": None,
+        "newer": None,
+        "download_url": None,
+        "download_note": "",
+        "published_at": None,
+        "notes": "",
+        "error": "",
+    }
+    info: dict[str, Any] = {
+        "supported": False,
+        "mode": "desktop",
+        "version": current,
+        "platform": platform_name(),
+        "checked_at": now_iso(),
+        "desktop": desktop,
+    }
+    try:
+        release = _latest_release(force=force)
+    except ReleaseError as exc:
+        desktop["error"] = str(exc)
+        return info
+    tag = str(release.get("tag_name") or "").strip()
+    desktop["tag"] = tag or None
+    desktop["notes"] = str(release.get("body") or "")
+    desktop["published_at"] = str(release.get("published_at") or "") or None
+    desktop["download_url"] = _release_asset_url(release)
+    if not desktop["download_url"]:
+        desktop["download_note"] = (
+            "这个 Release 没有挂安装包：只能自己去 Release 页面取。"
+        )
+    remote = _version_tuple(tag)
+    if remote is None:
+        desktop["error"] = (
+            f"远端 tag 读不懂（{tag or '空'}）：只认 vX.Y.Z 这种写法，这次比不了版本。"
+        )
+        return info
+    desktop["latest"] = tag[1:] if tag[:1] in ("v", "V") else tag
+    local = _version_tuple(current)
+    if local is None:
+        desktop["error"] = f"本地版本号读不懂（{current}）：只认 X.Y.Z 这种写法，这次比不了版本。"
+        return info
+    desktop["newer"] = remote > local
+    return info
+
+
+def collect_info(repo=None, refresh: bool = False) -> dict[str, Any]:
+    """本地与 GitHub 的差距。读不到远端就说读不到，绝不说「已是最新」。
+
+    桌面端（冻结包 / 壳拉起来的后端）走另一条路：那里没有 .git，git 一个子进程都不起，
+    直接查 Releases 比版本号。界面只认 `supported` / `mode` 这两个判据。
+    """
+    if is_desktop_build():
+        return desktop_update_info(force=refresh)
     root = Path(repo) if repo else paths.project_root()
     info: dict[str, Any] = {
+        # 界面按这两个字段决定给哪一张卡：服务器版能在线更新，桌面版只能给下载链接。
+        "supported": True,
+        "mode": "repo",
         "current_sha": None,
         "current_short": None,
         "branch": None,

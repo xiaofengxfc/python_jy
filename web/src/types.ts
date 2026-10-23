@@ -367,6 +367,23 @@ export interface UpdateCommit {
   date: string;
 }
 
+/** GitHub Releases 那一套（桌面安装版没有 git 仓库，只能按 tag 比版本号）。 */
+export interface UpdateDesktop {
+  /** 本机版本（btrader.__version__）。 */
+  current?: string | null;
+  /** 远端版本，不带 v。 */
+  latest?: string | null;
+  /** 远端 tag，带 v（v0.6.2）。 */
+  tag?: string | null;
+  /** true 有新版 / false 已最新 / null 比不出来（当「查不到」处理，别当「已最新」）。 */
+  newer?: boolean | null;
+  download_url?: string | null;
+  published_at?: string | null;
+  notes?: string | null;
+  /** 查不到那一档的后端原话。 */
+  error?: string | null;
+}
+
 export interface UpdateInfo {
   current_sha?: string | null;
   current_short?: string | null;
@@ -383,6 +400,13 @@ export interface UpdateInfo {
   /** 后端跑在哪个平台（Linux / Windows）：手动命令按它给。 */
   platform?: string | null;
   error?: string | null;
+  /** false = 桌面安装版（没有 git 仓库、没有 pip/npm）：整张卡换成 Releases 的比对结果。 */
+  supported?: boolean;
+  /** server / desktop。 */
+  mode?: string | null;
+  /** 本机版本号（桌面态用它比）。 */
+  version?: string | null;
+  desktop?: UpdateDesktop | null;
 }
 
 /** 一键更新的一步：跑完才写。output 是命令的原文，失败时原样贴出来。 */

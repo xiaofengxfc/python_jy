@@ -1609,3 +1609,83 @@ def test_an_unfilled_order_is_not_reported_as_filled() -> None:
     assert "已提交，状态未知" in src, "状态读不懂就要照实说不知道"
     assert "买入成功" not in src and "卖出成功" not in src, "受理还写成「成功」"
     assert "买入成交" in src and "卖出成交" in src, "成交那一档也要说人话"
+
+# ---------------------------------------------------------------- t95 桌面端只查 Releases
+
+
+def _desktop_branch() -> str:
+    """桌面卡那一段源码（卡内标记之间）：supported === false 时才渲染的内容。"""
+    card = _update_card_source()
+    begin = card.index("{/* desktop-card-begin */}")
+    split = card.index("{/* desktop-card-split */}")
+    end = card.index("{/* desktop-card-end */}")
+    assert begin < split < end, "桌面卡与服务器版的标记顺序不对"
+    return card[begin:split]
+
+
+def _server_branch() -> str:
+    """服务器版那一段（git 那套）：桌面态里一个都不许渲染。"""
+    card = _update_card_source()
+    split = card.index("{/* desktop-card-split */}")
+    end = card.index("{/* desktop-card-end */}")
+    return card[split:end]
+
+
+def test_the_desktop_card_has_none_of_the_repository_buttons() -> None:
+    """桌面安装版里没有 git 仓库：三个按钮、那句「正在读…」、状态轮询一个都不许出现。"""
+    desk = _desktop_branch()
+    assert "立即更新" not in desk, "桌面卡里还有「立即更新」"
+    assert "回滚" not in desk, "桌面卡里还有「回滚」"
+    assert "检查更新" not in desk, "桌面卡里还有「检查更新」"
+    assert "正在读本地与 GitHub 的提交" not in desk, "桌面卡里还有那句「正在读本地与 GitHub 的提交…」"
+    assert "loadUpdateStatus" not in desk, "桌面卡还在读 /api/update/status"
+    assert "软件更新" in _update_card_source(), "标题还是「软件更新」"
+
+
+def test_the_desktop_card_says_which_version_is_out() -> None:
+    """有新版：说出远端版本与自己的版本，给下载外链；没挂安装包也要说清去哪看。"""
+    desk = _desktop_branch()
+    assert "GitHub 上已经有" in desk, "有新版时没说远端是哪个版本"
+    assert "你现在是" in desk, "没说本机是哪个版本"
+    assert "下载新安装包" in desk
+    assert 'target="_blank"' in desk and 'rel="noreferrer"' in desk, "外链要用新窗口打开"
+    assert "这个 Release 没有挂安装包" in desk, "Release 没挂安装包时没给替代说法"
+    page = (UI_DIR / "pages" / "SettingsPage.tsx").read_text(encoding="utf-8")
+    assert "https://github.com/xiaofengxfc/python_jy/releases" in page, "没挂安装包时要去 Release 页面看"
+    assert "RELEASES_PAGE" in desk, "页面上的链接没走那个常量"
+    assert "{desktopTag}" in desk and "{desktopCurrent}" in desk, "版本号写死了，没取后端给的那几个字段"
+    assert "{desktopDownload}" in desk or "desktop?.download_url" in desk, "下载链接没取后端给的"
+
+
+def test_the_desktop_card_tells_latest_apart_from_unknown() -> None:
+    """已最新与查不到是两回事：newer 是 null（比不出来）必须算查不到，不许算已最新。"""
+    card = _update_card_source()
+    desk = _desktop_branch()
+    assert "已是最新" in desk, "已最新那一档没文案"
+    assert "查不到 GitHub 上的版本" in desk, "查不到那一档没文案"
+    assert "重新检查" in desk, "查不到时要能重新检查"
+    assert 'refresh ? "/api/update/info?refresh=1" : "/api/update/info"' in card, "重新检查没打 ?refresh=1"
+    assert "desktop.newer === true" in card and "desktop.newer === false" in card
+    assert card.count(': "unknown"') >= 2, "null / 缺字段 / 有 error 都要算「查不到」"
+    assert "不下载不改文件" in desk, "卡底要写清这里只比对、不下载不改文件"
+
+
+def test_the_server_card_is_untouched_when_supported_is_missing() -> None:
+    """服务器版不许被改坏：supported 缺失或 true 时按钮、那句「正在读…」、轮询照旧。"""
+    card = _update_card_source()
+    assert "const desktopMode = Boolean(update && update.supported === false);" in card, (
+        "只有后端明确说 false 才切桌面，别拿「没这个字段」当桌面"
+    )
+    server = _server_branch()
+    for word in ("检查更新", "立即更新", "回滚", "正在读本地与 GitHub 的提交"):
+        assert word in server, f"服务器版少了「{word}」"
+    assert "info?.supported !== false" in card, "桌面态还在轮询 /api/update/status"
+
+
+def test_the_desktop_types_are_declared() -> None:
+    """/api/update/info 的桌面字段要有类型，别拿 any 顶。"""
+    types = (UI_DIR / "types.ts").read_text(encoding="utf-8")
+    for field in ("supported", "mode", "version", "desktop"):
+        assert f"{field}?" in types, f"UpdateInfo 少了 {field}"
+    for field in ("current", "latest", "tag", "newer", "download_url", "published_at", "notes"):
+        assert field in types, f"desktop 块少了 {field}"

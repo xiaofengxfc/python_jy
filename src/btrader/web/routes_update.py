@@ -73,21 +73,33 @@ def _busy_refusal() -> None:
 
 
 def _desktop_refusal() -> None:
-    """桌面壳启动的进程不许更新。
+    """桌面端不许在线更新：那里只查 Releases，给下载链接。
 
-    壳用的是 `--port 0` + `--parent-pid` / `--watch-stdin`：更新完重启拉起的是裸
-    `run_web.py`，新进程既不知道临时端口，也没有壳盯着——壳当场失联，界面上是
-    「更新完了但窗口连不上后端」。这种时候只让人回应用里重启，不静默把壳弄丢。
+    两种桌面进程都拦：
+      * 冻结包（PyInstaller）里没有 .git、没有 venv、没有 npm，服务器那套一步都做不了；
+      * 桌面壳拉起来的进程带着 `--port 0` + `--parent-pid` / `--watch-stdin`：更新完重启
+        拉起的是裸 run_web.py，新进程既不知道临时端口，也没有壳盯着——壳当场失联，界面上
+        是「更新完了但窗口连不上后端」。
+    两种都返回 400：不建任务、不写状态文件。
     """
-    reason = updater.desktop_shell_reason()
-    if not reason:
+    if not updater.is_desktop_build():
         return
+    reason = updater.desktop_shell_reason()
+    if reason:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"当前这个后端是桌面壳启动的（{reason}）：更新最后要重启后端，而这里拉起的是"
+                "裸的 run_web.py，新进程接不上壳（端口是壳当场选的、壳还盯着这个 pid 与 stdin）。"
+                "请关掉窗口再打开应用，或者在应用里重启后端；服务端部署请用 run_web.py 或 systemd 那份。"
+            ),
+        )
     raise HTTPException(
         status_code=400,
         detail=(
-            f"当前这个后端是桌面壳启动的（{reason}）：更新最后要重启后端，而这里拉起的是"
-            "裸的 run_web.py，新进程接不上壳（端口是壳当场选的、壳还盯着这个 pid 与 stdin）。"
-            "请关掉窗口再打开应用，或者在应用里重启后端；服务端部署请用 run_web.py 或 systemd 那份。"
+            "桌面版是打包好的 exe，里面没有 .git、没有 venv、没有 npm：服务器那套"
+            "git fetch / merge / pip / 重启一步都做不了，所以这里不做在线更新。"
+            "桌面版只查 GitHub Releases：有新版本时界面上会给下载链接，装完重新打开应用即可。"
         ),
     )
 
@@ -96,9 +108,13 @@ def build_update_router() -> APIRouter:
     router = APIRouter()
 
     @router.get("/api/update/info")
-    def update_info() -> dict[str, Any]:
-        """本地与 GitHub 的差距。读不到远端就是 error 非空，界面不许说「已是最新」。"""
-        return updater.collect_info()
+    def update_info(refresh: int = 0) -> dict[str, Any]:
+        """本地与 GitHub 的差距。读不到远端就是 error 非空，界面不许说「已是最新」。
+
+        桌面端只查 Releases，结果进程内缓存 300 秒（未认证 API 每小时 60 次）；
+        refresh=1 跳过缓存，界面上「再查一次」用。
+        """
+        return updater.collect_info(refresh=bool(refresh))
 
     @router.post("/api/update/apply")
     def update_apply() -> dict[str, Any]:

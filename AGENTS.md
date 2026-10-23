@@ -476,3 +476,20 @@ Node 不在 PATH 时，先把 Node 目录加进去。
 - 测试全离线：`tests/test_update.py`（信息收集、五种前置、失败停在那一格、状态收尾、两条重启分支）
   + `tests/test_update_hardening.py`（垫片日志写不了不能当成功、端口没人听要报 failed、
   `JobBusy` 409、外部 pid 不许收尾、`from_sha` 校验、非 daemon 线程）。
+- 桌面端不查仓库，只查 Releases（t94 起）：桌面版是 PyInstaller 冻结的 exe，里面没有 `.git`、
+  没有 `.venv`、没有 npm，上面那条流水线一步都做不了。所以 `updater.is_desktop_build()`
+  （`sys.frozen` 为真，或壳的 `--parent-pid` / `--watch-stdin` / `--port 0` 通过 `set_desktop_shell`
+  喂进来）成立时，`collect_info` 第一行就 return `desktop_update_info()`：`/api/update/info` 回
+  `supported: false` + `desktop` 块（`current` / `latest` / `tag` / `newer` / `download_url` /
+  `error`），只打一次 `GET /repos/xiaofengxfc/python_jy/releases/latest`（10 秒超时、成功缓存 300 秒），
+  **一个 git 子进程都不起**。版本按三元组比（`0.6.10 > 0.6.9`），tag 读不懂就 `newer: null` 并说
+  「读不懂」——不许当成最新。界面据此换成桌面卡：三态（有新版给下载链接 / 已最新 / 查不到带
+  「重新检查」打 `?refresh=1`），仓库版那三个按钮和「正在读本地与 GitHub 的提交…」一个都不出现。
+  桌面端只比对、不下载不改文件——没签名，静默升级会被 SmartScreen 拦。
+- 发版走 `packaging/release.py --version X.Y.Z [--build]`：三处版本号（`pyproject.toml`、
+  `electron/package.json`、`src/btrader/__init__.py`）必须一致、工作树必须干净、`v<版本>` 这个 tag
+  必须还没打过，任一不满足直接退出且什么都不做。顺序是打 tag → 推 tag → 建 Release → 上传
+  `dist-electron/biTrader-Setup-<版本>.exe`（流式，1 MiB 一块）→ 打印 `html_url`。token 取
+  `GITHUB_TOKEN`，没有就 `git credential fill`，**任何情况下不进日志**。桌面端靠 Release 判断有没有
+  新版，所以每次发版**必须把安装包传上去**；Linux 服务器版按提交 SHA 比，不发 Release 也能更新。
+  安装包 140+ MB，不进仓库（`dist-electron/` 在 `.gitignore` 里）。细节见 `docs/RELEASE.md`。

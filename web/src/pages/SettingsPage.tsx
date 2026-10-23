@@ -57,6 +57,9 @@ const PCT_FIELDS: [keyof AppSettings["risk"], string, string][] = [
 /** 更新任务的终态：这几个一出现就不会再变，轮询到此为止。 */
 const UPDATE_FINAL_STATES = ["done", "ok", "success", "failed", "error", "cancelled", "stopped"];
 
+/** 桌面端只给链接，不下载：查到新版时落到这里。 */
+const RELEASES_PAGE = "https://github.com/xiaofengxfc/python_jy/releases";
+
 export default function SettingsPage({ settings, settingsError = "", onSaved }: Props) {
   const [draft, setDraft] = useState<AppSettings | null>(settings);
   /** 拉列表用：effect 里要读「用户原来选的那一对」，放进依赖会让它反复触发。 */
@@ -204,23 +207,22 @@ export default function SettingsPage({ settings, settingsError = "", onSaved }: 
     updateWatch.current += 1;
   }, []);
 
-  const loadUpdate = useCallback(async () => {
+  /** refresh 是真的问一次 GitHub：桌面卡「重新检查」要绕过后端那 300 秒缓存。 */
+  const loadUpdate = useCallback(async (refresh = false) => {
     setUpdateBusy("info");
     try {
-      const info = await api<UpdateInfo>("/api/update/info");
+      const info = await api<UpdateInfo>(refresh ? "/api/update/info?refresh=1" : "/api/update/info");
       setUpdate(info);
       setUpdateError("");
+      return info;
     } catch (caught) {
       setUpdate(null);
       setUpdateError(caught instanceof Error ? caught.message : String(caught));
+      return null;
     } finally {
       setUpdateBusy("");
     }
   }, []);
-
-  useEffect(() => {
-    void loadUpdate();
-  }, [loadUpdate]);
 
   /** 服务重启期间 /api/tickers 那类请求都会断，只问 /api/health：200 就说明回来了。
    *  一分钟还没回来就停在这里，把手动命令交给用户，不自己编原因。 */
@@ -315,8 +317,12 @@ export default function SettingsPage({ settings, settingsError = "", onSaved }: 
   }, [watchUpdate]);
 
   useEffect(() => {
-    void loadUpdateStatus();
-  }, [loadUpdateStatus]);
+    // 先问一次 info：桌面安装版（supported === false）没有 git 仓库、也没有 update-state.json
+    // 那一套，读它只会白花一次请求、还在卡上留个「盘上这次任务的现场」。
+    void loadUpdate().then((info) => {
+      if (info?.supported !== false) void loadUpdateStatus();
+    });
+  }, [loadUpdate, loadUpdateStatus]);
 
   /** 立即更新：落后才可点，点了先问一次。 */
   const startUpdate = async () => {
@@ -377,6 +383,34 @@ export default function SettingsPage({ settings, settingsError = "", onSaved }: 
     if (given.includes("linux")) return "linux";
     return uaPlatform;
   }, [update?.platform, updateJob?.platform, uaPlatform]);
+
+  /** 桌面安装版：后端在 supported === false 时给 desktop 块，整张卡换成 Releases 的比对结果。
+   *  「没这个字段」和 true 都算服务器版——老后端不会给这个字段，别把它当桌面。 */
+  const desktopMode = Boolean(update && update.supported === false);
+  const desktop = update?.desktop ?? null;
+  /** 版本号一律取后端给的，前端一个都不写死。 */
+  const desktopCurrent = desktop?.current || update?.version || "没读到";
+  const desktopTag = desktop?.tag || (desktop?.latest ? `v${desktop.latest}` : "远端版本没读到");
+  const desktopPublished = desktop?.published_at
+    ? String(desktop.published_at).slice(0, 10)
+    : "发布日期没读到";
+  const desktopCheckedAt = (() => {
+    const raw = String(update?.checked_at ?? "");
+    const at = raw.indexOf("T");
+    return at >= 0 ? raw.slice(at + 1, at + 6) : raw || "没记";
+  })();
+  const desktopDownload = desktop?.download_url ? String(desktop.download_url) : "";
+  /** 三种结局：true 有新版 / false 已最新 / 其它（null 比不出来、缺字段、带 error）一律查不到。
+   *  newer 是 null 只能说明「比不出来」，把它当「已最新」等于骗人。 */
+  const desktopState: "newer" | "latest" | "unknown" =
+    desktop && !desktop.error
+      ? desktop.newer === true
+        ? "newer"
+        : desktop.newer === false
+          ? "latest"
+          : "unknown"
+      : "unknown";
+  const desktopError = desktop?.error || update?.error || "后端没有给出原因";
 
   /** 盘上那个任务是失败收场的：这时候用户最需要的就是手动命令与原文，不用再等 60 秒。 */
   const jobStopped = Boolean(
@@ -1824,180 +1858,248 @@ export default function SettingsPage({ settings, settingsError = "", onSaved }: 
             <span className="card-title">软件更新</span>
             <span className="spacer" />
             <span className="faint" style={{ fontSize: "var(--fs-12)" }}>
-              {update?.current_short ? `当前 ${update.current_short}` : "还没读到"}
+              {desktopMode
+                ? desktop?.current
+                  ? `当前 ${desktop.current}`
+                  : "还没读到"
+                : update?.current_short
+                  ? `当前 ${update.current_short}`
+                  : "还没读到"}
             </span>
           </div>
           <div className="card-body stack">
-            {updateError && <div className="banner warn">{updateError}</div>}
-
-            {update && (
-              <div className="deploy-rows">
-                <div className="deploy-row">
-                  <span>当前提交</span>
-                  <b className="num">{update.current_short ?? "—"}</b>
-                </div>
-                <div className="deploy-row">
-                  <span>分支</span>
-                  <b>{update.branch ?? "—"}</b>
-                </div>
-                <div className="deploy-row">
-                  <span>远端最新</span>
-                  <b className="num">{update.remote_short ?? "读不到"}</b>
-                </div>
-                <div className="deploy-row">
-                  <span>差距</span>
-                  <b>
-                    落后 {countText(update.behind_by)} 个 / 领先 {countText(update.ahead_by)} 个
-                  </b>
-                </div>
-                <div className="deploy-row">
-                  <span>上次检查</span>
-                  <b>
-                    {update.checked_at ?? "—"}
-                    {update.source ? `（来源：${update.source}）` : ""}
-                  </b>
-                </div>
-              </div>
-            )}
-
-            {/* error 是后端原话：两条路都读不到时它非空，这时候一句「已是最新」都不能说。 */}
-            {update?.error && <div className="banner warn">{update.error}</div>}
-            {updateBlock && <div className="banner warn">{updateBlock}</div>}
-
-            {update?.commits && update.commits.length > 0 && (
+            {/* 桌面安装版没有 git 仓库：整张卡换成 GitHub Releases 的比对结果，只给链接，
+                不下载、不装、不碰文件（见 .zcf/plan/current/桌面端更新改成查Releases.md）。 */}
+            {/* desktop-card-begin */}
+            {desktopMode ? (
               <>
-                <div className="hint">远端最新的提交（最多 10 条）</div>
-                <pre className="deploy-log">
-                  {update.commits
-                    .slice(0, 10)
-                    .map((item) => `${item.short}  ${item.title}`)
-                    .join("\n")}
-                </pre>
-              </>
-            )}
-
-            <div className="row" style={{ gap: 8 }}>
-              <button
-                type="button"
-                className="btn-sm"
-                disabled={updateBusy !== ""}
-                onClick={() => void loadUpdate()}
-              >
-                {updateBusy === "info" ? "检查中…" : "检查更新"}
-              </button>
-              <button
-                type="button"
-                className="btn-sm primary"
-                disabled={!canUpdate || updateBusy !== ""}
-                onClick={() => void startUpdate()}
-              >
-                {updateBusy === "apply" ? "正在更新…" : "立即更新"}
-              </button>
-              <button
-                type="button"
-                className="btn-sm"
-                disabled={updateBusy !== ""}
-                onClick={() => void rollbackUpdate()}
-              >
-                {updateBusy === "rollback" ? "正在回滚…" : "回滚"}
-              </button>
-            </div>
-
-            {!update && !updateError && (
-              <div className="hint">正在读本地与 GitHub 的提交…</div>
-            )}
-            {update && !update.error && !updateBlock && update.behind_by === 0 && (
-              <div className="hint">本地和远端是同一个提交。</div>
-            )}
-
-            {updateNote && <div className="banner ok">{updateNote}</div>}
-
-            {/* 盘上这个任务的现场：刷新页面也读得到（失败的任务在重启之后只剩这一份记忆）。 */}
-            {jobTrace && (
-              <>
-                <div className="hint">盘上这次任务的现场（刷新页面也读得到）</div>
-                <div className="update-steps">
-                  <div className="update-step">
-                    <span className="faint">状态</span>
-                    <b>{jobTrace.state}</b>
+                {/* 三种结局：有新版 / 已最新 / 查不到。newer 是 null 说明比不出来，按查不到说。 */}
+                {desktopState === "newer" && (
+                  <>
+                    <div className="banner ok">
+                      GitHub 上已经有 {desktopTag}（发布 {desktopPublished}），你现在是 {desktopCurrent}。
+                    </div>
+                    {desktopDownload ? (
+                      <a
+                        className="btn-sm primary"
+                        href={desktopDownload}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        下载新安装包
+                      </a>
+                    ) : (
+                      <div className="hint">
+                        这个 Release 没有挂安装包，去{" "}
+                        <a href={RELEASES_PAGE} target="_blank" rel="noreferrer">
+                          Release 页面
+                        </a>
+                        看。
+                      </div>
+                    )}
+                  </>
+                )}
+                {desktopState === "latest" && (
+                  <div className="hint">
+                    已是最新：{desktopCurrent}（GitHub 上的 {desktopTag}，查于 {desktopCheckedAt}）。
                   </div>
-                  <div className="update-step">
-                    <span className="faint">起始提交</span>
-                    <b>{jobTrace.from}</b>
-                  </div>
-                  <div className="update-step">
-                    <span className="faint">目标提交</span>
-                    <b>{jobTrace.to}</b>
-                  </div>
-                  <div className="update-step">
-                    <span className="faint">端口</span>
-                    <b>{jobTrace.port}</b>
-                  </div>
+                )}
+                {desktopState === "unknown" && (
+                  <>
+                    <div className="banner warn">查不到 GitHub 上的版本：{desktopError}</div>
+                    <div className="row" style={{ gap: 8 }}>
+                      <button
+                        type="button"
+                        className="btn-sm"
+                        disabled={updateBusy !== ""}
+                        onClick={() => void loadUpdate(true)}
+                      >
+                        {updateBusy === "info" ? "检查中…" : "重新检查"}
+                      </button>
+                    </div>
+                  </>
+                )}
+                <div className="hint">
+                  桌面安装版里没有 git 仓库，也不带 Python 和 npm，所以这里只做版本比对、不下载不改文件。你的配置与成交记录都在{" "}
+                  {"%APPDATA%\\biTrader"}，覆盖安装不会动。
                 </div>
               </>
-            )}
-
-            {/* 后端已经把「重启中、等新进程接手」写到状态文件里：这时不能按普通的
-                running 画，否则界面就是一个永远不动、也不说在等什么的进度条。 */}
-            {restartPending && (
-              <div className="hint">
-                正在等新进程起来…（旧进程已经退出，新进程接手后会接着把剩下的步骤写进这里，页面不用刷新）
-              </div>
-            )}
-
-            {/* 每步跑完才写一条；失败的原文原样贴出来，不截断也不转述。 */}
-            {updateJob?.steps && updateJob.steps.length > 0 && (
+            ) : (
               <>
-                <div className="hint">进度（失败的那一步原文贴在下面）</div>
-                <div className="update-steps">
-                  {updateJob.steps.map((step) => (
-                    <div key={step.name} className="update-step">
-                      <span className={step.ok ? "num up" : "num down"}>
-                        {step.ok ? "✓" : "✗"}
-                      </span>
-                      <b>{step.name}</b>
-                      <span className="faint" style={{ fontSize: "var(--fs-12)" }}>
-                        {step.seconds != null ? `${Number(step.seconds).toFixed(1)} 秒` : ""}
-                      </span>
+                {/* desktop-card-split */}
+                {updateError && <div className="banner warn">{updateError}</div>}
+
+                {update && (
+                  <div className="deploy-rows">
+                    <div className="deploy-row">
+                      <span>当前提交</span>
+                      <b className="num">{update.current_short ?? "—"}</b>
+                    </div>
+                    <div className="deploy-row">
+                      <span>分支</span>
+                      <b>{update.branch ?? "—"}</b>
+                    </div>
+                    <div className="deploy-row">
+                      <span>远端最新</span>
+                      <b className="num">{update.remote_short ?? "读不到"}</b>
+                    </div>
+                    <div className="deploy-row">
+                      <span>差距</span>
+                      <b>
+                        落后 {countText(update.behind_by)} 个 / 领先 {countText(update.ahead_by)} 个
+                      </b>
+                    </div>
+                    <div className="deploy-row">
+                      <span>上次检查</span>
+                      <b>
+                        {update.checked_at ?? "—"}
+                        {update.source ? `（来源：${update.source}）` : ""}
+                      </b>
+                    </div>
+                  </div>
+                )}
+
+                {/* error 是后端原话：两条路都读不到时它非空，这时候一句「已是最新」都不能说。 */}
+                {update?.error && <div className="banner warn">{update.error}</div>}
+                {updateBlock && <div className="banner warn">{updateBlock}</div>}
+
+                {update?.commits && update.commits.length > 0 && (
+                  <>
+                    <div className="hint">远端最新的提交（最多 10 条）</div>
+                    <pre className="deploy-log">
+                      {update.commits
+                        .slice(0, 10)
+                        .map((item) => `${item.short}  ${item.title}`)
+                        .join("\n")}
+                    </pre>
+                  </>
+                )}
+
+                <div className="row" style={{ gap: 8 }}>
+                  <button
+                    type="button"
+                    className="btn-sm"
+                    disabled={updateBusy !== ""}
+                    onClick={() => void loadUpdate()}
+                  >
+                    {updateBusy === "info" ? "检查中…" : "检查更新"}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-sm primary"
+                    disabled={!canUpdate || updateBusy !== ""}
+                    onClick={() => void startUpdate()}
+                  >
+                    {updateBusy === "apply" ? "正在更新…" : "立即更新"}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-sm"
+                    disabled={updateBusy !== ""}
+                    onClick={() => void rollbackUpdate()}
+                  >
+                    {updateBusy === "rollback" ? "正在回滚…" : "回滚"}
+                  </button>
+                </div>
+
+                {!update && !updateError && (
+                  <div className="hint">正在读本地与 GitHub 的提交…</div>
+                )}
+                {update && !update.error && !updateBlock && update.behind_by === 0 && (
+                  <div className="hint">本地和远端是同一个提交。</div>
+                )}
+
+                {updateNote && <div className="banner ok">{updateNote}</div>}
+
+                {/* 盘上这个任务的现场：刷新页面也读得到（失败的任务在重启之后只剩这一份记忆）。 */}
+                {jobTrace && (
+                  <>
+                    <div className="hint">盘上这次任务的现场（刷新页面也读得到）</div>
+                    <div className="update-steps">
+                      <div className="update-step">
+                        <span className="faint">状态</span>
+                        <b>{jobTrace.state}</b>
+                      </div>
+                      <div className="update-step">
+                        <span className="faint">起始提交</span>
+                        <b>{jobTrace.from}</b>
+                      </div>
+                      <div className="update-step">
+                        <span className="faint">目标提交</span>
+                        <b>{jobTrace.to}</b>
+                      </div>
+                      <div className="update-step">
+                        <span className="faint">端口</span>
+                        <b>{jobTrace.port}</b>
+                      </div>
+                    </div>
+                  </>
+                )}
+
+                {/* 后端已经把「重启中、等新进程接手」写到状态文件里：这时不能按普通的
+                    running 画，否则界面就是一个永远不动、也不说在等什么的进度条。 */}
+                {restartPending && (
+                  <div className="hint">
+                    正在等新进程起来…（旧进程已经退出，新进程接手后会接着把剩下的步骤写进这里，页面不用刷新）
+                  </div>
+                )}
+
+                {/* 每步跑完才写一条；失败的原文原样贴出来，不截断也不转述。 */}
+                {updateJob?.steps && updateJob.steps.length > 0 && (
+                  <>
+                    <div className="hint">进度（失败的那一步原文贴在下面）</div>
+                    <div className="update-steps">
+                      {updateJob.steps.map((step) => (
+                        <div key={step.name} className="update-step">
+                          <span className={step.ok ? "num up" : "num down"}>
+                            {step.ok ? "✓" : "✗"}
+                          </span>
+                          <b>{step.name}</b>
+                          <span className="faint" style={{ fontSize: "var(--fs-12)" }}>
+                            {step.seconds != null ? `${Number(step.seconds).toFixed(1)} 秒` : ""}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                )}
+                {updateJob?.steps
+                  ?.filter((step) => !step.ok)
+                  .map((step) => (
+                    <div key={`${step.name}-output`}>
+                      <div className="hint">{step.name} 的原始输出</div>
+                      <pre className="deploy-log">{step.output}</pre>
                     </div>
                   ))}
-                </div>
-              </>
-            )}
-            {updateJob?.steps
-              ?.filter((step) => !step.ok)
-              .map((step) => (
-                <div key={`${step.name}-output`}>
-                  <div className="hint">{step.name} 的原始输出</div>
-                  <pre className="deploy-log">{step.output}</pre>
-                </div>
-              ))}
-            {updateJob?.error && (
-              <>
-                <div className="hint">任务失败的原因（后端原话）</div>
-                <pre className="deploy-log">{updateJob.error}</pre>
-              </>
-            )}
-
-            {/* 手动命令：后端给的那条带真实端口，优先用它；自己拼的那条端口取状态里记的。 */}
-            {showManual && (
-              <>
-                <div className="hint">
-                  {manualPlatform === "linux"
-                    ? "手动命令（在服务器上执行，先看服务状态，不行再看日志）"
-                    : "手动重启命令（在仓库根目录执行）"}
-                  {backendManual ? "——这条是后端给的，端口是这次真跑的那个" : ""}
-                </div>
-                <pre className="deploy-log">{manualCommand.text}</pre>
-                {manualCommand.fallback && (
-                  <div className="hint">这条命令里的端口按默认 8765 算：状态里没记下这次跑的端口。</div>
+                {updateJob?.error && (
+                  <>
+                    <div className="hint">任务失败的原因（后端原话）</div>
+                    <pre className="deploy-log">{updateJob.error}</pre>
+                  </>
                 )}
+
+                {/* 手动命令：后端给的那条带真实端口，优先用它；自己拼的那条端口取状态里记的。 */}
+                {showManual && (
+                  <>
+                    <div className="hint">
+                      {manualPlatform === "linux"
+                        ? "手动命令（在服务器上执行，先看服务状态，不行再看日志）"
+                        : "手动重启命令（在仓库根目录执行）"}
+                      {backendManual ? "——这条是后端给的，端口是这次真跑的那个" : ""}
+                    </div>
+                    <pre className="deploy-log">{manualCommand.text}</pre>
+                    {manualCommand.fallback && (
+                      <div className="hint">这条命令里的端口按默认 8765 算：状态里没记下这次跑的端口。</div>
+                    )}
+                  </>
+                )}
+
+                <div className="hint">
+                  更新只用快进合并，不会 --force、也不会 reset --hard；工作树不干净或自动交易在跑时后端直接拒绝。
+                </div>
               </>
             )}
-
-            <div className="hint">
-              更新只用快进合并，不会 --force、也不会 reset --hard；工作树不干净或自动交易在跑时后端直接拒绝。
-            </div>
+            {/* desktop-card-end */}
           </div>
         </div>
       </div>

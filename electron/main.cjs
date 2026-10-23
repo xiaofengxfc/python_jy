@@ -133,8 +133,11 @@ function createWindow(port) {
   win.once("ready-to-show", () => win.show());
 
   // External links belong in the user's browser, never in the app frame.
+  // Only http/https may reach the OS: handing shell.openExternal a file:, smb: or a
+  // custom scheme lets a remote page pick a local handler, which is worse than a no-op.
   win.webContents.setWindowOpenHandler(({ url }) => {
-    void shell.openExternal(url);
+    const target = String(url ?? "");
+    if (/^https?:\/\//i.test(target)) void shell.openExternal(target);
     return { action: "deny" };
   });
 
