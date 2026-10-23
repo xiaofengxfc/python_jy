@@ -126,6 +126,15 @@ Node 不在 PATH 时，先把 Node 目录加进去。
 - 合约的 24 小时 ticker 响应里没有 `bidPrice/askPrice`（只有现货有），ccxt 的 unified `bid/ask`
   因此是 None，别用 `float(raw.get("bid") or 0.0)` 把它压成 0——那样界面是「有最新价但没有买卖价」。
   取价顺序：unified → 原始 payload → 盘口顶档（`rest.ticker_bid_ask`），都没有才留 0，前端按 0 判空。
+- 成交之后立刻把这一对记账：`/api/orders` 与 `/api/positions/close` 拿到 `filled > 0` 的回执就
+  当场 `sync_symbol_fills`（`web/app.py::_book_the_fill`）。成交同步本身是 5 秒一轮的，不补这一次，
+  刚买完那十几秒面板会把程序自己买的仓位画成「钱包余额 / 卖出（预填整笔余额）」，
+  不带 size 的现货平仓还会以「账本里没有这一对」400；平完之后也会停在旧数量上。
+  `refresh=1` 只解决快照缓存，账本是另一回事——两者都要。
+- 本机时钟偏差也走这一层：币安对时间戳的容忍度很小，实测本机快 1.3 秒，所有签名请求
+  都被 `-1021` 拒，界面上只有一句「无法读取当前持仓」，看不出是时钟。`rest.BinanceREST`
+  在客户端 `fetch` 那一层装了守卫：只拦这一类错误，`load_time_difference()` 后重试一次。
+  这个版本的 ccxt python 客户端没有 `adjustForTimeDifference`，别把守卫删掉。
 - SQLite 里 `mode='paper'` 的旧成交还在库里，界面只显示 `live` 的成交。
 
 ## 5. 已确认的限制
