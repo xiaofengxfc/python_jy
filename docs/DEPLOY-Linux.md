@@ -21,7 +21,7 @@
 | 端口 | 80 和 443 要能过（Caddy 申请证书用）。后端 8765 **不要**对公网开 |
 | 时间 | 时钟必须准。币安签名容忍度很小，差 1 秒就回 `-1021` |
 
-DNS：在域名服务商那里加一条 A 记录，指向服务器公网 IP。**先配 DNS 再跑脚本**，否则 Caddy 签证书会失败（见第 6 节排错）。
+DNS：在域名服务商那里加一条 A 记录，指向服务器公网 IP。**先配 DNS 再跑脚本**，否则 Caddy 签证书会失败（见第 7 节排错）。
 
 ```
 # 确认 DNS 生效（在你自己的电脑上执行，等它吐出服务器 IP）
@@ -60,18 +60,21 @@ bash deploy/install.sh --dry-run --domain trade.example.com
 sudo bash deploy/install.sh --domain trade.example.com
 ```
 
-脚本做的事（10 步，任一步失败立刻停并说清是哪一步）：
+脚本做的事（11 步，任一步失败立刻停并说清是哪一步）：
 
 1. 平台检查（不是 Debian/Ubuntu 直接退出）
 2. root 检查
 3. Python 版本（>= 3.10，与 pyproject 的 requires-python 一致；3.11/3.12 是实测过的）
-4. `apt-get` 装 `ca-certificates curl gnupg git rsync python3-venv python3-pip`
+4. `apt-get` 装 `ca-certificates curl gnupg git rsync python3-venv python3-pip sudo`
+   （`sudo` 是必须的：第 9 步那条 NOPASSWD 之后，程序靠 `sudo -n` 执行那一个 root 脚本）
 5. 建系统用户 `bitrader`（不能登录）、数据目录 `/var/lib/bitrader`（750）
 6. 代码放 `/opt/bitrader`（`--repo` 就给 git pull / clone，否则用当前目录 rsync 过去）
 7. `/opt/bitrader/.venv` + `pip install -r requirements.txt`
 8. 写 `/etc/systemd/system/bitrader.service`、`enable` + `restart`，并检查 `is-active`
-9. 装 Caddy（官方 apt 源）、按域名填 `/etc/caddy/Caddyfile`、`caddy validate`、reload
-10. 查时钟同步、打印防火墙提示
+9. 装域名切换脚本到 `/usr/local/lib/bitrader/set-domain.sh`（root:root 755），
+   写 `/etc/sudoers.d/bitrader`（只授这一条 NOPASSWD）并用 `visudo -c` 校验
+10. 装 Caddy（官方 apt 源）、按域名填 `/etc/caddy/Caddyfile`、`caddy validate`、reload
+11. 查时钟同步、打印防火墙提示
 
 **幂等**：每一步先看现状，已经在位就跳过。连跑两遍不会炸，也不会覆盖已有的 `secrets.bin`。
 
@@ -167,9 +170,71 @@ sudo systemctl start bitrader
 
 ---
 
-## 6. 排错
+## 6. 换域名 / 重签证书（在界面里做，不用再登服务器）
 
-### 6.1 域名没生效 / 证书拿不到
+装好之后换域名不需要改服务器上的文件：界面里填域名 → 检查解析 → 签发证书。三个接口：
+
+| 接口 | 做什么 |
+|---|---|
+| `GET /api/deploy/info` | 当前域名、Caddy 装没装/在不在跑、本机公网 IP、证书到期时间、数据目录 |
+| `POST /api/deploy/check {domain}` | 解析这个域名的 A/AAAA 记录，和本机公网 IP 比；不一致时把两个 IP 都念出来 |
+| `POST /api/deploy/tls {domain}` | 写 Caddyfile + reload Caddy，然后轮询 `https://域名/`（最多 60 秒）确认通 |
+
+- 公网 IP 先读本机记录（`/var/lib/bitrader/deploy.json`、Caddyfile 里的 IP 跳转段），都没有才问
+  `https://api.ipify.org`（3 秒超时）。查不到就是 `null` + 一句为什么，不填 0.0.0.0。
+- 证书到期时间读 `/var/lib/caddy/.local/share/caddy/certificates/**/*.crt`，读不到就是 `null`。
+- 失败时接口把 `journalctl -u caddy -n 20 --no-pager`（或 `/var/log/caddy/*.log` 尾部）的**原文**
+  放进 `log_tail`，脚本自己的输出放进 `script_output`。原因以那两段为准，接口不替 Caddy 编理由。
+- 非 Linux（Windows / macOS）这三个接口一律 501 并说明，不假装能签。
+
+### 6.1 权限是怎么给的
+
+服务以 `bitrader` 用户跑，写 `/etc/caddy/Caddyfile` 和 reload Caddy 要 root。所以：
+
+```bash
+# install.sh 装的东西（root:root 755，bitrader 改不了它）
+sudo ls -l /usr/local/lib/bitrader/set-domain.sh
+
+# sudoers 只授这一条
+sudo cat /etc/sudoers.d/bitrader
+# 由 deploy/install.sh 写入：只授一条命令，给程序里的「签发证书」按钮用
+# 域名写法与写坏回滚由 /usr/local/lib/bitrader/set-domain.sh 自己把关
+bitrader ALL=(root) NOPASSWD: /usr/local/lib/bitrader/set-domain.sh
+```
+
+程序侧就是一条 `sudo -n /usr/local/lib/bitrader/set-domain.sh <域名>`，参数走列表、不过 shell，
+域名进不了命令行解析。三个设计点别改回去：
+
+1. **脚本放 `/usr/local/lib/bitrader/`，不放 `/opt/bitrader/`。** 后者属主是 bitrader 用户，
+   一个改得动的脚本配上 NOPASSWD sudo 就等于把 root 送出去。
+2. **sudoers 只能按命令授权**，没法表达「只允许一个合法域名参数」。所以脚本自己校验参数个数与
+   域名写法，`caddy validate` 不通过就还原上一份 Caddyfile 再退出。
+3. **systemd 单元里 `NoNewPrivileges=no`、`ProtectSystem=yes`**（原来是 `yes` / `full`）：
+   NNP=yes 会让 `sudo` 直接失败；ProtectSystem=full 把 `/etc` 也挂成只读，root 子进程继承同一套
+   挂载，脚本照样写不进 Caddyfile。让步的边界就是这一个脚本、这一个文件。
+
+### 6.2 排错时手动重放
+
+```bash
+# 和界面上点「签发证书」做的是同一件事
+sudo /usr/local/lib/bitrader/set-domain.sh trade.example.com
+
+# 证书申请过程（接口失败时 log_tail 就是它）
+sudo journalctl -u caddy -n 40 --no-pager
+
+# 域名现在解析到哪、本机公网是多少
+dig +short trade.example.com
+curl -fsS https://api.ipify.org; echo
+```
+
+`sudo -n ...` 报 `a password is required`：sudoers 那一行没生效（`sudo -l -U bitrader` 查），
+把 6.1 里那条重写一遍、`visudo -c -f /etc/sudoers.d/bitrader` 校验。
+
+---
+
+## 7. 排错
+
+### 7.1 域名没生效 / 证书拿不到
 
 表现：`https://域名` 打不开，`journalctl -u caddy` 里有 `no such host` 或 `HTTP 403` 之类的 ACME 报错。
 
@@ -182,7 +247,7 @@ sudo journalctl -u caddy -n 80 --no-pager | grep -i -E "acme|certificate|tls"
 - 有 CDN / 代理（Cloudflare 橙云）→ 先关掉或确认它没拦 `/.well-known/acme-challenge/`。
 - 证书申请失败次数太多会被限流，等一会儿再 `sudo systemctl restart caddy`。
 
-### 6.2 80 / 443 被墙
+### 7.2 80 / 443 被墙
 
 表现：`curl http://服务器IP` 超时，或者 Caddy 日志里 ACME 一直卡在 `tls-alpn` / `http-01`。
 
@@ -194,7 +259,7 @@ sudo ss -lntp | grep -E ":80|:443"        # 应该是 caddy 在听
 
 云主机还要在控制台的**安全组**里放行同样两个端口——本机 ufw 开了、安全组没开，外部一样进不来。
 
-### 6.3 界面能开，但图表不拉数据 / 保存 Key 出错
+### 7.3 界面能开，但图表不拉数据 / 保存 Key 出错
 
 ```bash
 # 后端是否真的活着
@@ -211,7 +276,7 @@ curl -s "http://127.0.0.1:8765/api/credentials" | python3 -m json.tool | head -2
 | 显示「不可用」 | 既没有密钥环，也没装 `cryptography` | `sudo /opt/bitrader/.venv/bin/pip install cryptography` 然后重启服务 |
 | 保存 Key 报 500 | 数据目录写不进去 | `sudo chown -R bitrader:bitrader /var/lib/bitrader` |
 
-### 6.4 时钟 / 时区
+### 7.4 时钟 / 时区
 
 表现：所有签名请求报 `-1021 Timestamp for this request is outside of the recvWindow`，界面上往往只是一句「无法读取当前持仓」。
 
@@ -228,7 +293,7 @@ sudo apt-get install -y chrony && sudo systemctl enable --now chrony
 chronyc tracking                           # System time 偏差应该在毫秒级
 ```
 
-### 6.5 服务起不来
+### 7.5 服务起不来
 
 ```bash
 sudo systemctl status bitrader --no-pager
@@ -242,7 +307,7 @@ sudo -u bitrader env BITRADER_DATA_DIR=/var/lib/bitrader \
 
 ---
 
-## 7. 其它发行版
+## 8. 其它发行版
 
 脚本只支持 Debian/Ubuntu（apt）。换 Fedora / Arch 的话，等价步骤是：
 
@@ -254,7 +319,7 @@ sudo -u bitrader env BITRADER_DATA_DIR=/var/lib/bitrader \
 
 ---
 
-## 8. Windows 上没有的东西
+## 9. Windows 上没有的东西
 
 原来桌面上依赖的两样在 Linux 上走的是另一条路（都在代码里分好了）：
 

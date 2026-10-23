@@ -30,9 +30,7 @@ StandardError=journal
 SyslogIdentifier=bitrader
 
 # ---------------------------------------------------------------- 加固
-NoNewPrivileges=yes
 PrivateTmp=yes
-ProtectSystem=full
 ProtectHome=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
@@ -41,6 +39,15 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 # 除了数据目录，整个系统只读：策略文件和 keys 只能落在 /var/lib/bitrader
 ReadWritePaths=/var/lib/bitrader
+# 这两个开关是给「填域名 → 自动签证书」那一路让路的，别改回去：
+#   * NoNewPrivileges=yes 会让 sudo 直接失败，程序就没法执行 /usr/local/lib/bitrader/
+#     set-domain.sh（那是唯一一条 NOPASSWD，见 deploy/install.sh 写的 sudoers）；
+#   * ProtectSystem=full 把 /etc 也挂成只读，而那个脚本写的就是 /etc/caddy/Caddyfile，
+#     root 子进程继承同一套挂载，一样写不进去。
+# 让步的边界：那个脚本是 root:root 755、只改 /etc/caddy/Caddyfile 一个文件、自己校验域名、
+# caddy validate 不过就还原；除它之外没有第二条 sudo 权限。真正的防线是 sudoers 只授一条命令。
+NoNewPrivileges=no
+ProtectSystem=yes
 
 [Install]
 WantedBy=multi-user.target

@@ -344,3 +344,30 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   所以写错当场 400、不花一次交易所请求。读不到的字段是 `null`，**不是 0**：0 是「恰好不涨
   不跌」，`float(x or 0.0)` 会把这两件事压成一个看不出来的 0.00%。归一在
   `rest.ticker_snapshots`（t62）；客户端没有这个方法就 503 并说清要升级什么，不去猜字段。
+
+## 10. 域名与 HTTPS（只在 Linux 服务器上）
+
+- 三个接口在 `web/routes_deploy.py`：`GET /api/deploy/info`、`POST /api/deploy/check`、
+  `POST /api/deploy/tls`。非 Linux 一律 501 并说清，不假装——Windows 上没有 `/etc/caddy`、
+  没有 systemd，把 9 个字段填成 null 只会让人以为证书正在签。
+- 写 `/etc/caddy/Caddyfile` 与 reload caddy 要 root，而服务是 `bitrader` 用户。所以仓库里有
+  `deploy/set-domain.sh`，install.sh 把它以 **root:root 0755 装到 `/usr/local/lib/bitrader/`**，
+  并在 `/etc/sudoers.d/bitrader` 只授这一条 NOPASSWD。别把脚本放回 `/opt/bitrader/`：那个目录
+  属主就是 bitrader，改得动的脚本 + NOPASSWD sudo 等于把 root 送出去。
+- Python 侧只有 `subprocess.run(["sudo", "-n", 脚本, 域名])`：列表参数、不开 shell，域名进不了
+  shell。sudoers 没法表达「只允许一个合法域名参数」，所以脚本自己校验参数个数与写法，
+  `caddy validate` 不过就还原上一份 Caddyfile。
+- `deploy/bitrader.service` 里 `NoNewPrivileges=no` + `ProtectSystem=yes` 是**刻意**的（原来是
+  yes / full）：NNP=yes 会让 sudo 直接失败；ProtectSystem=full 把 `/etc` 也挂成只读，root 子进程
+  继承同一套挂载，一样写不进 Caddyfile。让步边界就是这一个脚本、这一个文件。
+- 读不到的字段一律 null / false 并说清来源：公网 IP 先读数据目录的 `deploy.json`，再读 Caddyfile
+  里的 IP 跳转段，最后才问 `https://api.ipify.org`（3 秒超时，失败给 `public_ip: null` 加
+  `public_ip_error`）；证书到期时间读
+  `/var/lib/caddy/.local/share/caddy/certificates/**/*.crt`（ISO-8601，读不到就是 null）。
+- 失败时把 `journalctl -u caddy -n 20 --no-pager`（或 `/var/log/caddy/*.log` 尾部）的**原文**放进
+  `log_tail`，脚本输出原样放 `script_output`。**不许自己写一句「可能是 DNS 没生效」冒充原因**：
+  接口只说看到了什么（退出码、最后一次探测的错误），原因以 Caddy 日志为准。
+- 域名校验两层（`routes_deploy.normalize_domain` 与脚本里的正则）都要留：一层给界面即时反馈，
+  一层是 root 脚本自己的保险。IP 直接拒——ACME 不给 IP 发证书，文案里要说清楚。
+- 证书由 Caddy 自己走 ACME（HTTP-01）并自动续期；程序不碰证书文件，只读到期时间。
+

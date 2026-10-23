@@ -17,6 +17,12 @@ APP_DIR="/opt/bitrader"
 DATA_DIR="/var/lib/bitrader"
 SERVICE="bitrader"
 PORT="8765"
+# 域名切换脚本：install.sh 把它以 root:root 装到这里，sudoers 也只授这一条。
+# **不要**放在 $APP_DIR 下面：那个目录属主是 bitrader，改得动的脚本 + NOPASSWD sudo
+# 等于把 root 送出去。
+HELPER_DIR="/usr/local/lib/bitrader"
+HELPER="$HELPER_DIR/set-domain.sh"
+SUDOERS_FILE="/etc/sudoers.d/bitrader"
 DOMAIN=""
 REPO_URL=""
 DRY_RUN=""
@@ -45,6 +51,7 @@ usage() {
   --repo <git 地址> 服务器上没有代码时从仓库拉取（默认用当前目录这份代码）
   --port <端口>     后端监听端口，默认 8765（只监听回环，对外由 Caddy 反代）
   --no-caddy        不装 Caddy、不写 Caddyfile（你自己有 nginx 时用）
+                    同时也跳过域名切换脚本与 sudoers（没有 Caddy 就没有这一路）
   --dry-run         只打印将执行的命令与写入的内容，不做任何修改
   -h, --help        这份帮助
 
@@ -98,7 +105,7 @@ write_file() {
 
 # ---------------------------------------------------------------- 1. 平台
 require_platform() {
-  CURRENT_STEP="1/10 平台检查"
+  CURRENT_STEP="1/11 平台检查"
   say "$CURRENT_STEP"
   local kernel
   kernel="$(uname -s)"
@@ -120,7 +127,7 @@ require_platform() {
 
 # ---------------------------------------------------------------- 2. root
 require_root() {
-  CURRENT_STEP="2/10 root 权限"
+  CURRENT_STEP="2/11 root 权限"
   say "$CURRENT_STEP"
   if [ "$(id -u)" -eq 0 ]; then
     note "已经是 root"
@@ -136,7 +143,7 @@ require_root() {
 # ---------------------------------------------------------------- 3. Python
 PYTHON_BIN="python3"
 require_python() {
-  CURRENT_STEP="3/10 Python 版本"
+  CURRENT_STEP="3/11 Python 版本"
   say "$CURRENT_STEP"
   local candidate version major minor
   PYTHON_BIN=""
@@ -173,17 +180,19 @@ require_python() {
 
 # ------------------------------------------------------ 4. 系统依赖（apt）
 install_packages() {
-  CURRENT_STEP="4/10 系统依赖"
+  CURRENT_STEP="4/11 系统依赖"
   say "$CURRENT_STEP"
   run env DEBIAN_FRONTEND=noninteractive apt-get update
+  # sudo 是必须的：程序里的「签发证书」靠 sudo -n 执行那一个 root 脚本（见第 9 步），
+  # 最小化装的 Debian 镜像上是没有 sudo 的。
   run env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    ca-certificates curl gnupg git rsync python3-venv python3-pip
+    ca-certificates curl gnupg git rsync python3-venv python3-pip sudo
   note "pandas / numpy / pyarrow / ccxt / uvicorn / cryptography 都有 manylinux wheel，不需要编译"
 }
 
 # --------------------------------------------------- 5. 系统用户与数据目录
 create_user() {
-  CURRENT_STEP="5/10 系统用户与数据目录"
+  CURRENT_STEP="5/11 系统用户与数据目录"
   say "$CURRENT_STEP"
   if id -u "$APP_USER" >/dev/null 2>&1; then
     note "用户 $APP_USER 已存在"
@@ -203,7 +212,7 @@ create_user() {
 
 # ---------------------------------------------------------------- 6. 代码
 place_code() {
-  CURRENT_STEP="6/10 放置代码"
+  CURRENT_STEP="6/11 放置代码"
   say "$CURRENT_STEP"
   if [ -n "$REPO_URL" ]; then
     if [ -d "$APP_DIR/.git" ]; then
@@ -228,7 +237,7 @@ place_code() {
 
 # ------------------------------------------------------ 7. 虚拟环境与依赖
 install_python_deps() {
-  CURRENT_STEP="7/10 虚拟环境与 Python 依赖"
+  CURRENT_STEP="7/11 虚拟环境与 Python 依赖"
   say "$CURRENT_STEP"
   if [ -x "$APP_DIR/.venv/bin/python" ]; then
     note "虚拟环境已存在，复用：$APP_DIR/.venv"
@@ -243,7 +252,7 @@ install_python_deps() {
 
 # ------------------------------------------------------------ 8. systemd
 install_service() {
-  CURRENT_STEP="8/10 systemd 服务"
+  CURRENT_STEP="8/11 systemd 服务"
   say "$CURRENT_STEP"
   if [ -f "$SRC_DIR/deploy/bitrader.service" ]; then
     sed "s/--port 8765/--port $PORT/" "$SRC_DIR/deploy/bitrader.service" \
@@ -267,9 +276,48 @@ install_service() {
   note "服务已启动：systemctl status $SERVICE"
 }
 
-# ---------------------------------------------------------------- 9. Caddy
+# ------------------------------------------- 9. 域名切换脚本与 sudoers
+# 程序里「填域名 → 自动签证书」这一路要写 /etc/caddy/Caddyfile 并 reload caddy，
+# 那是 root 才能做的事；服务本身以 bitrader 用户跑。所以：
+#   * 脚本以 root:root 装到 /usr/local/lib/bitrader/（bitrader 改不了它）
+#   * sudoers 只授这一个脚本的 NOPASSWD，别的命令一条都不给
+#   * 脚本自己校验域名、写坏就还原（见 deploy/set-domain.sh 的注释）
+# sudoers 没法表达「只允许一个合法域名参数」，所以那一步的保险在脚本里。
+install_domain_helper() {
+  CURRENT_STEP="9/11 域名切换脚本与 sudoers"
+  say "$CURRENT_STEP"
+  if [ "$WITH_CADDY" = "0" ]; then
+    note "按 --no-caddy 跳过：没有 Caddy 就没有域名切换，也不写 sudoers"
+    return 0
+  fi
+  if [ ! -f "$SRC_DIR/deploy/set-domain.sh" ]; then
+    die "找不到 deploy/set-domain.sh，代码没放全？"
+  fi
+  run install -d -m 755 -o root -g root "$HELPER_DIR"
+  run install -m 755 -o root -g root "$SRC_DIR/deploy/set-domain.sh" "$HELPER"
+  note "已安装 $HELPER（root:root 755）"
+  printf '%s\n' \
+    "# 由 deploy/install.sh 写入：只授一条命令，给程序里的「签发证书」按钮用" \
+    "# 域名写法与写坏回滚由 $HELPER 自己把关（sudoers 没法只允许一个合法参数）" \
+    "$APP_USER ALL=(root) NOPASSWD: $HELPER" \
+    | write_file "$SUDOERS_FILE" 440 root
+  note "已写 sudoers：$SUDOERS_FILE（只授 $HELPER）"
+  # 语法错会把 sudo 整体锁死（或者更糟：多授了东西），装完当场验一次
+  if [ -n "$DRY_RUN" ]; then
+    note "正式跑会执行 visudo -c -f $SUDOERS_FILE 校验语法"
+    return 0
+  fi
+  visudo -c -f "$SUDOERS_FILE" >/dev/null || {
+    rm -f "$SUDOERS_FILE"
+    die "sudoers 语法没通过，已删掉这一条（否则 sudo 可能整体不可用）。检查 $SUDOERS_FILE 的写法"
+  }
+  note "sudoers 语法检查通过"
+  note "程序里的「域名 → 签发证书」走：sudo -n $HELPER <域名>"
+}
+
+# --------------------------------------------------------------- 10. Caddy
 install_caddy() {
-  CURRENT_STEP="9/10 Caddy 反向代理"
+  CURRENT_STEP="10/11 Caddy 反向代理"
   say "$CURRENT_STEP"
   if [ "$WITH_CADDY" = "0" ]; then
     note "按 --no-caddy 跳过。自己用 nginx 的话，反代到 127.0.0.1:$PORT 并转发 Upgrade 头"
@@ -313,7 +361,7 @@ install_caddy() {
 
 # ------------------------------------------------ 10. 时钟、防火墙、收尾
 check_clock_and_finish() {
-  CURRENT_STEP="10/10 时钟与收尾"
+  CURRENT_STEP="11/11 时钟与收尾"
   say "$CURRENT_STEP"
   local synced=unknown
   if command -v timedatectl >/dev/null 2>&1; then
@@ -339,6 +387,9 @@ check_clock_and_finish() {
   printf "  重启： systemctl restart %s\n" "$SERVICE"
   printf "  数据： %s\n" "$DATA_DIR"
   printf "  密钥： 设置页「API 凭据」会写明用系统密钥环还是本机文件存储（文件在 %s/secrets.bin，权限 600）\n" "$DATA_DIR"
+  if [ "$WITH_CADDY" = "1" ]; then
+    printf "  换域名： 界面里填域名点「检查解析」→「签发证书」（sudo -n %s <域名>）\n" "$HELPER"
+  fi
 }
 
 main() {
@@ -352,6 +403,7 @@ main() {
   place_code
   install_python_deps
   install_service
+  install_domain_helper
   install_caddy
   check_clock_and_finish
 }
