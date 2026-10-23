@@ -128,6 +128,59 @@ def ticker_bid_ask(
     return bid or book_bid, ask or book_ask
 
 
+def _quite_float(value: Any) -> float | None:
+    """float or None — 缺字段是 None，真的 0 就是 0.0，两者不能混。"""
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _ticker_last(tick: dict) -> float | None:
+    """最新价：unified last → 原始 lastPrice → close。"""
+    info = tick.get("info") or {}
+    for value in (tick.get("last"), info.get("lastPrice"), info.get("close"), tick.get("close")):
+        number = _quite_float(value)
+        if number is not None:
+            return number
+    return None
+
+
+def _ticker_change_pct(tick: dict) -> float | None:
+    """24 小时涨跌幅，百分数：unified percentage → priceChangePercent → priceChange 折算。
+
+    实测三个市场的原始 payload 里都有 ``priceChangePercent``；``priceChange`` 是**绝对**
+    变化（现货 -1083.41、币本位 -1174.5），直接当百分比用会差两个数量级，必须按
+    ``openPrice`` 折算；连开盘价都没有就判不出来，回 None 而不是编一个。
+    """
+    info = tick.get("info") or {}
+    for value in (tick.get("percentage"), info.get("priceChangePercent")):
+        number = _quite_float(value)
+        if number is not None:
+            return number
+    change = _quite_float(info.get("priceChange"))
+    open_price = _quite_float(info.get("openPrice"))
+    if change is not None and open_price:
+        return change / open_price * 100.0
+    return None
+
+
+def _ticker_quote_volume(tick: dict) -> float | None:
+    """24 小时成交额（计价币）：原始 quoteVolume 优先，其次 ccxt 归一值。
+
+    交易所自己公布的数才是网页上那个数；ccxt 对合约有时按 volume×last 重算，
+    实测 U 本位差五万（12598069692.64 对 12598018471.89），别拿估算值冒充。
+    """
+    info = tick.get("info") or {}
+    for value in (info.get("quoteVolume"), tick.get("quoteVolume")):
+        number = _quite_float(value)
+        if number is not None:
+            return number
+    return None
+
+
 # Binance publishes read-only spot market data on its own host. Unlike
 # api.binance.com it is reachable from networks where the trading host refuses
 # connections, which is what lets a charting client read real candles without
@@ -433,6 +486,36 @@ class BinanceREST:
             return self.client(market).fetch_ticker(symbol)
         except Exception as exc:
             raise ExchangeError(_message(exc)) from exc
+
+    def ticker_snapshots(self, market: MarketType, symbols: list[str]) -> list[dict]:
+        """24 小时快照，一次问一批：``symbol`` / ``last`` / ``change_pct`` / ``quote_volume``.
+
+    公开行情，不需要密钥。三个值都可能是 None（交易所没给），**不是 0** —— "恰好
+    不涨不跌"和"读不到"是两件事，界面据此显示「—」。空列表直接回空，不去拉整个
+    市场（现货那是 1400 多项）。拿不到就抛 ExchangeError，文案是中文。
+        """
+        wanted = [str(symbol) for symbol in (symbols or []) if str(symbol).strip()]
+        if not wanted:
+            return []
+        try:
+            raw = self.client(market).fetch_tickers(wanted)
+        except Exception as exc:
+            raise ExchangeError(_message(exc)) from exc
+        rows: list[dict] = []
+        for symbol in wanted:
+            tick = raw.get(symbol) if isinstance(raw, dict) else None
+            if not isinstance(tick, dict):
+                # 交易所没回这一对：跳过，不补一行全 0 的占位。
+                continue
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "last": _ticker_last(tick),
+                    "change_pct": _ticker_change_pct(tick),
+                    "quote_volume": _ticker_quote_volume(tick),
+                }
+            )
+        return rows
 
     def fetch_bid_ask(self, market: MarketType, symbol: str) -> tuple[float, float]:
         """Top of book (bid, ask) without pulling the depth ladder.

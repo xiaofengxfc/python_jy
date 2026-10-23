@@ -160,6 +160,31 @@ def symbol_is_contract(symbol: str) -> bool:
     return bool(split_symbol(symbol)[2])
 
 
+def symbol_shape_error(symbol: str) -> str:
+    """写法自洽返回空串，否则返回一句中文说明（说明里带上该写的样子）。
+
+    现货是 ``BASE/QUOTE``，合约是 ``BASE/QUOTE:SETTLE``（交割再多一段 -YYMMDD）。
+    这里只判「写得像不像交易对」，不判市场对不对：收藏是跨市场的，同一个列表里
+    两种写法都合法；市场与写法的对应关系由 web 层的 ``_check_symbol_shape`` 判，
+    那条路要 400 给用户看，所以它自己带文案。
+
+    共用的理由和 ``split_symbol`` 一样：判定只写一份，别在收藏、批量涨幅、下单
+    三个入口各猜一次。
+    """
+    text = str(symbol or "").strip()
+    if not text:
+        return "缺少交易对。"
+    if any(char.isspace() for char in text):
+        return f"交易对里不能有空格：「{text}」。"
+    pair, colon, settle = text.partition(":")
+    base, _, quote = pair.partition("/")
+    if not base or not quote or "/" in quote or "/" in settle:
+        return f"交易对写法不对：「{text}」要写成「币/计价」，例如 BTC/USDT。"
+    if colon and not _SYMBOL_EXPIRY.sub("", settle):
+        return f"「{text}」冒号后面要写结算币，例如 BTC/USDT:USDT。"
+    return ""
+
+
 def market_for_symbol(symbol: str) -> MarketType:
     """Infer the market from a ccxt symbol when the caller did not say.
 

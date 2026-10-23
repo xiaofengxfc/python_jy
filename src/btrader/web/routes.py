@@ -24,12 +24,20 @@ from pydantic import BaseModel, Field
 import pandas as pd
 
 from ..backtest import BacktestConfig, grid_search, run_backtest
-from ..core.config import AIAutoSettings, RiskSettings
+from ..core.config import (
+    SYMBOL_LIST_LIMIT,
+    AIAutoSettings,
+    AppSettings,
+    ExecSettings,
+    RiskSettings,
+    clean_symbol_list,
+)
 from ..core.credentials import Credentials
 from ..core.types import (
     TIMEFRAME_SECONDS,
     MarketType,
     Network,
+    symbol_shape_error,
     timeframe_seconds,
 )
 from ..ai_pipeline import DEPTHS
@@ -249,6 +257,22 @@ class SettingsPayload(BaseModel):
     notify: dict[str, Any] | None = None
     ai: dict[str, Any] | None = None
     ai_auto: dict[str, Any] | None = None
+    # 执行台那三项：仓位比例 / 杠杆 / 轮询间隔。
+    exec: dict[str, Any] | None = None
+    # 交易对收藏与最近用过的一串（最近的在前）。
+    favorites: list[str] | None = None
+    recent_symbols: list[str] | None = None
+
+
+class SettingsResetPayload(BaseModel):
+    """恢复默认：只重置点名的这一段，别的段落一个字节都不动。
+
+    段落名见 ``RESETTABLE_SECTIONS``；"all" 重置全部运行配置。网络、市场、主题
+    这些不是「运行配置」，不在重置范围里——点一次「恢复默认」把用户切到的市场
+    换掉，比把参数留着更糟。
+    """
+
+    section: str = "ai_auto"
 
 
 class AITraderStartPayload(BaseModel):
@@ -738,7 +762,10 @@ class AITraderController:
         """
         ctx = state.ctx
         cfg = ctx.settings.ai_auto
-        market = _market(payload.market) if payload.market else ctx.market_type
+        # 请求体 > 保存的设置 > 全局。页面选过的市场记在 ai_auto.market_type 里，
+        # 不记的话换个页签回来就变成全局市场了。
+        wanted_market = (payload.market or cfg.market_type or "").strip()
+        market = _market(wanted_market) if wanted_market else ctx.market_type
         symbol = (payload.symbol or cfg.symbol or ctx.settings.last_symbol).strip()
         timeframe = payload.timeframe or cfg.timeframe or ctx.settings.timeframe
         if not symbol:
@@ -747,7 +774,7 @@ class AITraderController:
             raise HTTPException(status_code=400, detail=f"不支持的周期：{timeframe}")
         if not ctx.settings.ai.enabled:
             raise HTTPException(status_code=400, detail="请先在设置中启用 AI 助手")
-        strategy_key = (payload.strategy or "").strip()
+        strategy_key = (payload.strategy or cfg.strategy_key or "").strip()
         if not strategy_key:
             keys = ctx.strategies.keys
             strategy_key = keys[0] if keys else ""
@@ -1018,6 +1045,11 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
         changed = apply_settings(ctx, payload)
         log.info("设置已保存：%s", "、".join(changed) or "无改动")
         return {"ok": True, "settings": ctx.settings.to_dict()}
+
+    @router.post("/api/settings/reset")
+    def reset_defaults(payload: SettingsResetPayload) -> dict[str, Any]:
+        """把某一段恢复默认，返回重置后的设置（body: {"section": "ai_auto"}）。"""
+        return reset_settings(get_state().ctx, payload.section)
 
     # ---------------------------------------------------------------- risk
     @router.get("/api/risk")
@@ -1373,7 +1405,13 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
                     "current": market is ctx.market_type and network_obj is ctx.network,
                 }
             )
-        return {"network": network_obj.value, "items": items}
+        # 密钥存哪儿要能让用户看见：桌面上是系统密钥环，Debian/Ubuntu 服务器上
+        # 一般没有 SecretService/DBus，退化成数据目录里的加密文件（secret_store）。
+        return {
+            "network": network_obj.value,
+            "items": items,
+            "storage": ctx.credentials.describe(),
+        }
 
     @router.post("/api/credentials")
     def save_credentials(payload: CredentialsPayload) -> dict[str, Any]:
@@ -1401,9 +1439,13 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
                 ) from exc
 
         if not ctx.credentials.save(network, market, creds, platform):
+            storage = ctx.credentials.describe()
             raise HTTPException(
                 status_code=500,
-                detail="无法写入系统凭据库（keyring），请检查系统钥匙串是否可用",
+                detail=(
+                    f"密钥没能保存（当前存储：{storage.get('label') or '未知'}）。"
+                    "系统密钥环可用时检查系统凭据服务；退化成文件存储时检查数据目录的写权限。"
+                ),
             )
         if network is ctx.network and market is ctx.market_type and platform == ctx.platform:
             ctx.creds = creds
@@ -1707,6 +1749,9 @@ def apply_settings(ctx: Any, payload: "SettingsPayload") -> list[str]:
     notify_draft = replace(settings.notify)
     ai_draft = replace(settings.ai)
     ai_auto_draft = replace(settings.ai_auto)
+    exec_draft = replace(settings.exec)
+    favorites_draft = list(settings.favorites)
+    recent_draft = list(settings.recent_symbols)
     if payload.risk is not None:
         _apply_risk(risk_draft, payload.risk)
     if payload.notify is not None:
@@ -1715,6 +1760,12 @@ def apply_settings(ctx: Any, payload: "SettingsPayload") -> list[str]:
         _apply_ai(ai_draft, payload.ai)
     if payload.ai_auto is not None:
         _apply_ai_auto(ai_auto_draft, payload.ai_auto)
+    if payload.exec is not None:
+        _apply_exec(exec_draft, payload.exec)
+    if payload.favorites is not None:
+        favorites_draft = _clean_symbol_payload(payload.favorites, "favorites")
+    if payload.recent_symbols is not None:
+        recent_draft = _clean_symbol_payload(payload.recent_symbols, "recent_symbols")
 
     # 字段都合法了，开始落地。切换类操作不落盘，统一在最后保存一次。
     # 落地前留一份快照：save_settings() 会因为配置文件坏了直接拒绝保存
@@ -1753,7 +1804,12 @@ def apply_settings(ctx: Any, payload: "SettingsPayload") -> list[str]:
             ("notify", notify_draft),
             ("ai", ai_draft),
             ("ai_auto", ai_auto_draft),
+            ("exec", exec_draft),
         ):
+            if getattr(settings, name) != draft:
+                setattr(settings, name, draft)
+                changed.append(name)
+        for name, draft in (("favorites", favorites_draft), ("recent_symbols", recent_draft)):
             if getattr(settings, name) != draft:
                 setattr(settings, name, draft)
                 changed.append(name)
@@ -1779,6 +1835,9 @@ def apply_settings(ctx: Any, payload: "SettingsPayload") -> list[str]:
             "notify",
             "ai",
             "ai_auto",
+            "exec",
+            "favorites",
+            "recent_symbols",
         ):
             setattr(settings, name, getattr(snapshot, name))
         raise
@@ -1801,6 +1860,63 @@ def _apply_risk(risk: RiskSettings, values: dict[str, Any]) -> None:
             setattr(risk, key, bool(value) if isinstance(current, bool) else type(current)(value))
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail=f"风控字段 {key} 的值无效")
+
+
+def _apply_exec(target: ExecSettings, values: dict[str, Any]) -> None:
+    """执行台三项：只认 dataclass 声明过的字段，类型就地转，范围当场判。
+
+    这三项改不动任何一条风控闸（真上限在 RiskSettings 与 AITrader 里），但写进
+    去的值下次要直接用，所以 0 到 1 之外的仓位比例、小于 1 的杠杆必须当场拒绝——
+    存下来只会在下单时变成一个看不懂的 400。
+    """
+    for key, value in values.items():
+        if not hasattr(target, key):
+            log.debug("忽略未知执行台字段: %s", key)
+            continue
+        if value is None:
+            continue
+        try:
+            setattr(target, key, float(value))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"执行台字段 {key} 的值无效") from None
+    if not 0.0 < target.position_pct <= 1.0:
+        raise HTTPException(
+            status_code=400,
+            detail="执行台的仓位比例是 0 到 1 的比例（1 = 全部可用余额），不是百分数。",
+        )
+    if target.leverage < 1.0:
+        raise HTTPException(status_code=400, detail="执行台的杠杆至少是 1（现货只能是 1）。")
+    if target.poll_seconds < 1.0:
+        raise HTTPException(status_code=400, detail="执行台的轮询间隔至少 1 秒。")
+
+
+def _clean_symbol_payload(values: Any, name: str) -> list[str]:
+    """收藏 / 最近使用的一串交易对：去重、保序、判写法、卡上限。
+
+    未知交易对不拦——换个市场之后它可能暂时不在列表里，删掉用户的选择比留一行
+    空着更糟。写不成交易对的（"BTC"）当场 400，别把它存进配置里等下一次读盘。
+    """
+    if not isinstance(values, (list, tuple)):
+        raise HTTPException(status_code=400, detail=f"{name} 必须是交易对列表")
+    out: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        problem = symbol_shape_error(text)
+        if problem:
+            raise HTTPException(status_code=400, detail=f"{name}：{problem}")
+        if text not in out:
+            out.append(text)
+    if len(out) > SYMBOL_LIST_LIMIT:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{name} 最多记 {SYMBOL_LIST_LIMIT} 个交易对，这次给了 {len(out)} 个。"
+                "先把不看的删掉再保存。"
+            ),
+        )
+    return out
 
 
 def _apply_notify(target: Any, values: dict[str, Any]) -> None:
@@ -1906,11 +2022,65 @@ def _apply_ai_auto(target: AIAutoSettings, values: dict[str, Any]) -> None:
             raise HTTPException(
                 status_code=400, detail=f"AI 自动交易字段 {key} 的值无效"
             ) from None
-    for name in ("max_order_quote", "max_position_quote", "max_price_drift_pct"):
+    for name in ("max_order_quote", "max_position_quote", "max_price_drift_pct", "leverage"):
         if getattr(target, name) < 0:
             raise HTTPException(status_code=400, detail=f"ai_auto.{name} 不能为负")
     if not (0.0 <= target.min_confidence <= 1.0):
         raise HTTPException(status_code=400, detail="ai_auto.min_confidence 必须在 0 到 1 之间")
+    # 这几项存下来之后是启动 AI 交易的入参，写错了只会在点「开始」那一刻报 400。
+    # 空字符串表示「还没选」，回落全局/默认值，所以空放行。
+    if target.market_type and target.market_type not in {market.value for market in MarketType}:
+        raise HTTPException(
+            status_code=400, detail=f"ai_auto.market_type 未知市场：{target.market_type}"
+        )
+    if target.depth and target.depth not in DEPTHS:
+        raise HTTPException(status_code=400, detail=f"未知的决策深度：{target.depth}")
+    if target.timeframe and target.timeframe not in TIMEFRAME_SECONDS:
+        raise HTTPException(status_code=400, detail=f"不支持的周期：{target.timeframe}")
+    if target.symbol:
+        problem = symbol_shape_error(target.symbol)
+        if problem:
+            raise HTTPException(status_code=400, detail=f"ai_auto.symbol：{problem}")
+
+
+# 「恢复默认」认识这几段。网络、市场、主题、周期这些顶层设置不在里面：点一次
+# 「恢复默认运行配置」把用户切好的市场一起换掉，比把参数留着更糟。
+RESETTABLE_SECTIONS = ("risk", "notify", "ai", "ai_auto", "exec", "favorites", "recent_symbols")
+
+
+def reset_settings(ctx: Any, section: str) -> dict[str, Any]:
+    """把某一段恢复默认，返回重置后的设置。
+
+    只动点名的这一段（"all" 也只覆盖 RESETTABLE_SECTIONS）：一次按钮把全部设置
+    清掉的语义太宽，误点的代价是用户重新配一遍。
+    """
+    name = str(section or "").strip().lower()
+    if name == "all":
+        names = RESETTABLE_SECTIONS
+    elif name in RESETTABLE_SECTIONS:
+        names = (name,)
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"未知的设置段落：{section}。"
+                "可选：ai_auto、exec、favorites、recent_symbols、risk、notify、ai，或 all。"
+            ),
+        )
+    settings = ctx.settings
+    snapshot = replace(settings)
+    defaults = AppSettings()
+    try:
+        for target in names:
+            value = getattr(defaults, target)
+            setattr(settings, target, list(value) if isinstance(value, list) else value)
+        ctx.save_settings()
+    except Exception:
+        for target in names:
+            setattr(settings, target, getattr(snapshot, target))
+        raise
+    log.warning("设置已恢复默认：%s", "、".join(names))
+    return {"ok": True, "section": name, "settings": settings.to_dict()}
 
 
 def _news_block(ctx: Any, symbol: str, limit: int = 8) -> str:

@@ -307,3 +307,32 @@ Node 不在 PATH 时，先把 Node 目录加进去。
 - 策略页是两列骨架 `.strategy-page`：列表固定 300px，编辑器吃掉剩下的宽度，宽度上限跟三个 AI 页
   一样走 1400 档。它本来就是两列，所以没有 1360 那一档；断点只有 1024 —— 变单列后代码区改成
   固定 460px 自己滚，CodeMirror 外面那层 `.cm-theme` 的高度要一层层传下去，否则整页被源码撑长。
+## 9. 设置的保存与恢复默认
+
+- `config.json` 分段：`risk` / `notify` / `ai` / `ai_auto` / `exec` + 顶层标量 + 两个交易对列表
+  `favorites` / `recent_symbols`。`PUT /api/settings` 每个段落都能单独发一个子集，
+  只认 dataclass 声明过的字段（多出来的键安静忽略），校验全过才落盘。
+- `ai_auto` 是 AI 交易与 AI 量化的运行配置，字段即 `AITraderConfig` 的入参：金额、杠杆、
+  决策次数、置信度、决策有效期、漂移闸、冷却、轮询、`require_stop`、`depth`，外加页面
+  选过的 `strategy_key` 与 `market_type`（不记的话每次打开都回落到「第一条策略」和全局
+  市场）。启动时的优先级是「请求体 > `ai_auto` > 全局」。`confirm_live` 不在这里：那是
+  主网下单时当场说一句「这是真钱」，存下来等于把闸掰开。
+- `exec` 是执行台最后用过的那三项：`position_pct`（0 到 1 的比例，1 = 全部可用余额，不是
+  百分数）、`leverage`（≥ 1）、`poll_seconds`（≥ 1）。默认 1 / 1 / 10，刻意等于组件里原来
+  写死的那三个字面值。它们不是风控：真上限在 `risk` 与 `AITrader` 的闸里，改这三项动不了
+  任何一条闸。
+- `favorites` / `recent_symbols`：去重、保序、上限 100（`SYMBOL_LIST_LIMIT`）。PUT 超过上限
+  返回 400 并说清给了几个——静默截断会让第 101 个收藏点了没反应；只有手改 `config.json`
+  写多了才在读盘时静默截断（整份配置得能打开）。写法按「币/计价」或「币/计价:结算币」判
+  （`core.types.symbol_shape_error`），写不成交易对的当场 400；未知交易对**不拦**，换个市场
+  之后它可能暂时不在列表里，收藏跨市场，两种写法都留着。
+- `POST /api/settings/reset`，body `{"section": "ai_auto"}`，返回重置后的设置。只动点名的
+  那一段；`"all"` 也只覆盖 `RESETTABLE_SECTIONS`（risk / notify / ai / ai_auto / exec /
+  favorites / recent_symbols）。网络、市场、主题、周期这些顶层设置**不重置**：点一次「恢复
+  默认」把用户切好的市场一起换掉，比把参数留着更糟。未知段落 400 并列出可选的段落名。
+- `GET /api/tickers?market=&symbols=A,B` 返回 `{items: [{symbol, last, change_pct,
+  quote_volume}]}`，`change_pct` 是百分数（1.23 = +1.23%）。一次最多 50 个（超了 400），
+  写法与 `/api/ticker` 同一口径（`_check_symbol_shape`：现货不许带结算币、合约必须带），
+  所以写错当场 400、不花一次交易所请求。读不到的字段是 `null`，**不是 0**：0 是「恰好不涨
+  不跌」，`float(x or 0.0)` 会把这两件事压成一个看不出来的 0.00%。归一在
+  `rest.ticker_snapshots`（t62）；客户端没有这个方法就 503 并说清要升级什么，不去猜字段。

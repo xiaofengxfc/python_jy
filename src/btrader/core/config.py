@@ -12,9 +12,20 @@ from typing import Any
 from .. import paths
 from ..llm import AISettings
 from ..notify import NotifySettings
-from .types import MarketType, Network
+from .types import MarketType, Network, symbol_shape_error
 
 log = logging.getLogger(__name__)
+
+
+def _as_float(value: Any) -> float | None:
+    """能当数字用就返回 float，否则 None（手改配置里的 "abc" 当没写）。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return number
 
 
 class ConfigError(RuntimeError):
@@ -65,9 +76,49 @@ class AIAutoSettings:
     require_stop: bool = True
     # 决策深度：quick 一次调用，standard 四段，deep 六段。
     depth: str = "standard"
+    # 页面选过的策略与市场。不记的话，AI 交易/AI 量化每次打开都回落到「第一条
+    # 策略」和全局市场，用户挑的那一对就白挑了。启动时优先级仍是
+    # 请求体 > 这里 > 全局，见 routes.AITraderController._build。
+    strategy_key: str = ""
+    market_type: str = ""
     # Best parameter sets explicitly applied from the strategy lab, keyed by
     # strategy. They never change without a human clicking “apply”.
     strategy_params: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+
+@dataclass
+class ExecSettings:
+    """执行台（手动下单面板）最后用过的那一组参数。
+
+    这三项是「下次打开还按上次那样填」，不是风控：真正的上限在 RiskSettings 和
+    AITrader 的闸里，把它们写进配置改不动任何一条闸。默认值刻意等于组件里原来
+    写死的 1 / 1 / 10，第一次打开的行为和以前逐位一样。
+    """
+
+    position_pct: float = 1.0  # 下单金额占可用余额的比例，1 = 全部
+    leverage: float = 1.0
+    poll_seconds: float = 10.0
+
+
+# 收藏与最近使用最多记这么多对：再多界面上也没人翻，config.json 却会一直涨。
+SYMBOL_LIST_LIMIT = 100
+
+
+def clean_symbol_list(values: Any, limit: int = SYMBOL_LIST_LIMIT) -> list[str]:
+    """去重、保序、截到上限，写法不对的丢掉。
+
+    读盘用这个：手改 config.json 写坏一个收藏，不该让整份配置打不开——和「坏掉
+    的那一块退回默认值」同一条理由。PUT 那边要 400 给用户看，走的是它自己的校验。
+    """
+    out: list[str] = []
+    for value in values if isinstance(values, (list, tuple)) else ():
+        text = str(value or "").strip()
+        if not text or text in out or symbol_shape_error(text):
+            continue
+        out.append(text)
+        if len(out) >= limit:
+            break
+    return out
 
 
 @dataclass
@@ -93,6 +144,12 @@ class AppSettings:
     ai: AISettings = field(default_factory=AISettings)
     # AI 交易：默认关闭。没有单独的实盘总闸，凭据决定能不能下单。
     ai_auto: AIAutoSettings = field(default_factory=AIAutoSettings)
+    # 执行台最后用过的那一组参数（仓位比例 / 杠杆 / 轮询间隔）。
+    exec: ExecSettings = field(default_factory=ExecSettings)
+    # 交易对收藏与最近用过的（最近的在前）。未知交易对也照原样留着：换个市场
+    # 之后它可能暂时不在列表里，删掉用户的选择比留一个空行更糟。
+    favorites: list[str] = field(default_factory=list)
+    recent_symbols: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -132,6 +189,7 @@ class ConfigStore:
             "notify": raw.pop("notify", {}),
             "ai": raw.pop("ai", {}),
             "ai_auto": raw.pop("ai_auto", {}),
+            "exec": raw.pop("exec", {}),
         }
         for name, block in blocks.items():
             if block and not isinstance(block, dict):
@@ -141,6 +199,7 @@ class ConfigStore:
         notify_raw = blocks["notify"] or {}
         ai_raw = blocks["ai"] or {}
         ai_auto_raw = blocks["ai_auto"] or {}
+        exec_raw = blocks["exec"] or {}
         # A settings file written by an older build may still carry a sidecar
         # block; it is dropped here so the field list stays authoritative.
         raw.pop("freqtrade", None)
@@ -160,6 +219,17 @@ class ConfigStore:
         settings.ai_auto = AIAutoSettings(
             **{k: v for k, v in ai_auto_raw.items() if k in ai_auto_known}
         )
+        # 手改出来的 "1.5"、true、"abc" 都收进来：不是数字就当没写，退回默认值。
+        exec_known = {f for f in ExecSettings.__dataclass_fields__}
+        settings.exec = ExecSettings(
+            **{
+                key: float(value)
+                for key, value in exec_raw.items()
+                if key in exec_known and _as_float(value) is not None
+            }
+        )
+        settings.favorites = clean_symbol_list(settings.favorites)
+        settings.recent_symbols = clean_symbol_list(settings.recent_symbols)
         return settings
 
     def _back_up_broken_file(self) -> Path | None:
