@@ -6,8 +6,13 @@
 `dist-electron/biTrader-Setup-<版本>.exe` 不在就直接退出。打包另走一步
 （`cd electron && npm run dist`），三步怎么串见 docs/RELEASE.md。
 
-前置校验（三处版本号一致、工作区干净、tag 不存在、安装包就位）任一不过就退出：
-一个 tag 都不打、一个 push 都不发、一个请求都不发。
+前置校验（三处版本号一致、工作区干净、安装包就位）任一不过就退出：一个 tag 都不打、
+一个 push 都不发、一个改动都不做。
+
+顺序是：打 tag → 推 tag → **建 draft Release** → 传安装包 → PATCH 成正式发布。
+先 draft 后发布是刻意的：传输 150 MB 中途断掉很常见，正式发布过的 Release 会立刻被
+`/releases/latest` 当成最新，桌面用户看到「有新版」却下不到包。传崩了就停在 draft，
+用户看不到；同一条命令再跑一次会认出那个 draft 接着传（tag 还在，不重打、不重推）。
 
 token 先看环境变量 `GITHUB_TOKEN`，没有再问 `git credential fill`；它只用来拼
 Authorization 头，打印里最多出现 `gho_…（长度 40）` 这种样子。
@@ -46,6 +51,10 @@ VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 
 class ReleaseError(RuntimeError):
     """发版中途失败。message 直接给人看，里面不会有 token。"""
+
+
+class ReleaseRefused(ReleaseError):
+    """还没动手就发现不该继续：退出码 2，和前置校验不过一样什么都不做。"""
 
 
 # ------------------------------------------------------------------ 哪三处版本号
@@ -145,12 +154,7 @@ def preflight(root: Path | None = None, version: str = "", *, build: bool = Fals
             "工作树不干净（tag 要指向一棵提交过的树，先把这些提交掉）：\n" + dirty
         )
 
-    tag = TAG_PREFIX + (version or "")
-    tags = _git("tag", "--list", tag, cwd=base)
-    if (tags.stdout or "").strip():
-        problems.append(
-            "tag " + tag + " 已经存在：版本号没抬？已发的 tag 不要改，抬一个版本再发"
-        )
+    # tag 打没打过不在这里判：打过也可能是上次停在 draft（见 tag_exists + main 里的续传）。
 
     if build:
         exe = installer_path(base, version)
@@ -161,6 +165,16 @@ def preflight(root: Path | None = None, version: str = "", *, build: bool = Fals
                 + "（先在 electron 目录跑 npm run dist）"
             )
     return problems
+
+
+def tag_exists(root: Path | None = None, tag: str = "") -> bool:
+    """本地有没有这个 tag。有也不一定不能发——上次可能停在 draft（续传）。"""
+    proc = _git("tag", "--list", tag, cwd=root if root is not None else ROOT)
+    return bool((proc.stdout or "").strip())
+
+
+def installer_name(version: str) -> str:
+    return "biTrader-Setup-" + version + ".exe"
 
 
 # ------------------------------------------------------------------ token
@@ -255,25 +269,36 @@ def explain_http(code: int, body: str, what: str) -> str:
 
 # ------------------------------------------------------------------ HTTP
 
-def _post_json(url: str, payload: dict[str, Any], token: str, *, what: str = "请求", timeout: float = HTTP_TIMEOUT) -> dict[str, Any]:
-    """发一个 JSON POST。4xx/5xx 翻成中文人话，连不上原样贴。不重试。"""
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    request = urllib.request.Request(
-        url,
-        data=data,
-        method="POST",
-        headers={
-            "Authorization": "Bearer " + token,
-            "Accept": "application/vnd.github+json",
-            "Content-Type": "application/json; charset=utf-8",
-            "User-Agent": USER_AGENT,
-        },
-    )
+def _json_request(
+    method: str,
+    url: str,
+    payload: dict[str, Any] | None,
+    token: str,
+    *,
+    what: str = "请求",
+    timeout: float = HTTP_TIMEOUT,
+    allow_404: bool = False,
+) -> dict[str, Any] | None:
+    """发一个 JSON 请求。4xx/5xx 翻成中文人话，连不上原样贴。不重试。
+
+    allow_404 只给「先问问这个 tag 上有没有 Release」用：404 是正常答案（没有），不是错。
+    """
+    data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    headers = {
+        "Authorization": "Bearer " + token,
+        "Accept": "application/vnd.github+json",
+        "User-Agent": USER_AGENT,
+    }
+    if data is not None:
+        headers["Content-Type"] = "application/json; charset=utf-8"
+    request = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             raw = response.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")
+        if allow_404 and exc.code == 404:
+            return None
         raise ReleaseError(explain_http(exc.code, detail, what)) from None
     except urllib.error.URLError as exc:
         raise ReleaseError(what + "连不上 GitHub：" + str(exc.reason)) from None
@@ -281,6 +306,31 @@ def _post_json(url: str, payload: dict[str, Any], token: str, *, what: str = "�
         return json.loads(raw)
     except ValueError:
         raise ReleaseError(what + "回来的东西读不懂：" + raw[:200]) from None
+
+
+def _post_json(url: str, payload: dict[str, Any], token: str, *, what: str = "请求", timeout: float = HTTP_TIMEOUT) -> dict[str, Any]:
+    return _json_request("POST", url, payload, token, what=what, timeout=timeout) or {}
+
+
+def _patch_json(url: str, payload: dict[str, Any], token: str, *, what: str = "请求", timeout: float = HTTP_TIMEOUT) -> dict[str, Any]:
+    return _json_request("PATCH", url, payload, token, what=what, timeout=timeout) or {}
+
+
+def _get_json(url: str, token: str, *, what: str = "请求", timeout: float = HTTP_TIMEOUT) -> dict[str, Any] | None:
+    """读一个 JSON。404 回 None（「没有」也是答案），其余照旧报错。"""
+    return _json_request("GET", url, None, token, what=what, timeout=timeout, allow_404=True)
+
+
+def releases_url() -> str:
+    return API_BASE + "/repos/" + REPO + "/releases"
+
+
+def release_url(release_id: Any) -> str:
+    return releases_url() + "/" + str(release_id)
+
+
+def release_by_tag_url(tag: str) -> str:
+    return releases_url() + "/tags/" + urllib.parse.quote(tag)
 
 
 def _mb(size: int) -> str:
@@ -336,6 +386,26 @@ def _upload_asset(
         raise ReleaseError("上传 " + name + " 回来的东西读不懂：" + raw[:200]) from None
 
 
+def _tell_the_draft_is_waiting(tag: str, exc: ReleaseError) -> None:
+    """传崩了 / 发布没成：那条件 Release 还是 draft，用户看不到。把恢复路径写清楚。"""
+    print("发版没完成：" + str(exc), file=sys.stderr)
+    print(
+        "tag " + tag + " 上的 Release 还是 draft：用户看不到它（只有你登着 GitHub 才看得见），"
+        "/releases/latest 也不会把它当最新，桌面端不会提示有新版。",
+        file=sys.stderr,
+    )
+    print(
+        "恢复办法：网络缓过来之后，把同一条命令再跑一次 —— tag 还在、" + tag
+        + " 的 draft 还在，脚本会认出它接着传，传完自动发布（不重打 tag、不重推）。",
+        file=sys.stderr,
+    )
+    print(
+        "不想续传：在网页上删掉那个 draft Release，再 git tag -d " + tag
+        + "，然后重新跑一遍。（这一节也写在 docs/RELEASE.md 第 5 节。）",
+        file=sys.stderr,
+    )
+
+
 # ------------------------------------------------------------------ 主流程
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -354,22 +424,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _plan(version: str, *, build: bool, notes_file: str) -> list[str]:
+def _plan(version: str, *, build: bool, notes_file: str, tag_exists: bool = False) -> list[str]:
     tag = TAG_PREFIX + version
-    steps = [
-        "git tag -a " + tag + " -m \"biTrader " + version + "\"",
-        "git push " + REMOTE + " " + tag,
-        "POST " + API_BASE + "/repos/" + REPO + "/releases"
-        "（tag_name=" + tag + "，name=" + tag + "，draft=false，prerelease=false，"
-        "body 来自 " + (notes_file or "最近 20 条提交") + "）",
-    ]
+    steps: list[str] = []
+    if tag_exists:
+        steps.append(
+            "GET " + release_by_tag_url(tag) + "（tag 已经在了：先问 GitHub 上次是不是停在 draft）"
+        )
+        steps.append(
+            "那个 Release 不是 draft（或者根本没有）：停下，什么都不做 —— 抬一个版本再发"
+        )
+        steps.append("是 draft：跳过打 tag / 推 tag / 建 Release，直接接着传")
+    else:
+        steps.append("git tag -a " + tag + " -m \"biTrader " + version + "\"")
+        steps.append("git push " + REMOTE + " " + tag)
+        steps.append(
+            "POST " + releases_url() + "（tag_name=" + tag + "，name=" + tag
+            + "，draft=true —— 先藏起来，桌面端看不到，prerelease=false，"
+            "body 来自 " + (notes_file or "最近 20 条提交") + "）"
+        )
     if build:
         steps.append(
-            "POST https://" + UPLOAD_HOST + "/repos/" + REPO + "/releases/<id>/assets?name=biTrader-Setup-"
-            + version + ".exe（边读边发，打印进度）"
+            "POST https://" + UPLOAD_HOST + "/repos/" + REPO + "/releases/<id>/assets?name="
+            + installer_name(version) + "（边读边发，打印进度）"
         )
     else:
         steps.append("（没带 --build：不传安装包。桌面端看不到这一版）")
+    steps.append(
+        "PATCH " + release_url("<id>") + "（draft=false，body 来自 "
+        + (notes_file or "最近 20 条提交") + "）—— 安装包传完才发布"
+    )
     steps.append("打印 Release 的 html_url")
     return steps
 
@@ -383,6 +467,7 @@ def main(
     args = parse_args(argv)
     version = args.version.strip()
     tag = TAG_PREFIX + version
+    exe_name = installer_name(version)
 
     problems = preflight(ROOT, version, build=args.build)
     if problems:
@@ -394,9 +479,20 @@ def main(
             print("  ✗ " + problem, file=sys.stderr)
         return 2
 
+    # tag 打没打过不拦人：可能上次停在 draft，接着传才对。dry-run 里连问都不问。
+    tag_taken = tag_exists(ROOT, tag)
+
     if args.dry_run:
         print("--dry-run：下面是要做的事，一个请求都不发、一个 tag 都不打。")
-        for index, step in enumerate(_plan(version, build=args.build, notes_file=args.notes_file), 1):
+        for index, step in enumerate(
+            _plan(
+                version,
+                build=args.build,
+                notes_file=args.notes_file,
+                tag_exists=tag_taken,
+            ),
+            1,
+        ):
             print("  " + str(index) + ". " + step)
         return 0
 
@@ -411,40 +507,100 @@ def main(
     print("用的 token：" + mask_token(token) + "（来自 " + source + "）")
 
     try:
-        _git_step(ROOT, ["tag", "-a", tag, "-m", "biTrader " + version], "打 tag " + tag + " ")
-        print("打 tag " + tag + "：好了")
+        have_asset = False
+        html_url = ""
 
-        _git_step(ROOT, ["push", REMOTE, tag], "推送 tag 到 " + REMOTE + " ")
-        print("推送 tag 到 " + REMOTE + "：好了")
+        if tag_taken:
+            # tag 已经推上去了：只可能是上次停在 draft。问一句，别瞎猜。
+            existing = _get_json(
+                release_by_tag_url(tag), token, what="问 tag " + tag + " 上的 Release "
+            )
+            if existing is None:
+                raise ReleaseRefused(
+                    "tag " + tag + " 已经存在，但 GitHub 上没有它的 Release（上次建 Release 那一步没成）。"
+                    "在网页上手动发这一版，或者 git tag -d " + tag + " 之后重跑。"
+                )
+            if not existing.get("draft"):
+                raise ReleaseRefused(
+                    "tag " + tag + " 已经发过了（Release #" + str(existing.get("id"))
+                    + " 不是 draft）：同一版不要发两次，抬一个版本再发。"
+                )
+            release_id = existing.get("id")
+            if not release_id:
+                raise ReleaseError(
+                    "那个 draft Release 没有 id：" + json.dumps(existing, ensure_ascii=False)[:200]
+                )
+            html_url = str(existing.get("html_url") or "")
+            have_asset = any(
+                str(asset.get("name") or "") == exe_name for asset in (existing.get("assets") or [])
+            )
+            print(
+                "tag " + tag + " 已经在，Release #" + str(release_id) + " 还是 draft：接着传，不重打 tag。"
+            )
+        else:
+            _git_step(ROOT, ["tag", "-a", tag, "-m", "biTrader " + version], "打 tag " + tag + " ")
+            print("打 tag " + tag + "：好了")
 
-        release = _post_json(
-            API_BASE + "/repos/" + REPO + "/releases",
-            {
-                "tag_name": tag,
-                "name": tag,
-                "body": body,
-                "draft": False,
-                "prerelease": False,
-            },
-            token,
-            what="建 Release ",
-        )
-        release_id = release.get("id")
-        if not release_id:
-            raise ReleaseError("建 Release 回来了，但没有 id：" + json.dumps(release, ensure_ascii=False)[:200])
-        print("建 Release " + tag + "：id " + str(release_id))
+            _git_step(ROOT, ["push", REMOTE, tag], "推送 tag 到 " + REMOTE + " ")
+            print("推送 tag 到 " + REMOTE + "：好了")
+
+            created = _post_json(
+                releases_url(),
+                {
+                    "tag_name": tag,
+                    "name": tag,
+                    "body": body,
+                    "draft": True,
+                    "prerelease": False,
+                },
+                token,
+                what="建 Release ",
+            )
+            release_id = created.get("id")
+            if not release_id:
+                raise ReleaseError(
+                    "建 Release 回来了，但没有 id：" + json.dumps(created, ensure_ascii=False)[:200]
+                )
+            html_url = str(created.get("html_url") or "")
+            print(
+                "建 draft Release " + tag + "：id " + str(release_id)
+                + "（还没发布，用户看不到）"
+            )
 
         if args.build:
             exe = installer_path(ROOT, version)
-            print("上传 " + exe.name + "（" + _mb(exe.stat().st_size) + "）")
-            asset = _upload_asset(exe, release_id, token, progress=progress)
-            print("传完：" + str(asset.get("name") or exe.name))
+            if have_asset:
+                print("这个 draft 里已经有 " + exe.name + "：跳过上传，直接发布。")
+            else:
+                print("上传 " + exe.name + "（" + _mb(exe.stat().st_size) + "）")
+                try:
+                    asset = _upload_asset(exe, release_id, token, progress=progress)
+                except ReleaseError as exc:
+                    _tell_the_draft_is_waiting(tag, exc)
+                    return 1
+                print("传完：" + str(asset.get("name") or exe.name))
         else:
             print("没带 --build：这次没传安装包，桌面端不会看到这一版。")
 
-        url = str(release.get("html_url") or "")
+        try:
+            published = _patch_json(
+                release_url(release_id),
+                {"draft": False, "body": body},
+                token,
+                what="发布 Release ",
+            )
+        except ReleaseError as exc:
+            _tell_the_draft_is_waiting(tag, exc)
+            return 1
+        print("发布 Release " + tag + "：好了")
+
+        url = str(published.get("html_url") or html_url or "")
         print("Release：" + (url or "（GitHub 没给 html_url）"))
         return 0 if url else 1
+    except ReleaseRefused as exc:
+        print("发版停下：" + str(exc), file=sys.stderr)
+        print("什么都没做（没打 tag、没 push、没改任何东西）。", file=sys.stderr)
+        return 2
     except ReleaseError as exc:
         print("发版失败：" + str(exc), file=sys.stderr)
         return 1

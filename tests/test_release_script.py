@@ -1,8 +1,8 @@
-"""t96：发版脚本的拒法、顺序，和 token 有没有漏出去。
+"""发版脚本的拒法、顺序，和 token 有没有漏出去。
 
-这里不碰网络、不打真 tag：git 与 HTTP 全是替身。钉三件事——四种情况下必须**什么都没做**
-（不打 tag、不 push、不发请求）；happy path 的动作顺序是 tag → push → 建 Release → 传 exe；
-任何一句打印里都不许出现 token 原文。
+这里不碰网络、不打真 tag：git 与 HTTP 全是替身。钉三件事——前置校验不过时**什么都没做**
+（不打 tag、不 push、不改 Release）；动作顺序是 tag → push → 建 draft Release → 传 exe →
+PATCH 发布，传崩了就停在 draft，用户看不到；任何一句打印里都不许出现 token 原文。
 """
 
 from __future__ import annotations
@@ -54,10 +54,15 @@ class Harness:
         }
         self.asset = {"name": "biTrader-Setup-" + VERSION + ".exe", "size": 1024}
         self.fail_release: tuple[int, str] | None = None
+        # tag 上已经有 Release 时，GET /releases/tags/<tag> 该回什么；None 就是 404
+        self.existing_release: dict | None = None
+        self.fail_upload: str = ""
         # 真实现留一份：有一条测试要看着它真的把文件一块块发出去
         self.real_upload = module._upload_asset
         module._git = self._git
         module._post_json = self._post_json
+        module._patch_json = self._patch_json
+        module._get_json = self._get_json
         module._upload_asset = self._upload_asset
 
     # ------------------------------------------------------------ 替身
@@ -81,8 +86,18 @@ class Harness:
             raise self.module.ReleaseError(self.module.explain_http(code, body, "建 Release "))
         return dict(self.release)
 
+    def _patch_json(self, url: str, payload: dict, token: str, **kwargs):
+        self.http_calls.append(("PATCH", url, payload, token))
+        return dict(self.release)
+
+    def _get_json(self, url: str, token: str, **kwargs):
+        self.http_calls.append(("GET", url, None, token))
+        return None if self.existing_release is None else dict(self.existing_release)
+
     def _upload_asset(self, path, release_id, token: str, **kwargs):
         self.http_calls.append(("UPLOAD", str(path), release_id, token))
+        if self.fail_upload:
+            raise self.module.ReleaseError(self.fail_upload)
         return dict(self.asset)
 
     # ------------------------------------------------------------ 记账
@@ -96,6 +111,9 @@ class Harness:
             for c in self.git_calls
             if c and (c[0] == "push" or (c[0] == "tag" and "-a" in c))
         ]
+
+    def kinds(self) -> list[str]:
+        return [c[0] for c in self.http_calls]
 
     def run(self, *extra: str) -> int:
         return self.module.main(["--version", VERSION, *extra])
@@ -170,13 +188,26 @@ def test_a_dirty_work_tree_is_refused(box, capsys):
     assert box.http_calls == []
 
 
-def test_an_existing_tag_is_refused(box, capsys):
+def test_an_existing_tag_without_any_release_is_refused(box, capsys):
+    """tag 推上去了但 Release 没建：不猜，让人自己处理，一个字节都不改。"""
     box.existing_tags = TAG + "\n"
-    assert box.run() == 2
+    assert box.run("--build") == 2
     err = capsys.readouterr().err
     assert TAG in err
     assert box.writes() == []
-    assert box.http_calls == []
+    assert box.kinds() == ["GET"]          # 只问了一次「这个 tag 上有没有 Release」
+
+
+def test_an_existing_tag_whose_release_is_published_is_refused(box, capsys):
+    """已经正式发布过的版本：不许往上贴第二份安装包，抬版本重发。"""
+    box.existing_tags = TAG + "\n"
+    box.existing_release = {"id": 4242, "draft": False, "assets": []}
+    assert box.run("--build") == 2
+    err = capsys.readouterr().err
+    assert TAG in err
+    assert "已经发布" in err or "抬一个版本" in err
+    assert box.writes() == []
+    assert box.kinds() == ["GET"]
 
 
 def test_build_without_the_installer_is_refused(box, capsys):
@@ -191,7 +222,7 @@ def test_build_without_the_installer_is_refused(box, capsys):
 def test_without_build_the_installer_is_not_required(box):
     box.drop_installer()
     assert box.run() == 0
-    assert [c[0] for c in box.http_calls] == ["POST"]
+    assert box.kinds() == ["POST", "PATCH"]
 
 
 # ---------------------------------------------------------------- happy path
@@ -205,20 +236,25 @@ def test_the_happy_path_goes_tag_push_release_upload(box, capsys):
         ("tag", "-a", TAG, "-m", "biTrader " + VERSION),
         ("push", "xf", TAG),
     ]
-    kinds = [c[0] for c in box.http_calls]
-    assert kinds == ["POST", "UPLOAD"]
+    # 建的是 draft → 传 exe → 最后一步才 PATCH 成正式发布
+    assert box.kinds() == ["POST", "UPLOAD", "PATCH"]
 
     _, url, payload, _token = box.http_calls[0]
     assert url == "https://api.github.com/repos/xiaofengxfc/python_jy/releases"
     assert payload["tag_name"] == TAG
     assert payload["name"] == TAG
     assert payload["body"] == "这版修了什么\n"
-    assert payload["draft"] is False
+    assert payload["draft"] is True
     assert payload["prerelease"] is False
 
     _, path, release_id, _ = box.http_calls[1]
     assert Path(path).name == "biTrader-Setup-" + VERSION + ".exe"
     assert release_id == 4242
+
+    _, patch_url, patch_payload, _ = box.http_calls[2]
+    assert patch_url == "https://api.github.com/repos/xiaofengxfc/python_jy/releases/4242"
+    assert patch_payload["draft"] is False
+    assert patch_payload["body"] == "这版修了什么\n"
 
     out = capsys.readouterr().out
     assert "https://github.com/xiaofengxfc/python_jy/releases/tag/" + TAG in out
@@ -245,6 +281,51 @@ def test_a_failed_tag_stops_before_the_push(box, capsys):
     assert "fatal: tag already exists" in capsys.readouterr().err
 
 
+# ---------------------------------------------------------------- 先 draft，传完再发布
+
+def test_a_failed_upload_leaves_the_release_in_draft(box, capsys):
+    """传崩了就停在 draft：桌面端查 /releases/latest 看不到它，用户不会点进空页面。"""
+    box.fail_upload = "上传 biTrader-Setup-" + VERSION + ".exe 时断了：timed out"
+    assert box.run("--build") == 1
+    # 没有 PATCH —— 这条件 Release 一步都没发布过
+    assert box.kinds() == ["POST", "UPLOAD"]
+    err = capsys.readouterr().err
+    assert "draft" in err
+    assert "用户看不到" in err
+    assert TAG in err
+    # 恢复办法写在同一段里：同一条命令再跑一次，脚本会认出那个 draft 接着传
+    assert "再跑一次" in err or "接着传" in err
+
+
+def test_rerunning_after_a_failed_upload_resumes_that_draft(box, capsys):
+    box.existing_tags = TAG + "\n"
+    box.existing_release = {"id": 4242, "draft": True, "assets": []}
+    assert box.run("--build") == 0
+    assert box.writes() == []                       # 不重打 tag、不重推
+    assert box.kinds() == ["GET", "UPLOAD", "PATCH"]
+    _, path, release_id, _ = box.http_calls[1]
+    assert Path(path).name == "biTrader-Setup-" + VERSION + ".exe"
+    assert release_id == 4242                       # 传进的是原来那条件 Release
+    _, patch_url, patch_payload, _ = box.http_calls[2]
+    assert patch_url.endswith("/releases/4242")
+    assert patch_payload["draft"] is False
+    out = capsys.readouterr().out
+    assert "接着传" in out or "draft" in out
+
+
+def test_a_draft_that_already_has_the_installer_is_only_published(box, capsys):
+    """上次传完了、只是最后那个 PATCH 没成功：146 MB 别再传一遍。"""
+    box.existing_tags = TAG + "\n"
+    box.existing_release = {
+        "id": 4242,
+        "draft": True,
+        "assets": [{"name": "biTrader-Setup-" + VERSION + ".exe"}],
+    }
+    assert box.run("--build") == 0
+    assert box.kinds() == ["GET", "PATCH"]
+    out = capsys.readouterr().out
+    assert "跳过" in out or "已经在" in out
+
 # ---------------------------------------------------------------- dry-run
 
 def test_dry_run_prints_the_plan_and_does_nothing(box, capsys):
@@ -252,6 +333,18 @@ def test_dry_run_prints_the_plan_and_does_nothing(box, capsys):
     out = capsys.readouterr().out
     assert "dry-run" in out
     assert TAG in out
+    assert "draft=true" in out         # 计划里要说清「先发成 draft」
+    assert "PATCH" in out             # 而且最后要 PATCH 成正式发布
+    assert box.writes() == []
+    assert box.http_calls == []
+
+
+def test_dry_run_with_an_existing_tag_still_touches_nothing(box, capsys):
+    """tag 打过的时候，连「问 GitHub 有没有 draft」都不该在 dry-run 里发生。"""
+    box.existing_tags = TAG + "\n"
+    assert box.run("--build", "--dry-run") == 0
+    out = capsys.readouterr().out
+    assert "draft" in out
     assert box.writes() == []
     assert box.http_calls == []
 
@@ -391,3 +484,13 @@ def test_the_release_doc_says_the_things_people_get_wrong():
         assert needle in text, needle
     # 别把「三条命令」写成假的：脚本里那个 flag 和文档里写的要一致
     assert "--build" in text and "--version" in text and "--dry-run" in text
+    # P2-1：先建 draft → 传安装包 → PATCH 发布；传崩了停在 draft，用户看不到
+    assert "draft" in text
+    assert "PATCH" in text
+    assert "看不到" in text
+    # P3-5：前置校验是四项，另加一步取 token —— 代码里 token 就在 preflight 之后取
+    assert "四项" in text
+    assert "五项" not in text
+    # P3-6：桌面卡上那个按钮叫「下载新安装包」，桌面端不做在线更新
+    assert "立即更新" not in text
+    assert "下载新安装包" in text

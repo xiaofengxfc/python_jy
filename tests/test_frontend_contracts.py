@@ -1689,3 +1689,60 @@ def test_the_desktop_types_are_declared() -> None:
         assert f"{field}?" in types, f"UpdateInfo 少了 {field}"
     for field in ("current", "latest", "tag", "newer", "download_url", "published_at", "notes"):
         assert field in types, f"desktop 块少了 {field}"
+
+# ---------------------------------------------------------------- t101 三态都能重新检查、缓存要说实话、主框架导航守住
+
+
+def test_the_desktop_card_offers_a_refresh_in_every_state() -> None:
+    """有新版 / 已最新 / 查不到 三档都要能立刻重查：刚发完版不该只能等 300 秒缓存。"""
+    desk = _desktop_branch()
+    assert desk.count("重新检查") == 1, "按钮该有一份、三态共用；只有一份说明它没挂在某一档里"
+    marker = desk.index("{/* desktop-refresh-row */}")
+    for state in ("newer", "latest", "unknown"):
+        assert desk.index(f'desktopState === "{state}"') < marker, f"{state} 那一档该在共用按钮之前收尾"
+    after_unknown = desk[desk.index('{desktopState === "unknown" && ('):]
+    assert after_unknown.index("</>") < after_unknown.index("重新检查"), (
+        "「重新检查」还被关在查不到那一档里，有新版 / 已最新时点不到"
+    )
+    row = desk[marker:]
+    row = row[: row.index("</div>")]
+    assert "loadUpdate(true)" in row, "重新检查要打 ?refresh=1"
+
+
+def test_the_unknown_desktop_state_still_gives_the_download_link() -> None:
+    """tag 读不懂时 newer 是 null，但 Release 上挂着安装包：这条兜底链接必须能到达。"""
+    desk = _desktop_branch()
+    unknown = desk[desk.index('{desktopState === "unknown" && ('):]
+    assert "比不出新旧" in unknown, "比不出新旧时没说可以自己下"
+    assert "{desktopDownload}" in unknown, "兜底链接没取后端给的 download_url"
+    assert 'target="_blank"' in unknown and 'rel="noreferrer"' in unknown
+    assert "desktopDownloadNote" in desk, "download_note 没显示"
+    assert "{desktopDownloadNote}" in unknown, "后端给的 download_note 没原样贴出来"
+
+
+def test_the_desktop_card_says_cached_when_the_answer_came_from_cache() -> None:
+    """缓存命中就说「缓存于」：把 5 分钟前抓的回包写成「刚查的」就是骗人。"""
+    card = _update_card_source()
+    desk = _desktop_branch()
+    assert "desktop?.cached" in card or "desktop.cached" in card, "没看 cached 标记"
+    assert "desktop?.fetched_at" in card, "没取真的抓取时间 fetched_at"
+    assert "缓存于 " in card and "5 分钟内不再问 GitHub" in card, "缓存命中时没有说法"
+    assert "查于 " in card, "没有缓存时仍要说「查于」"
+    assert "{desktopStamp}" in desk, "算了不显示等于没做"
+    types = (UI_DIR / "types.ts").read_text(encoding="utf-8")
+    for field in ("download_note", "fetched_at", "cached"):
+        assert field in types, f"UpdateDesktop 少了 {field}"
+
+
+def test_the_shell_guards_the_main_frame_navigation() -> None:
+    """主框架自己的导航也要守：拖个文件进来不能把整页导航到 file://。"""
+    main = (ROOT / "electron" / "main.cjs").read_text(encoding="utf-8")
+    assert 'on("will-navigate"' in main, "主框架导航没有守卫"
+    nav = main[main.index("const allowedOrigins"):]
+    nav = nav[: nav.index("void win.loadURL")]
+    assert "event.preventDefault()" in nav, "越界的导航没挡住"
+    assert "127.0.0.1" in nav and "localhost" in nav, "只放行回环地址"
+    assert "allowedOrigins" in nav or "origin" in nav, "按 origin 判，别按前缀猜"
+    assert "file:" not in nav and "data:" not in nav, "不许出现放行 file:/data: 的判断"
+    # 壳自己的初始加载不能被挡：守卫只挂在 will-navigate 上，不碰 loadURL
+    assert 'void win.loadURL(target);' in main

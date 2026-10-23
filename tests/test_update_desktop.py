@@ -20,10 +20,13 @@ import urllib.error
 import pytest
 from fastapi import HTTPException
 
+from pathlib import Path
+
 from btrader import __version__ as APP_VERSION
 from btrader.core import updater
 from btrader.web import routes_update
 
+ROOT = Path(__file__).resolve().parents[1]
 HEAD = "49aee73efba6a4ba49b868144d9d544dc2d5f107"
 REMOTE = "6ebef8311111111111111111111111111111111"
 TAG_URL = "https://github.com/xiaofengxfc/python_jy/releases/tag/v0.6.1"
@@ -36,10 +39,12 @@ def desktop_env(monkeypatch, tmp_path):
     monkeypatch.setenv("BITRADER_DATA_DIR", str(tmp_path))
     monkeypatch.delattr(sys, "frozen", raising=False)
     monkeypatch.setattr(updater, "_desktop_shell", "")
+    monkeypatch.setattr(updater, "_ephemeral_port", False)
     monkeypatch.setattr(updater, "_release_cache", {"at": 0.0, "payload": None})
     yield tmp_path
     monkeypatch.delattr(sys, "frozen", raising=False)
     updater.set_desktop_shell("")
+    updater.set_ephemeral_port(False)
 
 
 def _release(
@@ -61,6 +66,10 @@ def _release(
 
 def _exe_asset(url: str = EXE_URL, name: str = "biTrader-Setup-0.6.1.exe") -> dict:
     return {"name": name, "browser_download_url": url}
+
+
+def _release_setup(name: str = "biTrader-Setup-0.6.1.exe") -> dict:
+    return _exe_asset(EXE_URL, name)
 
 
 def _no_subprocess(monkeypatch):
@@ -218,7 +227,11 @@ def test_a_tag_that_is_not_x_y_z_is_not_a_version(monkeypatch, tag):
     ("code", "headers", "expected"),
     [
         (404, {}, "还没有发布过 Release"),
-        (403, {"X-RateLimit-Reset": str(int(time.time()) + 1800)}, "限流"),
+        (
+            403,
+            {"X-RateLimit-Reset": str(int(time.time()) + 1800), "X-RateLimit-Remaining": "0"},
+            "限流",
+        ),
         (500, {}, "500"),
     ],
 )
@@ -275,21 +288,55 @@ def test_a_release_without_an_installer_says_so(monkeypatch):
     assert "没有挂安装包" in desktop["download_note"], desktop
 
 
-def test_the_first_exe_asset_wins(monkeypatch):
+PORTABLE_URL = "https://x/biTrader-Portable-0.6.2.exe"
+
+
+def _desktop_with_assets(monkeypatch, tag: str, assets: list[dict]) -> dict:
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     _no_subprocess(monkeypatch)
-    _stub_release(
+    _stub_release(monkeypatch, _release(tag, assets=assets))
+    return updater.collect_info()["desktop"]
+
+
+def test_the_setup_installer_wins_whatever_the_upload_order(monkeypatch):
+    """免安装版和安装版都挂在同一个 Release 上时，给的是安装版。
+
+    实测（评审 P2-2）：以前取「第一个 .exe」，assets 顺序一换用户下到的就是目录版 exe——
+    不建快捷方式、不写开始菜单，行为完全不同。
+    """
+    portable = {"name": "biTrader-Portable-0.6.2.exe", "browser_download_url": PORTABLE_URL}
+    setup = {"name": "biTrader-Setup-0.6.2.exe", "browser_download_url": EXE_URL}
+    for assets in ([portable, setup], [setup, portable]):
+        desktop = _desktop_with_assets(monkeypatch, "v0.6.2", assets)
+        assert desktop["download_url"] == EXE_URL, [a["name"] for a in assets]
+        assert desktop["download_note"] == ""
+
+
+def test_a_name_with_setup_beats_a_plain_exe(monkeypatch):
+    desktop = _desktop_with_assets(
         monkeypatch,
-        _release(
-            "v0.6.2",
-            assets=[
-                {"name": "source.zip", "browser_download_url": "https://x/source.zip"},
-                {"name": "biTrader-Setup-0.6.2.exe", "browser_download_url": EXE_URL},
-                {"name": "other.exe", "browser_download_url": "https://x/other.exe"},
-            ],
-        ),
+        "v0.6.2",
+        [
+            {"name": "installer.exe", "browser_download_url": "https://x/installer.exe"},
+            {"name": "biTrader-SETUP-latest.EXE", "browser_download_url": EXE_URL},
+        ],
     )
-    assert updater.collect_info()["desktop"]["download_url"] == EXE_URL
+    assert desktop["download_url"] == EXE_URL
+
+
+def test_no_installer_at_all_says_how_many_exe_there_are(monkeypatch):
+    """一个 Setup 都挑不出来就留空，并把「有几个 exe、自己挑」写清楚。"""
+    desktop = _desktop_with_assets(
+        monkeypatch,
+        "v0.6.2",
+        [
+            {"name": "biTrader-Portable-0.6.2.exe", "browser_download_url": PORTABLE_URL},
+            {"name": "biTrader-CLI-0.6.2.exe", "browser_download_url": "https://x/cli.exe"},
+        ],
+    )
+    assert desktop["download_url"] is None
+    assert "2 个 exe" in desktop["download_note"], desktop["download_note"]
+    assert "自己挑" in desktop["download_note"], desktop["download_note"]
 
 
 # ------------------------------------------------------------------ 四、路由
@@ -304,11 +351,13 @@ def _endpoint(path: str, method: str = "GET"):
 def test_the_info_endpoint_skips_the_cache_when_refresh_is_one(monkeypatch):
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     _no_subprocess(monkeypatch)
-    seen = _stub_release(monkeypatch, _release("v0.6.2"))
+    seen = _stub_urlopen(monkeypatch, payload=_release("v0.6.2", assets=[_release_setup()]))
     endpoint = _endpoint("/api/update/info")
     endpoint()
-    endpoint(refresh=1)
-    assert seen == [False, True], seen
+    endpoint()  # 缓存命中：不再问 GitHub
+    assert len(seen) == 1, len(seen)
+    endpoint(refresh=1)  # 重新检查：跳缓存
+    assert len(seen) == 2, len(seen)
 
 
 def test_apply_and_rollback_stay_refused_on_the_desktop(monkeypatch, tmp_path):
@@ -370,3 +419,125 @@ def test_the_server_build_still_goes_through_git(monkeypatch):
     assert info["current_sha"] == HEAD
     assert info["remote_sha"] == REMOTE
     assert "rev-parse HEAD" in git.calls
+
+
+# ------------------------------------------------------------------ 六、桌面判据只认壳参数
+def test_port_zero_alone_is_not_a_desktop_build(monkeypatch):
+    """P1-1：python -m btrader.web 的 --port 默认就是 0，它必须还是仓库版。
+
+    以前 --port 0 被当成壳的证据，一个 python -m btrader.web 起的仓库版被判成桌面态，
+    整张更新卡换成「已最新」，而那份 checkout 可能落后好几个提交——界面在骗人。
+    """
+    updater.set_desktop_shell("")
+    updater.set_ephemeral_port(True)  # 就是 main() 在 --port 0 时做的事
+    assert updater.is_desktop_build() is False
+    git = _Git(
+        {
+            "rev-parse HEAD": (0, HEAD, ""),
+            "rev-parse --abbrev-ref HEAD": (0, "main", ""),
+            "config --get remote.xf.url": (0, "https://github.com/xiaofengxfc/python_jy.git", ""),
+            "fetch --all --prune": (0, "", ""),
+            f"rev-list --count --left-right HEAD...{REMOTE}": (0, "0\t3", ""),
+            "rev-parse --abbrev-ref --symbolic-full-name @{u}": (0, "xf/main", ""),
+        }
+    )
+    monkeypatch.setattr(updater, "_git", git)
+    monkeypatch.setattr(
+        updater,
+        "_github_commits",
+        lambda branch: [{"sha": REMOTE, "short": REMOTE[:7], "title": "x", "date": ""}],
+    )
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("仓库版不该问 Releases")
+
+    monkeypatch.setattr(updater, "_latest_release", refuse)
+    info = updater.collect_info()
+    assert info["supported"] is True
+    assert info["mode"] == "repo"
+    assert info["behind_by"] == 3, "落后几个提交就得照实说，不能显示「已最新」"
+
+
+def test_port_zero_alone_still_refuses_apply_but_tells_the_truth(monkeypatch, tmp_path):
+    """--port 0 的进程照样不许在线更新，但不许再冒充「壳盯着这个 pid 与 stdin」。"""
+    updater.set_desktop_shell("")
+    updater.set_ephemeral_port(True)
+    _no_subprocess(monkeypatch)
+    monkeypatch.setattr(routes_update, "running_engines", lambda: [])
+    state_file = tmp_path / "update-state.json"
+    for path, payload in (
+        ("/api/update/apply", None),
+        ("/api/update/rollback", routes_update.RollbackPayload(confirm=True)),
+    ):
+        endpoint = _endpoint(path, "POST")
+        with pytest.raises(HTTPException) as caught:
+            endpoint() if payload is None else endpoint(payload)
+        detail = str(caught.value.detail)
+        assert caught.value.status_code == 400, detail
+        assert "--port 0" in detail, detail
+        assert "临时" in detail, detail
+        assert "不是桌面壳" in detail, detail
+        # 别再声称壳盯着 pid / stdin —— 这个进程根本没有壳
+        assert "壳还盯着" not in detail, detail
+    assert not state_file.exists()
+
+
+def test_the_launcher_tells_updater_the_two_things_separately():
+    from btrader.web import __main__ as web_main
+
+    # 壳参数只有这两个：--port 0 是「让系统挑临时端口」，不是壳
+    assert web_main.desktop_flags(parent_pid=0, watch_stdin=False) == []
+    assert web_main.desktop_flags(parent_pid=777, watch_stdin=True) == [
+        "--parent-pid 777",
+        "--watch-stdin",
+    ]
+    assert web_main.ephemeral_port(0) is True
+    assert web_main.ephemeral_port(8765) is False
+    text = (ROOT / "src" / "btrader" / "web" / "__main__.py").read_text(encoding="utf-8")
+    assert "set_ephemeral_port" in text, "临时端口要单独告诉 updater"
+
+
+# ------------------------------------------------------------------ 七、P2-3 比不出新旧也要给链接
+def test_an_unreadable_tag_still_hands_out_the_installer(monkeypatch):
+    desktop = _desktop_with_assets(monkeypatch, "v0.6.1-beta", [_release_setup()])
+    assert desktop["newer"] is None
+    assert "读不懂" in desktop["error"]
+    assert desktop["download_url"] == EXE_URL, "比不出新旧不等于没有东西可下"
+    assert "比不出新旧" in desktop["download_note"], desktop["download_note"]
+    assert "自己下" in desktop["download_note"], desktop["download_note"]
+
+
+# ------------------------------------------------------------------ 八、P2-4 说清何时问过 GitHub
+def test_the_card_says_when_github_was_actually_asked(monkeypatch):
+    """缓存命中时 fetched_at 不许变，cached 要说是缓存——「查于 12:35」不能是假的。"""
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    _no_subprocess(monkeypatch)
+    seen = _stub_urlopen(monkeypatch, payload=_release("v0.6.2", assets=[_release_setup()]))
+    first = updater.collect_info()
+    second = updater.collect_info()
+    assert len(seen) == 1, "300 秒内只该问一次 GitHub"
+    assert first["checked_at"] and second["checked_at"], "响应时刻照旧给"
+    assert first["desktop"]["cached"] is False
+    assert second["desktop"]["cached"] is True
+    assert first["desktop"]["fetched_at"] == second["desktop"]["fetched_at"], (
+        "缓存命中时抓取时刻不该变"
+    )
+    # 强制刷新之后才算刚问过
+    third = updater.collect_info(refresh=True)
+    assert third["desktop"]["cached"] is False
+    assert len(seen) == 2
+
+
+# ------------------------------------------------------------------ 九、P3-3 403 不一定是限流
+def test_a_403_without_a_spent_quota_is_not_called_rate_limiting(monkeypatch):
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    _no_subprocess(monkeypatch)
+    _stub_urlopen(
+        monkeypatch,
+        error=_http_error(403, {"X-RateLimit-Remaining": "57"}),
+    )
+    desktop = updater.collect_info()["desktop"]
+    assert "限流" not in desktop["error"], desktop["error"]
+    assert "403" in desktop["error"], desktop["error"]
+    assert "拒绝" in desktop["error"], desktop["error"]
+    assert desktop["newer"] is None

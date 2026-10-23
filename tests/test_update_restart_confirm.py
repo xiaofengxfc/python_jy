@@ -554,14 +554,18 @@ def test_an_update_started_by_the_desktop_shell_is_refused(monkeypatch):
 def test_the_desktop_shell_flags_are_read_from_the_command_line():
     from btrader.web import __main__ as web_main
 
-    assert web_main.desktop_flags(port=0, parent_pid=0, watch_stdin=False) == ["--port 0"]
-    assert web_main.desktop_flags(port=8765, parent_pid=777, watch_stdin=True) == [
+    # --port 0 不是壳的证据：python -m btrader.web 的默认端口就是 0（见 t99 P1-1）
+    assert web_main.desktop_flags(parent_pid=0, watch_stdin=False) == []
+    assert web_main.desktop_flags(parent_pid=777, watch_stdin=True) == [
         "--parent-pid 777",
         "--watch-stdin",
     ]
-    assert web_main.desktop_flags(port=8765, parent_pid=0, watch_stdin=False) == []
+    # 临时端口单独标记：它照样拦 apply，只是文案不说「壳」
+    assert web_main.ephemeral_port(0) is True
+    assert web_main.ephemeral_port(8765) is False
     text = (ROOT / "src" / "btrader" / "web" / "__main__.py").read_text(encoding="utf-8")
     assert "set_desktop_shell" in text, "启动路径要把这件事告诉 updater"
+    assert "set_ephemeral_port" in text, "--port 0 要和壳参数分开告诉 updater"
 
 
 # ------------------------------------------------------------------ L2 优雅退出的宽限

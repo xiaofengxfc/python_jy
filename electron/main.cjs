@@ -141,6 +141,29 @@ function createWindow(port) {
     return { action: "deny" };
   });
 
+  // The app frame itself must never leave the local backend. `setWindowOpenHandler`
+  // above only covers new windows; a file dropped onto the page makes Chromium
+  // navigate this very window to file://, which replaces the trading UI with a
+  // blank local file. Only the loopback origins we serve from are allowed, and the
+  // check is by origin so file:/data:/custom schemes can never match.
+  const allowedOrigins = new Set([`http://127.0.0.1:${port}`, `http://localhost:${port}`]);
+  if (DEV_URL) {
+    try {
+      allowedOrigins.add(new URL(DEV_URL).origin);
+    } catch {
+      /* dev URL 写坏了就只认回环地址 */
+    }
+  }
+  win.webContents.on("will-navigate", (event, url) => {
+    let origin = "";
+    try {
+      origin = new URL(String(url ?? "")).origin;
+    } catch {
+      origin = "";
+    }
+    if (!allowedOrigins.has(origin)) event.preventDefault();
+  });
+
   const target = DEV_URL || `http://127.0.0.1:${port}/`;
   void win.loadURL(target);
 

@@ -73,16 +73,18 @@ def _busy_refusal() -> None:
 
 
 def _desktop_refusal() -> None:
-    """桌面端不许在线更新：那里只查 Releases，给下载链接。
+    """这条进程不许在线更新：三种情况分开说，别拿一种原因去顶另一种。
 
-    两种桌面进程都拦：
-      * 冻结包（PyInstaller）里没有 .git、没有 venv、没有 npm，服务器那套一步都做不了；
-      * 桌面壳拉起来的进程带着 `--port 0` + `--parent-pid` / `--watch-stdin`：更新完重启
-        拉起的是裸 run_web.py，新进程既不知道临时端口，也没有壳盯着——壳当场失联，界面上
-        是「更新完了但窗口连不上后端」。
-    两种都返回 400：不建任务、不写状态文件。
+      * 桌面壳拉起来的（`--parent-pid` / `--watch-stdin`）：更新完重启拉起的是裸
+        run_web.py，新进程没有壳盯着——壳当场失联，界面上是「更新完了但窗口连不上后端」；
+      * 冻结包（PyInstaller）：里面没有 .git、没有 venv、没有 npm，服务器那套一步都做不了；
+      * `--port 0` 起的（端口由系统临时分配）：重启完新进程接不上那个端口。
+
+    最后一种**不是桌面壳**——`python -m btrader.web` 的 `--port` 默认就是 0。以前把
+    `--port 0` 当成壳的证据，文案里就冒出一句「壳还盯着这个 pid 与 stdin」，而这个进程
+    根本没有壳。三种都是 400：不建任务、不写状态文件。
     """
-    if not updater.is_desktop_build():
+    if not (updater.is_desktop_build() or updater.ephemeral_port()):
         return
     reason = updater.desktop_shell_reason()
     if reason:
@@ -94,12 +96,22 @@ def _desktop_refusal() -> None:
                 "请关掉窗口再打开应用，或者在应用里重启后端；服务端部署请用 run_web.py 或 systemd 那份。"
             ),
         )
+    if updater.is_desktop_build():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "桌面版是打包好的 exe，里面没有 .git、没有 venv、没有 npm：服务器那套"
+                "git fetch / merge / pip / 重启一步都做不了，所以这里不做在线更新。"
+                "桌面版只查 GitHub Releases：有新版本时界面上会给下载链接，装完重新打开应用即可。"
+            ),
+        )
     raise HTTPException(
         status_code=400,
         detail=(
-            "桌面版是打包好的 exe，里面没有 .git、没有 venv、没有 npm：服务器那套"
-            "git fetch / merge / pip / 重启一步都做不了，所以这里不做在线更新。"
-            "桌面版只查 GitHub Releases：有新版本时界面上会给下载链接，装完重新打开应用即可。"
+            "这个后端用 --port 0 启动，端口是系统临时分的，重启后新进程接不上"
+            "（不是桌面壳：没带 --parent-pid / --watch-stdin）。"
+            "要用在线更新，请用一个固定的 --port 起服务（例如 run_web.py --host 127.0.0.1 --port 8765）"
+            "再来点更新。"
         ),
     )
 

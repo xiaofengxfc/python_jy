@@ -378,6 +378,12 @@ export interface UpdateDesktop {
   /** true 有新版 / false 已最新 / null 比不出来（当「查不到」处理，别当「已最新」）。 */
   newer?: boolean | null;
   download_url?: string | null;
+  /** 没挂安装包（或链接给不出来）时后端写的那句话，原样显示。 */
+  download_note?: string | null;
+  /** 真的去问 GitHub 的时刻（缓存命中时是更早那次抓取的时间）。 */
+  fetched_at?: string | null;
+  /** true = 这份结果来自 300 秒缓存：界面上不写「查于」，写「缓存于」。 */
+  cached?: boolean | null;
   published_at?: string | null;
   notes?: string | null;
   /** 查不到那一档的后端原话。 */

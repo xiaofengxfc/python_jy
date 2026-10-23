@@ -184,21 +184,28 @@ def serve(server, *, sockets=None) -> int:
     return 0
 
 
-def desktop_flags(*, port: int, parent_pid: int, watch_stdin: bool) -> list[str]:
-    """桌面壳那几个「进程一换就失联」的参数（空列表 = 普通的服务端启动）。
+def desktop_flags(*, parent_pid: int, watch_stdin: bool) -> list[str]:
+    """桌面壳独有的那两个参数（空列表 = 不是壳拉起来的）。
 
-    壳用 `--port 0` 让系统挑端口、用 `--parent-pid` / `--watch-stdin` 盯着这个进程；
-    更新最后一步拉起的是裸 run_web.py，这三样一个都不带，壳当场失联。所以带这些参数的
-    进程不许在线更新（见 routes_update._desktop_refusal）。
+    只有 `--parent-pid` / `--watch-stdin` 算壳的证据：壳盯着这个 pid 与 stdin，进程一换
+    就失联，更新最后一步拉起的是裸 run_web.py，这两样一个都不带。
+
+    **`--port 0` 不算**：那是 `python -m btrader.web` 的默认值（让系统挑个空闲端口），
+    普通的服务端启动也长这样。把它当成壳的证据，一个 `python -m btrader.web` 起的仓库版
+    就会被判成桌面态、整张更新卡换成「已是最新 0.6.x」，而那份 checkout 可能落后好几个提交。
+    `--port 0` 的信息不丢：它走 `ephemeral_port()`，只管 apply / rollback 的拒绝文案。
     """
     flags: list[str] = []
-    if port == 0:
-        flags.append("--port 0")
     if parent_pid:
         flags.append(f"--parent-pid {parent_pid}")
     if watch_stdin:
         flags.append("--watch-stdin")
     return flags
+
+
+def ephemeral_port(port: int) -> bool:
+    """`--port 0` = 让系统挑临时端口。和「是不是桌面壳」是两件事，别混。"""
+    return port == 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -214,14 +221,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
 
-    # 先告诉 updater 这个进程是怎么起来的：桌面壳那条路径不许在线更新。
+    # 先告诉 updater 这个进程是怎么起来的，两件事分开说：
+    #   1) 壳参数（--parent-pid / --watch-stdin）——这条路径不许在线更新，也不会换成桌面卡；
+    #   2) --port 0 只是「端口由系统临时分配」，照样拦 apply，但不算桌面壳。
     _updater.set_desktop_shell(
         "、".join(
-            desktop_flags(
-                port=args.port, parent_pid=args.parent_pid, watch_stdin=args.watch_stdin
-            )
+            desktop_flags(parent_pid=args.parent_pid, watch_stdin=args.watch_stdin)
         )
     )
+    _updater.set_ephemeral_port(ephemeral_port(args.port))
 
     setup_logging(
         getattr(logging, str(args.log_level).upper(), logging.INFO),

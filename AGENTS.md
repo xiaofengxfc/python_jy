@@ -478,10 +478,13 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   `JobBusy` 409、外部 pid 不许收尾、`from_sha` 校验、非 daemon 线程）。
 - 桌面端不查仓库，只查 Releases（t94 起）：桌面版是 PyInstaller 冻结的 exe，里面没有 `.git`、
   没有 `.venv`、没有 npm，上面那条流水线一步都做不了。所以 `updater.is_desktop_build()`
-  （`sys.frozen` 为真，或壳的 `--parent-pid` / `--watch-stdin` / `--port 0` 通过 `set_desktop_shell`
-  喂进来）成立时，`collect_info` 第一行就 return `desktop_update_info()`：`/api/update/info` 回
+  （`sys.frozen` 为真，或壳的 `--parent-pid` / `--watch-stdin` 通过 `set_desktop_shell`
+  喂进来；`--port 0` **不算**壳——那是 `python -m btrader.web` 的默认值，只说明端口是系统临时分的，
+  它单独走 `set_ephemeral_port`，只管 apply / rollback 的拒绝文案）成立时，
+  `collect_info` 第一行就 return `desktop_update_info()`：`/api/update/info` 回
   `supported: false` + `desktop` 块（`current` / `latest` / `tag` / `newer` / `download_url` /
-  `error`），只打一次 `GET /repos/xiaofengxfc/python_jy/releases/latest`（10 秒超时、成功缓存 300 秒），
+  `published_at` / `notes` / `fetched_at` / `cached` / `error`），
+  只打一次 `GET /repos/xiaofengxfc/python_jy/releases/latest`（10 秒超时、成功缓存 300 秒），
   **一个 git 子进程都不起**。版本按三元组比（`0.6.10 > 0.6.9`），tag 读不懂就 `newer: null` 并说
   「读不懂」——不许当成最新。界面据此换成桌面卡：三态（有新版给下载链接 / 已最新 / 查不到带
   「重新检查」打 `?refresh=1`），仓库版那三个按钮和「正在读本地与 GitHub 的提交…」一个都不出现。

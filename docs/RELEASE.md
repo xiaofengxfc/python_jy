@@ -48,8 +48,13 @@ python packaging/release.py --version 0.6.1 --build
 python packaging/release.py --version 0.6.1 --build --dry-run
 ```
 
-一次跑完的顺序：`git tag -a v0.6.1` → `git push xf v0.6.1` → 建 Release → 传 exe（边读边发，
-打印进度）→ 打印 Release 的 `html_url`。
+一次跑完的顺序：`git tag -a v0.6.1` → `git push xf v0.6.1` → 建 **draft** Release
+（`draft=true`，除了你没人看得见）→ 传 exe（边读边发，打印进度）→ `PATCH` 把 draft 改成正式发布、
+顺手写正文 → 打印 Release 的 `html_url`。
+
+先发成 draft、传完再发布，是刻意的：安装包一百五十来兆，传一半断了很常见。要是先发布再传，
+`/releases/latest` 立刻把这条件 Release 当成最新，所有用户都看到「有新版本」却下不到包；
+停在 draft 就没人看得见，重跑接着传。
 
 - **正文**：`--notes-file notes.md` 从文件读；不给就用最近 20 条提交标题。正文空着会被 GitHub 422 拒。
 - **`--build`**：把已经打好的 `dist-electron\biTrader-Setup-<版本>.exe` 一起传上去。脚本不替你打包。
@@ -68,21 +73,32 @@ token 从哪来：先看环境变量 `GITHUB_TOKEN`，没有再问 `git credenti
 
 ## 5. 停下来的情况
 
-前置校验有五项：三处版本号一致、工作区干净、`v<版本>` 的 tag 不存在、带 `--build` 时安装包就位、
-拿得到 token。任一项不过就退出，而且**什么都没做**——不打 tag、不 push、不发请求。问题一次报全，
-不用逐个试。
+前置校验是四项：`--version` 写成 `0.6.1` 这种三段数字、三处版本号都等于它、工作区干净、
+带 `--build` 时安装包就位。任一项不过就退出，而且**什么都没做**——不打 tag、不 push、不发请求。
+问题一次报全，不用逐个试。token 是在这四项之后才取的（先 `GITHUB_TOKEN`，没有再
+`git credential fill`），拿不到也一样什么都不做。
+
+tag 打过了不算「不能发」：脚本会先问一句 GitHub「这个 tag 上的 Release 是不是停在 draft」。
+是 draft 就接着传（不重打 tag、不重推，传完自动发布）；不是 draft 说明这版已经发过，抬一个版本；
+根本没有 Release 就停下，让人自己处理。
 
 中途失败就停在那一步，贴命令或 GitHub 的原始输出，不重试、不猜原因：
 
 - **403**：这把 token 没有 Contents: write。换一把，或者干脆在网页上手动发。
 - **422**：常见两种——`v<版本>` 的 tag 已经存在；Release 正文是空的。
-- **tag 打了但 push 挂了**：本地 tag 还在，先 `git tag -d v0.6.1` 再重跑，否则会被「tag 已存在」拦住。
-- **Release 建了但上传断了**：网页上删掉这个 Release（tag 还在就先删 tag）再重跑，或者手动把 exe 拖上去。
+- **上传断了、或者最后发布那一步没成**：stderr 会写明那条件 Release 还是 draft、用户看不到。
+  网络缓过来之后把同一条命令再跑一次就行——tag 还在、draft 还在，脚本认出它接着传，传完自动发布
+  （安装包已经在的直接跳过上传）。
+- **不想续传**：网页上删掉那个 draft Release，`git tag -d v0.6.1`，然后重新跑一遍。
+- **tag 推上去了但 Release 没建**（比如 push 之后断了）：重跑会停下来说「GitHub 上没有它的 Release」。
+  在网页上手动发这一版，或者 `git tag -d v0.6.1` 之后重跑。
 
 ## 6. 桌面端和服务器版看的不是一件事
 
-- **Windows 桌面端**：查 GitHub Releases 的最新 tag，和包里的 `__version__` 比。Release 上没有 exe，
-  用户点了「立即更新」也下不到东西，所以**每次发版都要传安装包**。
+- **Windows 桌面端**：装好的 exe 里没有 git、没有 Python 环境，**它不做在线更新**——只查一次
+  GitHub Releases 的最新 tag，和包里的 `__version__` 比。有新版就在设置页显示一张卡，按钮是
+  「下载新安装包」，点开是浏览器下载，装一遍就完事。Release 上没有 exe，用户看到「有新版本」
+  却点不动下载，只能自己去 Release 页面翻，所以**每次发版都要传安装包**。
 - **Linux 服务器版**：不看 Release，按提交 SHA 比（设置页那张卡走 `git fetch` + `--ff-only 合并`），
   服务器上不发 Release 也能更新。
 

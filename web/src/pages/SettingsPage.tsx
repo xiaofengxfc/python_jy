@@ -394,11 +394,19 @@ export default function SettingsPage({ settings, settingsError = "", onSaved }: 
   const desktopPublished = desktop?.published_at
     ? String(desktop.published_at).slice(0, 10)
     : "发布日期没读到";
-  const desktopCheckedAt = (() => {
-    const raw = String(update?.checked_at ?? "");
+  /** 真的去问 GitHub 的时刻：缓存命中时后端给 fetched_at（那是抓取时间，不是响应时刻）。 */
+  const desktopFetchedAt = (() => {
+    const raw = String(desktop?.fetched_at || update?.checked_at || "");
     const at = raw.indexOf("T");
     return at >= 0 ? raw.slice(at + 1, at + 6) : raw || "没记";
   })();
+  const desktopCached = Boolean(desktop?.cached);
+  /** 缓存命中就说「缓存于」：把 5 分钟前抓的回包写成「刚查的」就是骗人。 */
+  const desktopStamp = desktopCached
+    ? `缓存于 ${desktopFetchedAt}（5 分钟内不再问 GitHub，点重新检查立刻问）`
+    : `查于 ${desktopFetchedAt}`;
+  /** 后端给的那句「没挂安装包 / 自己去 Release 页面取」，原样显示。 */
+  const desktopDownloadNote = String(desktop?.download_note ?? "").trim();
   const desktopDownload = desktop?.download_url ? String(desktop.download_url) : "";
   /** 三种结局：true 有新版 / false 已最新 / 其它（null 比不出来、缺字段、带 error）一律查不到。
    *  newer 是 null 只能说明「比不出来」，把它当「已最新」等于骗人。 */
@@ -1901,24 +1909,41 @@ export default function SettingsPage({ settings, settingsError = "", onSaved }: 
                 )}
                 {desktopState === "latest" && (
                   <div className="hint">
-                    已是最新：{desktopCurrent}（GitHub 上的 {desktopTag}，查于 {desktopCheckedAt}）。
+                    已是最新：{desktopCurrent}（GitHub 上的 {desktopTag}，{desktopStamp}）。
                   </div>
                 )}
                 {desktopState === "unknown" && (
                   <>
                     <div className="banner warn">查不到 GitHub 上的版本：{desktopError}</div>
-                    <div className="row" style={{ gap: 8 }}>
-                      <button
-                        type="button"
-                        className="btn-sm"
-                        disabled={updateBusy !== ""}
-                        onClick={() => void loadUpdate(true)}
-                      >
-                        {updateBusy === "info" ? "检查中…" : "重新检查"}
-                      </button>
-                    </div>
+                    {/* 比不出新旧不代表没有东西可下：Release 上挂着安装包就先把链接给出来。 */}
+                    {desktopDownload ? (
+                      <div className="hint">
+                        比不出新旧，但 Release 上挂着安装包，可以直接下：{" "}
+                        <a href={desktopDownload} target="_blank" rel="noreferrer">
+                          下载安装包
+                        </a>
+                      </div>
+                    ) : null}
+                    {desktopDownloadNote ? <div className="hint">{desktopDownloadNote}</div> : null}
                   </>
                 )}
+                {/* desktop-refresh-row */}
+                {/* 三态共用这一行：刚发完版要能立刻确认，别让人等 300 秒缓存或刷新页面。 */}
+                <div className="row" style={{ gap: 8 }}>
+                  <button
+                    type="button"
+                    className="btn-sm"
+                    disabled={updateBusy !== ""}
+                    onClick={() => void loadUpdate(true)}
+                  >
+                    {updateBusy === "info" ? "检查中…" : "重新检查"}
+                  </button>
+                  {desktopState !== "latest" && (
+                    <span className="faint" style={{ fontSize: "var(--fs-12)" }}>
+                      {desktopStamp}
+                    </span>
+                  )}
+                </div>
                 <div className="hint">
                   桌面安装版里没有 git 仓库，也不带 Python 和 npm，所以这里只做版本比对、不下载不改文件。你的配置与成交记录都在{" "}
                   {"%APPDATA%\\biTrader"}，覆盖安装不会动。

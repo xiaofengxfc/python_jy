@@ -224,6 +224,23 @@ def desktop_shell_reason() -> str:
     return _desktop_shell
 
 
+# --port 0 是「让系统挑个临时端口」，不是桌面壳——python -m btrader.web 的 --port 默认就是 0。
+# 这种进程照样不许在线更新（重启后新进程接不上那个临时端口），但拒绝文案不许冒充桌面壳。
+# 所以它是**另一个**标记，不进 _desktop_shell（把两件事混成一件，仓库版会被判成桌面态）。
+_ephemeral_port = False
+
+
+def set_ephemeral_port(flag: Any) -> None:
+    """启动路径告诉这里：我这个进程是 --port 0 起的（端口由系统临时分配）。"""
+    global _ephemeral_port
+    _ephemeral_port = bool(flag)
+
+
+def ephemeral_port() -> bool:
+    """这个进程的端口是系统临时分的吗。和「是不是桌面壳」是两件事。"""
+    return _ephemeral_port
+
+
 def now_iso() -> str:
     """带时区的当前时间，前端直接显示。"""
     return datetime.now().astimezone().isoformat(timespec="seconds")
@@ -398,6 +415,8 @@ def is_desktop_build() -> bool:
     """这个进程是不是桌面端：PyInstaller 冻结包，或者 Electron 壳拉起来的后端。
 
     判据就这两条，别另写一套：壳参数那条路由 set_desktop_shell 在启动时喂过。
+    **--port 0 不算**：那是 python -m btrader.web 的默认值，只说明端口是系统临时分的
+    （见 ephemeral_port），一个普通的仓库版必须还能走 git 那条路。
     """
     if getattr(sys, "frozen", False):
         return True
@@ -465,10 +484,17 @@ def _latest_release(force: bool = False) -> dict[str, Any]:
                 "这个仓库还没有发布过 Release（GitHub 回 404）：发一个 tag 之后这里才会有内容。"
             ) from None
         if exc.code == 403:
-            note = _rate_limit_note((exc.headers or {}).get("X-RateLimit-Reset"))
+            headers = exc.headers or {}
+            # 403 不都是限流：abuse detection、被封、令牌没权限都回 403。
+            # 只有「额度真的用完了」（X-RateLimit-Remaining == 0）才说限流。
+            if str(headers.get("X-RateLimit-Remaining", "")).strip() == "0":
+                note = _rate_limit_note(headers.get("X-RateLimit-Reset"))
+                raise ReleaseError(
+                    f"GitHub 限流了（403，未认证请求每小时 60 次，额度已经用完）{note}。"
+                    f"原话：{_error_body(exc)}"
+                ) from None
             raise ReleaseError(
-                f"GitHub 限流了（403，未认证请求每小时 60 次）{note}。"
-                f"原话：{_error_body(exc)}"
+                f"GitHub 拒绝了这次请求（403）：{_error_body(exc)}"
             ) from None
         raise ReleaseError(f"问不到 GitHub Releases（HTTP {exc.code}）：{_error_body(exc)}") from None
     except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
@@ -492,19 +518,53 @@ def _version_tuple(text: Any) -> tuple[int, int, int] | None:
     return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
 
 
-def _release_asset_url(release: dict[str, Any]) -> str | None:
-    """Release 里第一个 .exe 安装包的下载地址；没挂安装包就是 None。"""
+def _pick_installer(release: dict[str, Any], version: str = "") -> tuple[str | None, str]:
+    """(安装包地址, 给用户的一句说明)。
+
+    先认 `biTrader-Setup-<版本>.exe`（不分大小写），再认名字里带 setup 的 .exe。
+    都不认就直接留空并说清有几个 exe——**不退回「第一个 .exe」**：同一个 Release 同时挂
+    免安装版和安装版时，上传顺序一换，用户下到的就是目录版 exe（不建快捷方式、不写开始
+    菜单，行为完全不同）。挑不出来比挑错强。
+    """
     assets = release.get("assets")
     if not isinstance(assets, list):
-        return None
+        return None, ""
+    exe: list[tuple[str, str]] = []
     for asset in assets:
         if not isinstance(asset, dict):
             continue
         name = str(asset.get("name") or "")
         url = str(asset.get("browser_download_url") or "")
         if url and name.lower().endswith(".exe"):
-            return url
-    return None
+            exe.append((name, url))
+    if not exe:
+        return None, "这个 Release 没有挂安装包：只能自己去 Release 页面取。"
+    wanted = f"bitrader-setup-{version}.exe".lower() if version else ""
+    if wanted:
+        for name, url in exe:
+            if name.lower() == wanted:
+                return url, ""
+    for name, url in exe:
+        if "setup" in name.lower():
+            return url, ""
+    return None, (
+        f"这个 Release 里挂了 {len(exe)} 个 exe，看不出哪个是安装包：去 Release 页面自己挑。"
+    )
+
+
+def _release_fetched(force: bool = False) -> tuple[dict[str, Any], float, bool]:
+    """(GitHub 回包, 真正问它的那一刻的 epoch, 是不是缓存命中)。
+
+    缓存命中的回包是几分钟前抓的：卡片上必须说得清「什么时候问的」，不然「查于 12:35」
+    其实写着 12:31 抓的东西，正是骗人那一类。
+    """
+    cached = _release_cache.get("payload")
+    at = float(_release_cache.get("at") or 0.0)
+    if not force and isinstance(cached, dict) and time.time() - at < RELEASE_CACHE_SECONDS:
+        return cached, at, True
+    payload = _latest_release(force=True)
+    stamp = float(_release_cache.get("at") or 0.0) or time.time()
+    return payload, stamp, False
 
 
 def desktop_update_info(force: bool = False) -> dict[str, Any]:
@@ -515,9 +575,13 @@ def desktop_update_info(force: bool = False) -> dict[str, Any]:
     **只报不装**：没有代码签名，静默升级会被 SmartScreen 拦。
 
     newer 一定是三元组比出来的：读不懂就看不出新旧，那时给 None 并附 error——
-    绝不说「已是最新」。
+    绝不说「已是最新」，但**该给的下载链接照给**（比不出新旧不等于没东西可下）。
+
+    时间戳分两个：`checked_at` 是这次响应的时间，`fetched_at` 是真正去问 GitHub 的那一刻，
+    `cached` 说明这一次是不是吃的 300 秒缓存。卡片写「查于 HH:MM」时要用 fetched_at。
     """
     current = str(APP_VERSION)
+    checked_at = now_iso()
     desktop: dict[str, Any] = {
         "current": current,
         "latest": None,
@@ -527,6 +591,8 @@ def desktop_update_info(force: bool = False) -> dict[str, Any]:
         "download_note": "",
         "published_at": None,
         "notes": "",
+        "fetched_at": checked_at,
+        "cached": False,
         "error": "",
     }
     info: dict[str, Any] = {
@@ -534,30 +600,38 @@ def desktop_update_info(force: bool = False) -> dict[str, Any]:
         "mode": "desktop",
         "version": current,
         "platform": platform_name(),
-        "checked_at": now_iso(),
+        "checked_at": checked_at,
         "desktop": desktop,
     }
     try:
-        release = _latest_release(force=force)
+        release, fetched, cached = _release_fetched(force=force)
     except ReleaseError as exc:
         desktop["error"] = str(exc)
         return info
+    desktop["cached"] = cached
+    desktop["fetched_at"] = (
+        datetime.fromtimestamp(fetched).astimezone().isoformat(timespec="seconds")
+    )
     tag = str(release.get("tag_name") or "").strip()
     desktop["tag"] = tag or None
     desktop["notes"] = str(release.get("body") or "")
     desktop["published_at"] = str(release.get("published_at") or "") or None
-    desktop["download_url"] = _release_asset_url(release)
-    if not desktop["download_url"]:
-        desktop["download_note"] = (
-            "这个 Release 没有挂安装包：只能自己去 Release 页面取。"
-        )
     remote = _version_tuple(tag)
+    version = tag[1:] if tag[:1] in ("v", "V") else tag
+    desktop["download_url"], note = _pick_installer(release, version)
+    desktop["download_note"] = note
     if remote is None:
         desktop["error"] = (
             f"远端 tag 读不懂（{tag or '空'}）：只认 vX.Y.Z 这种写法，这次比不了版本。"
         )
+        if desktop["download_url"]:
+            desktop["download_note"] = (
+                "比不出新旧，这个 Release 挂着安装包，可以自己下：" + note
+                if note
+                else "比不出新旧，这个 Release 挂着安装包，可以自己下。"
+            )
         return info
-    desktop["latest"] = tag[1:] if tag[:1] in ("v", "V") else tag
+    desktop["latest"] = version
     local = _version_tuple(current)
     if local is None:
         desktop["error"] = f"本地版本号读不懂（{current}）：只认 X.Y.Z 这种写法，这次比不了版本。"
