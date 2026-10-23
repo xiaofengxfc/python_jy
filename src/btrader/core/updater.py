@@ -73,6 +73,17 @@ LISTEN_TIMEOUT = 90.0
 LISTEN_POLL = 0.2
 
 STATE_NAME = "update-state.json"
+# 临时文件前缀就是状态文件名去掉后缀：update-state.json.<pid>.<rand>.tmp。
+STATE_TMP_GLOB = "update-state*.tmp"
+# 多久以前的临时文件算「没人管了」。只按时间删是不够的：那个进程可能还在慢慢写，
+# 所以还要看名字里那个 pid 是不是已经不在了（见 clean_stale_state_tmp）。
+STATE_TMP_GRACE = 300.0
+# 读接口天天在轮询，残渣清理按这个间隔做一次就够。
+TMP_CLEAN_INTERVAL = 60.0
+# 换名撞上 Windows 的共享冲突（WinError 5：目标文件正被别人读着）时重试几次：
+# 8 个线程一起写实测撞得到，重试一次就落盘了，不重试等于白丢这一次写入。
+STATE_REPLACE_ATTEMPTS = 3
+STATE_REPLACE_PAUSE = 0.05
 STATE_IDLE = "idle"
 STATE_RUNNING = "running"
 STATE_DONE = "done"
@@ -547,6 +558,9 @@ def _default_state() -> dict[str, Any]:
         "restart_deadline": "",
         "restart_log": "",
         "lock_note": "",
+        # 失败时照着敲的那一条（按真实的 --host/--port 拼）。以前只有自由文本里带一句，
+        # 界面上想单独摆出来就没得用。
+        "manual_hint": "",
     }
 
 
@@ -561,12 +575,100 @@ def write_state(state: dict[str, Any]) -> dict[str, Any]:
     # 临时文件名带 pid 和随机后缀：两个进程（或两个任务）同时写时，共用一个 .tmp
     # 会一个把另一个还没写完的半个 JSON 换上去。
     tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+    error: OSError | None = None
     try:
         tmp.write_text(payload, encoding="utf-8")
-        os.replace(tmp, path)
+        for attempt in range(STATE_REPLACE_ATTEMPTS):
+            try:
+                os.replace(tmp, path)
+                return state
+            except OSError as exc:
+                # Windows 上「目标文件正被别人读着」会回 WinError 5，等一瞬再换一次。
+                error = exc
+                if attempt + 1 < STATE_REPLACE_ATTEMPTS:
+                    time.sleep(STATE_REPLACE_PAUSE)
     except OSError as exc:
-        log.warning("更新状态写不下去：%s", exc)
+        error = exc
+    log.warning("更新状态写不下去：%s", error)
+    # 换名没成（Windows 上被别人读着就是 WinError 5），自己那份临时文件要当场删掉：
+    # 留着没人认领，只会和别的残渣一起越积越多。
+    try:
+        tmp.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as cleanup:
+        log.warning("更新状态的临时文件没删掉（%s）：%s", tmp, cleanup)
     return state
+
+
+def _tmp_pid(name: str) -> int:
+    """临时文件名里那个 pid（update-state.json.<pid>.<rand>.tmp）。认不出就是 0。"""
+    parts = name.split(".")
+    if len(parts) < 4:
+        return 0  # 老写法 update-state.json.tmp：没有 pid
+    try:
+        return int(parts[-3])
+    except ValueError:
+        return 0
+
+
+def clean_stale_state_tmp(grace: float | None = None) -> list[Path]:
+    """清掉没人管的 update-state 临时文件，返回删掉的那几个。
+
+    临时文件是「先写一份再换名」的中间产物，正常路径下 os.replace 一换就没了。留下的
+    都是写盘途中被杀的进程，或者换名撞上 Windows 共享冲突的那一份——实测进程内 8 线程
+    一轮能留 2 个、两个进程五轮留 1 个，没人再管。
+
+    判定两道一起过：mtime 超过 grace 秒，**而且**名字里那个 pid 已经不在了。只看时间会
+    删掉一个正在慢慢写的进程的东西；只看 pid 会把刚崩掉、还没人接手的那份也当成残渣。
+    """
+    limit = STATE_TMP_GRACE if grace is None else grace
+    directory = state_path().parent
+    keep_alive = os.getpid()
+    removed: list[Path] = []
+    now = time.time()
+    try:
+        candidates = sorted(directory.glob(STATE_TMP_GLOB))
+    except OSError:
+        return removed
+    for candidate in candidates:
+        try:
+            if now - candidate.stat().st_mtime < limit:
+                continue
+        except OSError:
+            continue
+        pid = _tmp_pid(candidate.name)
+        if pid and pid != keep_alive and _pid_alive(pid):
+            continue  # 写它的人还活着，别抢
+        try:
+            candidate.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            log.warning("更新状态的临时文件删不掉（%s）：%s", candidate, exc)
+            continue
+        removed.append(candidate)
+    if removed:
+        log.info(
+            "清掉 %d 个更新状态的临时文件：%s",
+            len(removed),
+            "、".join(item.name for item in removed),
+        )
+    return removed
+
+
+# 上一次扫残渣是什么时候（读接口一直在轮询，不能每次都扫目录）。
+_last_tmp_clean = 0.0
+
+
+def _maybe_clean_stale_tmp() -> None:
+    """按 TMP_CLEAN_INTERVAL 节流地扫一次残渣。读状态的路上顺手做，不另起线程。"""
+    global _last_tmp_clean
+    now = time.time()
+    if now - _last_tmp_clean < TMP_CLEAN_INTERVAL:
+        return
+    _last_tmp_clean = now
+    clean_stale_state_tmp()
 
 
 def _deadline_iso(seconds: float) -> str:
@@ -650,6 +752,15 @@ def _heal_state(state: dict[str, Any]) -> dict[str, Any]:
     还补上一条根本没发生过的「重启服务」。
     """
     if state.get("state") != STATE_RUNNING:
+        if state.get("restart_pending") or state.get("restart_deadline"):
+            # 终态不该再挂着「等新进程接手」：done / failed 都已经收过尾了。盘上留着它，
+            # 界面会一直显示「重启中」，而且没有任何一步会再去清（重启前的 finally 只管
+            # 本进程的任务）。这里顺手收干净并写回盘。
+            log.warning(
+                "终态（%s）上还挂着 restart_pending，清掉", state.get("state")
+            )
+            state = {**state, "restart_pending": False, "restart_deadline": ""}
+            write_state(state)
         return state
     owner = int(state.get("pid") or 0)
     if owner == os.getpid():
@@ -693,10 +804,10 @@ def _heal_state(state: dict[str, Any]) -> dict[str, Any]:
             }
         elif late:
             # 期限过了还没人接上：这次重启就是没成，收成 failed 并把手动命令写清楚。
+            hint = _manual_hint(paths.project_root())
             error = (
                 f"重启没等到：pid {owner} 把重启交出去之后，到 {state.get('restart_deadline')} "
-                f"还没有新进程接上来（{detail}）。{_port_note()}\n"
-                f"手动拉起：{_manual_hint(paths.project_root())}"
+                f"还没有新进程接上来（{detail}）。{_port_note()}\n手动拉起：{hint}"
             )
             _append_restart_log(log_path, error, who="新进程")
             state = {
@@ -705,6 +816,7 @@ def _heal_state(state: dict[str, Any]) -> dict[str, Any]:
                 "restart_pending": False,
                 "restart_deadline": "",
                 "error": error,
+                "manual_hint": hint,
                 "finished_at": state.get("finished_at") or now_iso(),
             }
         else:
@@ -746,6 +858,7 @@ def read_state() -> dict[str, Any]:
                 state[key] = raw[key]
     if not isinstance(state["steps"], list):
         state["steps"] = []
+    _maybe_clean_stale_tmp()  # 节流：读接口天天被轮询，隔一阵扫一次残渣
     return _heal_state(state)
 
 
@@ -872,8 +985,10 @@ def _restart_step(state: dict[str, Any]) -> tuple[bool, str]:
         return True, output
     state["restart_pending"] = False
     state["restart_deadline"] = ""
+    hint = _manual_hint(root)
+    state["manual_hint"] = hint
     if "手动" not in output:
-        output = f"{output}\n手动拉起：{_manual_hint(root)}"
+        output = f"{output}\n手动拉起：{hint}"
     # 失败详情与手动命令同时写一份进这一轮的日志：这时候本进程马上就要停了，
     # /api/update/status 要等用户手动起回来才看得到。
     _append_restart_log(_last_restart_log, f"重启失败：{output}", who="老进程")
@@ -956,6 +1071,8 @@ def _run_job(state: dict[str, Any], kind: str, info: dict[str, Any]) -> None:
         write_state(state)
     finally:
         release_update_lock()
+        # 失败分支也可能留下半截临时文件：收尾时按同一套判据（过期 + pid 不在）再扫一次。
+        clean_stale_state_tmp()
 
 
 # 一次只跑一个更新任务：两道 start_job 撞在一起时，第二个在这儿排队而不是一起跑。
@@ -1123,6 +1240,8 @@ def start_job(kind: str, info: dict[str, Any] | None = None) -> str:
                 f"上一个更新还在跑（任务 {busy.get('job_id') or '?'}，pid {busy.get('pid')}），"
                 "等它结束再来。"
             )
+        # 上一轮被杀的进程留下的临时文件没人认领，开新任务前先扫一遍。
+        clean_stale_state_tmp()
         state = _default_state()
         state.update(
             {
