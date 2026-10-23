@@ -83,6 +83,22 @@ Node 不在 PATH 时，先把 Node 目录加进去。
 - 权益基线存在 `account.baseline.v1:<network>:<market>`，只有全钱包读会写。
   单交易对读只继承。如果让单交易对读也写，第一次读的那一对会把偏小的金额
   冻成「起始资金」。
+- 回测把四件真实成本算进去了，各有各的开关，**别在没解释的情况下动默认值**：
+  强平（`liquidate`，只在合约且杠杆 > 1 时；多 `entry×(1-1/L+m)`、空 `entry×(1+1/L-m)`，
+  打穿就按触发价成交、开盘已穿过就按开盘价，`cash` 亏光归零，`exit_reason="liquidation"`，
+  强平那根不许再进场）；资金费（`funding` + `run_backtest(funding_rates=)`，结算落在
+  `(上一根, 这一根]` 就按这根收盘价扣 `qty×close×rate`，空头 qty 为负自然收钱；拿不到历史
+  就落一条 `warnings`，不假装算了）；跳空成交（止损止盈在开盘已跳过触发价时按开盘价成交，
+  **没有开关，之前按理论价是错的**）；最小量与步长（`min_amount` / `amount_step`，单位是基础币，
+  小于最小量跳过并记一条 warning）。指标多了 `funding_paid`、`liquidations`，结果里多了 `warnings`。
+  最小量与步长默认从 `contract_spec` 取（`amount_step` 是 t57 读进来的绝对步长，别再自己读
+  `precision.amount`）；币本位两样都是「张」，折成币要价格，于是两样都不折并落一条 `notes`/
+  `warnings`，不许一边折一边不折。资金费率按 `since` 往后翻页（一页 1000 条 ≈333 天，上限 5 页），
+  翻不满时 warning 说明「只覆盖到 X」——静默少掉后半段只会让曲线更乐观。三条路（单次回测、
+  参数优化、AI 复核）共用 `routes._apply_funding`，别各写一份。
+  护栏：`funding=False, liquidate=False` 且不给最小量时，数字必须和加这些成本之前**逐位相同**
+  （`tests/test_backtest_model.py` 钉着改前引擎跑出来的数）。现货不扣资金费、不强平：
+  `_validate_backtest` 按市场收死，和杠杆、做空同一条口径。
 - 回测也按市场类型收死：现货不许借杠杆、不许做空（`leverage=1`、`allow_short=False`），
   合约照常。`_validate_backtest` 原样透传 `leverage` / `allow_short` 的时候，直调接口能给现货
   跑出「做空 10 倍杠杆」的收益曲线，那条曲线在真实市场里根本不存在。
