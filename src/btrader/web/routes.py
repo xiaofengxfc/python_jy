@@ -371,6 +371,13 @@ class BacktestPayload(BaseModel):
     allow_short: bool = True
     stop_loss_pct: float = Field(default=0.0, ge=0, le=1)
     take_profit_pct: float = Field(default=0.0, ge=0, le=1)
+    # 真实成本四件：强平、资金费、最小下单量、步长。前两样按市场收死（现货没有），
+    # 后两样 None = 用交易所规格。
+    maintenance_margin_rate: float = Field(default=0.005, ge=0, le=0.5)
+    liquidate: bool = True
+    funding: bool = True
+    min_amount: float | None = Field(default=None, gt=0)
+    amount_step: float | None = Field(default=None, gt=0)
     save: bool = True
 
 
@@ -697,6 +704,7 @@ def _serialize_result(result, params: dict[str, Any], limit_points: int = 1200) 
         "params": params,
         "equity": points,
         "trades": trades,
+        "warnings": list(getattr(result, "warnings", ()) or ()),
     }
 
 
@@ -2078,6 +2086,7 @@ def _validate_backtest(state, payload: BacktestPayload):
     # 根本不存在的曲线（``BacktestConfig.deploy = position_pct * max(1, leverage)``）。
     # 自动交易那条路径（``AutoController.start``）早就按市场收了，这里漏了同一句话；
     # 前端碰巧传 1，直调接口就绕过去了。
+    min_amount, amount_step, notes = _size_limits(state, market, payload)
     config = BacktestConfig(
         initial_capital=payload.initial_capital,
         fee_rate=payload.fee_rate,
@@ -2088,8 +2097,147 @@ def _validate_backtest(state, payload: BacktestPayload):
         stop_loss_pct=payload.stop_loss_pct,
         take_profit_pct=payload.take_profit_pct,
         timeframe=payload.timeframe,
+        maintenance_margin_rate=payload.maintenance_margin_rate,
+        # 现货没有资金费、也没有强平（L 恒为 1）：和杠杆、做空同一条口径。
+        liquidate=bool(payload.liquidate) and market.is_futures,
+        funding=bool(payload.funding) and market.is_futures,
+        min_amount=min_amount,
+        amount_step=amount_step,
+        notes=notes,
     )
     return market, strategy, params, config
+
+
+def _size_limits(state, market: MarketType, payload: BacktestPayload):
+    """最小下单量与步长，换成引擎的量纲：基础币。返回 ``(min, step, notes)``。
+
+    payload 给了就用 payload，没给就从 ``ContractSpec`` 取（``amount_step`` 是 t57
+    从 ``precision.amount`` 读进来的绝对步长）。现货与本位合约一张就是一个币，
+    乘 ``contract_size`` 即可。
+
+    币本位的两样都是「张」，折成币要价格；而引擎的数量单位是币、回测窗口的价格
+    每根都不一样，校验阶段更是连一根 K 线都还没有。所以那种市场**两样都不折**，
+    宁可这次不按最小量截断，也不一边折一边不折（折出来的数量会差一个价格因子），
+    并把这件事写进 notes 让结果里说清楚。
+    """
+    try:
+        spec = state.ctx.market_rest_for(market).contract_spec(market, payload.symbol)
+    except Exception:
+        log.debug("读取最小下单量失败 %s", payload.symbol, exc_info=True)
+        spec = None
+    min_amount = payload.min_amount
+    amount_step = payload.amount_step
+    if spec is not None and getattr(spec, "inverse", False):
+        notes = []
+        if min_amount is None or amount_step is None:
+            notes.append(
+                "币本位的最小下单量与步长按「张」报，回测没有折算成币（折算要价格），"
+                "这一段没有按最小量截断。"
+            )
+        return min_amount, amount_step, notes
+    size = float(getattr(spec, "contract_size", 1.0) or 1.0) if spec is not None else 1.0
+    if min_amount is None:
+        units = float(getattr(spec, "min_amount", 0.0) or 0.0) * size
+        min_amount = units if units > 0 else None
+    if amount_step is None:
+        step = float(getattr(spec, "amount_step", 0.0) or 0.0) * size
+        amount_step = step if step > 0 else None
+    return min_amount, amount_step, []
+
+
+FUNDING_SETTLEMENT_MS = 8 * 3600 * 1000  # 币安每 8 小时结一次
+FUNDING_PAGE_LIMIT = 1000   # 带 since 一页 1000 条（约 333 天）
+FUNDING_MAX_PAGES = 5       # 翻到这就停：再长就不是回测窗口的问题了
+
+
+def _funding_rates(state, market: MarketType, symbol: str, frame):
+    """结算时刻(ms) -> 费率。返回 ``(rates, note)``。
+
+    一页只够 333 天（交易所带 since 一页 1000 条），所以按 since 往后翻页，直到
+    覆盖整个回测窗口；翻到上限还没到窗口末尾时，note 里说清「费率只覆盖到 X」，
+    因为静默少掉后半段只会让曲线看起来比真实更好。
+
+    ``rates`` 为 None 表示没有数据（接口不存在、抛错、空了）：引擎会记一条 warning。
+    交易所那位的函数名与签名以落盘的为准，所以按属性取、按 dict 读字段，少一个就
+    当作「没有数据」，不 import 一个不存在的名字。
+    """
+    if not market.is_futures:
+        return None, ""
+    # 用交易那一侧的客户端（带 Key），不是画图那一个：`market_rest_for` 是只读的公开
+    # 行情客户端、没有凭据，而 `fetch_funding_rate_history` 见到没 Key 就直接回 []，
+    # 于是测试网这一路永远是「没有资金费数据」，静默按零成本算。实测踩到过。
+    rest = state.ctx.rest_for(market)
+    fetch = getattr(rest, "fetch_funding_rate_history", None)
+    if fetch is None:
+        return None, ""
+    first = int(frame["timestamp"].iloc[0])
+    last = int(frame["timestamp"].iloc[-1])
+    rates: dict[int, float] = {}
+    since = first
+    pages = 0
+    try:
+        while pages < FUNDING_MAX_PAGES:
+            with state.locks[market]:
+                rows = fetch(market, symbol, since, FUNDING_PAGE_LIMIT)
+            pages += 1
+            page = _funding_rows(rows)
+            if not page:
+                break
+            fresh = {stamp: rate for stamp, rate in page.items() if stamp not in rates}
+            if not fresh:
+                break   # 交易所不再往后给了，别死循环
+            rates.update(fresh)
+            newest = max(fresh)
+            if newest >= last:
+                break
+            since = newest + 1
+    except Exception:
+        log.warning("读取资金费率历史失败 %s", symbol, exc_info=True)
+        return None, ""
+    if not rates:
+        return None, ""
+    # 资金费每 8 小时结算一次：数据末尾与最后一条结算之间差不到一个周期就是全covered，
+    # 差得更多才说明真没取到。以前直接拿 max(rates) < last 判，数据结束在 11:00、
+    # 最后结算 08:00 也会报「只覆盖到 08:00」——全是假警报。
+    if max(rates) + FUNDING_SETTLEMENT_MS < last:
+        covered = datetime.fromtimestamp(max(rates) / 1000).strftime("%Y-%m-%d %H:%M")
+        return rates, (
+            f"资金费率只覆盖到 {covered}（翻了 {pages} 页），之后的窗口没有扣资金费。"
+        )
+    return rates, ""
+
+
+def _apply_funding(state, market: MarketType, symbol: str, frame, config) -> dict[int, float] | None:
+    """取这段窗口的资金费率，顺手把「只覆盖到 X」这类说明挂到 config.notes。
+
+    三条路（单次回测、参数优化、AI 复核）都从这里取，别各写一份——以前优化那条
+    就漏过同一类东西。
+    """
+    if not getattr(config, "funding", True):
+        # 用户把资金费关了就别去取：拿了也用不上，还会把「只覆盖到 X」这种说明
+        # 挂到一个根本没算资金费的结果上，看着像少了钱。
+        return None
+    rates, note = _funding_rates(state, market, symbol, frame)
+    if note and note not in config.notes:
+        config.notes.append(note)
+    return rates
+
+
+def _funding_rows(rows) -> dict[int, float]:
+    """交易所返回的行 -> {结算时刻: 费率}。ccxt 的字段名是 fundingRate。"""
+    out: dict[int, float] = {}
+    for row in rows or ():
+        try:
+            stamp = row.get("timestamp") or row.get("time")
+            rate = row.get("rate")
+            if rate is None:
+                rate = row.get("fundingRate")
+            if stamp is None or rate is None:
+                continue
+            out[int(stamp)] = float(rate)
+        except (AttributeError, TypeError, ValueError):
+            continue
+    return out
 
 
 def _key_error_text(exc: KeyError) -> str:
@@ -2128,7 +2276,8 @@ def _start_backtest(state, jobs: JobStore, payload: BacktestPayload) -> dict[str
             jobs.update(job_id, progress=0.55)
             if frame.empty:
                 raise ValueError("没有取到 K 线，请检查交易对与周期")
-            result = run_backtest(frame, strategy, params, config)
+            funding = _apply_funding(state, market, payload.symbol, frame, config)
+            result = run_backtest(frame, strategy, params, config, funding_rates=funding)
             jobs.update(job_id, progress=0.9)
             serialized = _serialize_result(result, params)
             if payload.save:
@@ -2213,6 +2362,7 @@ def _start_optimize(state, jobs: JobStore, payload: OptimizePayload) -> dict[str
                 metric=payload.metric,
                 top_n=payload.top_n,
                 progress=progress,
+                funding_rates=_apply_funding(state, market, payload.symbol, frame, config),
             )
             rows = [
                 {key: _number(value) if not isinstance(value, str) else value
@@ -2271,7 +2421,13 @@ def _start_ai_filter(state, jobs: JobStore, payload: AIFilterPayload) -> dict[st
             )
             if frame.empty:
                 raise ValueError("没有取到 K 线，请检查交易对与周期")
-            result = run_backtest(frame, strategy, params, config)
+            result = run_backtest(
+                frame,
+                strategy,
+                params,
+                config,
+                funding_rates=_apply_funding(state, market, payload.symbol, frame, config),
+            )
             original = {key: _number(value) for key, value in result.metrics.items()}
             jobs.update(job_id, progress=0.35)
 
