@@ -332,6 +332,15 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   百分数）、`leverage`（≥ 1）、`poll_seconds`（≥ 1）。默认 1 / 1 / 10，刻意等于组件里原来
   写死的那三个字面值。它们不是风控：真上限在 `risk` 与 `AITrader` 的闸里，改这三项动不了
   任何一条闸。
+- `trade` 是下单框按市场记住的杠杆：`{"leverage": {"usdm": 10, "coinm": 5}}`，只存合约
+  市场（现货恒 1、不入库，PUT 里写 `"spot"` 直接 400），默认各市场 1。值是 1–125 的
+  **整数**（交易所只认整数，1.5 会被币安回 -1102），PUT 按市场合并——只发一个市场时
+  另一个不动；校验走和其他数字字段同一套守卫（`_check_number_input`），0 / 126 / 1.5 /
+  `"nan"` 各自 400 并点名 `trade.leverage.<市场>`。手改 config.json 写坏的那一项在读盘时
+  退回 1（`clean_trade_leverage`），整份配置照样打得开。**真上限仍是 `risk.max_leverage`**：
+  下单与预览取 `min(请求值, risk.max_leverage)`，请求体没带 leverage 就用这里记的值
+  （`routes.resolve_order_leverage`），被收口时响应里的 `leverage_note` 说清楚是哪一条上限，
+  不许静默改数；现货即使传 10 也按 1 下，`POST /api/settings/reset` 认 `trade` 段。
 - `favorites` / `recent_symbols`：去重、保序、上限 100（`SYMBOL_LIST_LIMIT`）。PUT 超过上限
   返回 400 并说清给了几个——静默截断会让第 101 个收藏点了没反应；只有手改 `config.json`
   写多了才在读盘时静默截断（整份配置得能打开）。写法按「币/计价」或「币/计价:结算币」判
@@ -380,3 +389,42 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   一层是 root 脚本自己的保险。IP 直接拒——ACME 不给 IP 发证书，文案里要说清楚。
 - 证书由 Caddy 自己走 ACME（HTTP-01）并自动续期；程序不碰证书文件，只读到期时间。
 
+
+## 11. 在线更新（手动点，不自动更）
+
+- 逻辑在 `core/updater.py`，四个接口在 `web/routes_update.py`：`GET /api/update/info`
+  （本地与 GitHub 的差距）、`POST /api/update/apply`（一键更新，返回 `job_id`，后台线程跑）、
+  `GET /api/update/status`（进度，重启之后照样读得到）、`POST /api/update/rollback`
+  （body `{"confirm": true}`，回到更新前那个提交）。界面上「立即更新」只在落后时能点。
+- 仓库里一个 tag 都没有，版本一律按提交 SHA 比，不写版本号比较。远端优先问 GitHub API
+  （公开仓库免 token，还能拿到提交标题），失败回落 `git ls-remote`（只读到 SHA，`commits`
+  给空数组，`source` 里写明没有标题）。两条都失败时 `remote_sha` 是 null、`error` 是
+  原始原因——**这时界面一个字都不许说「已是最新」**。只有「读不到远端」和「数不出差距」才写
+  `error`：降级（GitHub 挂了改用 ls-remote、fetch 没成功）不算错，写进去只会把更新按钮
+  白白变灰。
+- `apply` 的前置检查，任一不过直接返回、**不建任务、不写状态文件**：自动交易（含执行台部署）
+  或 AI 交易（含 AI 量化）在跑 → 409；工作树有没提交的改动（`git status --porcelain` 非空）
+  → 400；`behind_by == 0` → 400；本地和远端各有新提交（分叉）→ 400 并说清要手动处理。
+  探针表是 `routes.RUNNING_ENGINE_PROBES`，由 `build_router` 填一次——控制器建在那儿，
+  路由之间没有共享对象，别在 routes_update 里另建一套判断。
+- 流水线：`git fetch --all --prune` → 记 `from_sha` → `git merge --ff-only <remote>/<branch>`
+  → `pip install -r requirements.txt`（用 `sys.executable`）→ 只有本机有 npm 且 `web/`
+  这次真的有改动才 `npm run build`（服务器没 npm，跳过并在该步 output 写明「服务器不需要
+  构建，产物跟着仓库走」）→ 重启。每步记 `name/ok/output/seconds`，任一步失败立刻停、
+  `state=failed`、`error` 是那一步的**原始输出**，不替用户编原因。
+- 重启：Linux `subprocess.run(["sudo", "-n", "systemctl", "restart", "bitrader"])`（列表参数、
+  不开 shell，仓库里装着这一条 NOPASSWD）；Windows 起一个分离的垫片，等 8765 端口释放后再拉起
+  `.venv\Scripts\python.exe run_web.py`，然后走 uvicorn 的 `should_exit` 优雅退出
+  （`web/__main__.py` 把 Server 的开关交给 `updater.set_shutdown_hook`）。
+  **不许 `os._exit`**，Windows 上也不许 `os.kill(os.getpid(), SIGTERM)`——那在 Windows 上是
+  TerminateProcess，硬切会把状态文件写坏。
+- 状态落盘在 `<数据目录>/update-state.json`（临时文件 + `os.replace`，原子写）。重启前先把
+  `state=running` + `restart_pending` 落到盘上；新进程读到「重启中且 pid 换了」就把状态收成
+  `done` 并补上「重启服务」这一步，否则前端刷新后看到一个永远转圈的 running。
+- 回滚不改写历史：`git revert --no-edit <from_sha>..HEAD` 把内容退回更新前那个提交，
+  只允许在 `state == done` 且有 `from_sha` 时调用，同样走流水线 + 状态 + 重启。
+  **绝对不用** `git reset --hard` / `git clean` / 任何 `--force` / `shell=True`，
+  也不把用户输入拼进命令行（域名之类的参数一律列表传递）。
+- 测试在 `tests/test_update.py`，全部离线：git、GitHub、重启全是替身，
+  「两条远端都失败不报已是最新」「五种前置拒绝」「失败停在那一格且 error 是原文」
+  「重启后状态文件还能读成 done」「Windows 与 Linux 两条重启分支」都钉着。
