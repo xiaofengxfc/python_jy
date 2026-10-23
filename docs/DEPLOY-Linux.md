@@ -21,7 +21,7 @@
 | 端口 | 80 和 443 要能过（Caddy 申请证书用）。后端 8765 **不要**对公网开 |
 | 时间 | 时钟必须准。币安签名容忍度很小，差 1 秒就回 `-1021` |
 
-DNS：在域名服务商那里加一条 A 记录，指向服务器公网 IP。**先配 DNS 再跑脚本**，否则 Caddy 签证书会失败（见第 7 节排错）。
+DNS：在域名服务商那里加一条 A 记录，指向服务器公网 IP。**先配 DNS 再跑脚本**，否则 Caddy 签证书会失败（见第 8 节排错）。
 
 用 IP 直接打开时只有 `http://IP` 那一段：它会 301 到域名。不做 `https://IP`——ACME 不给 IP 签证书，
 那个站点块永远拿不到证书，写了也不会生效。要 HTTPS 就用域名访问。
@@ -149,7 +149,7 @@ sudo -u bitrader test -r /var/lib/bitrader/secrets.bin && echo 可读
 ## 5. 日常运维
 
 ```bash
-# 更新代码（--repo 装的）
+# 更新代码（--repo 装的）。更省事的做法是设置页那张「软件更新」卡，见第 7 节
 sudo bash deploy/install.sh --repo https://github.com/you/biTrader.git --domain trade.example.com
 
 # 手动重启（改过 Python 代码之后必须重启，没有热重载）
@@ -198,10 +198,11 @@ sudo systemctl start bitrader
 # install.sh 装的东西（root:root 755，bitrader 改不了它）
 sudo ls -l /usr/local/lib/bitrader/set-domain.sh
 
-# sudoers 只授这一条
+# sudoers 里和签发证书有关的就是这一条（另一条是「重启服务」，见 7.2）
 sudo cat /etc/sudoers.d/bitrader
-# 由 deploy/install.sh 写入：只授一条命令，给程序里的「签发证书」按钮用
-# 域名写法与写坏回滚由 /usr/local/lib/bitrader/set-domain.sh 自己把关
+# 由 deploy/install.sh 写入：只授下面这几条，都是程序里的按钮在用，别的命令一条都不给
+# 1) 签发证书：写 /etc/caddy/Caddyfile 再 reload caddy
+#    域名写法与写坏回滚由 /usr/local/lib/bitrader/set-domain.sh 自己把关（sudoers 没法只允许一个合法参数）
 bitrader ALL=(root) NOPASSWD: /usr/local/lib/bitrader/set-domain.sh
 ```
 
@@ -235,9 +236,76 @@ curl -fsS https://api.ipify.org; echo
 
 ---
 
-## 7. 排错
+## 7. 更新与回滚
 
-### 7.1 域名没生效 / 证书拿不到
+升级不用重新部署，也不用登服务器敲 git：设置页那张「软件更新」卡就是这件事。它是**手动**的——
+只有你点「检查更新」「更新到最新」它才动，程序自己不会检查、也不会自己装。
+
+- **检查**：`GET /api/update/info` 比本地 HEAD 与远端分支（默认 `xf/main`）的提交 SHA，
+  列出落后的条数与每条标题。远端读不到时 `remote_sha` 是 `null` 加一句为什么，不会显示「已是最新」。
+- **一键更新**：`POST /api/update/apply`，后台线程按顺序做四件事，每步的输出都显示在那张卡上：
+  1. `git fetch --all --prune`，记下更新前的 SHA；
+  2. `git merge --ff-only <远端>/<分支>`——只做快进，不用 `reset --hard`，也不 `--force`；
+  3. 用服务自己的 venv 跑 `pip install -r requirements.txt`；
+  4. 重启服务：Linux 上是 `systemctl restart bitrader`，Windows 上拉起新进程后旧进程退出。
+- **前置检查**：自动交易 / AI 量化 / 执行台在跑 → 直接拒（409），不替你停引擎；工作树有未提交改动 →
+  400；已经是最新 → 400；本地有提交又落后（分叉）→ 400 让你手动处理。
+- **服务器上不跑 `npm run build`**：部署的是仓库里已经构建好的 `src/btrader/web/static/`，前端产物
+  跟着 git 一起来。只有本机（Windows）更新时，如果装了 Node 且 `web/` 真有改动，才顺带 build 一次；
+  服务器上没装 Node，跳过并在步骤里写明原因。
+- **失败就停在那一步**（`state=failed`），屏幕上贴的是那条命令的**原始输出**（git / pip 自己说的话），
+  不替你编原因。
+
+日志看两处：
+
+```bash
+# 1) 设置页那张「软件更新」卡的步骤输出：每步一条，带耗时和原始输出
+# 2) 服务自己的日志
+sudo journalctl -u bitrader -n 80 --no-pager
+```
+
+### 7.1 回滚
+
+- 卡片上的「回滚」：`POST /api/update/rollback {confirm: true}`，回到这次更新**之前**的那个 SHA，
+  依赖与重启照旧走一遍，步骤输出一样能看到。
+- 服务器上手动的等价做法：
+
+```bash
+cd /opt/bitrader
+sudo -u bitrader git status                 # 工作树必须是干净的，否则先处理掉
+sudo -u bitrader git reset --hard <更新前的 SHA>
+sudo -u bitrader .venv/bin/pip install -r requirements.txt
+sudo systemctl restart bitrader
+```
+
+回滚丢掉的是更新带上来的那些提交；数据目录 `/var/lib/bitrader`（SQLite、配置、策略、密钥）一个字节都不动。
+
+### 7.2 sudoers 允许了哪一条
+
+更新要重启服务、重启要 root，而服务以 `bitrader` 用户跑。所以 `install.sh` 在
+`/etc/sudoers.d/bitrader` 里**只多授一条**（`start` / `stop` / 别的单元一条都没有）：
+
+```bash
+sudo cat /etc/sudoers.d/bitrader
+# 由 deploy/install.sh 写入：只授下面这几条，都是程序里的按钮在用，别的命令一条都不给
+# 1) 签发证书：写 /etc/caddy/Caddyfile 再 reload caddy
+#    域名写法与写坏回滚由 /usr/local/lib/bitrader/set-domain.sh 自己把关（sudoers 没法只允许一个合法参数）
+bitrader ALL=(root) NOPASSWD: /usr/local/lib/bitrader/set-domain.sh
+# 2) 一键更新：代码拉完、依赖装完后重启本服务。
+#    只允许 restart 这一个子命令、只对 bitrader 这一个单元：start / stop / 其它单元都不给。
+bitrader ALL=(root) NOPASSWD: /usr/bin/systemctl restart bitrader
+```
+
+`systemctl` 的路径是装的时候探测出来的（Debian / Ubuntu 一般是 `/usr/bin/systemctl`）；探测不到就不写
+这一条并打印一句提示，那种机器上更新完自己敲一次 `systemctl restart bitrader`。
+
+这条 sudo 跟「代码换了要重新起进程」有关：`Restart=always` 管的是进程自己崩了，它不会加载新代码。
+t81 之前的安装没有这一条，重跑一次 `sudo bash deploy/install.sh --domain <你的域名>` 就补上（重复跑是幂等的）。
+
+---
+## 8. 排错
+
+### 8.1 域名没生效 / 证书拿不到
 
 表现：`https://域名` 打不开，`journalctl -u caddy` 里有 `no such host` 或 `HTTP 403` 之类的 ACME 报错。
 
@@ -250,7 +318,7 @@ sudo journalctl -u caddy -n 80 --no-pager | grep -i -E "acme|certificate|tls"
 - 有 CDN / 代理（Cloudflare 橙云）→ 先关掉或确认它没拦 `/.well-known/acme-challenge/`。
 - 证书申请失败次数太多会被限流，等一会儿再 `sudo systemctl restart caddy`。
 
-### 7.2 80 / 443 被墙
+### 8.2 80 / 443 被墙
 
 表现：`curl http://服务器IP` 超时，或者 Caddy 日志里 ACME 一直卡在 `tls-alpn` / `http-01`。
 
@@ -262,7 +330,7 @@ sudo ss -lntp | grep -E ":80|:443"        # 应该是 caddy 在听
 
 云主机还要在控制台的**安全组**里放行同样两个端口——本机 ufw 开了、安全组没开，外部一样进不来。
 
-### 7.3 界面能开，但图表不拉数据 / 保存 Key 出错
+### 8.3 界面能开，但图表不拉数据 / 保存 Key 出错
 
 ```bash
 # 后端是否真的活着
@@ -279,7 +347,7 @@ curl -s "http://127.0.0.1:8765/api/credentials" | python3 -m json.tool | head -2
 | 显示「不可用」 | 既没有密钥环，也没装 `cryptography` | `sudo /opt/bitrader/.venv/bin/pip install cryptography` 然后重启服务 |
 | 保存 Key 报 500 | 数据目录写不进去 | `sudo chown -R bitrader:bitrader /var/lib/bitrader` |
 
-### 7.4 时钟 / 时区
+### 8.4 时钟 / 时区
 
 表现：所有签名请求报 `-1021 Timestamp for this request is outside of the recvWindow`，界面上往往只是一句「无法读取当前持仓」。
 
@@ -296,7 +364,7 @@ sudo apt-get install -y chrony && sudo systemctl enable --now chrony
 chronyc tracking                           # System time 偏差应该在毫秒级
 ```
 
-### 7.5 服务起不来
+### 8.5 服务起不来
 
 ```bash
 sudo systemctl status bitrader --no-pager
@@ -310,7 +378,7 @@ sudo -u bitrader env BITRADER_DATA_DIR=/var/lib/bitrader \
 
 ---
 
-## 8. 其它发行版
+## 9. 其它发行版
 
 脚本只支持 Debian/Ubuntu（apt）。换 Fedora / Arch 的话，等价步骤是：
 
@@ -322,7 +390,7 @@ sudo -u bitrader env BITRADER_DATA_DIR=/var/lib/bitrader \
 
 ---
 
-## 9. Windows 上没有的东西
+## 10. Windows 上没有的东西
 
 原来桌面上依赖的两样在 Linux 上走的是另一条路（都在代码里分好了）：
 

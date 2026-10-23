@@ -7,6 +7,13 @@ Wants=network-online.target
 # 崩了要能自动起来，但不能无限重启打满 journal：StartLimit 管住这一条
 StartLimitIntervalSec=300
 StartLimitBurst=5
+# Restart=always 管的是「进程自己崩了」，管不了「代码换了要重新起」：更新是先 git 拉新代码，
+# 再让 root 做一次 systemctl restart bitrader —— 旧进程收 SIGTERM 正常退出（下面 TimeoutStopSec），
+# systemd 按 ExecStart 把新代码拉起来。这条 restart 只有 root 能做，而服务以 bitrader 跑，
+# 于是 deploy/install.sh 在 sudoers 里单授了一条（就这一条，别的命令都没有）：
+#   bitrader ALL=(root) NOPASSWD: /usr/bin/systemctl restart bitrader
+# 只允许 restart 这一个子命令、只对 bitrader 这一个单元。别放宽成 systemctl 通配：
+# 那等于把整台机器的服务管理权交给程序用户。
 
 [Service]
 Type=simple

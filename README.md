@@ -364,6 +364,13 @@ sudo bash deploy/install.sh --domain trade.example.com        # 真装
 换服务器或重装系统后 `secrets.bin` 解不开是正常现象：凭据显示「未配置」，重新填一次即可。
 
 时钟：币安签名对时间敏感，`timedatectl` 里 `System clock synchronized: yes` 才算合格，差一秒就会满屏 `-1021`。
+
+升级不用重新部署：设置页最下面那张「软件更新」卡做在线更新，能检查有没有新提交，点一下「更新到最新」就依次
+`git fetch` → `--ff-only` 合并 → `pip install` → 重启服务（服务器上不跑 npm，前端产物跟着仓库一起来）。
+这一步是手动点的，程序不会自己更新；失败停在那一步并贴命令的原始输出，也能一键回滚到更新前的提交。
+细节、回滚步骤和 sudoers 里多授的那条 `systemctl restart bitrader` 见
+[docs/DEPLOY-Linux.md](docs/DEPLOY-Linux.md) 第 7 节。
+
 ## 项目结构
 
 ```

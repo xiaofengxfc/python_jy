@@ -51,7 +51,7 @@ usage() {
   --repo <git 地址> 服务器上没有代码时从仓库拉取（默认用当前目录这份代码）
   --port <端口>     后端监听端口，默认 8765（只监听回环，对外由 Caddy 反代）
   --no-caddy        不装 Caddy、不写 Caddyfile（你自己有 nginx 时用）
-                    同时也跳过域名切换脚本与 sudoers（没有 Caddy 就没有这一路）
+                    同时也跳过域名切换脚本那一条 sudo；「重启服务」那条照写
   --dry-run         只打印将执行的命令与写入的内容，不做任何修改
   -h, --help        这份帮助
 
@@ -277,31 +277,70 @@ install_service() {
 }
 
 # ------------------------------------------- 9. 域名切换脚本与 sudoers
-# 程序里「填域名 → 自动签证书」这一路要写 /etc/caddy/Caddyfile 并 reload caddy，
-# 那是 root 才能做的事；服务本身以 bitrader 用户跑。所以：
-#   * 脚本以 root:root 装到 /usr/local/lib/bitrader/（bitrader 改不了它）
-#   * sudoers 只授这一个脚本的 NOPASSWD，别的命令一条都不给
-#   * 脚本自己校验域名、写坏就还原（见 deploy/set-domain.sh 的注释）
-# sudoers 没法表达「只允许一个合法域名参数」，所以那一步的保险在脚本里。
+# 程序里有两处按钮要做 root 才能做的事，服务本身以 bitrader 用户跑，于是 sudoers 只授两条：
+#   * 「填域名 → 签发证书」要写 /etc/caddy/Caddyfile 并 reload caddy：
+#     脚本以 root:root 装到 /usr/local/lib/bitrader/（bitrader 改不了它），sudoers 授这一个脚本；
+#     脚本自己校验域名、写坏就还原（见 deploy/set-domain.sh 的注释）。
+#     sudoers 没法表达「只允许一个合法域名参数」，所以那一步的保险在脚本里。
+#   * 「一键更新」拉完代码要重启服务：只授 `<systemctl 绝对路径> restart bitrader` 这一条，
+#     start / stop / 别的单元一条都不给。没有它，更新完代码服务还是旧进程。
 install_domain_helper() {
   CURRENT_STEP="9/11 域名切换脚本与 sudoers"
   say "$CURRENT_STEP"
+  # systemctl 的路径先探测：sudoers 里必须是绝对路径，写错一个字的后果是整份 sudo 不可用。
+  # 探测不到（比如在 Windows 上推演）就不写这一条，只提示，不猜路径。
+  local systemctl_bin=""
+  local candidate
+  for candidate in "$(command -v systemctl 2>/dev/null || true)" /usr/bin/systemctl /bin/systemctl; do
+    if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+      systemctl_bin="$candidate"
+      break
+    fi
+  done
+  if [ -z "$systemctl_bin" ]; then
+    if [ -n "$DRY_RUN" ]; then
+      systemctl_bin="/usr/bin/systemctl"
+      note "探测不到 systemctl（这台机器不是 Linux）：按 Debian/Ubuntu 的 /usr/bin/systemctl 推演"
+    else
+      note "探测不到 systemctl：跳过「一键更新 → 重启服务」那条 sudo 权限"
+      note "  后果：更新完代码后服务不会自己重启，命令行补一句 systemctl restart $SERVICE"
+    fi
+  fi
+  local -a sudo_lines
+  sudo_lines=(
+    "# 由 deploy/install.sh 写入：只授下面这几条，都是程序里的按钮在用，别的命令一条都不给"
+  )
+  local granted=""
   if [ "$WITH_CADDY" = "0" ]; then
-    note "按 --no-caddy 跳过：没有 Caddy 就没有域名切换，也不写 sudoers"
+    note "按 --no-caddy 跳过签发证书那一路：不装 $HELPER，sudoers 里也不写它"
+  else
+    if [ ! -f "$SRC_DIR/deploy/set-domain.sh" ]; then
+      die "找不到 deploy/set-domain.sh，代码没放全？"
+    fi
+    run install -d -m 755 -o root -g root "$HELPER_DIR"
+    run install -m 755 -o root -g root "$SRC_DIR/deploy/set-domain.sh" "$HELPER"
+    note "已安装 $HELPER（root:root 755）"
+    sudo_lines+=(
+      "# 1) 签发证书：写 /etc/caddy/Caddyfile 再 reload caddy"
+      "#    域名写法与写坏回滚由 $HELPER 自己把关（sudoers 没法只允许一个合法参数）"
+      "$APP_USER ALL=(root) NOPASSWD: $HELPER"
+    )
+    granted="$HELPER"
+  fi
+  if [ -n "$systemctl_bin" ]; then
+    sudo_lines+=(
+      "# 2) 一键更新：代码拉完、依赖装完后重启本服务。"
+      "#    只允许 restart 这一个子命令、只对 $SERVICE 这一个单元：start / stop / 其它单元都不给。"
+      "$APP_USER ALL=(root) NOPASSWD: $systemctl_bin restart $SERVICE"
+    )
+    granted="${granted:+$granted 与 }$systemctl_bin restart $SERVICE"
+  fi
+  if [ "${#sudo_lines[@]}" -le 1 ]; then
+    note "没有要写的 sudo 权限（没有 Caddy，也探测不到 systemctl），跳过 $SUDOERS_FILE"
     return 0
   fi
-  if [ ! -f "$SRC_DIR/deploy/set-domain.sh" ]; then
-    die "找不到 deploy/set-domain.sh，代码没放全？"
-  fi
-  run install -d -m 755 -o root -g root "$HELPER_DIR"
-  run install -m 755 -o root -g root "$SRC_DIR/deploy/set-domain.sh" "$HELPER"
-  note "已安装 $HELPER（root:root 755）"
-  printf '%s\n' \
-    "# 由 deploy/install.sh 写入：只授一条命令，给程序里的「签发证书」按钮用" \
-    "# 域名写法与写坏回滚由 $HELPER 自己把关（sudoers 没法只允许一个合法参数）" \
-    "$APP_USER ALL=(root) NOPASSWD: $HELPER" \
-    | write_file "$SUDOERS_FILE" 440 root
-  note "已写 sudoers：$SUDOERS_FILE（只授 $HELPER）"
+  printf '%s\n' "${sudo_lines[@]}" | write_file "$SUDOERS_FILE" 440 root
+  note "已写 sudoers：$SUDOERS_FILE（只授 $granted）"
   # 语法错会把 sudo 整体锁死（或者更糟：多授了东西），装完当场验一次
   if [ -n "$DRY_RUN" ]; then
     note "正式跑会执行 visudo -c -f $SUDOERS_FILE 校验语法"
