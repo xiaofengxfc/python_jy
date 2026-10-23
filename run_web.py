@@ -22,20 +22,24 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser(description="biTrader local web UI")
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     args = parser.parse_args()
 
-    import uvicorn
-
     from btrader.web.app import create_app
+    from btrader.web.__main__ import build_server, serve
 
-    # Pass the app object rather than an import string: uvicorn's reloader
-    # spawns a fresh interpreter that would not inherit the sys.path fix above.
-    uvicorn.run(create_app(), host=args.host, port=args.port, log_level="info")
+    # 装配走 web/__main__.build_server，和 `python -m btrader.web` 共用同一份：
+    # 在线更新最后一步要重启，updater 拿到的 should_exit 就是这里这个 Server 的。
+    # 自己再拼一套 uvicorn.Config/Server，那个机制在真实进程里就等于不存在。
+    #
+    # 仍然传 app 对象而不是导出字符串：uvicorn 的 reloader 会另起一个解释器，
+    # 拿不到上面那段 sys.path 修正。
+    server = build_server(create_app(), host=args.host, port=args.port, access_log=True)
+    return serve(server)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

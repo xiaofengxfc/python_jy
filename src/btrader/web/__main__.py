@@ -121,6 +121,61 @@ def _watch_stdin(server) -> None:
     server.should_exit = True
 
 
+def build_server(
+    app,
+    *,
+    host: str,
+    port: int,
+    log_config: dict | None = None,
+    access_log: bool = False,
+):
+    """装配 uvicorn 的 Config + Server，并把退出开关交给 updater。
+
+    两条启动路径（``python -m btrader.web`` 和仓库根的 ``run_web.py``）都走这里。
+    在线更新最后一步要重启，靠的就是 ``updater.set_shutdown_hook`` 拿到的
+    ``should_exit``；各写一份装配代码的话，换条路径跑就等于悄悄失去优雅退出。
+    端口也在这里交给 updater（``set_web_port``）：更新完的垫子要等的是这个端口，
+    不是写死的 8765。
+    """
+    import uvicorn
+
+    config = uvicorn.Config(
+        app,
+        host=host,
+        port=port,
+        log_config=LOG_CONFIG if log_config is None else log_config,
+        log_level="info",
+        access_log=access_log,
+        lifespan="on",
+    )
+    server = uvicorn.Server(config)
+
+    from ..core import updater as _updater
+
+    _updater.set_shutdown_hook(lambda: setattr(server, "should_exit", True))
+    # 重启要跟着真实端口走：垫片盯的就是这个端口。写死 8765 的话，任何不在 8765 上
+    # 跑的实例（自带端口、--port 0 临时端口、量测用的 8799）更新完重启都必然失败。
+    _updater.set_web_port(port)
+    return server
+
+
+def serve(server, *, sockets=None) -> int:
+    """跑起来，Ctrl+C 不算失败。
+
+    uvicorn 自己会接 SIGINT / SIGTERM 把它变成 ``should_exit``；这里再兜一层
+    ``KeyboardInterrupt``，是为了在信号处理器装不上（非主线程、某些终端）时
+    也不至于在用户眼前抛一段 traceback。返回 0 表示「按正常方式停了」。
+    """
+    try:
+        if sockets:
+            server.run(sockets=list(sockets))
+        else:
+            server.run()
+    except KeyboardInterrupt:  # pragma: no cover - 交互式才走到
+        pass
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="biTrader local backend")
     parser.add_argument("--host", default="127.0.0.1")
@@ -151,26 +206,11 @@ def main(argv: list[str] | None = None) -> int:
 
     port = sock.getsockname()[1]
 
-    import uvicorn
-
     from .app import create_app
 
-    config = uvicorn.Config(
-        create_app(),
-        host=args.host,
-        port=port,
-        log_config=LOG_CONFIG,
-        log_level="info",
-        access_log=False,
-        lifespan="on",
-    )
-    server = uvicorn.Server(config)
-
-    # 在线更新的最后一步要重启：让 updater 拿到这个 Server 的退出开关，
-    # 走 uvicorn 自己的优雅退出，而不是硬切。
-    from ..core import updater as _updater
-
-    _updater.set_shutdown_hook(lambda: setattr(server, "should_exit", True))
+    # 配置与 Server 的装配在 build_server 里，和 run_web.py 共用同一份：
+    # 在线更新要重启时，updater 拿到的就是这里的 should_exit。
+    server = build_server(create_app(), host=args.host, port=port)
 
     if args.parent_pid:
         threading.Thread(
@@ -215,15 +255,12 @@ def main(argv: list[str] | None = None) -> int:
     threading.Thread(target=_announce, name="ready-announce", daemon=True).start()
 
     try:
-        server.run(sockets=[sock])
-    except KeyboardInterrupt:  # pragma: no cover - interactive only
-        pass
+        return serve(server, sockets=[sock])
     finally:
         try:
             sock.close()
         except Exception:
             pass
-    return 0
 
 
 if __name__ == "__main__":
