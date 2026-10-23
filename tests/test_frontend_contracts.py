@@ -1117,3 +1117,71 @@ def test_the_run_config_saves_itself_and_can_go_back_to_defaults() -> None:
     assert "恢复默认" in window
     types = (UI_DIR / "types.ts").read_text(encoding="utf-8")
     assert "export interface ExecSettings" in types and "exec?: ExecSettings;" in types
+
+
+def _deploy_card_source() -> str:
+    """设置页「域名与 HTTPS」那一整块：状态、三个请求、整张卡的 JSX。
+
+    只切 JSX 会漏掉写在卡片上面的请求与二次确认；整段切到文件尾又会把别处的
+    注释（那里写着「可能存着」这类普通叙述）算进来，所以两块各取一段拼起来。
+    """
+    page = (UI_DIR / "pages" / "SettingsPage.tsx").read_text(encoding="utf-8")
+    start = page.index("const [deploy, setDeploy] = useState<DeployInfo | null>(null);")
+    stop = page.index("const loadSettings = useCallback(", start)
+    title = '<span className="card-title">域名与 HTTPS</span>'
+    assert title in page, "状态有了，卡片呢"
+    return page[start:stop] + page[page.index(title) :]
+
+
+def test_the_deploy_card_calls_the_three_endpoints() -> None:
+    """三个接口都用上：读状态、检查解析、签证书。"""
+    card = _deploy_card_source()
+    for path in ("/api/deploy/info", "/api/deploy/check", "/api/deploy/tls"):
+        assert path in card, f"{path} 没被调用"
+    assert 'method: "POST"' in card, "检查与签发都得是 POST"
+
+
+def test_the_deploy_card_greys_out_instead_of_hiding_the_buttons() -> None:
+    """501（Windows/macOS）时整卡置灰：按钮还在但点不动，后端那句说明原样显示。
+
+    不能画一个能点的按钮让人点完才看到 501——那等于让人白点两次。
+    """
+    card = _deploy_card_source()
+    assert "deployUnavailable" in card, "没有「这台机器用不了」的开关"
+    assert "disabled={deployUnavailable" in card, "501 时按钮还点得动"
+    assert "{deployError}" in card, "后端那句说明没有原样显示"
+    for word in ("可能", "也许", "大概是", "估计是"):
+        assert word not in card, f"卡片里自己编了解释：{word}"
+
+
+def test_the_deploy_card_shows_the_log_tail_verbatim() -> None:
+    """失败时把 Caddy 日志与脚本输出原样贴出来：pre 里整段，不截断、不转述。"""
+    card = _deploy_card_source()
+    assert "{deployTls.log_tail}" in card, "log_tail 没原样渲染"
+    assert "{deployTls.script_output}" in card, "script_output 没原样渲染"
+    assert "<pre" in card, "日志要放在 pre 里"
+    assert 'className="deploy-log"' in card, "日志块没有 deploy-log 这个类"
+    assert "log_tail.slice(" not in card and "script_output.slice(" not in card, "截断了日志"
+    css = (UI_DIR / "styles.css").read_text(encoding="utf-8")
+    assert ".deploy-log {" in css and "overflow: auto" in css, "日志块不能滚动"
+
+
+def test_the_certificate_confirmation_mentions_the_interruption() -> None:
+    """签发前的二次确认要说清：改 Caddyfile、reload caddy、会短暂中断。"""
+    card = _deploy_card_source()
+    assert "window.confirm(" in card, "签发之前没有二次确认"
+    confirm = card[card.index("window.confirm("):]
+    confirm = confirm[: confirm.index(");") + 2]
+    assert "reload" in confirm, "没说要 reload caddy"
+    assert "中断" in confirm, "没说会短暂中断"
+    assert "Caddyfile" in confirm, "没说改的是 Caddyfile"
+
+
+def test_the_deploy_card_explains_where_the_public_ip_came_from() -> None:
+    """公网 IP 要连来源一起显示，并说清 A 记录指到它；拿不到就显示后端给的原因。"""
+    card = _deploy_card_source()
+    assert "public_ip_source" in card
+    assert "public_ip_error" in card
+    assert "A 记录" in card, "没说要指到这个地址"
+    assert "cert_expires" in card, "没显示证书到期时间"
+    assert "placeholder=" in card, "没有域名输入框"

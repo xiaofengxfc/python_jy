@@ -8,6 +8,9 @@ import type {
   AppSettings,
   CredentialItem,
   CredentialStorage,
+  DeployCheck,
+  DeployInfo,
+  DeployResult,
   NotifyStatus,
   PlatformOption,
   RiskState,
@@ -80,6 +83,92 @@ export default function SettingsPage({ settings, settingsError = "", onSaved }: 
   const [aiKey, setAiKey] = useState("");
   const [aiBusy, setAiBusy] = useState<"key" | "test" | "">("");
   const [aiNote, setAiNote] = useState<{ tone: "ok" | "err"; text: string } | null>(null);
+
+  /** 域名与 HTTPS：只在 Linux 服务器上有（Caddy + systemd + ACME）。非 Linux 后端一律 501，
+   *  那句话本身就是完整说明，原样显示；这张卡跟着置灰，别画一个点了才报错的按钮。 */
+  const [deploy, setDeploy] = useState<DeployInfo | null>(null);
+  const [deployUnavailable, setDeployUnavailable] = useState(false);
+  const [deployError, setDeployError] = useState("");
+  const [deployDomain, setDeployDomain] = useState("");
+  const [deployCheck, setDeployCheck] = useState<DeployCheck | null>(null);
+  const [deployTls, setDeployTls] = useState<DeployResult | null>(null);
+  const [deployBusy, setDeployBusy] = useState<"load" | "check" | "tls" | "">("");
+
+  const loadDeploy = useCallback(async () => {
+    setDeployBusy("load");
+    try {
+      const info = await api<DeployInfo>("/api/deploy/info");
+      setDeploy(info);
+      setDeployUnavailable(false);
+      setDeployError("");
+      setDeployDomain((current) => current || info.domain || "");
+    } catch (caught) {
+      setDeploy(null);
+      setDeployUnavailable(true);
+      setDeployError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setDeployBusy("");
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadDeploy();
+  }, [loadDeploy]);
+
+  const checkDeployDomain = async () => {
+    const domain = deployDomain.trim();
+    if (!domain) {
+      setDeployError("先填一个域名，比如 trade.example.com。");
+      return;
+    }
+    setDeployBusy("check");
+    setDeployTls(null);
+    try {
+      setDeployCheck(
+        await api<DeployCheck>("/api/deploy/check", {
+          method: "POST",
+          body: JSON.stringify({ domain }),
+        }),
+      );
+      setDeployError("");
+    } catch (caught) {
+      setDeployCheck(null);
+      setDeployError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setDeployBusy("");
+    }
+  };
+
+  const issueCertificate = async () => {
+    const domain = deployDomain.trim();
+    if (!domain) {
+      setDeployError("先填一个域名，比如 trade.example.com。");
+      return;
+    }
+    const ok = window.confirm(
+      `即将把 Caddyfile 的站点改成 ${domain}，然后 reload caddy。\n\n` +
+        "reload 期间会有短暂中断：正在访问的页面会掉一下，几秒后自己好。证书由 Caddy 自己走 ACME 申请并自动续期。确认继续？",
+    );
+    if (!ok) return;
+    setDeployBusy("tls");
+    setDeployTls(null);
+    // 上一次「检查」的结论和这次签发并排显示会自相矛盾（解析不一致 vs 签成功），先清掉。
+    setDeployCheck(null);
+    setDeployError("");
+    try {
+      const result = await api<DeployResult>("/api/deploy/tls", {
+        method: "POST",
+        body: JSON.stringify({ domain }),
+      });
+      setDeployTls(result);
+      // 成功后当前域名、证书到期时间都变了，重读一遍状态。
+      if (result.ok) await loadDeploy();
+    } catch (caught) {
+      setDeployError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setDeployBusy("");
+    }
+  };
 
   /** 重新读服务端设置。进页面就读一次：别处改过的值必须先看到，再允许保存。 */
   const loadSettings = useCallback(async () => {
@@ -1290,6 +1379,149 @@ export default function SettingsPage({ settings, settingsError = "", onSaved }: 
                 全局熔断（禁止所有新订单）
               </label>
             </div>
+          </div>
+        </div>
+
+        <div className="card">
+          <div className="card-head">
+            <span className="card-title">域名与 HTTPS</span>
+            <span className="spacer" />
+            <span className="faint" style={{ fontSize: "var(--fs-12)" }}>
+              {deployUnavailable
+                ? "只在 Linux 服务器上可用"
+                : deploy?.https_enabled && deploy.domain
+                  ? `https://${deploy.domain}`
+                  : "还没配置"}
+            </span>
+          </div>
+          <div className="card-body stack">
+            {/* 501 的那句话是后端给的完整说明，原样显示，前端不翻译也不解释。 */}
+            {deployError && <div className="banner warn">{deployError}</div>}
+
+            {deploy && (
+              <div className="deploy-rows">
+                <div className="deploy-row">
+                  <span>系统</span>
+                  <b>{deploy.platform}</b>
+                </div>
+                <div className="deploy-row">
+                  <span>Caddy</span>
+                  <b>
+                    {deploy.caddy_installed ? "已安装" : "未安装"}
+                    {deploy.caddy_installed ? (deploy.caddy_active ? " · 运行中" : " · 未运行") : ""}
+                  </b>
+                </div>
+                <div className="deploy-row">
+                  <span>当前域名</span>
+                  <b>{deploy.domain ?? "还没配置"}</b>
+                </div>
+                <div className="deploy-row">
+                  <span>证书到期</span>
+                  <b>{deploy.cert_expires ?? "—"}</b>
+                </div>
+                <div className="deploy-row">
+                  <span>公网 IP</span>
+                  <b>
+                    {deploy.public_ip ?? "查不到"}
+                    {deploy.public_ip_source ? `（来源：${deploy.public_ip_source}）` : ""}
+                  </b>
+                </div>
+              </div>
+            )}
+
+            {deploy && !deploy.public_ip && deploy.public_ip_error && (
+              <div className="hint">公网 IP 读不到：{deploy.public_ip_error}</div>
+            )}
+            {deploy && deploy.public_ip && (
+              <div className="hint">
+                域名 A 记录要指到这个地址（{deploy.public_ip}），ACME 才能从 80 端口验到这台机器。
+              </div>
+            )}
+
+            <div className="field">
+              <label className="field-label" htmlFor="deploy-domain">
+                <span>域名</span>
+                <em>换域名用同一个按钮</em>
+              </label>
+              <input
+                id="deploy-domain"
+                className="input"
+                autoComplete="off"
+                spellCheck={false}
+                placeholder={deploy?.domain ?? "trade.example.com"}
+                value={deployDomain}
+                disabled={deployUnavailable || deployBusy !== ""}
+                onChange={(event) => setDeployDomain(event.target.value)}
+              />
+            </div>
+
+            <div className="row" style={{ gap: 8 }}>
+              <button
+                type="button"
+                className="btn-sm"
+                disabled={deployUnavailable || deployBusy !== ""}
+                onClick={() => void checkDeployDomain()}
+              >
+                {deployBusy === "check" ? "检查中…" : "检查解析"}
+              </button>
+              <button
+                type="button"
+                className="btn-sm primary"
+                disabled={deployUnavailable || deployBusy !== ""}
+                onClick={() => void issueCertificate()}
+              >
+                {deployBusy === "tls" ? "正在签发…" : "签发证书"}
+              </button>
+              {deployBusy === "tls" && (
+                <span className="faint" style={{ fontSize: "var(--fs-12)" }}>
+                  写 Caddyfile → reload caddy → 轮询 HTTPS，最多约 40 秒
+                </span>
+              )}
+            </div>
+
+            {/* 检查结果：message 是后端给的原文，一致就绿、不一致就红。 */}
+            {deployCheck && (
+              <div className={`banner ${deployCheck.match ? "ok" : "error"}`}>
+                {deployCheck.message}
+              </div>
+            )}
+
+            {deployTls && (
+              <div className={`banner ${deployTls.ok ? "ok" : "error"}`}>{deployTls.message}</div>
+            )}
+            {deployTls?.ok && (
+              <div className="deploy-rows">
+                <div className="deploy-row">
+                  <span>访问地址</span>
+                  <b>{deployTls.url}</b>
+                </div>
+                <div className="deploy-row">
+                  <span>证书到期</span>
+                  <b>{deployTls.cert_expires ?? "还没读到"}</b>
+                </div>
+              </div>
+            )}
+
+            {/* 失败时把原文贴出来：原因以 Caddy 自己的日志为准，不转述、不截断。 */}
+            {deployTls?.log_tail && (
+              <>
+                <div className="hint">Caddy 日志原文（journalctl -u caddy -n 20）</div>
+                <pre className="deploy-log">{deployTls.log_tail}</pre>
+              </>
+            )}
+            {deployTls?.script_output && (
+              <>
+                <div className="hint">set-domain.sh 原样输出</div>
+                <pre className="deploy-log">{deployTls.script_output}</pre>
+              </>
+            )}
+
+            {!deployUnavailable && (
+              <div className="hint">
+                证书由 Caddy 自己走 ACME（HTTP-01）申请并自动续期。域名要先解析到这台机器的公网 IP，
+                80 端口对外可达；IP 不能直接签证书。
+              </div>
+            )}
           </div>
         </div>
       </div>

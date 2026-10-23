@@ -314,6 +314,42 @@ export interface AIAnalysis {
 /* 三个页面（AI 交易、AI 量化、策略实验室）共用这几份形状。字段一律可选：
    后端升级前后互不匹配时，界面要能降级显示，而不是白屏。 */
 
+/** 域名与 HTTPS（Linux 服务器才有）：GET /api/deploy/info 的回执。 */
+export interface DeployInfo {
+  platform: string;
+  caddy_installed: boolean;
+  caddy_active: boolean;
+  domain: string | null;
+  https_enabled: boolean;
+  public_ip: string | null;
+  public_ip_source: string;
+  public_ip_error: string | null;
+  cert_expires: string | null;
+  data_dir: string;
+}
+
+/** POST /api/deploy/check：域名现在解析到哪、和本机公网 IP 一不一致。 */
+export interface DeployCheck {
+  ok: boolean;
+  domain: string;
+  resolves_to: string[];
+  public_ip: string | null;
+  public_ip_source: string;
+  match: boolean;
+  message: string;
+}
+
+/** POST /api/deploy/tls：签证书的结果。失败时 log_tail / script_output 是原文。 */
+export interface DeployResult {
+  ok: boolean;
+  domain: string;
+  url: string;
+  cert_expires: string | null;
+  log_tail: string;
+  script_output: string;
+  message: string;
+}
+
 /** 执行台最后用过的那三项，存在设置的 exec 里。不是风控：真上限在 risk 与
  *  AITrader 的闸里，改这三项动不了任何一条闸。 */
 export interface ExecSettings {
