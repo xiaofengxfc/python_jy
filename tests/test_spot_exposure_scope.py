@@ -14,7 +14,8 @@ t51 实测两件事，根子是同一个混淆——把钱包里的币当成我�
 - 现货敞口 = `min(本地成交账本里这一对的数量, 钱包数量)`——账本是我们买的，钱包是
   真在手上有的，取小的那个既不放宽（买得越多闸门越紧），也不会把用户自己的币算进来；
 - 现货行的未实现盈亏只按**账本数量 × 账本均价**算，并带上 `unrealized_basis="ledger"`
-  和 `ledger_size` 说明这是账本口径；`contracts` / `quote_value` 仍是钱包事实。
+  和 `ledger_size` 说明这是账本口径。t66 起现货拆成两行（账本行 + 自有余额行），
+  账本行的 `contracts` 就是账本数量，两行加起来才是钱包事实。
 """
 
 from __future__ import annotations
@@ -191,20 +192,32 @@ def _seed_buy(db: Database, amount: float, price: float, trade_id: str = "t1") -
 
 
 def test_a_spot_row_books_pnl_on_the_ledger_size_not_the_wallet(tmp_path):
-    """钱包 1.00042、账本 0.00042：未实现盈亏只能是 0.00042 那一份。"""
+    """钱包 1.00042、账本 0.00042：未实现盈亏只能是 0.00042 那一份。
+
+    t66 起这里是两行：账本行 0.00042（带盈亏）＋ 自有余额行 1.0（盈亏恒 0），
+    两行加起来才是钱包事实 1.00042。
+    """
     venue = _spot_venue()
     service, db = _account(tmp_path, venue)
     try:
         _seed_buy(db, 0.00042, 80_000.0)
         snap = service.snapshot(MarketType.SPOT, SPOT)
-        row = snap.positions[0]
-        assert row["contracts"] == pytest.approx(1.00042)  # 钱包事实
-        assert row["quote_value"] == pytest.approx(1.00042 * PRICE)
-        assert row["entry_price"] == pytest.approx(80_000.0)
-        assert row["ledger_size"] == pytest.approx(0.00042)
-        assert row["unrealized_basis"] == "ledger"
+        ledger_row, own_row = snap.positions
+
+        assert ledger_row["origin"] == "ledger"
+        assert ledger_row["contracts"] == pytest.approx(0.00042)
+        assert ledger_row["quote_value"] == pytest.approx(0.00042 * PRICE)
+        assert ledger_row["entry_price"] == pytest.approx(80_000.0)
+        assert ledger_row["ledger_size"] == pytest.approx(0.00042)
+        assert ledger_row["unrealized_basis"] == "ledger"
         # (81000 - 80000) * 0.00042 = 0.42，不是 1000.42
-        assert row["unrealized"] == pytest.approx(0.42)
+        assert ledger_row["unrealized"] == pytest.approx(0.42)
+
+        assert own_row["origin"] == "wallet"
+        assert own_row["contracts"] == pytest.approx(1.0)
+        assert own_row["unrealized"] == pytest.approx(0.0)
+        assert own_row["quote_value"] == pytest.approx(1.0 * PRICE)
+        assert sum(row["contracts"] for row in snap.positions) == pytest.approx(1.00042)
     finally:
         db.close()
 
@@ -218,11 +231,16 @@ def test_pnl_does_not_move_when_more_user_coins_arrive(tmp_path):
         before = service.snapshot(MarketType.SPOT, SPOT).positions[0]
 
         venue.balances[MarketType.SPOT]["BTC"] = 2.00042
-        after = service.snapshot(MarketType.SPOT, SPOT, refresh=True).positions[0]
+        ledger_row, own_row = service.snapshot(
+            MarketType.SPOT, SPOT, refresh=True
+        ).positions
 
-        assert after["contracts"] == pytest.approx(2.00042)
-        assert after["unrealized"] == pytest.approx(before["unrealized"])
-        assert after["unrealized"] == pytest.approx(0.42)
+        # 账本那一行一个数都没动，涨的是「自有余额」那一行。
+        assert ledger_row["contracts"] == pytest.approx(0.00042)
+        assert ledger_row["unrealized"] == pytest.approx(before["unrealized"])
+        assert ledger_row["unrealized"] == pytest.approx(0.42)
+        assert own_row["contracts"] == pytest.approx(2.0)
+        assert own_row["unrealized"] == pytest.approx(0.0)
     finally:
         db.close()
 

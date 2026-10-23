@@ -371,6 +371,17 @@ class AccountService:
         order are still held. Assets the venue does not quote against the
         wallet currency (testnet junk, delisted coins) are skipped rather than
         priced at zero, which would silently shrink equity.
+
+        一对币最多出两行（t66）：
+
+        * 「账本持仓」——本程序买的那一份：数量是账本数量、成本价来自成交账本、
+          未实现盈亏按它算，界面上的按钮是「平仓」；
+        * 「自有余额」——钱包里减去账本剩下的那些，是用户自己充进来（或测试网白送）
+          的，成本价不知道、未实现盈亏恒 0，界面上的按钮是「卖出」。
+
+        以前挤成一行：数量取钱包事实、origin 却是 ledger、按钮是「平仓」，于是用户
+        自己那 1 个币在账本平掉之前没有任何卖出入口。两行加起来正好是钱包里的数量，
+        wallet_value / equity 一个数都不变。
         """
         totals = balance.get("total") if isinstance(balance, dict) else None
         if not isinstance(totals, dict):
@@ -442,28 +453,60 @@ class AccountService:
             # 有成交台账、成本价也拿得到，才算「买来的持仓」。其余是钱包里本来就
             # 有的东西：充值的、测试网白送的、空投的。它们的成本价是 0，硬算盈亏
             # 会得到一个假数字，所以单独标出来。
-            origin = "ledger" if amount_in_ledger > 0 and entry > 0 else "wallet"
-            # 盈亏只能按账本数量算。以前 entry 取账本、数量取钱包，两边混用：钱包
-            # 1.00042 而账本 0.00042 时按 1.00042 算，报出 +1000 USDT 的假浮盈。
-            # 封顶于钱包余额：账本比钱包多说明币已经被提走，那部分不再是我们的敞口。
-            booked = min(amount, amount_in_ledger) if origin == "ledger" else 0.0
-            out.append(
-                {
-                    "symbol": name,
-                    "contracts": amount,
-                    "side": "long",
-                    "entry_price": entry,
-                    "last": last,
-                    "unrealized": (last - entry) * booked if origin == "ledger" else 0.0,
-                    # 盈亏口径写在数据里：界面据此标「账本口径」，不是凭空的数。
-                    "unrealized_basis": "ledger" if origin == "ledger" else "",
-                    "ledger_size": booked,
-                    "quote_value": amount * last,
-                    "realized_pnl": float(state.get("realized") or 0.0),
-                    "fees": float(state.get("fees") or 0.0),
-                    "origin": origin,
-                }
+            # 盈亏只能按账本数量算，并封顶于钱包余额：账本比钱包多说明币已经被提走，
+            # 那部分不再是我们的敞口。
+            booked = (
+                min(amount, amount_in_ledger)
+                if amount_in_ledger > 0 and entry > 0
+                else 0.0
             )
+            if booked > 0:
+                # 账本行：这一行的数量就是账本数量。以前这里填的是钱包事实
+                # （1.0025），按钮却是「平仓」（只平账本 0.0025），于是用户自己那
+                # 1 个币在账本平掉之前没有任何卖出入口——钱包行才是「卖出」那条口径
+                # 被这一行挤掉了。
+                out.append(
+                    {
+                        "symbol": name,
+                        "contracts": booked,
+                        "side": "long",
+                        "entry_price": entry,
+                        "last": last,
+                        "unrealized": (last - entry) * booked,
+                        # 盈亏口径写在数据里：界面据此标「账本口径」，不是凭空的数。
+                        "unrealized_basis": "ledger",
+                        "ledger_size": booked,
+                        "quote_value": booked * last,
+                        "realized_pnl": float(state.get("realized") or 0.0),
+                        "fees": float(state.get("fees") or 0.0),
+                        "origin": "ledger",
+                    }
+                )
+            own = amount - booked
+            if own > 1e-12:
+                # 自有余额行：用户自己充进来、程序没买过的那些币。成本价是 0
+                # （不知道人家多少钱买的），未实现盈亏恒 0；界面上这一行是「卖出」，
+                # 预填的数量就是这一行的 contracts。只有差额 > 0 时才出这一行。
+                # realized / fees 同一对只记在一行上（有账本行时记在账本行），
+                # 两行都写就等于把已实现盈亏算两遍。
+                out.append(
+                    {
+                        "symbol": name,
+                        "contracts": own,
+                        "side": "long",
+                        "entry_price": 0.0,
+                        "last": last,
+                        "unrealized": 0.0,
+                        "unrealized_basis": "",
+                        "ledger_size": 0.0,
+                        "quote_value": own * last,
+                        "realized_pnl": (
+                            0.0 if booked > 0 else float(state.get("realized") or 0.0)
+                        ),
+                        "fees": 0.0 if booked > 0 else float(state.get("fees") or 0.0),
+                        "origin": "wallet",
+                    }
+                )
         return sorted(
             out,
             key=lambda item: (item["origin"] == "ledger", item["quote_value"]),

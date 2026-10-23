@@ -68,6 +68,19 @@ class OrderRejected(RuntimeError):
     pass
 
 
+def _min_size_note(spec: Any) -> str:
+    """最小下单量怎么说：单位 + （币本位才有）「1 张 = 多少 USD」。
+
+    现货与 U 本位合约的 amount 就是币本身，没有「张」这回事。以前一律带上
+    spec.describe()，现货拒单时说出「下单量 0.00000417 低于最小下单量 0.0001。
+    （1 张 = 1 ETH）」——1 币被当成 1 张，用户看不出该下多少。币本位才是真按张
+    成交的，那句话得留着：1 张 = 100 USD。
+    """
+    if spec.inverse:
+        return f"{format_amount(spec.min_amount)} 张。（{spec.describe()}）"
+    return f"{format_amount(spec.min_amount)} {spec.base or '币'}。"
+
+
 def _is_filled(order: dict) -> bool:
     """Whether an order already has exposure to protect.
 
@@ -220,8 +233,7 @@ class TradingService:
             raise OrderRejected("数量无效，无法计算下单量。")
         if spec.min_amount > 0 and raw < spec.min_amount - 1e-12:
             raise OrderRejected(
-                f"下单量 {format_amount(raw)} 低于最小下单量 "
-                f"{format_amount(spec.min_amount)}。（{spec.describe()}）"
+                f"下单量 {format_amount(raw)} 低于最小下单量 {_min_size_note(spec)}"
             )
         if offline:
             # A preview never places anything: round exactly the way the venue
@@ -230,9 +242,10 @@ class TradingService:
         else:
             exchange_amount = rest.amount_to_precision(market_type, symbol, raw)
         if exchange_amount <= 0:
+            # 现货没有「张」这个东西，别把 describe() 那句塞进来。
+            detail = f"（{spec.describe()}）" if spec.inverse else ""
             raise OrderRejected(
-                f"下单量 {format_amount(raw)} 无法满足交易所的最小下单单位。"
-                f"（{spec.describe()}）"
+                f"下单量 {format_amount(raw)} 无法满足交易所的最小下单单位。{detail}"
             )
         rounded_base = spec.contracts_to_base(exchange_amount, price)
         return float(exchange_amount), rounded_base

@@ -152,9 +152,13 @@ def test_refresh_sees_a_new_row_that_the_cache_does_not_have(box: Box):
     assert cached["positions"][0]["origin"] == "wallet"
 
     fresh = _account(box, market="spot", symbol=SPOT, refresh="1")
-    row = fresh["positions"][0]
-    assert row["origin"] == "ledger"
-    assert row["contracts"] == pytest.approx(1.2)
+    rows = fresh["positions"]
+    # t66 起现货拆两行：账本行是程序买的那一份，自有行是用户自己那 1 个。
+    assert [row["origin"] for row in rows] == ["ledger", "wallet"]
+    assert rows[0]["contracts"] == pytest.approx(0.2)
+    assert rows[0]["ledger_size"] == pytest.approx(0.2)
+    assert rows[1]["contracts"] == pytest.approx(1.0)
+    assert sum(row["contracts"] for row in rows) == pytest.approx(1.2)
 
 
 def test_the_plain_read_still_uses_the_cache(box: Box):

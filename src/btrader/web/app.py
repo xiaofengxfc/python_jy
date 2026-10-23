@@ -46,6 +46,7 @@ from ..exchange.rest import (
 )
 from ..logging_setup import error_buffer
 from .routes import build_router
+from .routes_deploy import build_deploy_router
 from .routes_lab import build_lab_router
 from .routes_strategy import build_strategy_router
 from .stream import StreamHub
@@ -410,12 +411,17 @@ def _ledger_entry_price(state: _State, market: MarketType, symbol: str) -> float
     except Exception:
         log.debug("读取持仓成本失败 %s", symbol, exc_info=True)
         return 0.0
+    # t66 起现货同一对会有两行（账本行 + 自有余额行），自有行的成本价是 0：
+    # 要的是「有成本的那一行」，不是列表里的第一行。
     for position in getattr(snapshot, "positions", []) or []:
-        if position.get("symbol") == symbol:
-            try:
-                return float(position.get("entry_price") or 0.0)
-            except (TypeError, ValueError):
-                return 0.0
+        if position.get("symbol") != symbol:
+            continue
+        try:
+            entry = float(position.get("entry_price") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if entry > 0:
+            return entry
     return 0.0
 
 
@@ -747,6 +753,8 @@ def create_app() -> FastAPI:
     app.include_router(build_lab_router(get_state))
     # Source editor for user strategy plugins.
     app.include_router(build_strategy_router(get_state))
+    # 域名与 HTTPS（Linux 服务器上的 Caddy）；非 Linux 一律 501。
+    app.include_router(build_deploy_router())
 
     if STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
