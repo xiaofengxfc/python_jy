@@ -148,8 +148,10 @@ Key 存系统密钥环，不写进 `config.json`。
 - 回测过滤只看开仓点之前的 K 线。调用失败或回答读不懂时保留该笔交易，
   避免出现「因为超时所以策略变好」。
 - 持仓和盈亏默认不外发。要打开「允许把持仓和盈亏发给模型」开关才会出现在请求里。
-- 调用额度不开放配置，设置页里没有这一项。问答和分析一次 4000 token，写策略代码这类长回答
-  8000，两个值在 `llm.py` 的 `OUTPUT_TOKENS` / `OUTPUT_TOKENS_CODE`，要改只能改常量。
+- 调用额度不开放配置，设置页里没有这一项，因为现在**不再替模型定额度**：OpenAI 兼容协议里
+  `max_tokens` 是可选的，没传就不发这个字段，让模型自己决定什么时候停。只有供应商必填的那一路
+  才给兜底值——Anthropic 的 `max_tokens` 必填，用 `llm.py` 的 `FALLBACK_MAX_TOKENS`（32000），
+  被以「max_tokens 超过模型上限」拒掉时自动降到 `FALLBACK_MAX_TOKENS_RETRY`（8192）重试一次。
   同一根 K 线重复提问走缓存（5 分钟内不重复计费）。调用记录写到 `logs/ai-audit.jsonl`，
   设置页只显示今日次数。
 - 额度用完被截断时，报错直接说「输出被截断」并给出上限。截断有两种叫法，模型说 `length`
@@ -332,9 +334,41 @@ packaging\build_dev.bat
 产物是 `dist\biTrader-backend\biTrader-backend.exe`，由 Electron 外壳拉起。
 前端资源由后端从 `src/btrader/web/static` 提供，打包时一并复制。
 
+## 部署到 Linux 服务器（Debian / Ubuntu）
+
+服务器上只跑后端 + 浏览器访问，不需要 Electron，也不需要 node（前端产物已经打进 `src/btrader/web/static/`）。
+完整步骤、排错和数据目录说明见 [docs/DEPLOY-Linux.md](docs/DEPLOY-Linux.md)，下面是三条命令的样子：
+
+```bash
+sudo git clone https://github.com/you/biTrader.git /root/biTrader && cd /root/biTrader
+bash deploy/install.sh --dry-run --domain trade.example.com   # 先看它要做什么，不改任何东西
+sudo bash deploy/install.sh --domain trade.example.com        # 真装
+```
+
+装完的形态：
+
+- 服务跑在 `/opt/bitrader`，数据在 `/var/lib/bitrader`，systemd 单元 `bitrader`（`Restart=always`，日志进 journald）；
+- 后端只监听 `127.0.0.1:8765`，对外由 Caddy 反代并自动签 HTTPS 证书；用 `http://服务器IP` 打开会 301 到域名；
+- 没有域名时不带 `--domain`：Caddy 只监听回环，用 `ssh -N -L 8080:127.0.0.1:8080 你@服务器` 进去访问；
+- 防火墙要放 **80 / 443**（证书走这两个端口），8765 不要对外开；
+- 脚本可以反复跑：已经在位的步骤会跳过，不会覆盖已有的密钥文件。
+
+服务器上的两处差异（代码里已经分好路，不用改配置）：
+
+| | Windows 桌面 | Linux 服务器 |
+|---|---|---|
+| 数据目录 | `%APPDATA%\biTrader` | `/var/lib/bitrader`（systemd unit 的 `BITRADER_DATA_DIR`） |
+| API Key | Windows 凭据管理器 | 有 SecretService 就用系统密钥环；服务器上没有，就落到 `/var/lib/bitrader/secrets.bin`（AES-256-GCM，文件 600 / 目录 700，钥匙由 machine-id 派生） |
+
+设置页「API 凭据」卡片会显示当前用的是哪一种（「系统密钥环」还是「本机文件存储」）以及后者的含义。
+换服务器或重装系统后 `secrets.bin` 解不开是正常现象：凭据显示「未配置」，重新填一次即可。
+
+时钟：币安签名对时间敏感，`timedatectl` 里 `System clock synchronized: yes` 才算合格，差一秒就会满屏 `-1021`。
 ## 项目结构
 
 ```
+deploy/          install.sh / bitrader.service / Caddyfile.example
+docs/            DEPLOY-Linux.md 等部署文档
 src/btrader/
 ├─ core/          配置、凭据、数据模型、指标、SQLite 存储
 ├─ exchange/      ccxt 封装、K 线缓存、交易对

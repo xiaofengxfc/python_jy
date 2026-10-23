@@ -4,6 +4,8 @@ pandas>=2.0
 numpy>=1.26
 pyarrow>=14
 keyring>=24
+# 没有系统密钥环时的文件后端要用它（AES-256-GCM）。manylinux wheel 现成，不编译。
+cryptography>=42
 python-dateutil>=2.8
 
 # Local backend (FastAPI + WebSocket market stream)

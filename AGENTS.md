@@ -167,7 +167,10 @@ Node 不在 PATH 时，先把 Node 目录加进去。
 
 改 `btrader/llm.py` 和 `btrader/ai.py` 之前，先读 README 的「AI 助手」一节。
 
-- 密钥在系统密钥环，service 叫 `biTrader-ai`，不进 `config.json`。
+- 密钥不进 `config.json`：走 `core/secret_store` 的同一个 store（和交易所 Key 一样），
+  service 叫 `biTrader-ai`、user 叫 `api_key` —— 这两个名字别改，改了等于让老用户已存的 Key 作废。
+  桌面有系统密钥环就用密钥环；Debian/Ubuntu 服务器上没有 SecretService/DBus 就落到数据目录的
+  加密文件（AES-256-GCM，600/700），`GET /api/ai/status` 的 `storage` 字段告诉界面是哪种。
   `AISettings` 只存供应商、模型、接口地址、温度、开关。
 - `llm.py` 只管收发：多供应商、缓存、审计、限额。
   `ai.py` 只管提示词和解析。两个模块都不碰交易。改提示词只动 `ai.py`。
@@ -181,11 +184,16 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   它和 `/api/klines` 一样会回落到 Gate 永续行情。
   不要在 AI 路由里直接调 `ctx.klines.fetch`，否则图表能用，分析接口报 500。
 - AI 测试在 `tests/test_ai.py`，全部离线：`FakeLLM` 替身加 `monkeypatch` 密钥环。
-- 输出额度是两个常量，都在 `llm.py`：`OUTPUT_TOKENS`（4000）给问答、分析、简报这类普通回答；
-  `OUTPUT_TOKENS_CODE`（8000）给写代码这类长回答，策略实验室生成一个完整模块走它。
-  推理模型先把额度花在思考上，写策略的额度给小了，JSON 会从中间断掉。
-  改额度只动这两个常量，别在调用点写数字。`routes_lab` 曾经自己写了 2400，比默认值还小，
-  长策略被截成坏 JSON，报出来的是「没有可解析的 JSON」，文案还让用户去设置里调一个不存在的项。
+- 输出上限不再是「我们替模型定一个额度」（t60 起改的）。OpenAI 兼容协议里 `max_tokens` 是可选的，
+  调用方没传就**根本不发**这个字段，让模型自己决定什么时候停；ollama 的 `num_predict` 同理，
+  只有显式传了 `max_tokens` 才写。只有「供应商必填」那一档才有兜底数字：Anthropic 的
+  `max_tokens` 是必填字段，给 `FALLBACK_MAX_TOKENS`（32000），被供应商以「max_tokens 超过
+  模型上限」拒掉时自动降到 `FALLBACK_MAX_TOKENS_RETRY`（8192）重试**一次**；第二次还被拒就
+  报中文实话，别把英文原文甩给用户。这两个常量都在 `llm.py`，别在调用点写数字。
+  以前固定 4000/8000：推理模型先把额度花在思考上，分析类回答常从中间断掉；`routes_lab` 自己
+  写了 2400 比默认还小，长策略被截成坏 JSON，报出来的是「没有可解析的 JSON」——那类报错现在
+  先看 `truncated`，别把「额度用完被截断」和「回答不合格、解析不出来」混成一句话。
+  截断口径没变：判据仍是 `llm.TRUNCATED_FINISH` / `llm.is_truncated()`，被截断的答案不进缓存。
 - 缓存窗口和每日调用次数也不进设置，固定在 `CACHE_SECONDS`。
   设置页只留开关、供应商、模型、接口地址、Key。
 - `ask()` 的返回除了 `ok` / `text` / `error` / `tokens`，还有 `finish`（供应商的 finish_reason）

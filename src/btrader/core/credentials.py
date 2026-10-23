@@ -1,4 +1,9 @@
-"""Secure API credential storage backed by the OS keyring."""
+"""API Key 的存放：系统密钥环，或本机加密文件（headless Linux 的兜底）。
+
+选哪一种由 core/secret_store.py 在启动时探测决定：系统密钥环能写进去就读写它，
+探不过（Debian/Ubuntu 服务器没有 SecretService/DBus，keyring 退化成 fail 后端）
+就落到数据目录的 secrets.bin。存储种类的说明通过 describe() 交给设置页。
+"""
 
 from __future__ import annotations
 
@@ -6,6 +11,7 @@ import logging
 from dataclasses import dataclass
 
 from .. import APP_NAME
+from . import secret_store
 from .types import MarketType, Network
 
 log = logging.getLogger(__name__)
@@ -39,17 +45,19 @@ def _account_id(network: Network) -> str:
 class CredentialStore:
     """Stores credentials in the OS keyring (Windows Credential Manager, etc.)."""
 
-    def __init__(self, backend=None) -> None:
+    def __init__(self, backend=None, path=None) -> None:
         if backend is not None:
             self._backend = backend
             return
-        try:
-            import keyring
+        # 探测出来的真后端：能写就用系统密钥环，不能写就用本机加密文件。
+        # 这里不再 import keyring 直接用——服务器上那样「API Key 存不进去」。
+        self._backend = secret_store.open_store(path)
 
-            self._backend = keyring
-        except ImportError:  # pragma: no cover - keyring is a hard dependency
-            log.error("keyring 未安装，凭据将不会被持久化")
-            self._backend = None
+    def describe(self) -> dict:
+        """现在用的是哪一种存储，给设置页看。"""
+        if self._backend is None:
+            return secret_store.describe(None)
+        return secret_store.describe(self._backend)
 
     def _service(self, network: Network, market: MarketType, platform: str = "binance") -> str:
         # One entry per platform, network and market. A USDⓈ-M key and a COIN-M

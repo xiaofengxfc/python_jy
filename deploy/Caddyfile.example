@@ -1,0 +1,55 @@
+# biTrader 的 Caddy 配置模板（install.sh 按域名填好后拷到 /etc/caddy/Caddyfile）
+#
+# 三段各自独立，按你的情况保留或删掉：
+#   1. 站点块：域名 + 自动 HTTPS（Caddy 自己申请、续期证书）
+#   2. IP 跳转：用 http(s)://IP 打开的人 301 到域名
+#   3. WebSocket：行情推送走 /ws，说明为什么不用单独配置
+# 没有域名时用第 4 段（只监听回环 + SSH 隧道）先验证，再回来开站点块。
+
+# ---------------------------------------------------------------- 1. 站点块
+trade.example.com {
+	# 后端只监听 127.0.0.1:8765，对外一律走这里
+	reverse_proxy 127.0.0.1:8765 {
+		header_up X-Real-IP {remote_host}
+	}
+	# 排错先看这里：/var/log/caddy/access.log
+	log {
+		output file /var/log/caddy/access.log {
+			roll_size 10MiB
+			roll_keep 5
+		}
+	}
+	encode gzip zstd
+}
+
+# ---------------------------------------------------------------- 2. IP 跳转
+# 把 REPLACE_WITH_SERVER_IP 换成服务器公网 IP。没有域名就把这一段删掉。
+# 证书只能签给域名，用 IP 访问永远拿不到 HTTPS，所以这里只做 301 跳转。
+http://REPLACE_WITH_SERVER_IP {
+	redir https://trade.example.com{uri} 301
+}
+
+https://REPLACE_WITH_SERVER_IP {
+	redir https://trade.example.com{uri} 301
+}
+
+# ---------------------------------------------------------------- 3. WebSocket
+# 行情推送走 /ws，和普通 HTTP 同端口、同站点块：Caddy v2 的 reverse_proxy
+# 默认就转发 Upgrade / Connection 头，不需要为 WebSocket 单开一段。
+# 只有两件事要注意：
+#   * 别在站点块里加 respond / strip 之类会吃掉 Upgrade 头的指令；
+#   * 前端在 https 页面上会自动用 wss://，反向代理的超时要放开：
+#       reverse_proxy 127.0.0.1:8765 {
+#           transport http {
+#               read_timeout 0
+#           }
+#       }
+# 验证：浏览器控制台 Network 里看 /ws 是不是 101 Switching Protocols。
+
+# ------------------------------------------------- 4. 没有域名时的临时入口
+# 只监听本机回环，然后在本地机器上开隧道：
+#   ssh -N -L 8080:127.0.0.1:8080 你@服务器
+# 浏览器打开 http://127.0.0.1:8080 即可（此段不能对公网开放明文界面）。
+#127.0.0.1:8080 {
+#	reverse_proxy 127.0.0.1:8765
+#}

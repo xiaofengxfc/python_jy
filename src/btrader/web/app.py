@@ -57,6 +57,9 @@ FONT_DIR = Path(__file__).resolve().parents[1] / "assets" / "fonts"
 
 # Shown when the exchange cannot be reached, so the UI still has something to
 # render while offline.
+# 批量涨幅一次最多问这么多对：这是面板用的一小撮，不是整市场（现货 1400+ 项）。
+TICKER_BATCH_LIMIT = 50
+
 _FALLBACK_SYMBOLS: dict[str, list[str]] = {
     "spot": ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT"],
     "usdm": ["BTC/USDT:USDT", "ETH/USDT:USDT", "BNB/USDT:USDT", "SOL/USDT:USDT"],
@@ -463,6 +466,21 @@ def _venue_symbol(state: _State, market: MarketType, symbol: str) -> str:
     return f"{pair}:{tail}"
 
 
+def _quote_number(value: Any) -> float | None:
+    """行情里的一个数字：读不到就是 None，绝不折成 0。
+
+    `float(value or 0.0)` 这种写法把「交易所没给」和「恰好 0.00%」压成同一个值，
+    界面上就变成一个看不出来的 0.00%。nan / inf 同样当读不到。
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return number
+
+
 def _check_symbol_shape(market: MarketType, symbol: str) -> str:
     """交易对写法与市场对不上时当场 400，别放它去花一次交易所请求。
 
@@ -860,6 +878,71 @@ def create_app() -> FastAPI:
             "quote_volume": float(raw.get("quoteVolume") or 0.0),
             "change_pct": float(raw.get("percentage") or 0.0),
             "timestamp": int(raw.get("timestamp") or 0),
+        }
+
+    @app.get("/api/tickers")
+    def api_tickers(market: str = "spot", symbols: str = "") -> dict[str, Any]:
+        """一批交易对的 24 小时涨幅：{items: [{symbol, last, change_pct, quote_volume}]}。
+
+        `change_pct` 是百分数（1.23 表示 +1.23%），和 /api/ticker 一个口径。拿不到的
+        字段一律 `null`：0 是「恰好不涨不跌」，和「交易所没给」不是一回事，界面按 null
+        显示「—」。归一在 `rest.ticker_snapshots`（t62 那一路），这里只管上限、写法与
+        错误码。
+
+        上限 50：这是图表面板用的一小撮，不是整市场列表——现货 1400 多项一次拉下来会把
+        面板和交易所的权重一起拖垮。写法按 `_check_symbol_shape` 同一口径判，写错了当场
+        400 并指出该写的名字，不花一次交易所请求。
+        """
+        state = get_state()
+        mt = _market(market)
+        wanted: list[str] = []
+        for piece in str(symbols or "").split(","):
+            text = piece.strip()
+            if not text:
+                continue
+            text = _check_symbol_shape(mt, text)
+            if text not in wanted:
+                wanted.append(text)
+        if not wanted:
+            raise HTTPException(
+                status_code=400,
+                detail="请给出要查的交易对，例如 symbols=BTC/USDT,ETH/USDT",
+            )
+        if len(wanted) > TICKER_BATCH_LIMIT:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"一次最多查 {TICKER_BATCH_LIMIT} 个交易对，这次给了 {len(wanted)} 个。"
+                ),
+            )
+        rest = state.ctx.market_rest_for(mt)
+        fetch = getattr(rest, "ticker_snapshots", None)
+        if fetch is None:
+            # 老客户端只有 fetch_tickers：这里不去猜它的字段，直接说清要升级什么。
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "当前交易所客户端没有批量行情接口（ticker_snapshots），"
+                    "请升级交易所模块后重试。"
+                ),
+            )
+        try:
+            with state.locks[mt]:
+                rows = fetch(mt, wanted)
+        except ExchangeError as exc:
+            symbol = wanted[0] if len(wanted) == 1 else ""
+            raise _venue_http_error(exc, "无法获取行情", symbol) from exc
+        return {
+            "items": [
+                {
+                    "symbol": str(row.get("symbol") or ""),
+                    "last": _quote_number(row.get("last")),
+                    "change_pct": _quote_number(row.get("change_pct")),
+                    "quote_volume": _quote_number(row.get("quote_volume")),
+                }
+                for row in rows or ()
+                if isinstance(row, dict)
+            ]
         }
 
     @app.get("/api/orderbook")
