@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import shutil
 import socket
+import time
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -66,6 +67,17 @@ class _Recorder:
         if not self.results:
             return _Run(0, "", "")
         return self.results.pop(0)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_ipify_cache():
+    """每个用例都从空的公网 IP 缓存起步，并且不把后台线程留给下一个用例。"""
+    reset = getattr(rd, "reset_ipify_cache", None)
+    if reset is not None:
+        reset()
+    yield
+    if reset is not None:
+        reset()
 
 
 @pytest.fixture
@@ -165,15 +177,64 @@ def test_the_caddyfile_ip_redirect_is_a_local_source(monkeypatch, tmp_path):
     assert rd.public_ip_info() == ("203.0.113.7", "caddyfile", None)
 
 
-def test_ipify_is_used_when_there_is_no_local_record(monkeypatch, tmp_path):
+def _wait_for_ipify(timeout=3.0):
+    """等后台那一次查询落地。测试里不能真等 3 秒，也不能真联网。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not rd.ipify_pending():
+            return
+        time.sleep(0.01)
+    raise AssertionError("后台查公网 IP 没有在 %.1f 秒内结束" % timeout)
+
+
+def test_the_first_call_does_not_wait_for_ipify(monkeypatch, tmp_path):
+    """评审实测：info 在 Linux 上会同步卡 ipify 3 秒，首屏被它挂住。
+
+    现在第一下立刻返回（public_ip 为 null 加一句「正在后台查」），查询在守护线程里做。
+    """
     monkeypatch.setattr(rd, "CADDYFILE", tmp_path / "missing-Caddyfile")
     monkeypatch.setattr(rd, "deploy_record_path", lambda: tmp_path / "deploy.json")
-    # 两端空白要去掉：ipify 回的是纯文本，换行很容易带进来
-    monkeypatch.setattr(rd, "_ipify_get", lambda url, timeout: " 1.2.3.4\n")
+
+    def slow(url, timeout):
+        time.sleep(0.5)  # 比 ipify 的 3 秒超时短，但足够证明「没在同步等」
+        return " 1.2.3.4\n"
+
+    monkeypatch.setattr(rd, "_ipify_get", slow)
+
+    started = time.monotonic()
+    ip, source, error = rd.public_ip_info()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.3, "第一次调用不该等 ipify，实际等了 %.2f 秒" % elapsed
+    assert ip is None
+    assert source == "none"
+    assert error and "后台" in error
+
+    # 后台那一次查完之后，下一次调用就有 IP 了（两端空白也要去掉）
+    _wait_for_ipify()
     assert rd.public_ip_info() == ("1.2.3.4", "ipify", None)
 
 
-def test_ipify_failure_is_null_plus_a_reason(monkeypatch, tmp_path):
+def test_the_public_ip_is_cached_for_ten_minutes(monkeypatch, tmp_path):
+    """查到就记 10 分钟：每 2 秒刷新一次的界面不该每次都去打 ipify。"""
+    monkeypatch.setattr(rd, "CADDYFILE", tmp_path / "missing-Caddyfile")
+    monkeypatch.setattr(rd, "deploy_record_path", lambda: tmp_path / "deploy.json")
+    calls = []
+
+    def once(url, timeout):
+        calls.append(url)
+        return "1.2.3.4"
+
+    monkeypatch.setattr(rd, "_ipify_get", once)
+
+    rd.public_ip_info()
+    _wait_for_ipify()
+    for _ in range(3):
+        assert rd.public_ip_info() == ("1.2.3.4", "ipify", None)
+    assert len(calls) == 1, "十次刷新只该问一次 ipify，实际问了 %d 次" % len(calls)
+
+
+def test_a_failed_lookup_is_null_plus_a_reason(monkeypatch, tmp_path):
     monkeypatch.setattr(rd, "CADDYFILE", tmp_path / "missing-Caddyfile")
     monkeypatch.setattr(rd, "deploy_record_path", lambda: tmp_path / "deploy.json")
 
@@ -181,10 +242,31 @@ def test_ipify_failure_is_null_plus_a_reason(monkeypatch, tmp_path):
         raise socket.timeout("timed out")
 
     monkeypatch.setattr(rd, "_ipify_get", boom)
+    rd.public_ip_info()
+    _wait_for_ipify()
+
     ip, source, error = rd.public_ip_info()
     assert ip is None
     assert source == "none"
     assert "api.ipify.org" in error and "timed out" in error
+
+
+def test_a_failed_lookup_is_not_retried_on_every_refresh(monkeypatch, tmp_path):
+    """查不到也别每 2 秒打一次：失败记 1 分钟。"""
+    monkeypatch.setattr(rd, "CADDYFILE", tmp_path / "missing-Caddyfile")
+    monkeypatch.setattr(rd, "deploy_record_path", lambda: tmp_path / "deploy.json")
+    calls = []
+
+    def boom(url, timeout):
+        calls.append(url)
+        raise socket.timeout("timed out")
+
+    monkeypatch.setattr(rd, "_ipify_get", boom)
+    rd.public_ip_info()
+    _wait_for_ipify()
+    for _ in range(3):
+        rd.public_ip_info()
+    assert len(calls) == 1, "失败后一小时内只该问一次，实际问了 %d 次" % len(calls)
 
 
 def test_a_record_from_disk_is_read_back(monkeypatch, tmp_path):
@@ -207,6 +289,51 @@ def test_domain_falls_back_to_the_caddyfile(monkeypatch, tmp_path):
     monkeypatch.setattr(rd, "CADDYFILE", caddyfile)
     monkeypatch.setattr(rd, "deploy_record_path", lambda: tmp_path / "deploy.json")
     assert rd.read_domain() == "real.example.com"
+
+
+# ------------------------------------------------------------------ IDN
+# 评审抓的：routes_deploy.py 的 TLD 判定是 ^[a-z]{2,}$，于是 .中国 这种合法 IDN
+# 顶级域被判死。合法 IDN 应当归一成 punycode（xn--fiqs8s 这类）再放行，
+# 非法的（长度、首尾连字符、纯数字 TLD、两个点挨着）照旧 400。
+
+
+@pytest.mark.parametrize(
+    "given,expected",
+    [
+        ("trade.中国", "trade.xn--fiqs8s"),
+        ("www.trade.中国", "www.trade.xn--fiqs8s"),
+        ("TRADE.中国", "trade.xn--fiqs8s"),
+        ("trade.中国.", "trade.xn--fiqs8s"),
+        ("münchen.de", "xn--mnchen-3ya.de"),
+        ("trade.xn--fiqs8s", "trade.xn--fiqs8s"),
+        ("trade.example.com", "trade.example.com"),
+    ],
+)
+def test_an_idn_domain_is_normalised_to_punycode(given, expected):
+    assert rd.normalize_domain(given) == expected
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "trade.123",          # 纯数字顶级域
+        "trade..中国",         # 两个点挨着
+        "trade.中国..",        # 两个收尾点：只允许一个
+        "-bad.中国",
+        "bad-.中国",
+        "a" * 64 + ".中国",     # 单段太长
+        "trade.中国/path",
+    ],
+)
+def test_a_bad_idn_domain_is_still_refused(bad):
+    with pytest.raises(ValueError):
+        rd.normalize_domain(bad)
+
+
+def test_punycode_is_not_double_encoded(linux):
+    """已经在 punycode 里的域名不许再转一次（trade.xn--fiqs8s 别变成 xn--trade-...）。"""
+    assert rd._domain_or_400("trade.xn--fiqs8s") == "trade.xn--fiqs8s"
+    assert rd._domain_or_400("trade.中国") == "trade.xn--fiqs8s"
 
 
 # ------------------------------------------------------------------ check

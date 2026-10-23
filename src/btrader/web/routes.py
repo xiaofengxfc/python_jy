@@ -9,12 +9,13 @@ importing it) to keep the dependency one-way and avoid a circular import.
 from __future__ import annotations
 
 import logging
+import math
 import json
 import threading
 import time
 import uuid
 from collections import deque
-from dataclasses import asdict, replace
+from dataclasses import asdict, fields as dataclass_fields, replace
 from datetime import datetime
 from typing import Any, Callable
 
@@ -33,6 +34,7 @@ from ..core.config import (
     clean_symbol_list,
 )
 from ..core.credentials import Credentials
+from ..core.secret_store import ReadError as SecretReadError
 from ..core.types import (
     TIMEFRAME_SECONDS,
     MarketType,
@@ -1102,8 +1104,14 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
         """Store the API key in the OS keyring, never in ``config.json``."""
         ctx = get_state().ctx
         if not ctx.ai.set_key(payload.key):
+            # 后端原话优先：密钥文件读不出时它会说清「已备份到 X、本次没有写入」，
+            # 换成「密钥环不可用」就把真正的原因盖掉了。
             raise HTTPException(
-                status_code=400, detail="写入系统密钥环失败，请检查系统凭据服务是否可用。"
+                status_code=400,
+                detail=(
+                    llm.last_error()
+                    or "写入系统密钥环失败，请检查系统凭据服务是否可用。"
+                ),
             )
         return ctx.ai.status()
 
@@ -1438,7 +1446,13 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
                     status_code=400, detail=f"连接测试失败：{exc}"
                 ) from exc
 
-        if not ctx.credentials.save(network, market, creds, platform):
+        try:
+            saved = ctx.credentials.save(network, market, creds, platform)
+        except SecretReadError as exc:
+            # 只转述后端那句话：它已经写明「读不出 / 备份到哪 / 本次没有写入」。
+            # 这里自己编解释（权限、密钥环）会把真正的原因盖掉。
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        if not saved:
             storage = ctx.credentials.describe()
             raise HTTPException(
                 status_code=500,
@@ -1799,17 +1813,27 @@ def apply_settings(ctx: Any, payload: "SettingsPayload") -> list[str]:
         if payload.notification_sound is not None and settings.notification_sound != payload.notification_sound:
             settings.notification_sound = payload.notification_sound
             changed.append("notification_sound")
-        for name, draft in (
-            ("risk", risk_draft),
-            ("notify", notify_draft),
-            ("ai", ai_draft),
-            ("ai_auto", ai_auto_draft),
-            ("exec", exec_draft),
+        # 只写请求体里真正出现过的段落。草稿是「这次请求开始时的那一份」，
+        # 整段写回去会把另一个标签页刚存的改动顶掉（甲在改风控、乙刚存了 AI 配置，
+        # 甲那一保存就把乙的 AI 配置写回旧值）。PUT /api/settings 本来就允许发子集。
+        for name, draft, provided in (
+            ("risk", risk_draft, payload.risk is not None),
+            ("notify", notify_draft, payload.notify is not None),
+            ("ai", ai_draft, payload.ai is not None),
+            ("ai_auto", ai_auto_draft, payload.ai_auto is not None),
+            ("exec", exec_draft, payload.exec is not None),
         ):
+            if not provided:
+                continue
             if getattr(settings, name) != draft:
                 setattr(settings, name, draft)
                 changed.append(name)
-        for name, draft in (("favorites", favorites_draft), ("recent_symbols", recent_draft)):
+        for name, draft, provided in (
+            ("favorites", favorites_draft, payload.favorites is not None),
+            ("recent_symbols", recent_draft, payload.recent_symbols is not None),
+        ):
+            if not provided:
+                continue
             if getattr(settings, name) != draft:
                 setattr(settings, name, draft)
                 changed.append(name)
@@ -1844,6 +1868,58 @@ def apply_settings(ctx: Any, payload: "SettingsPayload") -> list[str]:
     return changed
 
 
+def _check_number_input(section: str, key: str, value: Any) -> None:
+    """数字字段的入参先过一遍：nan / inf / null / 布尔 / "nan" 这种字符串当场 400。
+
+    以前这里只有 type(current)(value)：float("nan") 过得去，写进 config.json 之后
+    json.dumps 把它落成 NaN，于是 GET /api/settings 每次都 500（Starlette 的
+    allow_nan=False）；更隐蔽的是 999999 > nan 恒为 False，每单上限、持仓上限、
+    决策有效期这些闸全部静默失效，一个字的报错都没有。
+    """
+    if isinstance(value, bool) or value is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{section}.{key} 要的是有限数字，收到的是 {value!r}"
+                "（true / false / null 都不是数字；不改这一项就别发它）"
+            ),
+        )
+    if isinstance(value, str):
+        try:
+            number = float(value.strip())
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{section}.{key} 要的是数字，收到的是「{value}」",
+            ) from None
+        if not math.isfinite(number):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{section}.{key} 要的是有限数字，收到的是「{value}」",
+            )
+        return
+    if isinstance(value, (int, float)) and not math.isfinite(float(value)):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{section}.{key} 要的是有限数字，收到的是 {value!r}",
+        )
+
+
+def _guard_finite(section: str, target: Any) -> None:
+    """setattr 之后再统一过一遍 math.isfinite：哪一段都不许留非有限数。
+
+    入参那一层管「显式发来的值」，这一层兜「转换过程里变出来的」
+    （"1e999" 转出来就是 inf），两处都要。
+    """
+    for spec in dataclass_fields(target):
+        value = getattr(target, spec.name, None)
+        if isinstance(value, float) and not math.isfinite(value):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{section}.{spec.name} 要的是有限数字，收到的是 {value!r}",
+            )
+
+
 def _apply_risk(risk: RiskSettings, values: dict[str, Any]) -> None:
     """Only fields the dataclass declares; unknown keys are ignored."""
     for key, value in values.items():
@@ -1856,10 +1932,13 @@ def _apply_risk(risk: RiskSettings, values: dict[str, Any]) -> None:
             # str(None) 会把文本字段写成字符串 "None"。当作没提供。
             log.debug("忽略 null 风控字段: %s", key)
             continue
+        if isinstance(current, (int, float)) and not isinstance(current, bool):
+            _check_number_input("risk", key, value)
         try:
             setattr(risk, key, bool(value) if isinstance(current, bool) else type(current)(value))
         except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail=f"风控字段 {key} 的值无效")
+            raise HTTPException(status_code=400, detail=f"风控字段 {key} 的值无效") from None
+    _guard_finite("risk", risk)
 
 
 def _apply_exec(target: ExecSettings, values: dict[str, Any]) -> None:
@@ -1873,8 +1952,8 @@ def _apply_exec(target: ExecSettings, values: dict[str, Any]) -> None:
         if not hasattr(target, key):
             log.debug("忽略未知执行台字段: %s", key)
             continue
-        if value is None:
-            continue
+        # 三项都是数字，没有「清空」这一说：null / 布尔 / "nan" 一律当场 400。
+        _check_number_input("exec", key, value)
         try:
             setattr(target, key, float(value))
         except (TypeError, ValueError):
@@ -1888,6 +1967,7 @@ def _apply_exec(target: ExecSettings, values: dict[str, Any]) -> None:
         raise HTTPException(status_code=400, detail="执行台的杠杆至少是 1（现货只能是 1）。")
     if target.poll_seconds < 1.0:
         raise HTTPException(status_code=400, detail="执行台的轮询间隔至少 1 秒。")
+    _guard_finite("exec", target)
 
 
 def _clean_symbol_payload(values: Any, name: str) -> list[str]:
@@ -1955,6 +2035,7 @@ def _apply_notify(target: Any, values: dict[str, Any]) -> None:
             setattr(target, key, bool(value) if isinstance(current, bool) else type(current)(value))
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail=f"通知字段 {key} 的值无效") from None
+    _guard_finite("notify", target)
     if target.enabled and not str(target.webhook_url or "").strip():
         raise HTTPException(
             status_code=400,
@@ -1980,10 +2061,13 @@ def _apply_ai(target: Any, values: dict[str, Any]) -> None:
         if isinstance(current, bool):
             setattr(target, key, bool(value))
             continue
+        if isinstance(current, (int, float)):
+            _check_number_input("ai", key, value)
         try:
             setattr(target, key, type(current)(value))
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail=f"AI 字段 {key} 的值无效") from None
+    _guard_finite("ai", target)
 
 
 def _apply_ai_auto(target: AIAutoSettings, values: dict[str, Any]) -> None:
@@ -2016,12 +2100,15 @@ def _apply_ai_auto(target: AIAutoSettings, values: dict[str, Any]) -> None:
         if isinstance(current, bool):
             setattr(target, key, bool(value))
             continue
+        if isinstance(current, (int, float)):
+            _check_number_input("ai_auto", key, value)
         try:
             setattr(target, key, type(current)(value))
         except (TypeError, ValueError):
             raise HTTPException(
                 status_code=400, detail=f"AI 自动交易字段 {key} 的值无效"
             ) from None
+    _guard_finite("ai_auto", target)
     for name in ("max_order_quote", "max_position_quote", "max_price_drift_pct", "leverage"):
         if getattr(target, name) < 0:
             raise HTTPException(status_code=400, detail=f"ai_auto.{name} 不能为负")

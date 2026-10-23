@@ -45,6 +45,9 @@ CADDY_CERT_DIR = Path("/var/lib/caddy/.local/share/caddy/certificates")
 CADDY_LOG_DIR = Path("/var/log/caddy")
 IPIFY_URL = "https://api.ipify.org"
 IPIFY_TIMEOUT = 3.0
+# 查到就记 10 分钟；没查到记 1 分钟，免得每 2 秒刷新一次的界面每次都去打一遍。
+IPIFY_CACHE_SECONDS = 600.0
+IPIFY_RETRY_SECONDS = 60.0
 DNS_TIMEOUT = 5.0
 PROBE_TIMEOUT = 5.0
 SCRIPT_TIMEOUT = 120.0
@@ -55,6 +58,8 @@ DOMAIN_MAX = 253
 
 _LABEL = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 _TLD = re.compile(r"^[a-z]{2,}$")
+# 转成 punycode 之后的 IDN 顶级域（.中国 -> xn--fiqs8s）。至少 4 位，不可能是纯数字。
+_PUNYCODE_TLD = re.compile(r"^xn--[a-z0-9-]{4,}$")
 _ADDRESS_LINE = re.compile(r"^(?P<address>[^{}#]+)\{")
 
 
@@ -81,6 +86,21 @@ def _require_linux() -> None:
 
 
 # ------------------------------------------------------------------ 域名
+
+
+def _to_punycode(label: str, domain: str) -> str:
+    """IDN 的那一段转成 punycode；纯 ASCII 的原样返回。
+
+    .中国 这种合法 IDN 顶级域以前被 ^[a-z]{2,}$ 判死。转成 xn--fiqs8s 之后走同一条
+    校验（长度、首尾连字符照旧管），Caddyfile 里写的也是 punycode —— Caddy 认这个。
+    已经是 xn-- 的段不再转一次，否则会叠成 xn--xn----…。
+    """
+    if label.isascii():
+        return label
+    try:
+        return "xn--" + label.encode("punycode").decode("ascii")
+    except (UnicodeError, ValueError):
+        raise ValueError(f"域名「{domain}」里的「{label}」转不成 punycode") from None
 
 
 def normalize_domain(text: str) -> str:
@@ -111,21 +131,35 @@ def normalize_domain(text: str) -> str:
         raise ValueError("域名后面不要带端口，只填 trade.example.com 这一段")
     if "@" in raw:
         raise ValueError("这里要的是域名，不是邮箱地址")
-    domain = raw.lower().rstrip(".")
+    domain = raw.lower()
+    # 只吃一个收尾点（FQDN 那种写法），中间的空段是写错。
+    if domain.endswith("."):
+        domain = domain[:-1]
     labels = domain.split(".")
     if len(labels) < 2:
         raise ValueError(f"「{domain}」不是完整域名，至少要两段，例如 trade.example.com")
+    ascii_labels: list[str] = []
     for label in labels:
-        if not _LABEL.match(label):
+        if not label:
+            raise ValueError(f"域名「{domain}」里有两个点挨在一起")
+        ascii_label = _to_punycode(label, domain)
+        if not _LABEL.match(ascii_label):
             raise ValueError(
                 f"域名「{domain}」里的「{label}」不合法：每段只能用字母、数字和连字符，"
                 "长度 1-63，且不能以连字符开头或结尾"
             )
-    if not _TLD.match(labels[-1]):
+        ascii_labels.append(ascii_label)
+    ascii_domain = ".".join(ascii_labels)
+    if len(ascii_domain) > DOMAIN_MAX:
         raise ValueError(
-            f"域名「{domain}」的结尾「.{labels[-1]}」不像顶级域，应该是 .com / .net / .cn 这类"
+            f"域名最长 {DOMAIN_MAX} 个字符，这个转成 punycode 之后有 {len(ascii_domain)} 个"
         )
-    return domain
+    tld = ascii_labels[-1]
+    if not (_TLD.match(tld) or _PUNYCODE_TLD.match(tld)):
+        raise ValueError(
+            f"域名「{ascii_domain}」的结尾「.{tld}」不像顶级域，应该是 .com / .net / .cn 这类"
+        )
+    return ascii_domain
 
 
 def _domain_or_400(text: str) -> str:
@@ -193,6 +227,64 @@ def _looks_like_ip(text: str) -> bool:
     return True
 
 
+_ipify_lock = threading.Lock()
+_ipify_state: dict[str, Any] = {"ip": None, "error": None, "at": 0.0, "pending": False}
+
+
+def reset_ipify_cache() -> None:
+    """清掉公网 IP 缓存（测试用；换完域名想重新问一遍也可以调它）。"""
+    with _ipify_lock:
+        _ipify_state.update({"ip": None, "error": None, "at": 0.0, "pending": False})
+
+
+def ipify_pending() -> bool:
+    """后台那一次查询还在跑吗（自检与测试用）。"""
+    with _ipify_lock:
+        return bool(_ipify_state["pending"])
+
+
+def _refresh_public_ip() -> None:
+    """守护线程里问一次 ipify，结果记进缓存。失败也记，失败别每 2 秒重打一次。"""
+    ip: str | None = None
+    error: str | None = None
+    try:
+        answered = _ipify_get(IPIFY_URL, IPIFY_TIMEOUT).strip()
+        if _looks_like_ip(answered):
+            ip = answered
+        else:
+            error = f"{IPIFY_URL} 回的不是一个 IP：{answered!r}"
+    except Exception as exc:  # noqa: BLE001 - 任何失败都只是「查不到」
+        error = (
+            f"连不上 {IPIFY_URL}（{IPIFY_TIMEOUT:g} 秒超时）："
+            f"{type(exc).__name__}: {exc}"
+        )
+    finally:
+        with _ipify_lock:
+            _ipify_state.update(
+                {"ip": ip, "error": error, "at": time.monotonic(), "pending": False}
+            )
+
+
+def _cached_public_ip() -> tuple[str | None, str | None]:
+    """(ip, 错误说明)。命中缓存立刻返回；没命中就起个后台线程去问，这次先返回 None。
+
+    评审实测：info 在 Linux 上会同步卡 ipify 3 秒，首屏被它挂住。所以查询放到守护
+    线程里做，结果记 10 分钟；失败记 1 分钟。首屏那几个字段（域名、Caddy 状态、
+    证书到期）都不等它。
+    """
+    now = time.monotonic()
+    with _ipify_lock:
+        at = float(_ipify_state["at"] or 0.0)
+        fresh_for = IPIFY_CACHE_SECONDS if _ipify_state["ip"] else IPIFY_RETRY_SECONDS
+        if at and now - at < fresh_for:
+            return _ipify_state["ip"], _ipify_state["error"]
+        if not _ipify_state["pending"]:
+            _ipify_state["pending"] = True
+            threading.Thread(
+                target=_refresh_public_ip, name="deploy-ipify", daemon=True
+            ).start()
+    return None, "正在后台查本机公网 IP，刷新一下就能看到（其它字段不受影响）。"
+
 def _caddyfile_public_ip() -> str | None:
     """从 IP 跳转那一段里读出本机公网 IP（install.sh 写进去的）。"""
     try:
@@ -228,17 +320,10 @@ def public_ip_info() -> tuple[str | None, str, str | None]:
     from_caddy = _caddyfile_public_ip()
     if from_caddy:
         return from_caddy, "caddyfile", None
-    try:
-        answered = _ipify_get(IPIFY_URL, IPIFY_TIMEOUT).strip()
-    except Exception as exc:  # noqa: BLE001 - 任何失败都只是「查不到」
-        return (
-            None,
-            "none",
-            f"连不上 {IPIFY_URL}（{IPIFY_TIMEOUT:g} 秒超时）：{type(exc).__name__}: {exc}",
-        )
-    if not _looks_like_ip(answered):
-        return None, "none", f"{IPIFY_URL} 回的不是一个 IP：{answered!r}"
-    return answered, "ipify", None
+    ip, error = _cached_public_ip()
+    if ip:
+        return ip, "ipify", None
+    return None, "none", error
 
 
 def caddy_state() -> tuple[bool, bool]:

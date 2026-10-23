@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +27,37 @@ def _as_float(value: Any) -> float | None:
         return None
     return number
 
+
+def _coerce_block(name: str, cls: type, raw: dict[str, Any]) -> dict[str, Any]:
+    """按 dataclass 声明的类型把一段配置收一遍：数字字段要有限，int 字段保持 int。
+
+    手改过的 config.json 里可能写着 NaN 或 Infinity —— 它们是合法 JSON，json 能读
+    进来，但存着会让 999999 > nan 恒 False（每单上限、持仓上限、决策有效期全部
+    静默失效），也会让每条 GET /api/settings 因为 allow_nan=False 变成 500。
+    这类值一律退回默认值并记一条 warning：整份配置必须还能打开。
+    """
+    specs = {spec.name: spec for spec in fields(cls)}
+    out: dict[str, Any] = {}
+    for key, value in raw.items():
+        spec = specs.get(key)
+        if spec is None:
+            continue
+        kind = str(spec.type)
+        if kind == "float":
+            number = _as_float(value)
+            if number is None:
+                log.warning("配置里的 %s.%s 不是有限数字（%r），按默认值处理", name, key, value)
+                continue
+            out[key] = number
+        elif kind == "int":
+            number = None if isinstance(value, bool) else _as_float(value)
+            if number is None or number != int(number):
+                log.warning("配置里的 %s.%s 不是整数（%r），按默认值处理", name, key, value)
+                continue
+            out[key] = int(number)
+        else:
+            out[key] = value
+    return out
 
 class ConfigError(RuntimeError):
     """配置文件写入被拒绝。用户读到的话必须说明文件在哪、怎么修。"""
@@ -205,29 +236,20 @@ class ConfigStore:
         raw.pop("freqtrade", None)
         known = {f for f in AppSettings.__dataclass_fields__}
         settings = AppSettings(**{k: v for k, v in raw.items() if k in known})
-        risk_known = {f for f in RiskSettings.__dataclass_fields__}
-        settings.risk = RiskSettings(**{k: v for k, v in risk_raw.items() if k in risk_known})
         # Nested dataclasses must be rebuilt from their dicts; leaving a plain
         # dict here would break every ``settings.notify.<field>`` read.
-        notify_known = {f for f in NotifySettings.__dataclass_fields__}
+        # 每一段都过 _coerce_block：手改出来的 "1.5"、true、"abc"、NaN 都按类型收，
+        # 收不了的退回默认值（以前只有 exec 走这条路，risk / ai / ai_auto 原样读回，
+        # 盘上一个 NaN 就让整份配置再也存不出去）。
+        settings.risk = RiskSettings(**_coerce_block("risk", RiskSettings, risk_raw))
         settings.notify = NotifySettings(
-            **{k: v for k, v in notify_raw.items() if k in notify_known}
+            **_coerce_block("notify", NotifySettings, notify_raw)
         )
-        ai_known = {f for f in AISettings.__dataclass_fields__}
-        settings.ai = AISettings(**{k: v for k, v in ai_raw.items() if k in ai_known})
-        ai_auto_known = {f for f in AIAutoSettings.__dataclass_fields__}
+        settings.ai = AISettings(**_coerce_block("ai", AISettings, ai_raw))
         settings.ai_auto = AIAutoSettings(
-            **{k: v for k, v in ai_auto_raw.items() if k in ai_auto_known}
+            **_coerce_block("ai_auto", AIAutoSettings, ai_auto_raw)
         )
-        # 手改出来的 "1.5"、true、"abc" 都收进来：不是数字就当没写，退回默认值。
-        exec_known = {f for f in ExecSettings.__dataclass_fields__}
-        settings.exec = ExecSettings(
-            **{
-                key: float(value)
-                for key, value in exec_raw.items()
-                if key in exec_known and _as_float(value) is not None
-            }
-        )
+        settings.exec = ExecSettings(**_coerce_block("exec", ExecSettings, exec_raw))
         settings.favorites = clean_symbol_list(settings.favorites)
         settings.recent_symbols = clean_symbol_list(settings.recent_symbols)
         return settings
@@ -251,11 +273,20 @@ class ConfigStore:
                 "修好或删掉坏文件后重启程序再改。"
             )
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            # allow_nan=False：NaN / Infinity 不是合法 JSON。写下去之后 json 读得回来，
+            # 但每条读设置的响应都会因为 allow_nan=False 变成 500，重启也救不回来。
+            # 让它在这里当场炸，别落盘。
+            text = json.dumps(
+                self.settings.to_dict(), indent=2, ensure_ascii=False, allow_nan=False
+            )
+        except ValueError as exc:
+            raise ConfigError(
+                f"设置里出现了非有限数（NaN / Infinity），这次没有保存：{exc}。"
+                "把对应的数字改回正常值再保存。"
+            ) from exc
         tmp = self._path.with_suffix(".tmp")
-        tmp.write_text(
-            json.dumps(self.settings.to_dict(), indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        tmp.write_text(text, encoding="utf-8")
         tmp.replace(self._path)
 
     def update(self, **kwargs: Any) -> None:
