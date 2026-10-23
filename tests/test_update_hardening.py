@@ -13,6 +13,7 @@ import socket
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta
 from typing import Any
 
 import pytest
@@ -28,7 +29,11 @@ OTHER = "1111111222222222222222222222222222222222"
 @pytest.fixture(autouse=True)
 def data_dir(monkeypatch, tmp_path):
     monkeypatch.setenv("BITRADER_DATA_DIR", str(tmp_path))
-    monkeypatch.setattr(updater, "_web_port", None)  # 端口是模块级全局，一个用例一个样
+    # 地址 / 端口 / 桌面壳标记也是模块级全局，一个用例一个样
+    monkeypatch.setattr(updater, "_web_host", None)
+    monkeypatch.setattr(updater, "_web_port", None)
+    monkeypatch.setattr(updater, "_desktop_shell", "")
+    monkeypatch.setattr(updater, "_last_restart_log", None)
     return tmp_path
 
 
@@ -118,28 +123,47 @@ def test_every_restart_gets_a_log_file_of_its_own(monkeypatch, data_dir):
         assert str(kwargs["stdout"].name) in args  # 垫片也知道自己该往哪儿写
 
 
-def test_a_new_process_that_never_listens_is_a_failure_with_the_log_and_the_manual_command(monkeypatch):
-    popen = _Popen(pid=777)
-    monkeypatch.setattr(updater.subprocess, "Popen", popen)
-    monkeypatch.setattr(updater, "_request_shutdown", lambda *a, **k: None)
-    # 第一次等（自己放开端口）成了；第二次等（新进程绑上来）没成
-    answers = iter([True, False])
-    monkeypatch.setattr(updater, "_wait_until", lambda fn, timeout, poll=0.0: next(answers))
-    ok, output = updater._restart_windows()
+def test_a_new_process_that_never_listens_is_a_failure_with_the_log_and_the_manual_command(
+    monkeypatch, data_dir
+):
+    """新进程那一侧：端口放开了，但一直到期限都没有服务接上来 → failed。
+
+    这条判据（连同手动命令、日志）现在落在**新进程**里做，而且判据是 /api/health，
+    不是「端口有人听」——绑上 0.3 秒就关的 socket 能骗过端口探测。
+    """
+    log = data_dir / "logs" / "restart-20261023-010203-abcdef.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text("", encoding="utf-8")
+    past = (datetime.now() - timedelta(seconds=5)).astimezone().isoformat(timespec="seconds")
+    with socket.socket() as probe:  # 一个空端口：没人听
+        probe.bind(("127.0.0.1", 0))
+        port = int(probe.getsockname()[1])
+    _write_state(
+        pid=777,
+        port=port,
+        restart_pending=True,
+        restart_deadline=past,
+        restart_log=str(log),
+    )
+    monkeypatch.setattr(updater, "_pid_alive", lambda pid: False)
+    ok, detail = updater._confirm_restart(updater._default_state() | {"port": port})
     assert ok is False
-    assert "新进程没起来" in output
-    assert str(updater.WEB_PORT) in output
-    log_path = popen.calls[0][1]["stdout"].name
-    assert log_path in output
-    assert "run_web.py" in output  # 手动命令
-    assert "--port" in output
+    assert "还没有人听" in detail
+    state = updater.read_state()
+    assert state["state"] == updater.STATE_FAILED
+    assert "重启没等到" in state["error"]
+    assert f"127.0.0.1:{port}" in state["error"]
+    assert "run_web.py" in state["error"]  # 手动命令
+    assert "--port" in state["error"]
+    assert "run_web.py" in log.read_text(encoding="utf-8")
 
 
 def test_a_restart_that_comes_back_up_is_success(monkeypatch):
     popen = _Popen(pid=888)
     monkeypatch.setattr(updater.subprocess, "Popen", popen)
     monkeypatch.setattr(updater, "_request_shutdown", lambda *a, **k: None)
-    answers = iter([True, True])
+    # 老进程只等一段（自己放开端口）；「新进程起来了吗」由新进程自己认。
+    answers = iter([True])
     monkeypatch.setattr(updater, "_wait_until", lambda fn, timeout, poll=0.0: next(answers))
     ok, output = updater._restart_windows()
     assert ok is True
@@ -169,7 +193,7 @@ def test_the_shim_really_spawns_the_child_and_keeps_its_output(tmp_path):
     with open(log_path, "wb") as handle:
         proc = subprocess.run(
             [sys.executable, "-c", updater._WINDOWS_SHIM, str(port), str(tmp_path),
-             sys.executable, str(log_path)],
+             sys.executable, str(log_path), "127.0.0.1"],
             stdin=subprocess.DEVNULL, stdout=handle, stderr=subprocess.STDOUT,
             timeout=60,
         )
@@ -349,11 +373,9 @@ def test_the_shim_waits_on_the_port_the_process_really_uses(monkeypatch):
     popen = _Popen(pid=999)
     seen: list[Any] = []
 
-    answers = iter([True, False])  # 第一次问「放开了吗」= 是，第二次问「有人听吗」= 是
-
     def spy(port=None, host=updater.WEB_HOST):
-        seen.append(port)
-        return next(answers, False)
+        seen.append(port)  # 老进程只探这一下：自己有没有把端口放开
+        return True
 
     monkeypatch.setattr(updater.subprocess, "Popen", popen)
     monkeypatch.setattr(updater, "_request_shutdown", lambda *a, **k: None)
@@ -363,7 +385,7 @@ def test_the_shim_waits_on_the_port_the_process_really_uses(monkeypatch):
     args = popen.calls[0][0]
     assert "8799" in args, args
     assert "8765" not in args
-    assert seen == [8799, 8799], seen
+    assert seen == [8799], seen
     assert "8799" in output
 
 

@@ -284,12 +284,23 @@ def _run_apply(monkeypatch, git: _Git, *, run=None, which=None):
     return _endpoint("/api/update/apply", "POST")()
 
 
-def test_a_successful_update_ends_in_done_and_writes_the_state_file(monkeypatch, data_dir):
+def test_a_successful_update_hands_the_restart_over_and_writes_the_state_file(
+    monkeypatch, data_dir
+):
+    """跑完一整轮：重启交出去之后**不写 done**，只留 running + restart_pending。
+
+    以前这里顺手写 done，于是盘上同时有 done 和 restart_pending=true；而且那个 done
+    是「拉起了就算成功」，服务有没有起来根本没人验。现在收尾在新进程里做
+    （/api/health 2xx 才 done），见 tests/test_update_restart_confirm.py。
+    """
     git = _git_ready()
     result = _run_apply(monkeypatch, git)
     assert result["job_id"]
     state = updater.read_state()
-    assert state["state"] == updater.STATE_DONE
+    assert state["state"] == updater.STATE_RUNNING
+    assert state["restart_pending"] is True
+    assert state["restart_deadline"], "期限要落到盘上，新进程靠它判断超时"
+    assert state["host"] and state["port"], "地址与端口都要落盘"
     assert state["from_sha"] == HEAD
     assert state["to_sha"] == HEAD
     assert state["error"] == ""
@@ -305,7 +316,8 @@ def test_a_successful_update_ends_in_done_and_writes_the_state_file(monkeypatch,
     assert all(isinstance(step["seconds"], (int, float)) for step in state["steps"])
     # 状态文件真的落在数据目录里，重启之后前端读的就是它。
     saved = (data_dir / "update-state.json").read_text(encoding="utf-8")
-    assert "\"state\": \"done\"" in saved
+    assert "\"state\": \"running\"" in saved
+    assert "\"restart_pending\": true" in saved
     assert updater.read_state()["steps"][3]["output"] == "ok\n"
 
 
@@ -364,6 +376,11 @@ def test_the_state_file_is_read_back_after_a_restart(monkeypatch):
     # 收尾的判据是「记下的那个 pid 真的不在了」，光「不是我这个 pid」不算：
     # 那是别人还活着的任务，任何进程读一次都不许把它收成 done。
     monkeypatch.setattr(updater, "_pid_alive", lambda pid: False)
+    # 收尾还要自己确认服务活着：桩掉，别去连本机 8765（那是开发服务器）。
+    monkeypatch.setattr(updater, "_port_free", lambda port=None, host=None: False)
+    monkeypatch.setattr(
+        updater, "_health_ok", lambda host=None, port=None: (True, "回了 200")
+    )
     updater.write_state(
         {
             "job_id": "abc12345",
@@ -442,7 +459,9 @@ def test_rollback_reverts_to_the_sha_the_update_started_from(monkeypatch):
     result = _endpoint("/api/update/rollback", "POST")(_rollback_payload())
     assert result["job_id"]
     state = updater.read_state()
-    assert state["state"] == updater.STATE_DONE
+    # 回滚也走同一条流水线：重启交出去之后停在 running，done 由新进程确认之后写。
+    assert state["state"] == updater.STATE_RUNNING
+    assert state["restart_pending"] is True
     assert state["to_sha"] == OLD
     assert state["from_sha"] == HEAD
     assert any("revert" in name for name in [step["name"] for step in state["steps"]])
@@ -464,7 +483,9 @@ def test_the_linux_restart_uses_sudo_with_a_list(monkeypatch):
     monkeypatch.setattr(updater, "_request_shutdown", lambda *a, **k: None)
     ok, output = updater.restart_service()
     assert ok is True
-    assert seen == [["sudo", "-n", "systemctl", "restart", "bitrader"]]
+    # --no-block 不能少：不带它，systemctl 要等本单元停完才返回，而本单元就是发命令的
+    # 这个进程——互锁到 TimeoutStopSec 被 SIGKILL，或者 -15 把成功记成失败。
+    assert seen == [["sudo", "-n", "systemctl", "--no-block", "restart", "bitrader"]]
     assert "restarted" in output
 
 
@@ -493,8 +514,8 @@ def test_the_windows_restart_spawns_a_detached_process_then_exits_gracefully(mon
     monkeypatch.setattr(updater.sys, "platform", "win32")
     monkeypatch.setattr(updater.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(updater, "_request_shutdown", lambda *a, **k: shut.append("asked"))
-    # 端口两段确认（自己放开 → 新进程接上）在测试里直接算过：这里只验装配，
-    # 真等待的行为在 tests/test_update_hardening.py 里钉着。
+    # 「自己放开端口」这一段在测试里直接算过：这里只验装配。真等待与新进程的
+    # /api/health 确认在 tests/test_update_restart_confirm.py / test_update_hardening.py 里钉着。
     monkeypatch.setattr(updater, "_wait_until", lambda fn, timeout, poll=0.0: True)
     ok, output = updater.restart_service()
     assert ok is True

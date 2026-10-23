@@ -45,16 +45,49 @@ def _busy_refusal() -> None:
 
     git 工作树只有一份，两条流水线同时跑会互相踩；而且第二个任务会把第一个的
     job_id 与步骤从盘上抹掉，界面上看是两个任务在两个 job_id 之间跳。
+
+    两道都查：状态文件里那条 running（本进程 + 别人进程都会写），以及跨进程的
+    `<数据目录>/update.lock`。评审实测过：三个进程共用同一份数据目录、同时点更新，
+    只查状态时三轮全部 3/3 都建成了任务。
     """
     busy = updater.running_job()
-    if busy is None:
+    if busy is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"上一个更新还在跑（任务 {busy.get('job_id') or '?'}，pid {busy.get('pid')}，"
+                f"状态 {busy.get('state')}）：等它跑完再来——两条流水线同时动同一个工作树，"
+                "会互相把对方的提交和状态搅乱。"
+            ),
+        )
+    holder = updater.lock_holder()
+    if holder is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"另一个进程正在更新（pid {holder.get('pid')}，任务 "
+                f"{holder.get('job_id') or '?'}，从 {holder.get('at') or '?'} 开始）："
+                "这份数据目录只许一个更新在跑——等它跑完再来。"
+            ),
+        )
+
+
+def _desktop_refusal() -> None:
+    """桌面壳启动的进程不许更新。
+
+    壳用的是 `--port 0` + `--parent-pid` / `--watch-stdin`：更新完重启拉起的是裸
+    `run_web.py`，新进程既不知道临时端口，也没有壳盯着——壳当场失联，界面上是
+    「更新完了但窗口连不上后端」。这种时候只让人回应用里重启，不静默把壳弄丢。
+    """
+    reason = updater.desktop_shell_reason()
+    if not reason:
         return
     raise HTTPException(
-        status_code=409,
+        status_code=400,
         detail=(
-            f"上一个更新还在跑（任务 {busy.get('job_id') or '?'}，pid {busy.get('pid')}，"
-            f"状态 {busy.get('state')}）：等它跑完再来——两条流水线同时动同一个工作树，"
-            "会互相把对方的提交和状态搅乱。"
+            f"当前这个后端是桌面壳启动的（{reason}）：更新最后要重启后端，而这里拉起的是"
+            "裸的 run_web.py，新进程接不上壳（端口是壳当场选的、壳还盯着这个 pid 与 stdin）。"
+            "请关掉窗口再打开应用，或者在应用里重启后端；服务端部署请用 run_web.py 或 systemd 那份。"
         ),
     )
 
@@ -71,6 +104,7 @@ def build_update_router() -> APIRouter:
     def update_apply() -> dict[str, Any]:
         """一键更新。前置检查全过才建任务。"""
         _busy_refusal()
+        _desktop_refusal()
         busy = running_engines()
         if busy:
             raise HTTPException(
@@ -109,12 +143,16 @@ def build_update_router() -> APIRouter:
         state = updater.read_state()
         if not state.get("job_id"):
             state["job_id"] = job_id
+        # 界面按平台给手动命令：服务器在 Linux、人坐在 Windows 前面时，只靠浏览器 UA
+        # 猜出来的那条命令是错的（cd /d 与 venv 里的 exe）。
+        state["platform"] = updater.platform_name()
         return state
 
     @router.post("/api/update/rollback")
     def update_rollback(payload: RollbackPayload) -> dict[str, Any]:
         """回到上次更新之前的那个提交。只允许在 done 之后调用。"""
         _busy_refusal()
+        _desktop_refusal()
         if not payload.confirm:
             raise HTTPException(
                 status_code=400,

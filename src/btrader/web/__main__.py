@@ -27,9 +27,14 @@ import threading
 import time
 
 from .. import __version__
+from ..core import updater as _updater
 from ..logging_setup import setup_logging
 
 READY_PREFIX = "BITRADER_READY "
+
+# 优雅退出的宽限：重启时老进程得能自己退出去。一个卡住的请求（大回测、慢导出）没有上限
+# 就会把老进程挂在那儿——Windows 上没人接手端口，systemd 那边也是干等到 SIGKILL。
+GRACEFUL_TIMEOUT = 30
 log = logging.getLogger(__name__)
 
 # uvicorn writes its banner and access log to stdout by default, which would
@@ -147,15 +152,18 @@ def build_server(
         log_level="info",
         access_log=access_log,
         lifespan="on",
+        # 重启时老进程得能自己退出去：一个卡住的请求（大回测、慢导出）没有上限就会把
+        # 老进程挂在那儿，Windows 上没人接手端口，systemd 那边也干等到 SIGKILL。
+        timeout_graceful_shutdown=GRACEFUL_TIMEOUT,
     )
     server = uvicorn.Server(config)
 
-    from ..core import updater as _updater
-
     _updater.set_shutdown_hook(lambda: setattr(server, "should_exit", True))
-    # 重启要跟着真实端口走：垫片盯的就是这个端口。写死 8765 的话，任何不在 8765 上
-    # 跑的实例（自带端口、--port 0 临时端口、量测用的 8799）更新完重启都必然失败。
-    _updater.set_web_port(port)
+    # 重启要跟着真实地址走：垫片拉的就是这一个地址、盯的就是这一个端口。写死
+    # 127.0.0.1:8765 的话，任何不在那儿的实例（自带端口、--port 0 临时端口、量测用的
+    # 8799、--host 0.0.0.0 的服务器）更新完重启都必然出问题：要么 Errno 10048，
+    # 要么服务只剩下回环、外面全连不上。
+    _updater.set_web_bind(host, port)
     return server
 
 
@@ -176,6 +184,23 @@ def serve(server, *, sockets=None) -> int:
     return 0
 
 
+def desktop_flags(*, port: int, parent_pid: int, watch_stdin: bool) -> list[str]:
+    """桌面壳那几个「进程一换就失联」的参数（空列表 = 普通的服务端启动）。
+
+    壳用 `--port 0` 让系统挑端口、用 `--parent-pid` / `--watch-stdin` 盯着这个进程；
+    更新最后一步拉起的是裸 run_web.py，这三样一个都不带，壳当场失联。所以带这些参数的
+    进程不许在线更新（见 routes_update._desktop_refusal）。
+    """
+    flags: list[str] = []
+    if port == 0:
+        flags.append("--port 0")
+    if parent_pid:
+        flags.append(f"--parent-pid {parent_pid}")
+    if watch_stdin:
+        flags.append("--watch-stdin")
+    return flags
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="biTrader local backend")
     parser.add_argument("--host", default="127.0.0.1")
@@ -188,6 +213,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
+
+    # 先告诉 updater 这个进程是怎么起来的：桌面壳那条路径不许在线更新。
+    _updater.set_desktop_shell(
+        "、".join(
+            desktop_flags(
+                port=args.port, parent_pid=args.parent_pid, watch_stdin=args.watch_stdin
+            )
+        )
+    )
 
     setup_logging(
         getattr(logging, str(args.log_level).upper(), logging.INFO),
