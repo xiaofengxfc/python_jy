@@ -138,6 +138,18 @@ SUPPORTED_PLATFORMS = {item["key"]: item["label"] for item in PLATFORMS if item[
 DEFAULT_PLATFORM = "binance"
 
 
+CLOCK_DRIFT_MARKERS = (
+    "-1021",
+    "ahead of the server's time",
+    "Timestamp for this request",
+)
+
+
+def _is_clock_drift(exc: BaseException) -> bool:
+    """这条错误是不是「本机时钟和交易所差太多」造成的。"""
+    text = str(exc)
+    return any(marker in text for marker in CLOCK_DRIFT_MARKERS)
+
 class BinanceREST:
     """One ccxt client per market type, created lazily.
 
@@ -200,8 +212,43 @@ class BinanceREST:
             if self.credentials.is_set:
                 client.apiKey = self.credentials.api_key
                 client.secret = self.credentials.api_secret
+            self._install_clock_guard(client)
             self._clients[market] = client
             return client
+
+    @staticmethod
+    def _install_clock_guard(client: ccxt.Exchange) -> None:
+        """签名请求遇到「本机时钟偏了」就校准一次再重试。
+
+        币安对时间戳的容忍度很小：实测本机快了 1.3 秒，所有签名请求都被
+        -1021 Timestamp for this request was 1000ms ahead of the server 拒掉。
+        界面上看到的是「无法读取当前持仓，为避免重复开仓已拒绝本次下单」，
+        用户完全不知道该怎么办。这个版本的 ccxt python 客户端没有
+        adjustForTimeDifference，所以在这里兜一次：只拦这一种错误，校准完
+        重试一次，其它错误照旧往上抛。
+        """
+        original = getattr(client, "fetch", None)
+        if not callable(original) or getattr(client, "_btrader_clock_guard", False):
+            return
+
+        def fetch_with_clock_retry(*args: Any, **kwargs: Any):
+            try:
+                return original(*args, **kwargs)
+            except Exception as exc:  # noqa: BLE001 - 只处理时钟这一类，其余原样抛
+                if not _is_clock_drift(exc):
+                    raise
+                try:
+                    offset = client.load_time_difference()
+                except Exception:
+                    raise exc from None
+                log.warning("本机时钟与交易所差 %s 毫秒，校准后重试一次", offset)
+                return original(*args, **kwargs)
+
+        try:
+            client.fetch = fetch_with_clock_retry
+            client._btrader_clock_guard = True
+        except AttributeError:  # 只读的替身对象，跳过
+            log.debug("客户端不接受挂载校时守卫，跳过")
 
     @staticmethod
     def _apply_test_environment(client: ccxt.Exchange, market: MarketType) -> None:
