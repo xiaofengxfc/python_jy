@@ -43,6 +43,28 @@ DEPTH_LIMITS: tuple[int, ...] = (5, 10, 20, 50, 100, 500, 1000)
 DEFAULT_DEPTH = 20
 
 
+def _amount_step(raw: dict | None) -> float:
+    """Amount step of one ccxt market, in the market's own amount unit.
+
+    ccxt 把步长放在 ``precision.amount``：现版本是绝对步长（``1e-05``），
+    老版本这一格是小数位数（``5``）。读不出来就回 0，让调用方不截断 —— 
+    把位数当步长会把数量放大六个数量级。
+    """
+    precision = (raw or {}).get("precision")
+    if not isinstance(precision, dict):
+        return 0.0
+    value = precision.get("amount")
+    if isinstance(value, bool):
+        return 0.0
+    if isinstance(value, int):
+        return 10.0 ** -value if value > 0 else 0.0
+    try:
+        step = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return step if step > 0 else 0.0
+
+
 def snap_depth(limit: Any) -> int:
     """把想要的档数换成交所认的那一档：向上取，超过最大档就取最大档。"""
     try:
@@ -335,6 +357,7 @@ class BinanceREST:
                 settle=raw.get("settle") or "",
                 min_amount=float(amount_limit.get("min") or 0.0),
                 min_cost=float(cost_limit.get("min") or 0.0),
+                amount_step=_amount_step(raw),
             )
             resolved = True
         except Exception as exc:
@@ -373,6 +396,31 @@ class BinanceREST:
             return self.client(market).fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
         except Exception as exc:
             raise ExchangeError(_message(exc)) from exc
+
+    def fetch_funding_rate_history(
+        self,
+        market: MarketType,
+        symbol: str,
+        since: int | None = None,
+        limit: int = 1000,
+    ) -> list[dict]:
+        """Settled funding rates as ccxt rows (``timestamp`` ms, decimal rate).
+
+        Only contracts have them: spot answers ``[]`` without a request. The
+        callers are backtests, so nothing here raises — an unsupported venue
+        (testnet), a timeout or an empty answer all come back as ``[]`` and the
+        run continues without funding instead of dying on it.
+        """
+        if not market.is_futures or not self.has_credentials:
+            return []
+        try:
+            rows = self.client(market).fetch_funding_rate_history(
+                symbol, since=since, limit=limit
+            )
+        except Exception as exc:
+            log.debug("读取资金费率失败 %s %s: %s", market.value, symbol, exc)
+            return []
+        return list(rows or [])
 
     def fetch_tickers(self, market: MarketType, symbols: list[str] | None = None) -> dict[str, dict]:
         try:

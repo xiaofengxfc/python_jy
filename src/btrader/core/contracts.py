@@ -30,6 +30,10 @@ class ContractSpec:
     # 映射到 ``limits.cost.min``。0 表示交易所没公布——下单预览如实报 null，不拿
     # min_amount × 价格去凑一个数（那是另一个口径，凑出来的值会骗人）。
     min_cost: float = 0.0
+    # 数量步长（交易所的 ``precision.amount``，现货与线性合约是币、币本位是张）。
+    # 回测按它截断调仓数量、按 min_amount 跳过太小的调仓；0 表示交易所没公布，
+    # 这时不截断，也不替它猜一个（猜错会把数量放大或缩小几个数量级）。
+    amount_step: float = 0.0
 
     @property
     def is_inverse(self) -> bool:
@@ -38,10 +42,12 @@ class ContractSpec:
     def is_tradable(self, amount: float) -> bool:
         """Whether an exchange amount clears the market minimum.
 
-        Deliberately does not guess step sizes: ccxt's ``precision.amount`` is
-        an absolute step in current versions and a digit count in older ones,
-        and misreading it scales orders by orders of magnitude. The actual
-        rounding is delegated to ``amount_to_precision`` instead.
+        The step (``precision.amount``) is read once by the REST layer into
+        ``amount_step`` and is *not* consulted here: ccxt reports an absolute
+        step in current versions and a digit count in older ones, and
+        misreading it scales orders by orders of magnitude. Rounding stays
+        delegated to ``amount_to_precision``; ``amount_step`` is for callers
+        that must truncate offline (the backtest).
         """
         if amount <= 0:
             return False
