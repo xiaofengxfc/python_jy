@@ -101,6 +101,14 @@ validate_args() {
       die "--domain 要填域名，不是 IP：「$DOMAIN」。证书只能签给域名，ACME 不给 IP 发证书"
     fi
     if ! printf '%s' "$DOMAIN" | grep -Eq "$DOMAIN_RE"; then
+      # 下划线单独说清楚：DNS 认它、浏览器也认它，只有证书不认（CA 只发 LDH 名字），
+      # 报一句「写法不对」的话，用户会以为脚本在挑域名，其实换一个字符就能签。
+      case "$DOMAIN" in
+        *_*) die "--domain 里有下划线（_）：「$DOMAIN」
+      证书只发字母、数字、连字符的名字，Caddy 申请带 _ 的名字会被 Let's Encrypt
+      以 rejectedIdentifier 拒掉，一直签不出来（DNS 和浏览器倒是认这个写法）。
+      换成连字符再试：$(printf '%s' "$DOMAIN" | tr '_' '-')（DNS 里也要有这一条记录）" ;;
+      esac
       die "--domain 写法不对：「$DOMAIN」要写成 trade.example.com 这种样子（字母、数字、连字符，结尾是 .com 这类）"
     fi
   fi

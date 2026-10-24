@@ -25,6 +25,11 @@
 
 DNS：在域名服务商那里加一条 A 记录，指向服务器公网 IP。**先配 DNS 再跑脚本**，否则 Caddy 签证书会失败（见第 8 节排错）。
 
+域名写法只有一条硬规矩：**不能带下划线**。DNS 和浏览器认 `python_jy.example.com`，但证书只发
+字母、数字、连字符的名字，Caddy 拿它去申请会被 Let's Encrypt 以 `rejectedIdentifier` 拒掉，
+一直签不出来。脚本会在参数校验那一关就拒，并给出连字符写法（`python-jy.example.com`）——
+记得在 DNS 里也加这一条记录。
+
 用 IP 直接打开时只有 `http://IP` 那一段：它会 301 到域名。不做 `https://IP`——ACME 不给 IP 签证书，
 那个站点块永远拿不到证书，写了也不会生效。要 HTTPS 就用域名访问。
 
@@ -282,6 +287,9 @@ curl -fsS https://api.ipify.org; echo
 2. **ACME 的验证路径不能被拦。** Caddy 走 HTTP-01，Cloudflare 必须能把
    `http://域名/.well-known/acme-challenge/<token>` 回源到这台机器的 80 端口：
    别在 WAF / Cache Rules / Page Rules 里拦它，也别给这个域名加强制跳转（Caddy 自己会处理 80 → 443）。
+   橙云下这一条是被转发出来的，所以出问题时无法从外面分辨是 CF 拦的还是源站没起来：
+   第一次签证书最省事的是先把这个子域的橙云关掉（灰云 / DNS only），签下来再打开——
+   开关只决定流量走不走 CF，不决定证书有没有效。
 3. **源站只对 Cloudflare 网段开 80/443。** 这样别人拿不到源站 IP 也就绕不过 CF。ufw 示例（**手动作业**：
    脚本不会替你改防火墙，云厂商安全组同样要自己开）：
 
@@ -314,6 +322,7 @@ sudo ufw status numbered        # 看完再决定要不要删旧的 80/443 规�
 | 现象 | 原因 |
 |---|---|
 | `curl` 一串 301 / 浏览器 `ERR_TOO_MANY_REDIRECTS` | Cloudflare 是 Flexible，改成 Full (strict) |
+| HTTP 521 | CF 连不上源站的 80/443（TCP 被拒或丢包）：防火墙、云安全组没放行，或者 Caddy / bitrader 没在跑。在机器上确认：`ss -lntp \| grep -E ':(80\|443)'`、`systemctl status caddy bitrader` |
 | HTTP 52x（522 / 523 / 524） | CF 回不到源站：服务没起来、80/443 没对 CF 网段开、端口不是 unit 里那个 |
 | HTTP 526 | 源站证书无效：先在机器上确认 443 上有这张域名的证书（`openssl s_client -connect 127.0.0.1:443 -servername 域名`） |
 | 页面能开，但接口全 502 | Caddyfile 里的反代端口和 unit 的 `--port` 不一致（`port.conf` 是不是旧值） |

@@ -132,6 +132,7 @@ def test_bad_arguments_are_refused_before_anything_is_written():
         ("--domain", "1.2.3.4"),
         ("--domain", "a&b.example.com"),
         ("--domain", "http://x.example.com"),
+        ("--domain", "python_jy.789446.xyz"),
         ("--port", "abc"),
         ("--port", "70000"),
         ("--repo", "https://example.com/a b.git"),
@@ -140,6 +141,18 @@ def test_bad_arguments_are_refused_before_anything_is_written():
         assert done.returncode != 0, bad
         output = done.stdout + done.stderr
         assert "[dry-run]" not in output, "参数没过关就不许开始写任何东西：%r" % (bad,)
+
+
+def test_a_domain_with_an_underscore_names_the_character_and_the_fix():
+    """DNS 认下划线、证书不认。报一句笼统的「写法不对」等于让人去猜，要把这一条点名。"""
+    done = _dry_run_rejects("--domain", "python_jy.789446.xyz")
+    assert done.returncode != 0
+    output = done.stdout + done.stderr
+    assert "下划线" in output, output
+    assert "python-jy.789446.xyz" in output, "要给出连字符写法"
+    assert "rejectedIdentifier" in output, "说清是谁拒的，别只说不合规矩"
+    assert "--domain 写法不对" not in output, "别退回那句笼统的"
+    assert "[dry-run]" not in output
 
 
 def test_the_ip_comes_from_the_cloud_metadata_before_a_public_service():
