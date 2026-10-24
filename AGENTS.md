@@ -321,8 +321,9 @@ Node 不在 PATH 时，先把 Node 目录加进去。
 
 ## 8. 策略
 
-- 内置策略在包里：`src/btrader/strategy/builtin/*.py`，跟着程序升级走。用户策略是数据目录
-  `%APPDATA%/biTrader/strategies/*.py`（`paths.user_strategies_dir()`）下的普通 `.py` 文件。
+- 内置策略在包里：`src/btrader/strategy/builtin/*.py`，跟着程序升级走。用户策略是数据目录下的
+  `strategies/*.py`（`paths.user_strategies_dir()`）普通 `.py` 文件：桌面版在
+  `%APPDATA%\biTrader\strategies`，源码跑起来在 `%APPDATA%\biTrader-dev\strategies`（见第 1 节）。
   AI 候选在 `strategies/candidates/`，不参与正式注册；批准时才复制进用户目录，并顺手把类属性
   `key = "..."` 改写成最终 key（撞库就带后缀）。策略是本机 Python 代码，权限和本程序相同。
 - 加载顺序是先内置、再用户目录。用户目录里的同名 `key` 顶掉内置，这就是「改内置」的实现：
