@@ -25,7 +25,7 @@ from btrader.core.storage import Database
 from btrader.core.types import MarketType, Network
 from btrader.engine.account import AccountService
 from btrader.engine.risk import RiskManager
-from btrader.engine.trading import LIVE_LEDGER_KEY, TradingService
+from btrader.engine.trading import TradingService, ledger_key
 from btrader.web import app as web_app
 from btrader.web.app import ClosePayload
 
@@ -113,7 +113,7 @@ class SimpleBox:
 
 def _book(db: Database, symbol: str, contracts: float, entry: float = 100.0) -> None:
     db.set_json(
-        LIVE_LEDGER_KEY,
+        ledger_key(Network.TESTNET),
         {"seen": [], "books": {symbol: {"contracts": contracts, "entry": entry}}},
     )
 

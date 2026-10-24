@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from ..core.config import AppSettings
+from ..core.credentials import account_id
 from ..core.storage import Database
 from ..core.types import (
     MarketType,
@@ -23,7 +24,7 @@ from ..core.types import (
     RunMode,
     market_for_symbol,
 )
-from ..exchange.rest import BinanceREST, ExchangeError
+from ..exchange.rest import DEFAULT_PLATFORM, BinanceREST, ExchangeError
 from ..exchange.symbols import format_amount
 from ..notify import Notifier
 from .risk import RiskDecision, RiskManager
@@ -53,6 +54,16 @@ def venue_rejection_message(exc: Exception) -> str:
 # charge the same exit twice.
 LIVE_LEDGER_KEY = "live.ledger.v1"
 LIVE_TRADE_LIMIT = 800
+
+
+def ledger_key(network: Network) -> str:
+    """成交账本的存储 key，按网络分开。
+
+    主网与测试网的成交编号各成一套、仓位也各自存在。共用一份 books 时，切到测试网
+    看到的是主网的持仓配上测试网的价格，未实现盈亏这类数字就这样凭空出现；
+    seen 里又只有成交 id，现货与合约撞号的那一笔会被当成「已经记过」直接跳过。
+    """
+    return f"{LIVE_LEDGER_KEY}:{network.value}"
 
 
 def _symbol_market(symbol: str) -> MarketType:
@@ -707,8 +718,11 @@ class TradingService:
 
 
     # -------------------------------------------------------- live accounting
+    def _ledger_key(self) -> str:
+        return ledger_key(self.network)
+
     def _live_ledger(self) -> dict:
-        data = self.db.get_json(LIVE_LEDGER_KEY)
+        data = self.db.get_json(self._ledger_key())
         if not isinstance(data, dict):
             data = {}
         return {
@@ -719,7 +733,7 @@ class TradingService:
     def _save_live_ledger(self, ledger: dict) -> None:
         try:
             self.db.set_json(
-                LIVE_LEDGER_KEY,
+                self._ledger_key(),
                 {
                     "seen": ledger["seen"][-LIVE_TRADE_LIMIT:],
                     "books": ledger["books"],
@@ -799,9 +813,13 @@ class TradingService:
                 continue
             for trade in sorted(trades, key=lambda item: item.get("timestamp") or 0):
                 trade_id = str(trade.get("id") or "")
-                if not trade_id or trade_id in seen:
+                # 去重键要带市场：现货与合约的成交编号各自从 1 数起，只按 id 记的话
+                # 合约那一笔会被当成「现货那笔已经记过」，账本少成交，风控也收不到
+                # 这次平仓的盈亏。
+                seen_id = f"{market.value}:{trade_id}" if trade_id else ""
+                if not seen_id or seen_id in seen:
                     continue
-                seen.add(trade_id)
+                seen.add(seen_id)
                 result = self._book_live_trade(trade, books)
                 if result is not None:
                     booked.append(result)
@@ -814,7 +832,9 @@ class TradingService:
                     )
                     self._merge_exit(announced, trade, result, market.value)
                 try:
-                    self.db.save_trade(self._account_id(), trade, RunMode.LIVE.value)
+                    self.db.save_trade(
+                        self._account_id(), trade, RunMode.LIVE.value, market.value
+                    )
                 except Exception:  # pragma: no cover - history is best effort
                     log.warning("实盘成交写库失败", exc_info=True)
 
@@ -1035,4 +1055,6 @@ class TradingService:
         self._leverage_applied.clear()
 
     def _account_id(self) -> str:
-        return f"binance:{self.network.value}"
+        # 平台跟着设置走，和 AccountService 用同一个 account_id：写库与读历史
+        # 各算一份时，界面上一条成交都读不出来，而且不报错。
+        return account_id(self.network, self.settings.platform or DEFAULT_PLATFORM)

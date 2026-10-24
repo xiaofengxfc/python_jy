@@ -56,6 +56,17 @@ class KlineStore:
         # handle still holds, so reading and writing the cache share one lock.
         self._io_lock = threading.Lock()
 
+    def set_source(self, source: str) -> None:
+        """换数据源分区。
+
+        缓存目录按源分开（source/market/symbol/timeframe）。运行中换交易所或换网络
+        时只改 self._source 会让下一次读盘落到新目录、而 _refreshed 里还存着旧目录
+        的刷新时间——那几秒内会直接吃一份没有的缓存，所以刷新表一起清掉。
+        """
+        with self._io_lock:
+            self._source = source
+        self._refreshed.clear()
+
     def _path(self, market: MarketType, symbol: str, timeframe: str) -> Path:
         safe = symbol.replace("/", "_").replace(":", "-")
         folder = self._root / self._source / market.value / safe

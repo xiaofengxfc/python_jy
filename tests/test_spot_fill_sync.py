@@ -24,7 +24,7 @@ from btrader.core.storage import Database
 from btrader.core.types import MarketType, Network
 from btrader.engine.account import AccountService
 from btrader.engine.risk import RiskManager
-from btrader.engine.trading import LIVE_LEDGER_KEY, OrderRequest, TradingService
+from btrader.engine.trading import OrderRequest, TradingService, ledger_key
 from btrader.exchange.rest import ExchangeError
 from btrader.web import app as web_app
 from btrader.web.app import ClosePayload
@@ -134,7 +134,7 @@ def test_a_booked_spot_pair_is_still_polled_after_a_restart(tmp_path):
     settings = _settings()
     db = Database(tmp_path / "restart.db")
     db.set_json(
-        LIVE_LEDGER_KEY,
+        ledger_key(Network.TESTNET),
         {
             "seen": [],
             "books": {

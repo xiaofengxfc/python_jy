@@ -37,9 +37,15 @@ class Credentials:
         return f"{self.api_key[:4]}...{self.api_key[-4:]}"
 
 
-def _account_id(network: Network) -> str:
-    # Spot and futures share one Binance API key per account, but testnet keys differ.
-    return network.value
+def account_id(network: Network, platform: str = "binance") -> str:
+    """订单/成交写库时用的账户标识：平台 + 网络。
+
+    现货与合约共用一个 Key（市场类型另有一列），主网与测试网各有各的账户，
+    所以这一列只到「平台 + 网络」。写入方（TradingService）和读取方
+    （AccountService）必须用同一个函数算它：各写一份时，界面按 network.value
+    查、下单向库写 "binance:testnet"，成交历史一条都读不出来，且没人报错。
+    """
+    return f"{platform}:{network.value}"
 
 
 class CredentialStore:

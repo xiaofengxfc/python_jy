@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import pytest
 
+from btrader.core.credentials import account_id
 from btrader.core.storage import Database
 from btrader.core.types import MarketType, Network
 from btrader.engine.account import AccountService
@@ -48,7 +49,7 @@ def _account(tmp_path, venue: FakeVenue) -> tuple[AccountService, Database]:
 
 def _seed_buy(db: Database, amount: float, price: float = ENTRY) -> None:
     db.save_trade(
-        "binance:testnet",
+        account_id(Network.TESTNET),
         {
             "id": "fill-1",
             "symbol": SPOT,

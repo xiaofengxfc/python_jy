@@ -11,12 +11,19 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .. import paths
+from .types import market_for_symbol
 
 log = logging.getLogger(__name__)
 
+# v1：orders / trades 的主键从 (id) 改成 (account, market_type, id)。
+# 币安现货、U 本位、币本位各有一套成交编号，撞号是常态而不是意外：同一个 id 的
+# 两笔成交在 (id) 这个主键上互相覆盖，剩下的那一行属于哪个市场已经无从得知。
+# 旧行的 market_type 从来没记过，靠 symbol 写法反推也只是猜，所以整表丢弃。
+SCHEMA_VERSION = 1
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS orders (
-    id TEXT PRIMARY KEY,
+    id TEXT NOT NULL,
     account TEXT NOT NULL,
     market_type TEXT NOT NULL,
     symbol TEXT NOT NULL,
@@ -30,13 +37,15 @@ CREATE TABLE IF NOT EXISTS orders (
     mode TEXT,
     created_at INTEGER,
     updated_at INTEGER,
-    raw TEXT
+    raw TEXT,
+    PRIMARY KEY (account, market_type, id)
 );
-CREATE INDEX IF NOT EXISTS idx_orders_symbol ON orders(account, symbol, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_orders_symbol ON orders(account, market_type, symbol, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS trades (
-    id TEXT PRIMARY KEY,
+    id TEXT NOT NULL,
     account TEXT NOT NULL,
+    market_type TEXT NOT NULL,
     symbol TEXT NOT NULL,
     side TEXT,
     price REAL,
@@ -46,9 +55,10 @@ CREATE TABLE IF NOT EXISTS trades (
     fee_currency TEXT,
     timestamp INTEGER,
     mode TEXT,
-    raw TEXT
+    raw TEXT,
+    PRIMARY KEY (account, market_type, id)
 );
-CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(account, symbol, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(account, market_type, symbol, timestamp DESC);
 
 CREATE TABLE IF NOT EXISTS backtest_runs (
     id TEXT PRIMARY KEY,
@@ -70,6 +80,24 @@ CREATE TABLE IF NOT EXISTS settings_kv (
 """
 
 
+def _scope_where(account: str | None, market_type: str | None) -> tuple[str, list[str]]:
+    """WHERE 片段 + 参数，供所有历史查询共用。
+
+    主网与测试网、现货与合约的成交都写在同一张表里，要读出「这个账户这个市场的
+    那几条」只能靠这两个条件。缺一个就会把另一侧的行混进列表——面板上看到的就是
+    「测试网的成交里出现了主网的数量」，而列表本身不说哪个数属于谁。
+    """
+    clauses: list[str] = []
+    params: list[str] = []
+    if account:
+        clauses.append("account = ?")
+        params.append(account)
+    if market_type:
+        clauses.append("market_type = ?")
+        params.append(market_type)
+    return ("WHERE " + " AND ".join(clauses)) if clauses else "", params
+
+
 class Database:
     """Thread-safe thin wrapper around sqlite3."""
 
@@ -79,15 +107,39 @@ class Database:
         self._conn = sqlite3.connect(str(self._path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         with self._lock, self._conn:
+            # 先迁移再建表：v0 的 trades 没有 market_type，直接跑 SCHEMA 里的
+            # CREATE INDEX 会撞上 "no such column"，整个库打不开。
+            self._migrate()
             self._conn.executescript(SCHEMA)
+
+    def _migrate(self) -> None:
+        """Bring an existing file up to SCHEMA_VERSION.
+
+        v0 的 orders / trades 主键只有 id，trades 连 market_type 都没有。改主键
+        在 SQLite 里只能重建表，而重建时没有任何一列能说清旧行属于哪个市场——
+        撞号的那一行早就被覆盖掉了。所以直接丢表重建（口径已确认），
+        backtest_runs 与 settings_kv 不受影响：配置和回测历史都留着。
+        """
+        version = int(self._conn.execute("PRAGMA user_version").fetchone()[0] or 0)
+        if version >= SCHEMA_VERSION:
+            return
+        self._conn.executescript(
+            "DROP TABLE IF EXISTS orders;\n"
+            "DROP TABLE IF EXISTS trades;\n"
+            + "PRAGMA user_version = %d;" % SCHEMA_VERSION
+        )
+        self._conn.commit()
+        log.info(
+            "数据库升级到 v%d：重建 orders / trades（旧行按约定丢弃）", SCHEMA_VERSION
+        )
 
     @contextmanager
     def cursor(self):
         """Run a statement block in one transaction.
 
         A failure rolls the transaction back before re-raising. Without this,
-        the connection kept the partially applied writes open and the *next*
-        ``commit()`` — from an unrelated save — flushed them to disk.
+        the connection kept the partially applied writes open and the next
+        commit() — from an unrelated save — flushed them to disk.
         """
         with self._lock:
             cur = self._conn.cursor()
@@ -119,7 +171,7 @@ class Database:
                 """INSERT INTO orders (id, account, market_type, symbol, side, type,
                        price, amount, filled, cost, status, mode, created_at, updated_at, raw)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                   ON CONFLICT(id) DO UPDATE SET
+                   ON CONFLICT(account, market_type, id) DO UPDATE SET
                        filled=excluded.filled, cost=excluded.cost, status=excluded.status,
                        updated_at=excluded.updated_at, raw=excluded.raw""",
                 (
@@ -141,17 +193,30 @@ class Database:
                 ),
             )
 
-    def save_trade(self, account: str, trade: dict, mode: str) -> None:
+    def save_trade(
+        self,
+        account: str,
+        trade: dict,
+        mode: str,
+        market_type: str | None = None,
+    ) -> None:
+        """Store one fill, scoped by account and market.
+
+        market_type 缺省时按 symbol 写法推（BTC/USDT 现货、BTC/USDT:USDT U 本位）：
+        主键里就有它，留空等于让另一侧的同号成交顶掉这一条，所以宁可从 symbol 现推。
+        """
+        market = market_type or market_for_symbol(str(trade.get("symbol") or "")).value
         raw = json.dumps(trade, default=str, ensure_ascii=False)
         with self.cursor() as cur:
             cur.execute(
                 """INSERT OR REPLACE INTO trades
-                   (id, account, symbol, side, price, amount, cost, fee, fee_currency,
-                    timestamp, mode, raw)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   (id, account, market_type, symbol, side, price, amount, cost, fee,
+                    fee_currency, timestamp, mode, raw)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     str(trade.get("id", "")),
                     account,
+                    market,
                     trade.get("symbol", ""),
                     trade.get("side", ""),
                     trade.get("price"),
@@ -186,27 +251,42 @@ class Database:
                 ),
             )
 
-    def recent_orders(self, limit: int = 200) -> list[sqlite3.Row]:
+    def recent_orders(
+        self,
+        limit: int = 200,
+        *,
+        account: str | None = None,
+        market_type: str | None = None,
+    ) -> list[sqlite3.Row]:
+        where, params = _scope_where(account, market_type)
         return self.query(
-            "SELECT * FROM orders ORDER BY created_at DESC LIMIT ?", (limit,)
+            f"SELECT * FROM orders {where} ORDER BY created_at DESC LIMIT ?",
+            (*params, limit),
         )
 
     def recent_trades(
-        self, limit: int = 100, *, mode: str | None = None
+        self,
+        limit: int = 100,
+        *,
+        mode: str | None = None,
+        account: str | None = None,
+        market_type: str | None = None,
     ) -> list[sqlite3.Row]:
         """Stored fills, newest first.
 
         The mode filter picks the account a fill came from: the venue ledger
         ("live") is what the app shows now, while rows left over from the
-        removed paper account stay readable for comparison.
+        removed paper account stay readable for comparison. account and
+        market_type are the scope the caller is looking at: without them a
+        testnet session reads the mainnet fills as its own history.
         """
+        where, params = _scope_where(account, market_type)
         if mode:
-            return self.query(
-                "SELECT * FROM trades WHERE mode = ? ORDER BY timestamp DESC LIMIT ?",
-                (mode, limit),
-            )
+            where = (where + " AND mode = ?") if where else "WHERE mode = ?"
+            params.append(mode)
         return self.query(
-            "SELECT * FROM trades ORDER BY timestamp DESC LIMIT ?", (limit,)
+            f"SELECT * FROM trades {where} ORDER BY timestamp DESC LIMIT ?",
+            (*params, limit),
         )
 
     def recent_backtests(self, limit: int = 50) -> list[sqlite3.Row]:

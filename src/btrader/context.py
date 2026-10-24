@@ -51,7 +51,9 @@ class AppContext:
             proxy=self.settings.proxy,
             platform=self.platform,
         )
-        self.risk = RiskManager(self.settings.risk, self.db)
+        # 当日计数与熔断按网络分开存：共用一个 key 时，测试网的亏损会吃掉主网的
+        # 当日额度，主网的熔断也让测试网起不来。
+        self.risk = RiskManager(self.settings.risk, self.db, scope=self.network.value)
         # Outbound WeChat push. Constructed even when disabled so the settings
         # page can report whether the OpenClaw CLI is actually reachable.
         self.notifier = Notifier(self.settings.notify)
@@ -75,18 +77,30 @@ class AppContext:
             chart_rest_for=self.market_rest_for,
             db=self.db,
             network=self.network,
+            platform=self.platform,
         )
 
         # Keyless feed: announcements plus two RSS outlets, no token to manage.
         self.news = NewsService()
 
-        self.klines = KlineStore(self.market_rest, paths.kline_cache_dir(), source="mainnet")
+        self.klines = KlineStore(
+            self.market_rest, paths.kline_cache_dir(), source=self._kline_source()
+        )
 
         self.strategies = StrategyRegistry()
         self.strategies.discover([paths.user_strategies_dir()])
 
         self._market_rest: dict[MarketType, BinanceREST] = {self.market_type: self.rest}
         self._data_rest: dict[MarketType, BinanceREST] = {self.market_type: self.market_rest}
+
+    def _kline_source(self) -> str:
+        """K 线缓存的分区名：交易所 + 网络。
+
+        以前写死 "mainnet"，于是测试网会话和换过的交易所仍然读写同一份 parquet，
+        两边的 K 线被合并进同一个文件——图上是两种价格拼起来的一根根柱子，而界面
+        不说哪根来自哪边。
+        """
+        return f"{self.platform}-{self.network.value}"
 
     # ------------------------------------------------------------------ market
     def rest_for(self, market: MarketType) -> BinanceREST:
@@ -150,6 +164,10 @@ class AppContext:
         self._data_rest = {self.market_type: self.market_rest}
         self.account.network = network
         self.account.invalidate()
+        # 风控状态与 K 线缓存都按网络分开：切过去要换作用域，否则测试网看到的是
+        # 主网的熔断状态和主网的 K 线。
+        self.risk.set_scope(network.value)
+        self.klines.set_source(self._kline_source())
         if persist:
             self.config.save()
 
@@ -181,11 +199,14 @@ class AppContext:
         self.rest.platform = target
         self.rest.credentials = self.creds
         self.rest.reset()
+        self.account.platform = target
         self.market_rest.platform = target
         self.market_rest.reset()
         self._market_rest = {self.market_type: self.rest}
         self._data_rest = {self.market_type: self.market_rest}
         self.account.invalidate()
+        # 别的交易所的 K 线不能混进同一份缓存。
+        self.klines.set_source(self._kline_source())
         if persist:
             self.config.save()
 

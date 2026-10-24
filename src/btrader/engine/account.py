@@ -23,6 +23,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from ..core.credentials import account_id
 from ..core.storage import Database
 from ..core.types import STOP_TYPES, TAKE_PROFIT_TYPES, MarketType, Network
 
@@ -150,6 +151,7 @@ class AccountService:
         chart_rest_for: Callable[[MarketType], Any],
         db: Database,
         network: Network,
+        platform: str = "binance",
         ttl: float = 3.0,
         wallet_ttl: float = 10.0,
     ) -> None:
@@ -157,12 +159,18 @@ class AccountService:
         self._chart_rest_for = chart_rest_for
         self.db = db
         self.network = network
+        # 成交历史按「平台 + 网络」读：写入方是 TradingService._account_id()，
+        # 两边不是同一个标识时，界面上的成交列表永远是空的。
+        self.platform = platform
         self.ttl = ttl
         # Equity is a whole-wallet figure and pricing every coin is the
         # expensive part, so it is refreshed on a slower beat than a pair read.
         self.wallet_ttl = wallet_ttl
         self._lock = threading.RLock()
         self._cache: dict[tuple[MarketType, str], Snapshot] = {}
+
+    def _account_id(self) -> str:
+        return account_id(self.network, self.platform)
 
     # ------------------------------------------------------------------ public
     def invalidate(self) -> None:
@@ -575,7 +583,9 @@ class AccountService:
     # ------------------------------------------------------------ trade ledger
     def _recent_trades(self) -> list[dict[str, Any]]:
         try:
-            rows = self.db.recent_trades(limit=60, mode="live")
+            rows = self.db.recent_trades(
+                limit=60, mode="live", account=self._account_id()
+            )
         except Exception:
             log.debug("读取成交历史失败", exc_info=True)
             return []
@@ -595,7 +605,9 @@ class AccountService:
 
     def _ledger(self) -> dict[str, dict[str, float]]:
         try:
-            rows = self.db.recent_trades(limit=LEDGER_TRADE_LIMIT, mode="live")
+            rows = self.db.recent_trades(
+                limit=LEDGER_TRADE_LIMIT, mode="live", account=self._account_id()
+            )
         except Exception:
             log.debug("读取成交账本失败", exc_info=True)
             return {}

@@ -20,6 +20,7 @@ from types import SimpleNamespace
 import pytest
 
 from btrader.core.config import AppSettings
+from btrader.core.credentials import account_id
 from btrader.core.contracts import ContractSpec
 from btrader.core.storage import Database
 from btrader.core.types import MarketType, Network
@@ -133,7 +134,7 @@ def test_refresh_sees_a_new_row_that_the_cache_does_not_have(box: Box):
 
     # 程序买了一笔，账本记上，钱包也跟着变
     box.db.save_trade(
-        "binance:testnet",
+        account_id(Network.TESTNET),
         {
             "id": "fill-1",
             "symbol": SPOT,

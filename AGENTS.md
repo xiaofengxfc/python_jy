@@ -36,6 +36,9 @@ Node 不在 PATH 时，先把 Node 目录加进去。
 
 提交前必须全绿。测试不访问网络：`tests/conftest.py` 把 `notify._post_json` 换成
 一个直接报错的替身，暂存文件也指向临时目录。要验证发送的测试自己替换它。
+另有一条 `isolated_data_dir`：`BITRADER_DATA_DIR` 指向每个用例自己的临时目录。
+没有它，凡是构造 `AppContext` 的用例都会打开 `%APPDATA%/biTrader/bitrader.db`
+（跑一次测试就跑一次 schema 迁移）并往真实 `config.json` 里写东西。
 
 ## 3. 改代码的注意事项
 
@@ -159,6 +162,19 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   在客户端 `fetch` 那一层装了守卫：只拦这一类错误，`load_time_difference()` 后重试一次。
   这个版本的 ccxt python 客户端没有 `adjustForTimeDifference`，别把守卫删掉。
 - SQLite 里 `mode='paper'` 的旧成交还在库里，界面只显示 `live` 的成交。
+- 存储的每一项都要带作用域，别让两个账户（或两个市场）共用一个 key：
+  成交账本 `live.ledger.v1:<network>`（`trading.ledger_key`；`seen` 的元素是
+  `<market>:<trade_id>`——现货与合约的成交编号各自从 1 数起）、当日风控
+  `risk.state.v1:<network>`（`risk.risk_state_key`，切网络走 `set_scope`）、权益基线
+  `account.baseline.v1:<network>:<market>`、K 线缓存
+  `cache/klines/<平台>-<网络>/<市场>/<交易对>/<周期>.parquet`（`KlineStore.set_source`）。
+  `orders` / `trades` 的主键是 `(account, market_type, id)`，`account` 只能由
+  `core.credentials.account_id(network, platform)` 算：写入方是 `TradingService._account_id()`，
+  读取方是 `AccountService._account_id()`，各算一份就等于成交历史永远读不出来，而且不报错。
+  读历史一律带 `account` + `market_type`（`recent_trades` / `recent_orders`），
+  不带就会把两个网络、两个市场的行混进同一个列表。
+  库版本在 `PRAGMA user_version`（`storage.SCHEMA_VERSION`）：v1 重建了 `orders` / `trades`
+  并丢弃旧行——旧行没有 `market_type`，撞号的那一条早被覆盖，反推只能是猜。
 
 ## 5. 已确认的限制
 

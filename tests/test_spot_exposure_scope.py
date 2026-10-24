@@ -25,11 +25,12 @@ import threading
 import pytest
 
 from btrader.core.config import AppSettings
+from btrader.core.credentials import account_id
 from btrader.core.storage import Database
 from btrader.core.types import MarketType, Network
 from btrader.engine.account import AccountService
 from btrader.engine.risk import RiskDecision, RiskManager
-from btrader.engine.trading import LIVE_LEDGER_KEY, OrderRequest, TradingService
+from btrader.engine.trading import OrderRequest, TradingService, ledger_key
 
 from fakes import FakeVenue
 
@@ -52,7 +53,7 @@ def _trading(tmp_path, *, wallet_btc: float, cap: float = 5_000.0, books: dict |
     settings.risk.max_position_quote = cap
     db = Database(tmp_path / "exposure.db")
     if books is not None:
-        db.set_json(LIVE_LEDGER_KEY, {"seen": [], "books": books})
+        db.set_json(ledger_key(Network.TESTNET), {"seen": [], "books": books})
     trading = TradingService(
         settings=settings,
         rest=venue,
@@ -176,7 +177,7 @@ def _spot_venue(wallet_btc: float = 1.00042, last: float = PRICE) -> FakeVenue:
 
 def _seed_buy(db: Database, amount: float, price: float, trade_id: str = "t1") -> None:
     db.save_trade(
-        "binance:testnet",
+        account_id(Network.TESTNET),
         {
             "id": trade_id,
             "symbol": SPOT,

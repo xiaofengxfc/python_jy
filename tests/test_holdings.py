@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from btrader.core.credentials import CredentialStore, Credentials
+from btrader.core.credentials import CredentialStore, Credentials, account_id
 from btrader.core.storage import Database
 from btrader.core.types import MarketType, Network
 from btrader.engine.account import AccountService
@@ -95,7 +95,7 @@ def _service(tmp_path, venue: FakeVenue) -> tuple[AccountService, Database]:
 
 def _buy(db: Database, symbol: str, amount: float, price: float) -> None:
     db.save_trade(
-        "binance",
+        account_id(Network.TESTNET),
         {
             "id": f"t-{symbol}-{amount}",
             "symbol": symbol,

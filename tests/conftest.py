@@ -36,3 +36,15 @@ def no_real_http(monkeypatch, tmp_path):
     # 否则下一次 status() 会报出别的测试留下的条数。
     monkeypatch.setattr(notify, "_spool_path", lambda: tmp_path / "notify-spool.jsonl")
 
+
+@pytest.fixture(autouse=True)
+def isolated_data_dir(monkeypatch, tmp_path):
+    """整轮测试都不许碰真实数据目录。
+
+    paths.data_dir() 默认是 %APPDATA%/biTrader。没隔离时，凡是构造 AppContext 的
+    用例都会对真实 config.json 与 bitrader.db 动手：存一次设置就改掉用户配置，
+    打开一次库就跑一次 schema 迁移（v1 会把 orders / trades 重建掉）。
+    这条之前就存在，只是没人注意到——现在它不可能悄无声息地发生。
+    """
+    monkeypatch.setenv("BITRADER_DATA_DIR", str(tmp_path / "data"))
+

@@ -179,7 +179,8 @@ def test_risk_halt_survives_restart(tmp_path):
 def test_risk_state_from_an_older_day_is_discarded(tmp_path):
     """The caps are per-day; yesterday's loss must not block this morning."""
     from btrader.core.storage import Database
-    from btrader.engine.risk import RISK_STATE_KEY
+    from btrader.core.types import Network
+    from btrader.engine.risk import risk_state_key
 
     db = Database(tmp_path / "risk2.db")
     settings = RiskSettings(max_daily_loss=100, max_consecutive_losses=0)
@@ -187,9 +188,10 @@ def test_risk_state_from_an_older_day_is_discarded(tmp_path):
     first.record_trade(-150)
     assert not first.check_order(10, 0, 10)
 
-    stored = db.get_json(RISK_STATE_KEY)
+    key = risk_state_key(Network.MAINNET.value)
+    stored = db.get_json(key)
     stored["day"] = "2000-01-01"
-    db.set_json(RISK_STATE_KEY, stored)
+    db.set_json(key, stored)
 
     restarted = RiskManager(settings, db)
     assert restarted.check_order(10, 0, 10).allowed

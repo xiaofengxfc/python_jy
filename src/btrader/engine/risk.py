@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 
 from ..core.config import RiskSettings
 from ..core.storage import Database
-from ..core.types import MarketType
+from ..core.types import MarketType, Network
 
 log = logging.getLogger(__name__)
 
@@ -17,6 +17,15 @@ log = logging.getLogger(__name__)
 # the daily-loss and losing-streak breakers, which made them advisory in live
 # trading: closing the app cleared the halt.
 RISK_STATE_KEY = "risk.state.v1"
+
+
+def risk_state_key(scope: str) -> str:
+    """当日计数与熔断状态的 key，按作用域（现在是网络）分开。
+
+    主网与测试网共用一份时，测试网上的一次亏损会把主网的当日额度用掉，主网熔断
+    也会让测试网起不来——限额是账户级的，不是程序级的，两个账户就该各数各的。
+    """
+    return f"{RISK_STATE_KEY}:{scope}"
 
 
 @dataclass
@@ -60,8 +69,14 @@ class RiskManager:
     drop a halt or reset the day's loss budget.
     """
 
-    def __init__(self, settings: RiskSettings, db: "Database | None" = None) -> None:
+    def __init__(
+        self,
+        settings: RiskSettings,
+        db: "Database | None" = None,
+        scope: str = Network.MAINNET.value,
+    ) -> None:
         self.settings = settings
+        self._scope = scope
         self._lock = threading.RLock()
         self._state = _DayState(day=_today())
         self._loss_events: list[float] = []
@@ -82,6 +97,19 @@ class RiskManager:
             self._state = _DayState(day=_today())
             self._persist()
 
+    def set_scope(self, scope: str) -> None:
+        """换作用域（切网络）时读回那一侧的当日状态。
+
+        另一侧的数据留在库里不动：切回主网时熔断与当日盈亏还在，不会被测试网的一次
+        运行冲掉。day 不是今天的行本来就会被 restore 丢弃，所以这里只管换 key。
+        """
+        with self._lock:
+            if scope == self._scope:
+                return
+            self._scope = scope
+            self._state = _DayState(day=_today())
+        self.restore()
+
     def restore(self) -> bool:
         """Load the persisted counters, if they belong to today.
 
@@ -91,7 +119,7 @@ class RiskManager:
         if self.db is None:
             return False
         try:
-            data = self.db.get_json(RISK_STATE_KEY)
+            data = self.db.get_json(risk_state_key(self._scope))
         except Exception:  # pragma: no cover - a corrupt row must not block startup
             log.warning("读取风控状态失败", exc_info=True)
             return False
@@ -118,7 +146,7 @@ class RiskManager:
         state = self._state
         try:
             self.db.set_json(
-                RISK_STATE_KEY,
+                risk_state_key(self._scope),
                 {
                     "day": state.day,
                     "realized_pnl": state.realized_pnl,
