@@ -251,6 +251,30 @@ def test_spot_testnet_still_uses_sandbox_mode() -> None:
     assert client.demo is None
 
 
+def test_a_451_says_the_region_is_blocked_not_the_network() -> None:
+    """服务器放在币安不服务的地区（例如美国机房）时，出口 IP 会被 451 拒。
+    原文是一句英文法律声明，看着像网络抖动——要翻成「换地区或填代理」。"""
+    exc = ccxt.ExchangeNotAvailable(
+        "binance GET https://fapi.binance.com/fapi/v1/exchangeInfo 451 "
+        '{"code":0,"msg":"Service unavailable from a restricted location according to '
+        "'b. Eligibility' in https://www.binance.com/en/terms. Please contact customer service "
+        'if you believe you received this message in error."}'
+    )
+
+    text = _message(exc)
+
+    assert "451" in text
+    assert "地区" in text
+    assert "网络代理" in text, "要指向设置页那个输入框"
+    assert "API Key" in text, "要排除「密钥没配」这条歧路"
+    assert "restricted location" not in text, "别把英文原文原样甩出来"
+
+
+def test_a_plain_network_error_is_still_just_a_network_error() -> None:
+    text = _message(ccxt.NetworkError("binance GET https://api.binance.com/api/v3/ping timeout"))
+    assert text.startswith("网络错误")
+
+
 def test_retired_futures_testnet_error_is_explained_in_chinese() -> None:
     """ccxt 的英文弃用公告要翻成中文，并指向模拟盘。"""
     exc = ccxt.ExchangeError(

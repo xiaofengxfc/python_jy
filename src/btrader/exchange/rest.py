@@ -94,6 +94,21 @@ def looks_unknown_symbol(exc: BaseException) -> bool:
     return any(marker in text for marker in SYMBOL_MISSING_MARKERS)
 
 
+# HTTP 451：交易所按**出口 IP** 判了「受限地区」。ccxt 把它归进 NetworkError，
+# 界面上只剩一句英文法律声明，看着像网络抖动——用户会去重启、去换 DNS，怎么弄都不好。
+# 判据只用这两句原文：币安 451 的正文里有它们，别的错误里没有。
+RESTRICTED_MARKERS: tuple[str, ...] = (
+    "restricted location",
+    "unavailable for legal reasons",
+)
+
+
+def looks_restricted(exc: BaseException) -> bool:
+    """这个错误是不是「交易所不服务这台机器的 IP」（HTTP 451）。"""
+    text = str(exc).lower()
+    return any(marker in text for marker in RESTRICTED_MARKERS)
+
+
 def _as_float(value: Any) -> float:
     try:
         return float(value or 0.0)
@@ -1031,6 +1046,13 @@ def _message(exc: Exception) -> str:
     text = str(exc) or exc.__class__.__name__
     if _CCXT_DEPRECATION in text:
         return _DEMO_HINT
+    if looks_restricted(exc):
+        return (
+            "交易所按出口 IP 拒绝了这台机器（HTTP 451，地域限制）：它不服务这个 IP 所在的地区，"
+            "跟 API Key、DNS、网络抖动都无关，重启也不会好。两条路：一是把服务放到它允许的地区；"
+            "二是在设置页「网络代理」填一个能出去的 HTTP 代理（形如 http://127.0.0.1:7890），"
+            "保存后会重建交易所客户端、立刻按代理走。（HTTP 451）"
+        )
     code = _binance_code(exc)
     hint = _BINANCE_CODES.get(code or "")
     if hint:

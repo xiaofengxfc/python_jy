@@ -1360,8 +1360,9 @@ export default function SettingsPage({ settings, settingsError = "", onSaved }: 
                   onChange={(event) => patch({ proxy: event.target.value })}
                 />
                 <div className="faint" style={{ fontSize: "var(--fs-13)"}}>
-                  部分网络会污染币安合约域名（fapi.binance.com / dapi.binance.com）的 DNS。
-                  填了代理，合约 K 线和下单才能直连币安。留空则不走代理。
+                  部分网络会污染币安合约域名（fapi.binance.com / dapi.binance.com）的 DNS；
+                  服务器的出口 IP 被交易所判为受限地区（HTTP 451）时也只有这一条路。
+                  填了代理，行情、下单、账户都走它；留空则直连。
                 </div>
               </div>
             </div>
