@@ -175,11 +175,16 @@ def _domain_or_400(text: str) -> str:
 
 def run_command(args: list[str], timeout: float = 30.0) -> subprocess.CompletedProcess[str]:
     """跑一条外部命令。参数永远是列表：subprocess 默认 shell=False，用户输入进不了 shell。"""
+    # caddy / journalctl / sudo 的输出来自外部进程，一律按 UTF-8 解：text=True 走的是
+    # 本机 locale（中文 Windows 上是 GBK），日志与域名里一有中文就 UnicodeDecodeError，
+    # 整条部署排障信息丢掉。解不出来的字节用替换字符顶上，不能因为解码失败就没了输出。
     return subprocess.run(
         list(args),
         timeout=timeout,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
         stdin=subprocess.DEVNULL,
     )

@@ -614,6 +614,33 @@ def test_a_reduce_only_conditional_order_leaves_the_leverage_alone(tmp_path, mon
 
     assert venue.leverage_calls == []
 
+
+def test_a_spot_conditional_never_touches_leverage(tmp_path, monkeypatch):
+    """现货挂不了交易所侧条件单：别先去碰杠杆，把「现货…」那句准确的话盖掉。
+
+    rest.set_leverage 现在对没有 setLeverage 的客户端会直接报错，现货条件单如果
+    先去推杠杆，用户看到的就是「这家交易所的客户端不支持设置杠杆」——一句话把人
+    引到错误的方向。
+    """
+    venue, app = _served(tmp_path, monkeypatch)
+    place = _endpoint(app, "/api/orders/conditional", "POST")
+
+    with pytest.raises(HTTPException) as caught:
+        place(
+            ConditionalPayload(
+                market="spot",
+                symbol="BTC/USDT",
+                side="buy",
+                size_mode="amount",
+                size=1.0,
+                trigger=90.0,
+            )
+        )
+
+    assert venue.leverage_calls == [], "现货不该去推杠杆"
+    assert "现货" in str(caught.value.detail), caught.value.detail
+
+
 # ------------------------------------------------------- 交易所侧的杠杆调用
 class _LeverageClient:
     """只实现 set_leverage 的假 ccxt 客户端：用来钉重试与「不支持就说出来」。"""

@@ -167,9 +167,9 @@ class TradingService:
         # Last breaker reason already pushed to WeChat (dedupe across exits).
         self._halt_announced = ""
         self.network = Network(settings.network)
-        # Leverage already pushed to the venue, keyed by (market, symbol).
-        # Setting it on every order would burn a signed request each time.
-        self._leverage_applied: dict[tuple[MarketType, str], float] = {}
+        # 杠杆不再按交易对缓存「推过就不用推」：在币安 App 上手动改过杠杆之后，
+        # 那张缓存会让程序继续按旧值开仓，而且只有重启才发现。多一次签名请求换
+        # 「不会按别人的杠杆开仓」，这笔账明显划算（下单频率本来就不高）。
         # Pairs this process has actually sent an order for, per market. The fill
         # sync can only poll pairs it can name: spot has no position object, and
         # the settings pair usually points at a contract, so a freshly bought
@@ -1024,16 +1024,20 @@ class TradingService:
     def _ensure_leverage(
         self, market_type: MarketType, symbol: str, leverage: float
     ) -> None:
-        """Push the requested leverage to the venue, once per pair.
+        """Push the requested leverage to the venue, on every entry order.
 
         The exchange sizes a position with its own leverage setting; the value
         in the order payload is only validated locally. Skipping this call left
         live orders running at the account default regardless of what the panel
         showed. A failure is fatal for an entry: trading at an unknown leverage
         is exactly the surprise this is meant to prevent.
+
+        每次都推，不按交易对缓存：杠杆是账户级的、可以被币安 App 或网页改掉，
+        缓存一命中就意味着「按别人设的杠杆开仓」，而且只有重启才恢复。
         """
-        key = (market_type, symbol)
-        if abs(self._leverage_applied.get(key, 0.0) - leverage) < 1e-9:
+        if not market_type.is_futures:
+            # 现货没有杠杆这回事，也不该去问现货客户端要 setLeverage（它会回
+            # 「不支持设置杠杆」，把「现货不挂交易所侧条件单」那句准确的话盖掉）。
             return
         # 交易所的杠杆是整数。ccxt 把 1.0 序列化成 "1.0"，币安回
         # -1102 "leverage ... malformed"，于是每张合约单都 400「设置杠杆 1x 失败」，
@@ -1049,7 +1053,6 @@ class TradingService:
             self.rest_for(market_type).set_leverage(symbol, venue_leverage, market_type)
         except ExchangeError as exc:
             raise OrderRejected(f"设置杠杆 {venue_leverage}x 失败：{exc}") from exc
-        self._leverage_applied[key] = float(venue_leverage)
 
     def ensure_leverage(
         self, market_type: MarketType, symbol: str, leverage: float
@@ -1068,8 +1071,7 @@ class TradingService:
         self.rest.network = network
         self.rest.credentials = credentials
         self.rest.reset()
-        # A new venue means the leverage stored there is unknown again.
-        self._leverage_applied.clear()
+
 
     def _account_id(self) -> str:
         # 平台跟着设置走，和 AccountService 用同一个 account_id：写库与读历史

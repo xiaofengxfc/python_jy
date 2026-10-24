@@ -285,7 +285,8 @@ def test_live_entry_pushes_leverage_before_ordering(service):
         )
     )
     assert rest.leverage_calls == [("BTC/USD:BTC", 5.0, MarketType.COINM)]
-    # A second order at the same leverage must not spend another signed call.
+    # 第二张同杠杆的单子照样再推一次：杠杆是账户级的，用户可能刚在币安 App 上
+    # 改过，缓存一命中就是「按别人设的杠杆开仓」，而且要到重启才恢复。
     trading.submit(
         OrderRequest(
             symbol="BTC/USD:BTC",
@@ -297,7 +298,10 @@ def test_live_entry_pushes_leverage_before_ordering(service):
             market_type=MarketType.COINM,
         )
     )
-    assert len(rest.leverage_calls) == 1
+    assert rest.leverage_calls == [
+        ("BTC/USD:BTC", 5.0, MarketType.COINM),
+        ("BTC/USD:BTC", 5.0, MarketType.COINM),
+    ]
 
 
 def test_reduce_only_exit_skips_leverage(service):
