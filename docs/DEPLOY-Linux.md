@@ -470,6 +470,27 @@ t81 之前的安装没有这一条，重跑一次 `sudo bash deploy/install.sh -
 
 ### 8.1 域名没生效 / 证书拿不到
 
+先看 Caddy 到底有没有在跑。`caddy validate` 通过**不代表**服务起来了——它只适配配置，不打开日志文件、
+不绑端口。装完（或改完配置）第一件事：
+
+```bash
+systemctl is-active caddy                       # 要 active
+journalctl -u caddy -n 40 --no-pager            # 没起来就看这一段
+```
+
+真机上撞过的一例：`systemctl is-active` 是 `failed`，日志里是
+`open /var/log/caddy/access.log: permission denied` → 服务 exit 1 → 外面一路 521。
+原因是 `/var/log/caddy` 不归 caddy 用户。修法：
+
+```bash
+sudo install -d -m 0755 -o caddy -g caddy /var/log/caddy
+sudo systemctl restart caddy && systemctl is-active caddy
+```
+
+新的 install.sh 已经这么建目录，并且额外写一条 systemd drop-in
+（`/etc/systemd/system/caddy.service.d/bitrader-logs.conf` 里的 `LogsDirectory=caddy`，
+由 systemd 自己保证目录和属主），装完还会等 `is-active` 通过才算完——不通过就把日志原文贴出来并停下。
+
 表现：`https://域名` 打不开，`journalctl -u caddy` 里有 `no such host` 或 `HTTP 403` 之类的 ACME 报错。
 
 ```bash

@@ -155,6 +155,18 @@ def test_a_domain_with_an_underscore_names_the_character_and_the_fix():
     assert "[dry-run]" not in output
 
 
+def test_the_installer_checks_that_caddy_actually_started():
+    """validate 过了不等于服务起来了。真机上 caddy exit 1，脚本照样报「已就绪」，外面看到的是 521。"""
+    text = INSTALL.read_text(encoding="utf-8")
+    assert "install -d -m 0755 -o caddy -g caddy /var/log/caddy" in text
+    assert "LogsDirectory=caddy" in text, "目录属主要靠 systemd 自己的机制兜一层"
+    assert "systemctl is-active --quiet caddy" in text
+    assert "journalctl -u caddy -n 20 --no-pager" in text, "没起来就把日志原文贴出来"
+    assert text.index("systemctl is-active --quiet caddy") < text.index('note "Caddy 已就绪'), (
+        "「已就绪」必须排在 is-active 检查之后"
+    )
+
+
 def test_the_ip_comes_from_the_cloud_metadata_before_a_public_service():
     text = INSTALL.read_text(encoding="utf-8")
     for needle in ("100.100.100.200", "metadata.tencentyun.com", "169.254.169.254", "api.ipify.org"):

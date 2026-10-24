@@ -477,8 +477,21 @@ install_caddy() {
   run_sh "curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt | tee /etc/apt/sources.list.d/caddy-stable.list > /dev/null"
   run env DEBIAN_FRONTEND=noninteractive apt-get update
   run env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends caddy
-  run install -d -m 755 /var/log/caddy
-  run chown -R caddy:caddy /var/log/caddy
+  # 目录和属主一次给足。分开写（先 install -d 建个 root 的、再 chown）中间任何一种断法，
+  # 结果都是 Caddy 启动时 open /var/log/caddy/access.log permission denied → 服务 exit 1。
+  run install -d -m 0755 -o caddy -g caddy /var/log/caddy
+  if [ -z "$DRY_RUN" ]; then
+    local log_owner
+    log_owner="$(stat -c '%U' /var/log/caddy 2>/dev/null || printf '?')"
+    if [ "$log_owner" != "caddy" ]; then
+      die "/var/log/caddy 的属主是 $log_owner，不是 caddy。Caddy 起不来就是因为写不了这个目录里的 access.log"
+    fi
+  fi
+  # systemd 自己的机制再兜一层：LogsDirectory 由 systemd 建目录、属主固定是服务用户，
+  # 以后 apt 升级换掉包里的 unit 也不会丢。改 drop-in 比改包里的 unit 安全。
+  run install -d -m 0755 /etc/systemd/system/caddy.service.d
+  printf '%s\n' '[Service]' 'LogsDirectory=caddy' \
+    | write_file "/etc/systemd/system/caddy.service.d/bitrader-logs.conf" 644 root
 
   if [ -z "$DOMAIN" ]; then
     note "没给 --domain：Caddy 只监听 127.0.0.1:8080，公网访问请先配域名"
@@ -516,9 +529,25 @@ install_caddy() {
     fi
   fi
   run caddy validate --config /etc/caddy/Caddyfile
+  run systemctl daemon-reload
   run systemctl enable caddy
   # 刚装好时 caddy 通常已经在跑（apt 会 enable），reload 不行就 restart 兜底
   run_sh "systemctl reload caddy 2>/dev/null || systemctl restart caddy"
+  # 「validate 过了」不等于「服务起来了」：validate 只适配配置，不打开日志文件、不绑端口。
+  # 真机上就撞过这一下——验证通过、restart 退出 0、脚本报「已就绪」，而 caddy 已经 exit 1，
+  # 结果域名一路 521。所以这里必须问一句 is-active，不活就把日志原文贴出来。
+  if [ -z "$DRY_RUN" ]; then
+    local waited=0
+    while [ "$waited" -lt 10 ] && ! systemctl is-active --quiet caddy; do
+      sleep 1
+      waited=$((waited + 1))
+    done
+    if ! systemctl is-active --quiet caddy; then
+      printf '\n[失败] caddy 没起来。最近 20 行日志：\n\n' >&2
+      journalctl -u caddy -n 20 --no-pager >&2 || true
+      die "caddy 没起来（原因见上面的日志）。常见：/var/log/caddy 不归 caddy、80/443 被别的程序占了、Caddyfile 里域名写错"
+    fi
+  fi
   note "Caddy 已就绪；证书申请日志：journalctl -u caddy -f"
 }
 
