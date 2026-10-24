@@ -1169,10 +1169,17 @@ def read_state() -> dict[str, Any]:
 class _Job:
     """一条流水线的记账员：每一步都落盘，失败就停。"""
 
-    def __init__(self, state: dict[str, Any], root: Path) -> None:
+    def __init__(
+        self,
+        state: dict[str, Any],
+        root: Path,
+        on_step: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
         self.state = state
         self.root = root
         self.steps: list[dict[str, Any]] = list(state.get("steps") or [])
+        # CLI 要边跑边念：界面那条路不需要（它轮询状态文件），所以默认没有回调。
+        self.on_step = on_step
 
     def record(self, name: str, ok: bool, output: str, started: float) -> None:
         self.steps.append(
@@ -1185,6 +1192,11 @@ class _Job:
         )
         self.state["steps"] = self.steps
         write_state(self.state)
+        if self.on_step is not None:
+            try:
+                self.on_step(self.steps[-1])
+            except Exception:  # 回调只负责打印，坏了自己兜住，别把更新带崩
+                log.debug("步骤回调出错", exc_info=True)
 
     def fail(self, name: str, output: str) -> bool:
         self.state["state"] = STATE_FAILED
@@ -1211,7 +1223,19 @@ def _pip_step(root: Path) -> tuple[bool, str]:
     if not (root / "requirements.txt").exists():
         return True, "仓库里没有 requirements.txt，跳过依赖安装。"
     return _run_command(
-        [sys.executable, "-m", "pip", "install", "-r", "requirements.txt"],
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            # 服务器上没有人盯着这个终端：pip 一旦要问一句（依赖冲突、要不要继续），
+            # 它就会一直等到 PIP_TIMEOUT（900 秒）才失败，界面上只是一步卡住。
+            "--no-input",
+            # 小盘机器（40G 云盘很常见）装一次留一堆 wheel 缓存没必要，装完就没人再要了。
+            "--no-cache-dir",
+            "-r",
+            "requirements.txt",
+        ],
         cwd=root,
         timeout=PIP_TIMEOUT,
         env={"PYTHONIOENCODING": "utf-8", "PIP_DISABLE_PIP_VERSION_CHECK": "1"},
@@ -1259,6 +1283,31 @@ def _build_step(root: Path, state: dict[str, Any]) -> tuple[bool, str]:
     return ok, " ".join(part for part in (note, output) if part)
 
 
+def _unit_note(root: Path, state: dict[str, Any]) -> str:
+    """这次更新动了 systemd unit 的话，给「重启服务」那一步加一句警告。
+
+    不新增一步：步骤序列是测试与界面共同依赖的契约（6 步），多一格会让所有按位置
+    读步骤的地方都错位；这条信息本来就属于重启那一步。
+
+    为什么不直接替 root 重写 /etc/systemd/system/bitrader.service：那需要「把一个
+    bitrader 可写的文件装进 /etc」的权限，等于把 root 交给服务用户 —— set-domain.sh
+    之所以放在 /usr/local/lib/bitrader（root:root）就是这个道理。所以只警告，
+    把该做的事写清楚，让人自己决定什么时候重装。
+    """
+    changed = _changed_under(root, state.get("from_sha"), "deploy/")
+    if not changed:
+        return ""
+    units = [path for path in changed if path.endswith(".service")]
+    if not units:
+        return ""
+    return (
+        f"注意：这次更新动了 {'、'.join(units)}，但重启用的仍是服务器上那份旧 unit —— "
+        "unit 文件不归程序改（那要 root 写入权）。让它生效：在服务器上重跑一次安装"
+        "（sudo bash deploy/install.sh，参数与当初一致，幂等），或者手动拷到 "
+        "/etc/systemd/system/ 再 systemctl daemon-reload。\n"
+    )
+
+
 def _restart_step(state: dict[str, Any]) -> tuple[bool, str]:
     """重启：把这一步**交出去**，收尾留给新进程。
 
@@ -1269,6 +1318,7 @@ def _restart_step(state: dict[str, Any]) -> tuple[bool, str]:
     确认挪到新进程：它读到「重启中」时自己打一次 /api/health（见 _heal_state）。
     """
     root = paths.project_root()
+    note = _unit_note(root, state)
     state["host"] = web_host()
     state["port"] = web_port()
     if not web_bind_known():
@@ -1281,6 +1331,8 @@ def _restart_step(state: dict[str, Any]) -> tuple[bool, str]:
     _last_restart_log = None
     write_state(state)
     ok, output = restart_service()
+    if note:
+        output = f"{note}{output}"
     if _last_restart_log is not None:
         state["restart_log"] = str(_last_restart_log)
     if ok:
@@ -1299,9 +1351,16 @@ def _restart_step(state: dict[str, Any]) -> tuple[bool, str]:
     return False, output
 
 
-def _run_job(state: dict[str, Any], kind: str, info: dict[str, Any]) -> None:
+def _run_job(
+    state: dict[str, Any],
+    kind: str,
+    info: dict[str, Any],
+    *,
+    job: _Job | None = None,
+    sync: bool = False,
+) -> None:
     root = paths.project_root()
-    job = _Job(state, root)
+    job = job or _Job(state, root)
     try:
         fetched = job.step(
             STEP_FETCH,
@@ -1360,6 +1419,10 @@ def _run_job(state: dict[str, Any], kind: str, info: dict[str, Any]) -> None:
         if not job.step(STEP_RESTART, lambda: _restart_step(state)):
             return
         if state.get("restart_pending"):
+            if sync:
+                # CLI 自己还活着，它能自己等这次重启（界面那条路不行：发起更新的进程
+                # 马上就要被 systemd 停掉，在那儿等就是互锁）。判据与 _heal_state 同一个。
+                settle_restart(state)
             # 重启已经交出去了，本进程马上就没。done 由新进程确认之后写——以前这里
             # 顺手写了 done，盘上于是留下 done + restart_pending=true 的自相矛盾（L1）。
             return
@@ -1567,6 +1630,109 @@ def start_job(kind: str, info: dict[str, Any] | None = None) -> str:
         release_update_lock()
         raise
     return str(state["job_id"])
+
+def settle_restart(state: dict[str, Any]) -> dict[str, Any]:
+    """重启交出去之后，由一个**还活着**的进程自己等结果（CLI 的离线模式）。
+
+    界面那条路不能这么等：发起更新的进程就是要被重启的那一个，在那里等 systemctl
+    就是互锁（见 _restart_step 的说明）。CLI 是另一个进程，服务停多久都不影响它，
+    所以它自己等。判据和 _heal_state 用的是同一个 _confirm_restart：地址上有
+    `/api/health` 的 2xx 才算起来了，端口通了不算。
+    """
+    steps = list(state.get("steps") or [])
+    deadline = _deadline_epoch(state) or (time.time() + RESTART_CONFIRM_TIMEOUT)
+    log_path = Path(str(state["restart_log"])) if state.get("restart_log") else None
+    detail = ""
+    while True:
+        ok, detail = _confirm_restart(state)
+        if ok:
+            break
+        if time.time() >= deadline:
+            hint = _manual_hint(paths.project_root())
+            error = (
+                f"重启没等到：{state.get('restart_deadline') or '期限已过'} 还没有新进程接上来"
+                f"（{detail}）。{_port_note()}\n手动拉起：{hint}"
+            )
+            _append_restart_log(log_path, error, who="CLI")
+            state.update(
+                {
+                    "steps": steps,
+                    "state": STATE_FAILED,
+                    "restart_pending": False,
+                    "restart_deadline": "",
+                    "error": error,
+                    "manual_hint": hint,
+                    "finished_at": state.get("finished_at") or now_iso(),
+                }
+            )
+            write_state(state)
+            return state
+        time.sleep(1.0)
+    if steps and isinstance(steps[-1], dict) and steps[-1].get("name") == STEP_RESTART:
+        steps[-1] = {
+            **steps[-1],
+            "ok": True,
+            "output": f"{steps[-1].get('output') or ''}已确认服务起来了：{detail}",
+        }
+    else:
+        steps.append(
+            {"name": STEP_RESTART, "ok": True, "output": f"服务已重启：{detail}", "seconds": 0.0}
+        )
+    _append_restart_log(log_path, f"CLI 确认：{detail}", who="CLI")
+    state.update(
+        {
+            "steps": steps,
+            "state": STATE_DONE,
+            "restart_pending": False,
+            "restart_deadline": "",
+            "finished_at": state.get("finished_at") or now_iso(),
+        }
+    )
+    write_state(state)
+    return state
+
+
+def run_job_sync(
+    kind: str,
+    info: dict[str, Any] | None = None,
+    *,
+    on_step: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """在**调用方线程**里跑同一条流水线（`btrader update` 的离线模式）。
+
+    和 start_job 只差两处：跑在调用方线程里（CLI 要一行行打印），重启由调用方自己
+    确认（settle_restart）。锁、状态文件、步骤格式、失败即停全部共用同一份代码 ——
+    别在这里另写一条流水线，两份实现迟早会分叉（install.sh 里那句 reset --hard
+    就是这么漂出来的）。
+    """
+    with JOB_LOCK:
+        busy = running_job()
+        if busy is not None:
+            raise JobBusy(
+                f"上一个更新还在跑（任务 {busy.get('job_id') or '?'}，pid {busy.get('pid')}），"
+                "等它结束再来。"
+            )
+        # 上一轮被杀的进程留下的临时文件没人认领，开新任务前先扫一遍。
+        clean_stale_state_tmp()
+        state = _default_state()
+        state.update(
+            {
+                "job_id": uuid.uuid4().hex[:8],
+                "kind": kind,
+                "state": STATE_RUNNING,
+                "started_at": now_iso(),
+                "pid": os.getpid(),
+                "host": web_host(),
+                "port": web_port(),
+            }
+        )
+        _path, note = acquire_update_lock(str(state["job_id"]))
+        state["lock_note"] = note
+        write_state(state)
+    job = _Job(state, paths.project_root(), on_step=on_step)
+    _run_job(state, kind, dict(info or {}), job=job, sync=True)
+    return state
+
 
 # ------------------------------------------------------------------ 重启
 SHUTDOWN_HOOK: Callable[[], None] | None = None

@@ -33,12 +33,12 @@ def _bash() -> str:
     pytest.skip("这台机器上没有 bash，跳过真跑 deploy/install.sh 的检查")
 
 
-def _dry_run() -> str:
+def _dry_run(*extra: str) -> str:
     """按 Linux 推演一遍安装，拿它打印的「要写入什么」当证据。"""
     env = dict(os.environ)
     env["BI_RUN_DRY_ANYWHERE"] = "1"
     done = subprocess.run(
-        [_bash(), str(INSTALL), "--dry-run", "--domain", "x.example.com"],
+        [_bash(), str(INSTALL), "--dry-run", "--domain", "x.example.com", *extra],
         cwd=str(ROOT),
         env=env,
         capture_output=True,
@@ -95,6 +95,73 @@ def test_the_sudoers_check_still_rolls_back_on_a_syntax_error():
     text = INSTALL.read_text(encoding="utf-8")
     assert "visudo -c -f" in text
     assert 'rm -f "$SUDOERS_FILE"' in text
+
+
+def _dry_run_rejects(*extra: str) -> subprocess.CompletedProcess:
+    env = dict(os.environ)
+    env["BI_RUN_DRY_ANYWHERE"] = "1"
+    return subprocess.run(
+        [_bash(), str(INSTALL), "--dry-run", *extra],
+        cwd=str(ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=300,
+    )
+
+
+def test_the_port_reaches_the_caddyfile_and_the_domain_script():
+    """--port 不打通的话：装完界面能开、接口全 502，点一次「签发证书」还会被改回 8765。"""
+    out = _dry_run("--port", "9000")
+    assert "reverse_proxy 127.0.0.1:9000" in out, out[-3000:]
+    assert "ExecStart=/opt/bitrader/.venv/bin/python run_web.py --host 127.0.0.1 --port 9000" in out
+    assert "PORT=9000" in out, "port.conf 要写对，set-domain.sh 靠它"
+    assert "127.0.0.1:8765" not in out, "还有地方写着默认端口"
+
+
+def test_the_default_port_still_works():
+    out = _dry_run()
+    assert "reverse_proxy 127.0.0.1:8765" in out
+    assert "PORT=8765" in out
+
+
+def test_bad_arguments_are_refused_before_anything_is_written():
+    for bad in (
+        ("--domain", "1.2.3.4"),
+        ("--domain", "a&b.example.com"),
+        ("--domain", "http://x.example.com"),
+        ("--port", "abc"),
+        ("--port", "70000"),
+        ("--repo", "https://example.com/a b.git"),
+    ):
+        done = _dry_run_rejects(*bad)
+        assert done.returncode != 0, bad
+        output = done.stdout + done.stderr
+        assert "[dry-run]" not in output, "参数没过关就不许开始写任何东西：%r" % (bad,)
+
+
+def test_the_ip_comes_from_the_cloud_metadata_before_a_public_service():
+    text = INSTALL.read_text(encoding="utf-8")
+    for needle in ("100.100.100.200", "metadata.tencentyun.com", "169.254.169.254", "api.ipify.org"):
+        assert needle in text, needle
+    # 查不到公网 IP 就把那段整段删掉，别把占位符原样写进 Caddyfile
+    assert "REPLACE_WITH_SERVER_IP {/,/^}$/d" in text
+
+
+def test_the_installer_fast_forwards_instead_of_resetting():
+    """和 updater 同一语义：只快进。reset --hard 只留给「补 .git」的那一次迁移。"""
+    text = INSTALL.read_text(encoding="utf-8")
+    assert "merge --ff-only FETCH_HEAD" in text
+    assert text.count("reset --hard") == 1, text.count("reset --hard")
+    assert "init -q" in text, "rsync 装过的机器要能补上 .git"
+
+
+def test_the_clock_is_set_up_unless_something_else_already_does_it():
+    text = INSTALL.read_text(encoding="utf-8")
+    assert "chrony" in text
+    assert "systemd-timesyncd" in text, "已经有时间服务就别为了装 chrony 把它删掉"
 
 
 def test_the_unit_file_explains_why_one_restart_is_allowed():

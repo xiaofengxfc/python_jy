@@ -2,7 +2,7 @@
 
 整份测试不碰真实 Caddy、不发 DNS 查询、不发 HTTPS 请求：
 `routes_deploy` 把每个外部动作都收在一个小函数里（`run_command` / `resolve_all` /
-`_ipify_get` / `probe_https` / `cert_expires_at`），测试逐个换掉它们。
+`_ipify_get` / `probe_https` / `local_tls_probe` / `cert_expires_at`），测试逐个换掉它们。
 平台也换：本机是 Windows，不换的话三个接口全部 501。
 """
 
@@ -85,6 +85,10 @@ def linux(monkeypatch):
     """默认把平台换成 linux，并把 sudo / DNS / HTTPS 全部换成替身。"""
     monkeypatch.setattr(rd, "platform_name", lambda: "linux")
     monkeypatch.setattr(rd, "probe_https", lambda url, timeout=5.0: (True, "200 OK"))
+    # 第一段确认问的是本机 443（证书到底签出来没有），默认当成已经有了。
+    monkeypatch.setattr(
+        rd, "local_tls_probe", lambda domain, **kwargs: (True, "本机 443 已经在用它的证书", None)
+    )
     monkeypatch.setattr(rd, "resolve_all", lambda host: ["1.2.3.4"])
     monkeypatch.setattr(rd, "public_ip_info", lambda: ("1.2.3.4", "ipify", None))
     monkeypatch.setattr(rd, "cert_expires_at", lambda domain=None: None)
@@ -463,9 +467,19 @@ def test_a_script_failure_keeps_the_caddy_log_verbatim(linux, tmp_path):
 
 
 def test_the_poll_gives_up_after_a_minute(linux, tmp_path):
+    """第二段（从公网打开）到点就放弃，并把最后一次的错误写进 message。
+
+    这一段的判据是 /api/health 的 2xx —— 探 / 会被橙云的边缘缓存骗成成功。
+    """
+    seen: list[str] = []
     linux.setattr(rd, "run_command", _Recorder(_Run(0, "", "")))
-    linux.setattr(rd, "probe_https", lambda url, timeout=5.0: (False, "ssl: CERTIFICATE_VERIFY_FAILED"))
-    linux.setattr(rd, "TLS_VERIFY_SECONDS", 0.05)
+
+    def probe(url, timeout=5.0):
+        seen.append(url)
+        return False, "ssl: CERTIFICATE_VERIFY_FAILED"
+
+    linux.setattr(rd, "probe_https", probe)
+    linux.setattr(rd, "PUBLIC_VERIFY_SECONDS", 0.05)
     linux.setattr(rd, "TLS_POLL_SECONDS", 0.01)
     linux.setattr(rd, "caddy_log_tail", lambda: "certificate is not trusted")
     linux.setattr(rd, "deploy_record_path", lambda: tmp_path / "deploy.json")
@@ -474,7 +488,28 @@ def test_the_poll_gives_up_after_a_minute(linux, tmp_path):
     )
     assert result["ok"] is False
     assert "CERTIFICATE_VERIFY_FAILED" in result["message"]
+    assert "证书已签好" in result["message"], "证书有了就打不开是另一件事，要分开说"
     assert result["log_tail"] == "certificate is not trusted"
+    assert seen and all(url.endswith("/api/health") for url in seen), seen
+
+
+def test_the_certificate_wait_gives_up_when_caddy_never_gets_it(linux, tmp_path):
+    """第一段：Caddy 一直没拿到这张域名的证书。这时连公网都还没试，别说成「打不开」。"""
+    linux.setattr(rd, "run_command", _Recorder(_Run(0, "", "")))
+    linux.setattr(
+        rd, "local_tls_probe", lambda domain, **kwargs: (False, "本机 127.0.0.1:443 握手失败（ConnectionRefusedError）", None)
+    )
+    linux.setattr(rd, "TLS_VERIFY_SECONDS", 0.05)
+    linux.setattr(rd, "TLS_POLL_SECONDS", 0.01)
+    linux.setattr(rd, "caddy_log_tail", lambda: "obtaining certificate: no solvers available")
+    linux.setattr(rd, "deploy_record_path", lambda: tmp_path / "deploy.json")
+    result = _endpoint("/api/deploy/tls", "POST")(
+        payload=rd.DeployDomainPayload(domain="trade.example.com")
+    )
+    assert result["ok"] is False
+    assert "本机 443" in result["message"]
+    assert "ConnectionRefusedError" in result["message"]
+    assert result["log_tail"] == "obtaining certificate: no solvers available"
 
 
 def test_success_records_the_domain_and_the_cert(linux, tmp_path):
@@ -544,7 +579,19 @@ def test_the_certificate_reader_parses_a_real_file(monkeypatch, tmp_path):
 
 def test_the_certificate_reader_returns_none_when_there_is_nothing_to_read(monkeypatch, tmp_path):
     monkeypatch.setattr(rd, "CADDY_CERT_DIR", tmp_path / "nope")
+    # 兜底会去问本机 443：这里换成「也没有」，别真连本机的开发服务器。
+    monkeypatch.setattr(rd, "local_tls_probe", lambda domain, **kwargs: (False, "没有", None))
     assert rd.cert_expires_at("trade.example.com") is None
+
+
+def test_the_cert_reader_falls_back_to_the_local_handshake(monkeypatch, tmp_path):
+    """证书目录属 caddy（0700/0750），bitrader 读不到 —— 那种机器上到期时间只能这样问。"""
+    monkeypatch.setattr(rd, "CADDY_CERT_DIR", tmp_path / "nope")
+    monkeypatch.setattr(
+        rd, "local_tls_probe", lambda domain, **kwargs: (True, "ok", "2030-01-02T03:04:05+00:00")
+    )
+    assert rd.cert_expires_at("trade.example.com") == "2030-01-02T03:04:05+00:00"
+    assert rd.cert_expires_at() is None, "没有域名就没人可问，不许瞎猜一个"
 
 
 def test_the_root_script_guards_itself():

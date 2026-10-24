@@ -348,7 +348,8 @@ sudo bash deploy/install.sh --domain trade.example.com        # 真装
 装完的形态：
 
 - 服务跑在 `/opt/bitrader`，数据在 `/var/lib/bitrader`，systemd 单元 `bitrader`（`Restart=always`，日志进 journald）；
-- 后端只监听 `127.0.0.1:8765`，对外由 Caddy 反代并自动签 HTTPS 证书；用 `http://服务器IP` 打开会 301 到域名；
+- 后端只监听 `127.0.0.1:8765`（`--port` 可改，端口会同步写进 unit、Caddyfile 和
+  `/usr/local/lib/bitrader/port.conf`），对外由 Caddy 反代并自动签 HTTPS 证书；用 `http://服务器IP` 打开会 301 到域名；
 - 没有域名时不带 `--domain`：Caddy 只监听回环，用 `ssh -N -L 8080:127.0.0.1:8080 你@服务器` 进去访问；
 - 防火墙要放 **80 / 443**（证书走这两个端口），8765 不要对外开；
 - 脚本可以反复跑：已经在位的步骤会跳过，不会覆盖已有的密钥文件。
@@ -365,9 +366,18 @@ sudo bash deploy/install.sh --domain trade.example.com        # 真装
 
 时钟：币安签名对时间敏感，`timedatectl` 里 `System clock synchronized: yes` 才算合格，差一秒就会满屏 `-1021`。
 
-升级不用重新部署：设置页最下面那张「软件更新」卡做在线更新，能检查有没有新提交，点一下「立即更新」就依次
-`git fetch` → `--ff-only` 合并 → `pip install` → 重启服务（服务器上不跑 npm，前端产物跟着仓库一起来）。
-这一步是手动点的，程序不会自己更新；失败停在那一步并贴命令的原始输出，也能一键回滚到更新前的提交。
+升级不用重新部署，两条路都是同一条流水线（在线更新 = 设置页那张「软件更新」卡上点「立即更新」）：
+
+```bash
+sudo bash deploy/update.sh check     # 差几个提交、能不能更
+sudo bash deploy/update.sh           # 更新：fetch → --ff-only 合并 → pip install → 重启 → 确认真的起来了
+sudo bash deploy/update.sh rollback --yes
+```
+
+终端那条默认把活交给正在跑的服务（和界面里点「立即更新」是同一个任务），服务没应答才在本进程里跑
+同一套步骤；`--offline` 只用于服务起不来的时候。退出码 `0` 成功 / `1` 失败 / `2` 前置条件不满足（什么都没动）。
+服务器上不跑 npm，前端产物跟着仓库一起来。这一步是手动点的，程序不会自己更新；
+失败停在那一步并贴命令的原始输出，也能一键回滚到更新前的提交。
 更新前只拦两种在跑的东西：自动交易（含执行台部署）和 AI 交易（含 AI 量化）；**回测、参数优化在跑不拦**，
 它们跑完就结束，重启丢的是那一次结果。
 细节、回滚步骤和 sudoers 里多授的那条 `systemctl --no-block restart bitrader` 见
@@ -376,7 +386,7 @@ sudo bash deploy/install.sh --domain trade.example.com        # 真装
 ## 项目结构
 
 ```
-deploy/          install.sh / bitrader.service / Caddyfile.example
+deploy/          install.sh / update.sh / set-domain.sh / bitrader.service / Caddyfile.example
 docs/            DEPLOY-Linux.md 等部署文档
 src/btrader/
 ├─ core/          配置、凭据、数据模型、指标、SQLite 存储

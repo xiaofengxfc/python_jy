@@ -1769,15 +1769,30 @@ export default function SettingsPage({ settings, settingsError = "", onSaved }: 
                     {deploy.public_ip_source ? `（来源：${deploy.public_ip_source}）` : ""}
                   </b>
                 </div>
+                {deployCheck?.proxied && (
+                  <div className="deploy-row">
+                    <span>代理</span>
+                    <b>Cloudflare（橙云）</b>
+                  </div>
+                )}
               </div>
             )}
 
             {deploy && !deploy.public_ip && deploy.public_ip_error && (
               <div className="hint">公网 IP 读不到：{deploy.public_ip_error}</div>
             )}
-            {deploy && deploy.public_ip && (
+            {deploy && deploy.public_ip && !deployCheck?.proxied && (
               <div className="hint">
                 域名 A 记录要指到这个地址（{deploy.public_ip}），ACME 才能从 80 端口验到这台机器。
+              </div>
+            )}
+            {/* 橙云开着：解析落到 CF 边缘，A 记录本来就不指向源站，上面那条提示不适用。 */}
+            {deployCheck?.proxied && (
+              <div className="hint">
+                域名解析在 Cloudflare 边缘（橙云）：源站 IP 不参与比较。签证书前确认三件事 —
+                Cloudflare 的 SSL/TLS 加密模式为 Full 或 Full (strict)、
+                /.well-known/acme-challenge/ 没被 WAF 或 Cache Rules 拦、
+                源站 80/443 对 Cloudflare 网段放行。
               </div>
             )}
 
@@ -1817,14 +1832,16 @@ export default function SettingsPage({ settings, settingsError = "", onSaved }: 
               </button>
               {deployBusy === "tls" && (
                 <span className="faint" style={{ fontSize: "var(--fs-12)" }}>
-                  写 Caddyfile → reload caddy → 轮询 HTTPS，最多约 40 秒
+                  写 Caddyfile → reload caddy → 先确认本机证书，再等公网打通，最多约 105 秒
                 </span>
               )}
             </div>
 
-            {/* 检查结果：message 是后端给的原文，一致就绿、不一致就红。 */}
+            {/* 检查结果：message 是后端给的原文，可以签就绿、不行就红。
+                判据用 ok 而不是 match —— 橙云下 match 本来就是 false（源站 IP 不一致），
+                拿它染色会把一次能签的检查画成红的。 */}
             {deployCheck && (
-              <div className={`banner ${deployCheck.match ? "ok" : "error"}`}>
+              <div className={`banner ${deployCheck.ok ? "ok" : "error"}`}>
                 {deployCheck.message}
               </div>
             )}

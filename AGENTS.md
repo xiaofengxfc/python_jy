@@ -483,6 +483,22 @@ Node 不在 PATH 时，先把 Node 目录加进去。
 - 域名校验两层（`routes_deploy.normalize_domain` 与脚本里的正则）都要留：一层给界面即时反馈，
   一层是 root 脚本自己的保险。IP 直接拒——ACME 不给 IP 发证书，文案里要说清楚。
 - 证书由 Caddy 自己走 ACME（HTTP-01）并自动续期；程序不碰证书文件，只读到期时间。
+- **端口不许写死**：`--port` 会被 install.sh 写进四处（unit 的 `ExecStart`、
+  `/usr/local/lib/bitrader/port.conf`、Caddyfile 的 `reverse_proxy`、防火墙提示）。`set-domain.sh`
+  重写 Caddyfile 时从 `port.conf` 读端口（`sed` 取值，**不 source**：那是 root 脚本，不能执行数据）。
+  少写一处就是「界面能开、接口全 502」，或者点一次「签发证书」端口被改回 8765。
+- **签证书分两段判，别合成一段**：第一段问本机 443（SNI 握手读 notAfter，`local_tls_probe`）——
+  Caddy 到底签成没签成；第二段才探公网 `/api/health` 要 2xx。合成一段时橙云会拿它自己的证书摸到
+  边缘回 200，源站一张证书都没有也显示成功；只验本机又漏掉「证书有了但 80/443 被墙」。两段失败文案分开写。
+  到期时间同理：证书目录属 caddy（0700/0750）读不到时走本机 SNI 兜底，两边都没有才是 `null`。
+- **橙云不是一个「解析不一致」**：解析全落在 CF 网段时 `deploy_check` 的 `proxied` 与 `ok`
+  都为真，`match` 照实报 false（源站 IP 确实对不上）。界面染色用 `ok`，别用 `match`。
+  网段写在三处且必须逐字一致：`web/routes_deploy.py::CF_RANGES`（判定）、
+  `deploy/Caddyfile.example` 的 `trusted_proxies static ...`（还原真实 IP）、
+  `deploy/set-domain.sh::CF_RANGES`（重写配置时用）；`tests/test_deploy_cloudflare.py` 三份互相比对。
+  Caddy 没有续行符，那一行必须整行写完；`trusted_proxies` 要 Caddy ≥ 2.7。反代头用 `{client_ip}`，
+  `{remote_host}` 在橙云下是边缘 IP。网段每天拉一次 `api.cloudflare.com/client/v4/ips`，
+  拉不到用内置表、一小时后重试——**别把拉取失败当成「没有代理」**，那会让检查忽然报「解析不一致」。
 
 
 ## 11. 在线更新（手动点，不自动更）
@@ -491,6 +507,15 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   （本地与 GitHub 的差距）、`POST /api/update/apply`（一键更新，返回 `job_id`，后台线程跑）、
   `GET /api/update/status`（进度，重启之后照样读得到）、`POST /api/update/rollback`
   （body `{"confirm": true}`，回到更新前那个提交）。界面上「立即更新」只在落后时能点。
+- **命令行只是同一件事的另一个入口**，别写成第二条流水线：`src/btrader/update_cli.py`
+  （`check` / `status` / `apply` / `rollback`）+ 仓库根 `run_update.py`
+  （`src` 上 `sys.path` 垫片，服务器上 `btrader` 没 pip install）+ `deploy/update.sh`
+  （以 bitrader 用户跑、带上 unit 里那份 `BITRADER_DATA_DIR`）。默认把活交给正在跑的服务
+  （POST + 轮询 `/api/update/status` 念步骤），所以引擎闸、锁、状态文件全是同一份；
+  `/api/health` 不通才在本进程里走 `updater.run_job_sync`（同一套流水线，同步版本）。
+  `--offline` 在服务还活着时**直接拒**（退出码 2）：引擎跑在服务进程里，绕过它就没有那道闸。
+  数据目录和服务不一致时也拒（锁与状态落在数据目录，两边不一样等于两条流水线互相看不见）。
+  退出码：0 成功 / 1 失败 / 2 前置条件不满足（什么都没动）。
 - 仓库里一个 tag 都没有，版本一律按提交 SHA 比，不写版本号比较。远端优先问 GitHub API
   （公开仓库免 token，还能拿到提交标题），失败回落 `git ls-remote`（只读到 SHA，`commits`
   给空数组，`source` 里写明没有标题）。两条都失败时 `remote_sha` 是 null、`error` 是
@@ -544,6 +569,11 @@ Node 不在 PATH 时，先把 Node 目录加进去。
 - 更新线程**不是 daemon**（`updater._spawn`）：Windows 那条重启要等「自己放开端口 + 新进程绑上
   端口」两段确认，daemon 线程会在 uvicorn 主线程退出时被直接掐掉，「到底起没起来」就没人知道，
   状态又变成一句谎。代价是退出时得等这一轮更新跑完；每一步都有 timeout，不会无限挂着。
+- 更新把 `deploy/*.service` 也换掉了，**不许自动重写 `/etc/systemd/system/bitrader.service`**：
+  那要 root，而且会把用户手改过的 unit 覆盖掉。做法是在「重启服务」那一步的 output 前面加一句提醒
+  （`_unit_note`：这次更新改了 unit 文件，重跑一次 `deploy/install.sh` 才会生效）。
+  提醒写在重启步里而不是新增一步——步骤序列是 6 步，测试逐字钉着（`names[5] == "重启服务"`），
+  加一步会让列表全错位。
 - 一次只跑一个更新任务，锁是两层：`JOB_LOCK` 管本进程（`start_job` 里先查 `running_job()`，
   撞上抛 `JobBusy`，两个 POST 把它翻成 409「上一个更新还在跑」）；进程内锁管不了多 worker、
   也管不了两个实例共享同一个数据目录，所以外面还有一层文件锁 `<数据目录>/update.lock`

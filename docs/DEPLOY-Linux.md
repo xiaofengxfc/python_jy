@@ -3,9 +3,11 @@
 目标：一台干净的 Debian 12 或 Ubuntu 22.04 服务器，跑后端 + 浏览器访问界面（不做 Electron 桌面包）。
 域名和公网 IP 都有的情况，下面是「从零到 https」的完整序列；没有域名也能先跑起来（只监听回环，靠 SSH 隧道访问）。
 
-> 验证边界（先说实话）：这份文档和 `deploy/install.sh` 是在 Windows 机器上写的。
-> 写完之后做过的验证是：脚本 `bash -n` 语法通过、`--dry-run` 在本机 Git Bash 里把 10 个步骤全走了一遍（只打印不执行）、
-> Python 侧的新测试全绿。**没有在真实 Debian/Ubuntu 上跑过**——本机没有 Linux、没有 Docker/WSL。
+> 验证边界（先说实话）：这份文档、`deploy/install.sh` 与 `deploy/update.sh` 是在 Windows 机器上写的。
+> 写完之后做过的验证是：三个脚本 `bash -n` 语法通过；`deploy/install.sh --dry-run` 在本机 Git Bash 里把
+> 11 个步骤全走了一遍（只打印不执行），`--port 9000`、坏域名、坏端口、带空格的 `--repo` 都推演过；
+> 更新命令（`update_cli` / `run_update.py`）与证书、橙云判定有离线测试全绿。
+> **没有在真实 Debian/Ubuntu 上跑过**——本机没有 Linux、没有 Docker/WSL。
 > 所以第一次上服务器请按本文档分步执行，每步都有「怎么确认这一步成了」。
 
 ---
@@ -81,6 +83,24 @@ sudo bash deploy/install.sh --domain trade.example.com
 
 **幂等**：每一步先看现状，已经在位就跳过。连跑两遍不会炸，也不会覆盖已有的 `secrets.bin`。
 
+参数：
+
+| 参数 | 说明 |
+|---|---|
+| `--domain trade.example.com` | 域名（不带 `http://`、不带路径、不带端口）。会被校验：小写、非 IPv4、`^[a-z0-9](...)` 那套正则不过就直接退出，什么都不动 |
+| `--port 8765` | 后端监听端口（1–65535）。**它会被写进四个地方**：systemd unit 的 `ExecStart`、`/usr/local/lib/bitrader/port.conf`（界面点「签发证书」时重写 Caddyfile 要读它）、Caddyfile 的 `reverse_proxy 127.0.0.1:<端口>`、以及防火墙提示里的端口号。少写一处，装完就是「界面能开、接口全 502」 |
+| `--repo https://...` | 代码来源。字符集有白名单（会被拼进 `bash -c`，带空格和分号直接拒） |
+| `--no-caddy` | 不装 Caddy，自己拿 nginx 反代到 `127.0.0.1:<端口>` |
+| `--dry-run` | 只打印要写什么，一个字节都不落盘 |
+
+重复跑的时候，代码目录有三条路：已有 `.git` → `git fetch --depth 1` + `git merge --ff-only`
+（只快进，和在线更新同一语义）；有文件但没 `.git`（rsync 装的老机器）→ `git init` 补上仓库壳再对齐；
+目录基本是空的 → `git clone --depth 1`。数据目录 `/var/lib/bitrader` 三条路都不碰。
+
+公网 IP 不用你填：脚本先问云厂商的元数据服务（阿里云 `100.100.100.200`、腾讯云
+`metadata.tencentyun.com`、`169.254.169.254`），都没有才问 `https://api.ipify.org`，
+把结果写进 Caddyfile 的 IP 跳转段。一个都查不到就**删掉那段**，不让占位符留在配置里。
+
 没有域名时：
 
 ```bash
@@ -90,7 +110,11 @@ ssh -N -L 8080:127.0.0.1:8080 user@服务器
 # 浏览器打开 http://127.0.0.1:8080
 ```
 
-自己有 nginx：`sudo bash deploy/install.sh --no-caddy`，然后自己反代到 `127.0.0.1:8765`（记得转发 `Upgrade` 头给 `/ws`）。
+自己有 nginx：`sudo bash deploy/install.sh --no-caddy`，然后自己反代到 `127.0.0.1:8765`
+（换了 `--port` 就换成那个端口；记得转发 `Upgrade` 头给 `/ws`）。
+
+端口不是 8765 时记住它写在两处：unit 的 `ExecStart` 和 `/usr/local/lib/bitrader/port.conf`。
+后者是界面点「签发证书」重写 Caddyfile 时读的——只改 unit 不改它，点一次证书端口就被改回 8765。
 
 ---
 
@@ -100,7 +124,7 @@ ssh -N -L 8080:127.0.0.1:8080 user@服务器
 # 服务在跑？
 sudo systemctl status bitrader --no-pager
 
-# 后端在本机通不通？
+# 后端在本机通不通？（端口按 --port，默认 8765）
 curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8765/          # 期望 200
 curl -s http://127.0.0.1:8765/api/settings | head -c 200                # 期望一段 JSON
 
@@ -149,8 +173,15 @@ sudo -u bitrader test -r /var/lib/bitrader/secrets.bin && echo 可读
 ## 5. 日常运维
 
 ```bash
-# 更新代码（--repo 装的）。更省事的做法是设置页那张「软件更新」卡，见第 7 节
-sudo bash deploy/install.sh --repo https://github.com/you/biTrader.git --domain trade.example.com
+# 更新代码：一条命令（和界面那张卡走同一条流水线，见第 7 节）
+sudo bash deploy/update.sh check     # 先看差几个提交
+sudo bash deploy/update.sh           # 真的更新：fetch → 快进 → 装依赖 → 重启 → 确认起来了
+
+# 出问题退回上一次更新之前的提交
+sudo bash deploy/update.sh rollback --yes
+
+# 千万不要用重跑 install.sh 来当更新手段：它会把 unit、Caddyfile、sudoers 一起重写一遍，
+# 而更新只需要换代码。install.sh 只在装机和「补一条新 sudo 权限」时用。
 
 # 手动重启（改过 Python 代码之后必须重启，没有热重载）
 sudo systemctl restart bitrader && sudo journalctl -u bitrader -n 20 --no-pager
@@ -180,12 +211,17 @@ sudo systemctl start bitrader
 | 接口 | 做什么 |
 |---|---|
 | `GET /api/deploy/info` | 当前域名、Caddy 装没装/在不在跑、本机公网 IP、证书到期时间、数据目录 |
-| `POST /api/deploy/check {domain}` | 解析这个域名的 A/AAAA 记录，和本机公网 IP 比；不一致时把两个 IP 都念出来 |
-| `POST /api/deploy/tls {domain}` | 写 Caddyfile + reload Caddy，然后轮询 `https://域名/`（最多 60 秒）确认通 |
+| `POST /api/deploy/check {domain}` | 解析这个域名的 A/AAAA 记录，和本机公网 IP 比；不一致时把两个 IP 都念出来。解析**全部**落在 Cloudflare 边缘时不算不一致（`proxied: true`，见 6.3） |
+| `POST /api/deploy/tls {domain}` | 写 Caddyfile + reload Caddy，然后分两段确认：先等本机 443 上有这张域名的证书（最多 60 秒），再确认公网 `/api/health` 通（最多 45 秒） |
 
 - 公网 IP 先读本机记录（`/var/lib/bitrader/deploy.json`、Caddyfile 里的 IP 跳转段），都没有才问
   `https://api.ipify.org`（3 秒超时）。查不到就是 `null` + 一句为什么，不填 0.0.0.0。
-- 证书到期时间读 `/var/lib/caddy/.local/share/caddy/certificates/**/*.crt`，读不到就是 `null`。
+- 证书到期时间先读 `/var/lib/caddy/.local/share/caddy/certificates/**/*.crt`；那个目录属 `caddy`（0700/0750），
+  `bitrader` 读不到时改问本机 443（SNI 握手读证书的 notAfter），两边都没有才是 `null`。
+- 签证书分两段判，别只看一段：**本机 443 上有没有这张域名的证书**（Caddy 到底签成没签成）和
+  **公网打不打得开**（`/api/health` 回 2xx）是两件事。只看公网会被橙云的边缘缓存骗过——CF 用自己
+  的证书摸到边缘就回 200，源站其实一个证书都没有；反过来只在本机确认，又漏掉了「证书有了但 80/443 被墙」。
+  所以第一段老实等本机证书，第二段才探公网，两段各自的失败文案分开写。
 - 失败时接口把 `journalctl -u caddy -n 20 --no-pager`（或 `/var/log/caddy/*.log` 尾部）的**原文**
   放进 `log_tail`，脚本自己的输出放进 `script_output`。原因以那两段为准，接口不替 Caddy 编理由。
 - 非 Linux（Windows / macOS）这三个接口一律 501 并说明，不假装能签。
@@ -234,12 +270,92 @@ curl -fsS https://api.ipify.org; echo
 `sudo -n ...` 报 `a password is required`：sudoers 那一行没生效（`sudo -l -U bitrader` 查），
 把 6.1 里那条重写一遍、`visudo -c -f /etc/sudoers.d/bitrader` 校验。
 
+### 6.3 域名挂在 Cloudflare（橙云）
+
+橙云（代理开着，解析结果是一堆 CF 边缘 IP）和「A 记录直接指源站」是两套行为，这里列全。
+程序只能读到「解析落在 CF 网段」，**读不到 Cloudflare 面板里的开关**——面板上那几项要自己确认。
+
+1. **SSL/TLS 加密模式必须是 Full 或 Full (strict)。**
+   选 Flexible 会死循环：Caddy 把 http 301 到 https → CF 以 http 回源、看到 301 → 再回给浏览器 →
+   `ERR_TOO_MANY_REDIRECTS`（`curl -I` 能看到一串 301）。Full 和 Full (strict) 都能用，
+   推荐 strict：Caddy 签的是真证书（Let's Encrypt），strict 只是要求这张证书有效，不额外收钱。
+2. **ACME 的验证路径不能被拦。** Caddy 走 HTTP-01，Cloudflare 必须能把
+   `http://域名/.well-known/acme-challenge/<token>` 回源到这台机器的 80 端口：
+   别在 WAF / Cache Rules / Page Rules 里拦它，也别给这个域名加强制跳转（Caddy 自己会处理 80 → 443）。
+3. **源站只对 Cloudflare 网段开 80/443。** 这样别人拿不到源站 IP 也就绕不过 CF。ufw 示例（**手动作业**：
+   脚本不会替你改防火墙，云厂商安全组同样要自己开）：
+
+```bash
+# 先看清都有哪些网段，再一条条放行（v4 + v6）
+curl -fsS https://www.cloudflare.com/ips-v4; echo
+curl -fsS https://www.cloudflare.com/ips-v6; echo
+
+for net in $(curl -fsS https://www.cloudflare.com/ips-v4) $(curl -fsS https://www.cloudflare.com/ips-v6); do
+  sudo ufw allow proto tcp from "$net" to any port 80
+  sudo ufw allow proto tcp from "$net" to any port 443
+done
+sudo ufw status numbered        # 看完再决定要不要删旧的 80/443 规则
+```
+
+4. **日志里的真实 IP 靠 `trusted_proxies`。** Caddyfile 顶部 global 段写着 22 个 CF 网段
+   （`servers { trusted_proxies static ... }`），反代用 `header_up X-Real-IP {client_ip}`。
+   不写这一段，服务看到的全是边缘 IP：日志、失败计数、按 IP 限流全错。
+   - Caddy 没有续行符，这一行必须**一整行写完**（`deploy/Caddyfile.example` 就是这么放的）；
+   - `trusted_proxies` 要 Caddy ≥ 2.7（apt 源装的是 2.10，够用）；
+   - 改完 `sudo caddy validate --config /etc/caddy/Caddyfile` 再 reload。
+5. **网段会变。** `routes_deploy.py` 每天问一次 `https://api.cloudflare.com/client/v4/ips`，
+   问不到就用内置表（并记下失败时间，一小时后重试）。同一份网段写在三处，必须一致：
+   `web/routes_deploy.py`（判定用）、`deploy/Caddyfile.example`（还原真实 IP 用）、
+   `deploy/set-domain.sh`（界面点「签发证书」时重写配置用）。`tests/test_deploy_cloudflare.py`
+   把三份逐字比对，加网段时一起改。
+
+排错对照：
+
+| 现象 | 原因 |
+|---|---|
+| `curl` 一串 301 / 浏览器 `ERR_TOO_MANY_REDIRECTS` | Cloudflare 是 Flexible，改成 Full (strict) |
+| HTTP 52x（522 / 523 / 524） | CF 回不到源站：服务没起来、80/443 没对 CF 网段开、端口不是 unit 里那个 |
+| HTTP 526 | 源站证书无效：先在机器上确认 443 上有这张域名的证书（`openssl s_client -connect 127.0.0.1:443 -servername 域名`） |
+| 页面能开，但接口全 502 | Caddyfile 里的反代端口和 unit 的 `--port` 不一致（`port.conf` 是不是旧值） |
+
 ---
 
 ## 7. 更新与回滚
 
 升级不用重新部署，也不用登服务器敲 git：设置页那张「软件更新」卡就是这件事。它是**手动**的——
 只有你点「检查更新」「立即更新」它才动，程序自己不会检查、也不会自己装。
+
+两条路，同一条流水线 —— 界面点按钮和终端敲命令做的是同一件事（同一份闸、同一个状态文件、
+同一批步骤输出），不存在「命令行更宽松」这回事：
+
+| 在哪 | 怎么用 |
+|---|---|
+| 界面 | 设置页「软件更新」卡：检查更新 / 立即更新 / 回滚 |
+| 终端 | `sudo bash deploy/update.sh check` / 不带参数就是更新 / `status` / `rollback --yes` |
+
+命令行默认**把活交给正在跑的服务**（`POST /api/update/apply`，然后读 `/api/update/status`
+把步骤一行行念出来）；服务没应答（坏了、正在停、还没起来）才在本进程里跑同一条流水线。
+`--offline` 强制走后者，但**服务在跑时会被拒**：引擎跑在服务进程里，绕过它就等于绕过
+「引擎在跑不许更新」那道闸。真要离线跑，先 `sudo systemctl stop bitrader`。
+
+```bash
+sudo bash deploy/update.sh check          # 本机 / 远端各是哪个提交，差几个，能不能更
+sudo bash deploy/update.sh                # 更新（服务在跑就交给它）
+sudo bash deploy/update.sh status         # 上一次做到哪一步（重启之后照样读得到）
+sudo bash deploy/update.sh rollback --yes # 回滚，不加 --yes 什么都不做
+
+sudo bash deploy/update.sh check --json   # 给脚本用的机器可读输出
+```
+
+退出码：`0` 成功 / `1` 失败（那一步的原始输出会打出来）/ `2` 前置条件不满足
+（脏工作树、已有更新在跑、已经最新、分叉、桌面版……**什么都没动**）。
+
+`deploy/update.sh` 只做三件事：找到 `/opt/bitrader` 和它的 venv、以 `bitrader` 用户跑
+（用 root 跑会把 `update-state.json` 写成 root:root，界面再也读不到）、把 `BITRADER_DATA_DIR`
+对齐到 unit 里那一份。真正的逻辑在 `src/btrader/update_cli.py`，入口是仓库根的 `run_update.py`
+（服务器上 `btrader` 这个包没装进 venv，`python -m btrader.update_cli` 跑不起来）。
+把路径换成别的目录用 `BITRADER_APP_DIR=/srv/biTrader sudo bash deploy/update.sh check`。
+
 
 - **检查**：`GET /api/update/info` 比本地 HEAD 与远端分支（默认 `xf/main`）的提交 SHA，
   列出落后的条数与每条标题。远端读不到时 `remote_sha` 是 `null` 加一句为什么，不会显示「已是最新」。
@@ -291,7 +407,10 @@ sudo systemctl status bitrader --no-pager
 
 - 卡片上的「回滚」：`POST /api/update/rollback {confirm: true}`，回到这次更新**之前**的那个提交，
   依赖与重启照旧走一遍，步骤输出一样能看到。
-- 服务器上手动的等价做法：
+- 终端：`sudo bash deploy/update.sh rollback --yes`。不加 `--yes` 什么都不做（回滚会真的改代码，
+  值得多敲四个字符）。只有在 `state == done` 且有 `from_sha` 时才允许；`from_sha` 还得像提交
+  SHA（`[0-9a-f]{7,40}`），不像就拒——它会被拼进 `git revert` 的命令行。
+- 上一条命令自己都不好使了（服务起不来、`update-state.json` 丢了）？手工做同一件事：
 
 ```bash
 cd /opt/bitrader
@@ -350,7 +469,17 @@ sudo journalctl -u caddy -n 80 --no-pager | grep -i -E "acme|certificate|tls"
 ```
 
 - DNS 还没生效 → 等（TTL 通常几分钟到几小时），别急着重跑。
-- 有 CDN / 代理（Cloudflare 橙云）→ 先关掉或确认它没拦 `/.well-known/acme-challenge/`。
+- 挂在 Cloudflare 橙云上时，`dig` 出来的是一串 CF 边缘 IP —— **这是正常的**，不是「解析错了」。
+  证书到底签成没签成，别从公网看，先在本机看 443：
+
+```bash
+openssl s_client -connect 127.0.0.1:443 -servername trade.example.com 2>/dev/null \
+  | openssl x509 -noout -subject -dates
+```
+
+  有证书说明 Caddy 签成了，剩下的问题在 CF 那一侧（SSL/TLS 模式、回源端口、`/.well-known/acme-challenge/`
+  被拦），对照 6.3 的排错表。界面点「签发证书」的结果本来就分两段写（本机证书 / 公网可达），
+  失败文案会直接说是哪一段没过。
 - 证书申请失败次数太多会被限流，等一会儿再 `sudo systemctl restart caddy`。
 
 ### 8.2 80 / 443 被墙

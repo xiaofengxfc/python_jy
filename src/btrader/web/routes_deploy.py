@@ -19,6 +19,7 @@ import logging
 import re
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import threading
@@ -55,6 +56,47 @@ TLS_VERIFY_SECONDS = 60.0
 TLS_POLL_SECONDS = 2.0
 LOG_LINES = 20
 DOMAIN_MAX = 253
+
+# Cloudflare 公布的边缘网段（v4 + v6，https://www.cloudflare.com/ips/）。
+# 三处必须一致，改就一起改：这里、deploy/Caddyfile.example、deploy/set-domain.sh 的 CF_RANGES
+# （tests/test_deploy_cloudflare.py 会比对这三份，漏改一处就红）。
+CF_RANGES: tuple[str, ...] = (
+    "173.245.48.0/20",
+    "103.21.244.0/22",
+    "103.22.200.0/22",
+    "103.31.4.0/22",
+    "141.101.64.0/18",
+    "108.162.192.0/18",
+    "190.93.240.0/20",
+    "188.114.96.0/20",
+    "197.234.240.0/22",
+    "198.41.128.0/17",
+    "162.158.0.0/15",
+    "104.16.0.0/13",
+    "104.24.0.0/14",
+    "172.64.0.0/13",
+    "131.0.72.0/22",
+    "2400:cb00::/32",
+    "2606:4700::/32",
+    "2803:f800::/32",
+    "2405:b500::/32",
+    "2405:8100::/32",
+    "2a06:98c0::/29",
+    "2c0f:f248::/32",
+)
+# 网段是 CF 自己公布的，偶尔会加新段。内置表已经够用（判定「解析到 CF 边缘」不需要
+# 精确到最新一段），所以刷新失败就静默用内置：这条路径不该因为外部接口挂了就报错。
+CF_RANGES_URL = "https://api.cloudflare.com/client/v4/ips"
+CF_RANGES_TIMEOUT = 3.0
+CF_RANGES_TTL = 86400.0
+CF_RANGES_RETRY = 3600.0
+CF_PROXY = "cloudflare"
+# 本机回环上的 TLS：证书签发成功的判据（不验链，只问「有没有这张域名的证书」）。
+LOCAL_TLS_PORT = 443
+LOCAL_TLS_TIMEOUT = 3.0
+# 证书有了之后，再等「从公网真能打开」的时间。两段分开算：第一段说明证书签出来了，
+# 第二段说明端到端通，混成一段会把「证书好了但 443 被封」报成「证书没签出来」。
+PUBLIC_VERIFY_SECONDS = 45.0
 
 _LABEL = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 _TLD = re.compile(r"^[a-z]{2,}$")
@@ -344,6 +386,126 @@ def caddy_state() -> tuple[bool, bool]:
     return installed, done.stdout.strip() == "active"
 
 
+_cf_lock = threading.Lock()
+_cf_cache: dict[str, Any] = {"at": 0.0, "nets": [], "failed_at": 0.0}
+
+
+def _parse_networks(texts: Any) -> list[Any]:
+    nets: list[Any] = []
+    for text in texts or []:
+        try:
+            nets.append(ipaddress.ip_network(str(text).strip(), strict=False))
+        except ValueError:
+            continue
+    return nets
+
+
+def _fetch_cf_networks() -> list[Any]:
+    """问一次 CF 的公开接口。拿不到就返回空列表，调用方用内置表。"""
+    try:
+        with urllib.request.urlopen(CF_RANGES_URL, timeout=CF_RANGES_TIMEOUT) as resp:  # noqa: S310
+            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception:  # noqa: BLE001 - 网络问题不该让「检查解析」失败
+        log.debug("读 Cloudflare 网段失败", exc_info=True)
+        return []
+    result = payload.get("result") if isinstance(payload, dict) else None
+    if not isinstance(result, dict):
+        return []
+    return _parse_networks(result.get("ipv4_cidr")) + _parse_networks(result.get("ipv6_cidr"))
+
+
+def cf_networks() -> list[Any]:
+    """Cloudflare 边缘网段：内置一份，问到新的就换成新的（缓存 24 小时，失败 1 小时后再试）。"""
+    with _cf_lock:
+        nets = _cf_cache["nets"]
+        now = time.monotonic()
+        if nets and now - float(_cf_cache["at"]) < CF_RANGES_TTL:
+            return nets
+        if nets and now - float(_cf_cache["failed_at"]) < CF_RANGES_RETRY:
+            return nets
+        fetched = _fetch_cf_networks()
+        if fetched:
+            _cf_cache.update({"at": now, "nets": fetched, "failed_at": 0.0})
+            return fetched
+        builtin = _parse_networks(CF_RANGES)
+        _cf_cache.update({"at": now, "nets": builtin, "failed_at": now})
+        return builtin
+
+
+def cloudflare_proxied(addresses: list[str], nets: list[Any] | None = None) -> bool:
+    """这些解析结果是不是**全部**落在 Cloudflare 边缘。
+
+    全落在里面才算代理：一半 CF、一半别处，说明 DNS 还没改完或者有人手工加了一条，
+    那种情况不该说「没问题」。空列表也不算。
+    """
+    if not addresses:
+        return False
+    networks = cf_networks() if nets is None else nets
+    if not networks:
+        return False
+    for text in addresses:
+        try:
+            ip = ipaddress.ip_address(str(text).strip())
+        except ValueError:
+            return False
+        if not any(ip.version == net.version and ip in net for net in networks):
+            return False
+    return True
+
+
+def _cert_names(cert: Any) -> set[str]:
+    from cryptography import x509
+
+    try:
+        ext = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+    except x509.ExtensionNotFound:
+        return set()
+    return {str(name).lower() for name in ext.value.get_values_for_type(x509.DNSName)}
+
+
+def local_tls_probe(
+    domain: str,
+    *,
+    port: int = LOCAL_TLS_PORT,
+    timeout: float = LOCAL_TLS_TIMEOUT,
+) -> tuple[bool, str, str | None]:
+    """连本机 443、带 SNI=域名握一次手，把对端证书读出来。
+
+    返回 (有没有这张域名的证书, 说明, 到期时间 ISO-8601)。
+
+    为什么不验链（CERT_NONE）：这一步要回答的是「Caddy 拿没拿到这张域名的证书」，
+    可信与否由公网那一次探测回答。为什么要它：
+      * Caddy 的证书目录属 caddy（通常 0700/0750），bitrader 读不到，到期时间只能这样问；
+      * 云上 hairpin NAT / 安全组经常把「服务器访问自己的公网域名」挡掉，只靠公网探测
+        会把一次成功的签发报成失败。
+    """
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout) as raw:
+            with context.wrap_socket(raw, server_hostname=domain) as tls:
+                der = tls.getpeercert(binary_form=True)
+    except (OSError, ssl.SSLError) as exc:
+        return False, f"本机 127.0.0.1:{port} 握手失败（{type(exc).__name__}: {exc}）", None
+    if not der:
+        return False, f"本机 127.0.0.1:{port} 没有给出证书", None
+    try:
+        from cryptography import x509
+
+        cert = x509.load_der_x509_certificate(der)
+        names = _cert_names(cert)
+        moment = getattr(cert, "not_valid_after_utc", None)
+        if moment is None:  # 老版本 cryptography
+            moment = cert.not_valid_after.replace(tzinfo=timezone.utc)
+    except Exception as exc:  # noqa: BLE001 - 证书读不出来也要说清是哪一步
+        return True, f"拿到证书但读不出来（{type(exc).__name__}: {exc}）", None
+    expires = moment.astimezone(timezone.utc).isoformat()
+    if names and domain not in names:
+        return False, f"本机 443 上的证书不是给 {domain} 的（覆盖 {', '.join(sorted(names))[:120]}）", expires
+    return True, f"本机 443 已经在用 {domain} 的证书", expires
+
+
 def probe_https(url: str, timeout: float = PROBE_TIMEOUT) -> tuple[bool, str]:
     """发一次 HTTPS 请求：拿不到证书就是 False，具体错误原样带回去。"""
     try:
@@ -356,7 +518,23 @@ def probe_https(url: str, timeout: float = PROBE_TIMEOUT) -> tuple[bool, str]:
 
 
 def cert_expires_at(domain: str | None = None) -> str | None:
-    """Caddy 目录里那张证书的到期时间（ISO-8601，UTC）。读不到就是 None，不猜。"""
+    """证书到期时间（ISO-8601，UTC）。读不到就是 None，不猜。
+
+    先读 Caddy 的证书目录，读不出来再问本机 443：那个目录属 caddy（通常 0700/0750），
+    bitrader 用户进不去，所以服务器上这个字段以前恒为 null，界面也就不知道证书还剩多少天。
+    本机 443 带 SNI 握一次手就能拿到对端证书，不需要任何额外权限。
+    """
+    found = _cert_expires_from_files(domain)
+    if found:
+        return found
+    if domain:
+        ok, _detail, expires = local_tls_probe(domain)
+        if ok:
+            return expires
+    return None
+
+
+def _cert_expires_from_files(domain: str | None = None) -> str | None:
     try:
         found = sorted(CADDY_CERT_DIR.rglob("*.crt"))
     except OSError:
@@ -544,37 +722,59 @@ def deploy_check(payload: DeployDomainPayload) -> dict[str, Any]:
     _require_linux()
     domain = _domain_or_400(payload.domain)
     public_ip, source, error = public_ip_info()
-    resolved: list[str] = []
+
+    def _answer(
+        ok: bool,
+        match: bool,
+        resolved: list[str],
+        message: str,
+        proxied: bool = False,
+    ) -> dict[str, Any]:
+        return {
+            "ok": ok,
+            "domain": domain,
+            "resolves_to": resolved,
+            "public_ip": public_ip,
+            "public_ip_source": source,
+            # match 是老字段（源站 IP 一不一致），origin_match 是它的同义写法：
+            # 橙云下「不一致」是正常状态，别让它被读成失败。
+            "match": match,
+            "origin_match": match,
+            "proxied": proxied,
+            "proxy": CF_PROXY if proxied else None,
+            "message": message,
+        }
+
     try:
         resolved = resolve_all(domain)
     except TimeoutError as exc:
-        return {
-            "ok": False,
-            "domain": domain,
-            "resolves_to": [],
-            "public_ip": public_ip,
-            "public_ip_source": source,
-            "match": False,
-            "message": f"{exc}。看看本机的 DNS（/etc/resolv.conf）通不通，或者过几分钟再试。",
-        }
+        return _answer(
+            False, False, [], f"{exc}。看看本机的 DNS（/etc/resolv.conf）通不通，或者过几分钟再试。"
+        )
     except Exception as exc:  # noqa: BLE001 - 解析失败是常事，不是 500
-        return {
-            "ok": False,
-            "domain": domain,
-            "resolves_to": [],
-            "public_ip": public_ip,
-            "public_ip_source": source,
-            "match": False,
-            "message": (
-                f"解析 {domain} 失败：{type(exc).__name__}: {exc}。"
-                "域名拼错了，或者这台机器的 DNS 查询不通，都会是这样。"
-            ),
-        }
+        return _answer(
+            False,
+            False,
+            [],
+            f"解析 {domain} 失败：{type(exc).__name__}: {exc}。"
+            "域名拼错了，或者这台机器的 DNS 查询不通，都会是这样。",
+        )
+
+    proxied = cloudflare_proxied(resolved)
     match = bool(public_ip) and public_ip in resolved
     if not resolved:
         message = (
             f"{domain} 现在没有解析出任何地址：域名服务商那边还没加 A 记录，"
             "或者刚加上、TTL 还没到。"
+        )
+    elif proxied:
+        message = (
+            f"{domain} 解析到 {'、'.join(resolved)}（Cloudflare 边缘），橙云开着：算通过。"
+            "源站 IP 不参与比较，但签证书前要确认三件事："
+            "① Cloudflare 的 SSL/TLS 加密模式是 Full 或 Full (strict)——设成 Flexible 的话，"
+            "CF 用 80 连源站、Caddy 又 301 回 https，浏览器会无限重定向；"
+            "② /.well-known/acme-challenge/ 没被 WAF 或 Cache Rules 拦；"
+            "③ 源站的 80/443 对 Cloudflare 网段放行（云安全组一起确认）。"
         )
     elif public_ip is None:
         message = (
@@ -588,19 +788,41 @@ def deploy_check(payload: DeployDomainPayload) -> dict[str, Any]:
             f"{domain} 现在解析到 {'、'.join(resolved)}，本机公网是 {public_ip}："
             "两边不一样，签证书会失败（ACME 要访问指到这台机器 80 端口的域名）。"
             "去域名服务商把它改成 A 记录 → 这个 IP，等生效再点一次。"
+            "开着橙云（CDN 代理）时解析结果本来就不是源站 IP，那种情况上面会认成 Cloudflare 并放行；"
+            "这里没认出来，说明解析到的是别的 CDN，或者 A 记录还没改。"
         )
-    return {
-        "ok": bool(match),
-        "domain": domain,
-        "resolves_to": resolved,
-        "public_ip": public_ip,
-        "public_ip_source": source,
-        "match": match,
-        "message": message,
-    }
+    return _answer(bool(match or proxied), match, resolved, message, proxied)
+
+def _public_failure_hint(domain: str, detail: str) -> str:
+    """公网打不开时补一句方向，不冒充原因（原因仍在 log_tail 里）。"""
+    notes: list[str] = []
+    if detail.startswith("HTTP 52"):
+        notes.append(
+            "HTTP 52x 是 Cloudflare 打到源站失败：源站 443 没开，或者 CF 的加密模式比源站证书更严。"
+        )
+    elif detail.startswith("HTTP 30"):
+        notes.append(
+            "连续 30x 通常是 Cloudflare 加密模式设成了 Flexible：CF 用 80 连源站，"
+            "Caddy 又 301 回 https，来回跳。把它改成 Full 或 Full (strict)。"
+        )
+    notes.append("检查这台机器的 80/443 是否对公网放行（云安全组 + 本机防火墙）。")
+    try:
+        if cloudflare_proxied(resolve_all(domain)):
+            notes.append("这个域名解析在 Cloudflare 边缘（橙云），上面几条按橙云的口径看。")
+    except Exception:  # noqa: BLE001 - 只是补一句方向，解析失败不影响结论
+        log.debug("判断 Cloudflare 代理失败", exc_info=True)
+    return "".join(notes)
+
 
 def deploy_tls(payload: DeployDomainPayload) -> dict[str, Any]:
-    """切到域名并签证书：写 Caddyfile（root 脚本）→ reload → 轮询 HTTPS 确认通。
+    """切到域名并签证书：写 Caddyfile（root 脚本）→ reload → 两次确认。
+
+    确认分两段，别合成一段：
+      ① 本机 443 带 SNI 握手，看 Caddy 到底有没有这张域名的证书（「签出来了」的判据）；
+      ② 再探 https://域名/api/health（「从公网真能打开」的判据）。
+    只做②会被两件事骗：云上 hairpin NAT / 安全组把「服务器访问自己的公网域名」挡掉，
+    于是证书签好了却报失败；橙云下静态页面又可能被边缘缓存顶回来，源站没通也回 200。
+    探 /api/health 而不是 /，就是因为它不会被缓存。
 
     失败时把 Caddy 的日志原文放在 log_tail 里，脚本自己的输出放在 script_output
     里——原因以它们为准，这里只报「看到了什么」。
@@ -652,26 +874,52 @@ def deploy_tls(payload: DeployDomainPayload) -> dict[str, Any]:
         return _result(False, domain, url, None, caddy_log_tail(), output, message)
 
     deadline = time.monotonic() + TLS_VERIFY_SECONDS
+    expires: str | None = None
+    detail = ""
     while True:
-        reachable, detail = probe_https(url)
-        if reachable:
+        ready, detail, seen = local_tls_probe(domain)
+        if seen:
+            expires = seen
+        if ready:
             break
         if time.monotonic() >= deadline:
-            log.warning("域名 %s 在 %.0f 秒内没有应答：%s", domain, TLS_VERIFY_SECONDS, detail)
+            log.warning("域名 %s 在 %.0f 秒内没拿到证书：%s", domain, TLS_VERIFY_SECONDS, detail)
             return _result(
                 False,
                 domain,
                 url,
-                None,
+                expires,
                 caddy_log_tail(),
                 output,
-                f"Caddyfile 写好了、caddy 也 reload 了，但 {TLS_VERIFY_SECONDS:g} 秒内 "
-                f"{url} 没有应答（最后一次：{detail}）。"
+                f"Caddyfile 写好了、caddy 也 reload 了，但 {TLS_VERIFY_SECONDS:g} 秒内本机 443 上还没有 "
+                f"{domain} 的证书（最后一次：{detail}）。"
                 "下面是 Caddy 自己的日志原文，原因以它为准。",
             )
         time.sleep(TLS_POLL_SECONDS)
 
-    expires = cert_expires_at(domain)
+    health = f"{url}api/health"
+    public_deadline = time.monotonic() + PUBLIC_VERIFY_SECONDS
+    while True:
+        reachable, public_detail = probe_https(health)
+        if reachable:
+            break
+        if time.monotonic() >= public_deadline:
+            log.warning("域名 %s 证书就绪但公网打不开：%s", domain, public_detail)
+            return _result(
+                False,
+                domain,
+                url,
+                expires,
+                caddy_log_tail(),
+                output,
+                f"证书已签好（本机 443 已经在用 {domain} 的证书），但 {PUBLIC_VERIFY_SECONDS:g} 秒内"
+                f"从公网打开 {health} 没拿到 2xx（最后一次：{public_detail}）。"
+                + _public_failure_hint(domain, public_detail),
+            )
+        time.sleep(TLS_POLL_SECONDS)
+
+    if not expires:
+        expires = cert_expires_at(domain)
     public_ip = public_ip_info()[0]
     write_deploy_record(domain, public_ip)
     return _result(

@@ -18,14 +18,39 @@
 set -Eeuo pipefail
 
 DOMAIN="${1:-}"
+# 端口跟着安装走，见下面 read_port 的注释。
+HELPER_DIR="/usr/local/lib/bitrader"
+PORT_CONF="$HELPER_DIR/port.conf"
 PORT="8765"
 CADDYFILE="/etc/caddy/Caddyfile"
 BACKUP=""
 CADDY_BIN="$(command -v caddy || true)"
 
+# Cloudflare 公布的边缘网段（v4 + v6）。三处必须一致，改就一起改：
+#   deploy/Caddyfile.example、本文件的 CF_RANGES、routes_deploy.CF_RANGES。
+# 列在这里是为了让 {client_ip} 能还原真实客户端 —— 橙云下不信任 CF 网段的话，
+# 反代看到的永远是同一个边缘 IP。
+CF_RANGES="173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22 2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32"
+
 say() { printf "\n== %s\n" "$*"; }
 note() { printf "   %s\n" "$*"; }
 die() { printf "\n[失败] %s\n" "$*" >&2; exit 2; }
+
+# 端口：install.sh 第 9 步把 PORT=<端口> 写进 $PORT_CONF。以前这里写死 8765 ——
+# 用 --port 9000 装的机器点一次「签发证书」，反代就被改回 8765，页面 502，而报错
+# 看起来像证书的问题。只认 PORT=<数字> 这一行，别的内容一概不执行。
+read_port() {
+  [ -r "$PORT_CONF" ] || return 0
+  local value
+  value="$(sed -n 's/^PORT=\([0-9]\{1,5\}\)$/\1/p' "$PORT_CONF" | head -n 1)"
+  case "$value" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+  if [ "$value" -ge 1 ] && [ "$value" -le 65535 ]; then
+    PORT="$value"
+    note "后端端口从 $PORT_CONF 读到：$PORT"
+  fi
+}
 
 usage() {
   cat <<'USAGE'
@@ -76,6 +101,7 @@ if ! systemctl list-unit-files 2>/dev/null | grep -q '^caddy\.service'; then
   note "警告：没有 caddy.service 这个 unit，下面的 reload 会失败"
 fi
 
+read_port
 say "切换域名：$DOMAIN → 127.0.0.1:$PORT"
 
 # ---------------------------------------------------------------- 3. 公网 IP
@@ -104,7 +130,15 @@ if [ -f "$CADDYFILE" ]; then
 else
   install -d -m 755 /etc/caddy
 fi
-[ -d /var/log/caddy ] || install -d -m 755 /var/log/caddy
+# 访问日志目录：caddy 用户要能在这里建文件，否则 reload 之后配置写不进去。
+# install.sh 会 chown 成 caddy:caddy，但这一份也可能被单独执行（目录是别人建的、
+# 属主是 root:root 那种情况），所以每次顺手摆正。
+if id -u caddy >/dev/null 2>&1; then
+  install -d -m 755 -o caddy -g caddy /var/log/caddy
+else
+  install -d -m 755 /var/log/caddy
+  note "警告：没有 caddy 这个用户，/var/log/caddy 仍属 root —— caddy 可能写不进访问日志"
+fi
 
 # 临时文件建在同一个目录里（同一个文件系统，mv 才是原子改名），名字以点开头，
 # 不会被 Caddy 当成配置读；mktemp 用 O_EXCL 建，撞名不会覆盖别人的东西。
@@ -114,9 +148,16 @@ trap 'rm -f "$STAGE"' EXIT
 {
   printf '# 由 set-domain.sh 生成。别手改：下次点「签发证书」会重写这一份。\n'
   printf '# 域名 %s，证书由 Caddy 自己申请与续期；后端只监听 127.0.0.1:%s。\n\n' "$DOMAIN" "$PORT"
+  printf '# 全局：信任 Cloudflare 边缘。橙云下不写这一段，{client_ip} 还原不出来，\n'
+  printf '# 访问日志里每个客户端都是同一个边缘 IP。整段必须一行写完（Caddyfile 没有续行符）。\n'
+  printf '{\n'
+  printf '\tservers {\n'
+  printf '\t\ttrusted_proxies static %s\n' "$CF_RANGES"
+  printf '\t}\n'
+  printf '}\n\n'
   printf '%s {\n' "$DOMAIN"
   printf '\treverse_proxy 127.0.0.1:%s {\n' "$PORT"
-  printf '\t\theader_up X-Real-IP {remote_host}\n'
+  printf '\t\theader_up X-Real-IP {client_ip}\n'
   printf '\t}\n'
   printf '\tencode gzip zstd\n'
   printf '\tlog {\n'

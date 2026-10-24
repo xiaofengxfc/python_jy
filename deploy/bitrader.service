@@ -1,6 +1,6 @@
 [Unit]
 Description=biTrader 交易工作台（后端 + 浏览器访问的界面）
-Documentation=https://github.com/bitrader/docs/DEPLOY-Linux.md
+Documentation=https://github.com/xiaofengxfc/python_jy/blob/main/docs/DEPLOY-Linux.md
 # 网络要先起来；交易所是外网，但本机 127.0.0.1 上的 Caddy 反代也要等网卡就绪
 After=network-online.target
 Wants=network-online.target

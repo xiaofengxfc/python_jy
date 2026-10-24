@@ -17,6 +17,11 @@ APP_DIR="/opt/bitrader"
 DATA_DIR="/var/lib/bitrader"
 SERVICE="bitrader"
 PORT="8765"
+# 域名与公网 IP 的写法：和 deploy/set-domain.sh 用同一套口径，在参数这一层就收死。
+# 以前 --domain 原样进 sed 的替换串：带 & / # 的输入会写出畸形配置，而 --port 写个
+# 字母会直接写进 systemd 的 ExecStart，服务起不来还要翻 journalctl 才知道是参数写错。
+DOMAIN_RE='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$'
+IPV4_RE='^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$'
 # 域名切换脚本：install.sh 把它以 root:root 装到这里，sudoers 也只授这一条。
 # **不要**放在 $APP_DIR 下面：那个目录属主是 bitrader，改得动的脚本 + NOPASSWD sudo
 # 等于把 root 送出去。
@@ -47,13 +52,18 @@ usage() {
   cat <<'USAGE'
 用法: sudo bash deploy/install.sh [选项]
 
-  --domain <域名>   有域名就填，用于 Caddy 自动 HTTPS；不填只监听 127.0.0.1
+  --domain <域名>   有域名就填，用于 Caddy 自动 HTTPS（会校验写法，IP 直接拒）；
+                    不填只监听 127.0.0.1
   --repo <git 地址> 服务器上没有代码时从仓库拉取（默认用当前目录这份代码）
-  --port <端口>     后端监听端口，默认 8765（只监听回环，对外由 Caddy 反代）
+  --port <端口>     后端监听端口，默认 8765（1-65535；Caddyfile 与 set-domain.sh 都按它写）
   --no-caddy        不装 Caddy、不写 Caddyfile（你自己有 nginx 时用）
                     同时也跳过域名切换脚本那一条 sudo；「重启服务」那条照写
   --dry-run         只打印将执行的命令与写入的内容，不做任何修改
   -h, --help        这份帮助
+
+装完之后更新代码不用再跑本脚本（它做的是整套安装）：
+  sudo bash deploy/update.sh            # 检查 -> 快进 -> 装依赖 -> 重启 -> 确认服务回来
+  sudo bash deploy/update.sh check      # 只看本地与远端差几个提交
 
 本机（非 Linux）推演脚本逻辑：
   BI_RUN_DRY_ANYWHERE=1 bash deploy/install.sh --dry-run
@@ -73,6 +83,44 @@ parse_args() {
       *) die "不认识的参数：$1（用 --help 看用法）" ;;
     esac
   done
+}
+
+# 参数校验：在动系统之前把域名、端口、仓库地址收死。它不改任何东西，所以 dry-run 也照跑。
+validate_args() {
+  if [ -n "$DOMAIN" ]; then
+    DOMAIN="$(printf '%s' "$DOMAIN" | tr '[:upper:]' '[:lower:]')"
+    case "$DOMAIN" in
+      *' '*|*$'\t'*) die "--domain 里不能有空格：「$DOMAIN」" ;;
+      *://*|*/*)     die "--domain 只填域名本身，不要带协议或路径：「$DOMAIN」" ;;
+      *:*)           die "--domain 后面不要带端口，只填 trade.example.com 这一段：「$DOMAIN」" ;;
+    esac
+    if [ "${#DOMAIN}" -gt 253 ]; then
+      die "--domain 最长 253 个字符，这个是 ${#DOMAIN} 个"
+    fi
+    if printf '%s' "$DOMAIN" | grep -Eq "$IPV4_RE"; then
+      die "--domain 要填域名，不是 IP：「$DOMAIN」。证书只能签给域名，ACME 不给 IP 发证书"
+    fi
+    if ! printf '%s' "$DOMAIN" | grep -Eq "$DOMAIN_RE"; then
+      die "--domain 写法不对：「$DOMAIN」要写成 trade.example.com 这种样子（字母、数字、连字符，结尾是 .com 这类）"
+    fi
+  fi
+  case "$PORT" in
+    ''|*[!0-9]*) die "--port 只收数字，这次给的是「$PORT」" ;;
+  esac
+  if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+    die "--port 必须在 1-65535 之间，这次给的是 $PORT"
+  fi
+  # 仓库地址会拼进 run_sh 的 bash -c 字符串里，所以按白名单收：出现别的字符就当场拒。
+  if [ -n "$REPO_URL" ]; then
+    # 用白名单而不是黑名单：git 地址里该出现的就这几个字符，别的写法
+    # （引号、分号、$、反引号、空白、反斜杠）一律当写错，不让它进 bash -c。
+    if ! printf '%s' "$REPO_URL" | grep -Eq '^[A-Za-z0-9._~:/@%+,-]+$'; then
+      die "--repo 里有不认识的字符：「$REPO_URL」。git 地址只用 字母 数字 . _ ~ : / @ % + , - 这几个"
+    fi
+    if [ "${#REPO_URL}" -gt 512 ]; then
+      die "--repo 太长（${#REPO_URL} 个字符）：确认一下是不是粘错了"
+    fi
+  fi
 }
 
 # 所有改动系统的命令都要过 run / run_sh，--dry-run 时只打印
@@ -101,6 +149,28 @@ write_file() {
     return 0
   fi
   install -m "$mode" -o "$owner" -g "$owner" /dev/stdin "$path"
+}
+
+# 本机公网 IP：先问云厂商元数据，再问公共接口，都拿不到就返回空串。
+#
+# 国内云上 https://api.ipify.org 经常超时（实测），而阿里云 / 腾讯云 / 华为云都能从
+# 内网地址直接读到 EIP。以前只有 ipify 一条路，失败时把 REPLACE_WITH_SERVER_IP
+# 原样 sed 回自己：装完的 Caddyfile 里留一段永远匹配不上的死配置，caddy validate
+# 还照样通过，没人发现。现在拿不到就不写那一段（set-domain.sh 一直是这个口径）。
+read_public_ip() {
+  local url answer
+  for url in \
+    "http://100.100.100.200/latest/meta-data/eipv4" \
+    "http://metadata.tencentyun.com/latest/meta-data/public-ipv4" \
+    "http://169.254.169.254/latest/meta-data/public-ipv4" \
+    "https://api.ipify.org"; do
+    answer="$(curl -fsS --max-time 3 "$url" 2>/dev/null | tr -d '\r\n ' || true)"
+    if printf '%s' "$answer" | grep -Eq "$IPV4_RE"; then
+      printf '%s' "$answer"
+      return 0
+    fi
+  done
+  return 0
 }
 
 # ---------------------------------------------------------------- 1. 平台
@@ -188,6 +258,16 @@ install_packages() {
   run env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     ca-certificates curl gnupg git rsync python3-venv python3-pip sudo
   note "pandas / numpy / pyarrow / ccxt / uvicorn / cryptography 都有 manylinux wheel，不需要编译"
+  # 时钟：币安签名容忍度很小（差 1 秒就 -1021），装的时候就把它弄对。
+  # 已经有 NTP 客户端在跑（Debian 默认 systemd-timesyncd）就不动它，别为了装 chrony
+  # 把人家在用的时间服务删掉。
+  if systemctl is-active --quiet chrony 2>/dev/null || systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
+    note "时间同步服务已经在跑，不装 chrony"
+  else
+    run env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends chrony
+    run systemctl enable --now chrony
+    note "已装 chrony 并启动：下单签名对时间敏感，这一步别省"
+  fi
 }
 
 # --------------------------------------------------- 5. 系统用户与数据目录
@@ -216,8 +296,20 @@ place_code() {
   say "$CURRENT_STEP"
   if [ -n "$REPO_URL" ]; then
     if [ -d "$APP_DIR/.git" ]; then
-      note "已有代码，拉最新：$APP_DIR"
+      note "已有代码，快进到远端最新：$APP_DIR"
+      # 和 core/updater.py 同一语义：只做快进，不 reset、不 --force。本地分叉时
+      # merge 会失败并停在这一步，输出里就是 git 自己说的话，不会静默丢掉本地提交。
+      run_sh "git -C '$APP_DIR' fetch --depth 1 origin && git -C '$APP_DIR' merge --ff-only FETCH_HEAD"
+    elif [ -n "$(ls -A "$APP_DIR" 2>/dev/null || true)" ]; then
+      # 以前用 rsync 装的机器：目录里有代码但没 .git，git clone 到非空目录必失败
+      # （destination path already exists and is not an empty directory）。这里补一个
+      # 仓库壳再把工作树对齐到远端。这是全脚本唯一一次硬对齐，只覆盖仓库跟踪的文件；
+      # 数据目录（$DATA_DIR）一个字节都不碰。
+      note "$APP_DIR 里已经有代码但没有 .git（以前是 rsync / scp 装的）：补上远端再对齐"
+      run_sh "git -C '$APP_DIR' init -q"
+      run_sh "git -C '$APP_DIR' remote add origin '$REPO_URL' 2>/dev/null || git -C '$APP_DIR' remote set-url origin '$REPO_URL'"
       run_sh "git -C '$APP_DIR' fetch --depth 1 origin && git -C '$APP_DIR' reset --hard FETCH_HEAD"
+      note "已对齐；以后在线更新（设置页那张卡，或 sudo bash deploy/update.sh）就走 git 了"
     else
       run install -d -m 755 "$APP_DIR"
       run git clone --depth 1 "$REPO_URL" "$APP_DIR"
@@ -225,6 +317,8 @@ place_code() {
   elif [ -f "$SRC_DIR/run_web.py" ]; then
     note "用当前这份代码：$SRC_DIR"
     run install -d -m 755 "$APP_DIR"
+    # 注意：这里不拷 .git。rsync 装上来的机器没有仓库，在线更新用不了；
+    # 要用更新就在这台机器上重跑一次带 --repo 的安装（第 6 步会补 .git 再对齐）。
     run rsync -a --delete \
       --exclude .git --exclude .venv --exclude node_modules \
       --exclude .devdata --exclude .probe --exclude __pycache__ \
@@ -321,6 +415,10 @@ install_domain_helper() {
       die "找不到 deploy/set-domain.sh，代码没放全？"
     fi
     run install -d -m 755 -o root -g root "$HELPER_DIR"
+    # 端口随安装走：set-domain.sh 读它来写 reverse_proxy。不写这份的话，--port 9000
+    # 装的机器日后点一次「签发证书」就被改回 8765，页面直接 502。
+    # root:root 0644 —— bitrader 只读得到、改不了（它只影响反代目标端口）。
+    printf 'PORT=%s\n' "$PORT" | write_file "$HELPER_DIR/port.conf" 644 root
     run install -m 755 -o root -g root "$SRC_DIR/deploy/set-domain.sh" "$HELPER"
     note "已安装 $HELPER（root:root 755）"
     sudo_lines+=(
@@ -384,16 +482,30 @@ install_caddy() {
       "}" \
       | write_file "/etc/caddy/Caddyfile" 644 root
   else
-    local server_ip
+    local server_ip=""
     if [ -n "$DRY_RUN" ]; then
       server_ip="REPLACE_WITH_SERVER_IP"
     else
-      server_ip="$(curl -fsS --max-time 5 https://api.ipify.org || echo REPLACE_WITH_SERVER_IP)"
+      server_ip="$(read_public_ip)"
     fi
-    note "域名：$DOMAIN，服务器公网 IP：$server_ip"
-    sed -e "s/trade\.example\.com/$DOMAIN/g" -e "s/REPLACE_WITH_SERVER_IP/$server_ip/g" \
-      "$SRC_DIR/deploy/Caddyfile.example" \
-      | write_file "/etc/caddy/Caddyfile" 644 root
+    # 三处替换：域名、公网 IP、端口。端口也要换 —— 不换的话用 --port 9000 装的机器，
+    # 反代还指着 8765，界面能打开、所有接口 502。
+    if [ -n "$server_ip" ]; then
+      note "域名：$DOMAIN，服务器公网 IP：$server_ip"
+      sed -e "s/trade\.example\.com/$DOMAIN/g" \
+          -e "s/REPLACE_WITH_SERVER_IP/$server_ip/g" \
+          -e "s/127\.0\.0\.1:8765/127.0.0.1:$PORT/g" \
+        "$SRC_DIR/deploy/Caddyfile.example" \
+        | write_file "/etc/caddy/Caddyfile" 644 root
+    else
+      note "查不到公网 IP（云厂商元数据与 ipify 都没给）：不写「IP 访问 301 到域名」那一段"
+      note "  证书不受影响；想补上就在服务器上 curl https://api.ipify.org 拿到 IP，再点一次「签发证书」"
+      sed -e "s/trade\.example\.com/$DOMAIN/g" \
+          -e "s/127\.0\.0\.1:8765/127.0.0.1:$PORT/g" \
+          -e "/^http:\/\/REPLACE_WITH_SERVER_IP {/,/^}$/d" \
+        "$SRC_DIR/deploy/Caddyfile.example" \
+        | write_file "/etc/caddy/Caddyfile" 644 root
+    fi
   fi
   run caddy validate --config /etc/caddy/Caddyfile
   run systemctl enable caddy
@@ -437,6 +549,7 @@ check_clock_and_finish() {
 
 main() {
   parse_args "$@"
+  validate_args
   if [ -n "$DRY_RUN" ]; then printf "\n[dry-run] 只打印，不改系统\n"; fi
   require_platform
   require_root

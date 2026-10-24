@@ -337,7 +337,10 @@ export interface DeployInfo {
   data_dir: string;
 }
 
-/** POST /api/deploy/check：域名现在解析到哪、和本机公网 IP 一不一致。 */
+/** POST /api/deploy/check：域名现在解析到哪、和本机公网 IP 一不一致。
+ *
+ *  proxied 为真表示解析全部落在 Cloudflare 边缘（橙云）：源站 IP 对不上是正常状态，
+ *  这时 ok 已经是「可以签」。match 只说明源站 IP 一致不一致，别再拿它当成功判据。 */
 export interface DeployCheck {
   ok: boolean;
   domain: string;
@@ -345,6 +348,9 @@ export interface DeployCheck {
   public_ip: string | null;
   public_ip_source: string;
   match: boolean;
+  origin_match?: boolean;
+  proxied?: boolean;
+  proxy?: string | null;
   message: string;
 }
 
