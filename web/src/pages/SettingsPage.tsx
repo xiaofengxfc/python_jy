@@ -1678,16 +1678,26 @@ export default function SettingsPage({ settings, settingsError = "", onSaved }: 
                 <div key={key} className="field">
                   <label className="field-label" htmlFor={`risk-${key}`}>
                     <span>{label}</span>
-                    <em>{unit}</em>
+                    {/* 杠杆上限是合约开仓的那道闸：0 会让每张合约单都被拒，所以给范围。 */}
+                    <em>{key === "max_leverage" ? "×（1–125）" : unit}</em>
                   </label>
                   <input
                     id={`risk-${key}`}
                     className="input"
                     type="number"
-                    min={0}
+                    min={key === "max_leverage" ? 1 : 0}
+                    max={key === "max_leverage" ? 125 : undefined}
                     step={key === "max_leverage" ? 1 : 10}
                     value={Number(draft.risk[key])}
-                    onChange={(event) => patchRisk(key, Number(event.target.value))}
+                    onChange={(event) => {
+                      const next = Number(event.target.value);
+                      if (key === "max_leverage") {
+                        if (!Number.isFinite(next) || next < 1) return;
+                        patchRisk(key, Math.min(next, 125));
+                        return;
+                      }
+                      patchRisk(key, next);
+                    }}
                   />
                 </div>
               ))}

@@ -27,13 +27,18 @@ from btrader.context import AppContext
 from btrader.core.config import AppSettings, ConfigStore, RiskSettings
 from btrader.core.storage import Database
 from btrader.core.types import MarketType, Network
+from btrader.core.credentials import Credentials
 from btrader.engine.account import AccountService
 from btrader.engine.trading import TradingService
-from btrader.web.app import OrderPayload, PreviewPayload
+from btrader.exchange.rest import BinanceREST, ExchangeError
+from btrader.web.app import ConditionalPayload, OrderPayload, PreviewPayload
 from btrader.web.routes import (
+    AITraderController,
+    AITraderStartPayload,
     SettingsPayload,
     apply_settings,
     reset_settings,
+    resolve_engine_leverage,
     resolve_order_leverage,
 )
 
@@ -423,3 +428,276 @@ def test_a_leverage_below_one_is_refused(tmp_path):
 
     assert caught.value.status_code == 400
     assert "1" in caught.value.detail
+
+
+# ------------------------------------------- 引擎（执行台 / AI 交易）与条件单
+def test_an_engine_leverage_is_capped_instead_of_rejected():
+    """执行台 / AI 交易的超限杠杆按上限跑，不是每根 K 线被风控拒一次。
+
+    以前两条引擎路径把配置里的杠杆原样塞进 AutoTraderConfig / AITraderConfig，
+    risk.check_order 每次开仓都拒一次「杠杆 20x 超过上限 10x」：界面显示在跑，
+    一笔都不成交，而同一屏的下单框填 20 会按 10 下单。
+    """
+    settings = AppSettings()
+    settings.risk.max_leverage = 10.0
+
+    effective, note = resolve_engine_leverage(settings, MarketType.USDM, 20.0)
+    assert effective == 10.0
+    assert float(effective).is_integer(), "交易所只认整数杠杆"
+    assert "上限" in note and "20" in note and "10" in note
+
+    effective, note = resolve_engine_leverage(settings, MarketType.USDM, 5.0)
+    assert effective == 5.0
+    assert note == ""
+
+
+def test_an_engine_leverage_on_spot_is_one():
+    """现货恒 1：配置里写 10 也按 1 跑，而且不用解释（用户没得选）。"""
+    settings = AppSettings()
+
+    assert resolve_engine_leverage(settings, MarketType.SPOT, 10.0) == (1.0, "")
+
+
+@pytest.mark.parametrize("value", [0.0, 2.5, True])
+def test_a_broken_engine_leverage_is_refused(value):
+    """0 / 1.5 / true 都不是倍数：引擎启动时当场 400，不带着坏值跑。"""
+    settings = AppSettings()
+
+    with pytest.raises(HTTPException) as caught:
+        resolve_engine_leverage(settings, MarketType.USDM, value)
+
+    assert caught.value.status_code == 400
+
+
+def test_ai_auto_leverage_must_be_a_whole_multiple(tmp_path):
+    """ai_auto.leverage 以前只挡「不能为负」：0 存下来等于静默不推杠杆。"""
+    ctx, _ = _ctx(tmp_path)
+
+    for bad in (0, 1.5, 126):
+        with pytest.raises(HTTPException) as caught:
+            apply_settings(ctx, SettingsPayload(ai_auto={"leverage": bad}))
+        assert caught.value.status_code == 400
+        assert "leverage" in caught.value.detail, caught.value.detail
+    assert ctx.settings.ai_auto.leverage == 1.0
+
+    apply_settings(ctx, SettingsPayload(ai_auto={"leverage": 10}))
+    assert ctx.settings.ai_auto.leverage == pytest.approx(10.0)
+
+
+def test_exec_leverage_must_be_a_whole_multiple(tmp_path):
+    """执行台那一项同理：2.5 只会在下单那一刻才报「只能是整数」。"""
+    ctx, _ = _ctx(tmp_path)
+
+    for bad in (2.5, 130):
+        with pytest.raises(HTTPException) as caught:
+            apply_settings(ctx, SettingsPayload(exec={"leverage": bad}))
+        assert caught.value.status_code == 400
+        assert "exec.leverage" in caught.value.detail, caught.value.detail
+    assert ctx.settings.exec.leverage == 1.0
+
+
+def test_ai_start_carries_the_leverage_into_the_config(tmp_path, monkeypatch):
+    """AI 交易的杠杆：请求体的值收口后进 AITraderConfig，并在 status 里回显。
+
+    以前 AITraderStartPayload 根本没有 leverage 字段，_build 只读 ai_auto.leverage，
+    而设置页没有任何 ai_auto 的控件——AI 交易的倍数除了手改 config.json 改不了。
+    """
+    venue, app = _served(tmp_path, monkeypatch, max_leverage=10.0)
+    state = web_app._state
+    state.ctx.settings.ai.enabled = True
+    controller = AITraderController()
+
+    trader = controller._build(
+        state,
+        AITraderStartPayload(
+            market="usdm",
+            symbol=USDM,
+            timeframe="15m",
+            strategy=state.ctx.strategies.keys[0],
+            leverage=20,
+        ),
+    )
+
+    assert trader.config.leverage == 10.0
+    assert "上限" in trader.config.leverage_note
+    reported = trader.status()["config"]
+    assert reported["leverage"] == 10.0
+    assert reported["leverage_note"] == trader.config.leverage_note
+
+
+def test_ai_start_falls_back_to_the_saved_leverage(tmp_path, monkeypatch):
+    """请求体不带 leverage 就用 ai_auto 里那个值（与其它字段同一套优先级）。"""
+    venue, app = _served(tmp_path, monkeypatch, max_leverage=10.0)
+    state = web_app._state
+    state.ctx.settings.ai.enabled = True
+    state.ctx.settings.ai_auto.leverage = 4.0
+    controller = AITraderController()
+
+    trader = controller._build(
+        state,
+        AITraderStartPayload(
+            market="usdm",
+            symbol=USDM,
+            timeframe="15m",
+            strategy=state.ctx.strategies.keys[0],
+        ),
+    )
+
+    assert trader.config.leverage == 4.0
+
+
+def test_a_conditional_order_pushes_the_leverage_it_shows(tmp_path, monkeypatch):
+    """条件单也是真委托：面板显示 7 倍，交易所侧必须先对齐到 7 倍再挂触发器。
+
+    以前 ConditionalPayload 没有 leverage 字段，pydantic 把界面发来的值静默丢掉，
+    路由也不调 set_leverage——挂上去的仓位按账户当时的杠杆开，面板还写着「同样按
+    这里的倍数开」。
+    """
+    venue, app = _served(tmp_path, monkeypatch, saved={"usdm": 7})
+    place = _endpoint(app, "/api/orders/conditional", "POST")
+
+    result = place(
+        ConditionalPayload(
+            market="usdm",
+            symbol=USDM,
+            side="buy",
+            size_mode="amount",
+            size=0.002,
+            trigger=79_000.0,
+        )
+    )
+
+    assert venue.leverage_calls == [(USDM, 7, MarketType.USDM)]
+    assert venue.conditional_orders, "触发器要真的挂出去"
+    assert result["leverage"] == 7
+    assert result["leverage_note"] == ""
+
+
+def test_a_conditional_order_reports_the_cap(tmp_path, monkeypatch):
+    """条件单超上限同样收口并说明，和 /api/orders 一个口径。"""
+    venue, app = _served(tmp_path, monkeypatch, max_leverage=5.0)
+    place = _endpoint(app, "/api/orders/conditional", "POST")
+
+    result = place(
+        ConditionalPayload(
+            market="usdm",
+            symbol=USDM,
+            side="buy",
+            size_mode="amount",
+            size=0.002,
+            trigger=79_000.0,
+            leverage=20.0,
+        )
+    )
+
+    assert result["leverage"] == 5
+    assert venue.leverage_calls == [(USDM, 5, MarketType.USDM)]
+    assert "上限" in result["leverage_note"]
+
+
+def test_a_reduce_only_conditional_order_leaves_the_leverage_alone(tmp_path, monkeypatch):
+    """平仓用的条件单不动杠杆（和 submit 一样）：改杠杆会改掉已有仓位的保证金。"""
+    venue, app = _served(tmp_path, monkeypatch, saved={"usdm": 7})
+    place = _endpoint(app, "/api/orders/conditional", "POST")
+
+    place(
+        ConditionalPayload(
+            market="usdm",
+            symbol=USDM,
+            side="sell",
+            size_mode="amount",
+            size=0.002,
+            trigger=79_000.0,
+            reduce_only=True,
+        )
+    )
+
+    assert venue.leverage_calls == []
+
+# ------------------------------------------------------- 交易所侧的杠杆调用
+class _LeverageClient:
+    """只实现 set_leverage 的假 ccxt 客户端：用来钉重试与「不支持就说出来」。"""
+
+    def __init__(self, failures: int = 0, supports: bool = True) -> None:
+        self.has = {"setLeverage": True} if supports else {}
+        self.failures = failures
+        self.calls = 0
+
+    def set_leverage(self, leverage, symbol, params=None):
+        self.calls += 1
+        if self.calls <= self.failures:
+            import ccxt
+
+            raise ccxt.NetworkError("Connection reset by peer")
+        return {"symbol": symbol, "leverage": leverage}
+
+
+def _rest_with(client) -> BinanceREST:
+    rest = BinanceREST(Network.TESTNET, Credentials(api_key="k", api_secret="s"))
+    rest.client = lambda market: client  # type: ignore[assignment]
+    rest.LEVERAGE_RETRY_DELAY = 0
+    return rest
+
+
+def test_set_leverage_retries_once_on_a_network_blip():
+    """网络抖动重试一次：一次抖动就让整张合约单 400，等于把用户挡在门外。"""
+    client = _LeverageClient(failures=1)
+    rest = _rest_with(client)
+
+    assert rest.set_leverage(USDM, 10, MarketType.USDM)["leverage"] == 10
+    assert client.calls == 2
+
+
+def test_set_leverage_gives_up_after_one_retry():
+    """只重试一次：一直失败就老实报错，不无限重试把下单卡住。"""
+    client = _LeverageClient(failures=5)
+    rest = _rest_with(client)
+
+    with pytest.raises(ExchangeError) as caught:
+        rest.set_leverage(USDM, 10, MarketType.USDM)
+
+    assert client.calls == 2
+    assert "网络错误" in str(caught.value), str(caught.value)
+
+
+def test_set_leverage_does_not_pretend_when_unsupported():
+    """客户端没有 setLeverage 时以前安静返回 {}：面板写着 10 倍，交易所没收到。"""
+    rest = _rest_with(_LeverageClient(supports=False))
+
+    with pytest.raises(ExchangeError) as caught:
+        rest.set_leverage(USDM, 10, MarketType.USDM)
+
+    assert "不支持设置杠杆" in str(caught.value), str(caught.value)
+
+
+# ------------------------------------------------------------ 风控里的杠杆上限
+@pytest.mark.parametrize("value", [0, 0.5, 126, -3])
+def test_the_leverage_cap_must_be_a_sane_multiple(tmp_path, value):
+    """risk.max_leverage 存成 0 会让每张合约单被拒，存成 126 是交易所不收。"""
+    ctx, _ = _ctx(tmp_path)
+
+    with pytest.raises(HTTPException) as caught:
+        apply_settings(ctx, SettingsPayload(risk={"max_leverage": value}))
+
+    assert caught.value.status_code == 400
+    assert "max_leverage" in caught.value.detail, caught.value.detail
+    assert ctx.settings.risk.max_leverage == pytest.approx(10.0)
+
+
+def test_the_leverage_cap_can_be_raised_within_range(tmp_path):
+    ctx, _ = _ctx(tmp_path)
+
+    apply_settings(ctx, SettingsPayload(risk={"max_leverage": 25}))
+    assert ctx.settings.risk.max_leverage == pytest.approx(25.0)
+
+
+def test_other_risk_fields_still_save_with_a_zero_cap_on_disk(tmp_path):
+    """老配置里 max_leverage 是 0 时，改别的风控项不该被这条校验连坐。"""
+    ctx, _ = _ctx(tmp_path)
+    ctx.settings.risk.max_leverage = 0.0
+
+    apply_settings(ctx, SettingsPayload(risk={"max_daily_trades": 12}))
+
+    assert ctx.settings.risk.max_daily_trades == 12
+
+

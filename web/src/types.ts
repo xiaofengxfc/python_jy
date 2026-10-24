@@ -521,6 +521,10 @@ export interface AITraderStatus {
     depth?: string;
     max_order_quote?: number;
     max_position_quote?: number;
+    /** 这一轮真的按几倍在跑（已按 risk.max_leverage 收口）。 */
+    leverage?: number;
+    /** 被收口时的那句话，原样显示。 */
+    leverage_note?: string;
   };
   counters?: {
     decisions_today?: number;
@@ -819,6 +823,8 @@ export interface AutoStatus {
     network: string;
     position_pct: number;
     leverage: number;
+    /** 被风控/交易所上限收口时后端给的那句话，有就显示。 */
+    leverage_note?: string;
   } | null;
   last_signal: { target: number; reason: string; when: string } | null;
   seq: number;

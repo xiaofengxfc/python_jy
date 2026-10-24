@@ -15,13 +15,15 @@ interface Props {
   market: string;
   symbol: string;
   timeframe: string;
-  /** 设置的 exec 段：仓位比例 / 杠杆 / 轮询。默认 1 / 1 / 10。 */
+  /** 设置的 exec 段：仓位比例 / 杠杆 / 轮询。默认 0.2 / 1 / 10：
+ *  名义额 = 权益 × 仓位比例 × 杠杆，而上限是「500 USDT 与权益 25% 取大的」，
+ *  仓位比例填 100% 时名义额是上限的 4 倍，引擎每一轮都会被风控拒。 */
   settings?: AppSettings | null;
   onSettingsChange?: (patch: Partial<AppSettings>) => void;
 }
 
 /** 后端 ExecSettings 的默认值（`core/config.py` 的 1 / 1 / 10），恢复默认时兜底用。 */
-const DEFAULT_EXEC: ExecSettings = { position_pct: 1, leverage: 1, poll_seconds: 10 };
+const DEFAULT_EXEC: ExecSettings = { position_pct: 0.2, leverage: 1, poll_seconds: 10 };
 
 function readExec(settings: AppSettings | null | undefined): ExecSettings {
   const exec = settings?.exec;
@@ -54,8 +56,24 @@ export default function ExecutionConsole({
   /** 三项都跟设置走，改一下 500ms 后落盘——刷新之后还是上次的值。 */
   const [exec, setExec] = useState<ExecSettings>(() => readExec(settings));
   const loadedExec = useRef(false);
-  const saver = useMemo(() => createSectionSaver("exec"), []);
+  const saver = useMemo(
+    () =>
+      createSectionSaver("exec", {
+        // 写盘失败要说一声：以前静默吞掉，用户只看到「改了又回去」。
+        onError: (error) =>
+          setError("设置没存上：" + (error instanceof Error ? error.message : String(error))),
+        onSaved: () =>
+          setError((current) => (current.startsWith("设置没存上：") ? "" : current)),
+      }),
+    [],
+  );
   const { position_pct: positionPct, leverage, poll_seconds: pollSeconds } = exec;
+
+  /** 风控上限：真正的收口在 risk.max_leverage。输入框放到 125，也只按上限下单。 */
+  const leverageCap = (() => {
+    const cap = Number(settings?.risk?.max_leverage ?? 0);
+    return Number.isFinite(cap) && cap >= 1 ? Math.min(cap, 125) : 125;
+  })();
 
   useEffect(() => {
     // 只认第一份到手的设置：之后的更新是「自己刚存的」，拿它回填会把正在敲的
@@ -76,7 +94,7 @@ export default function ExecutionConsole({
   /** 恢复默认：只重置 exec 这一段，市场、交易对、主题都不动。 */
   const resetExec = async () => {
     const ok = window.confirm(
-      "恢复执行台的默认值？（仓位比例 100%、杠杆 1、轮询 10 秒）\n\n" +
+      "恢复执行台的默认值？（仓位比例 20%、杠杆 1、轮询 10 秒）\n\n" +
         "只重置这三项，市场、交易对、主题和策略都不动。",
     );
     if (!ok) return;
@@ -242,7 +260,7 @@ export default function ExecutionConsole({
           <div className="field">
             <label className="field-label" htmlFor="exec-lev">
               <span>杠杆</span>
-              <em>合约才用</em>
+              <em>{"合约才用，上限 " + leverageCap + "x"}</em>
             </label>
             <input
               id="exec-lev"
@@ -255,8 +273,9 @@ export default function ExecutionConsole({
               value={leverage}
               onChange={(event) => {
                 const next = Number(event.target.value);
-                if (!Number.isFinite(next) || next < 1) return;
-                patchExec({ leverage: next });
+                // 交易所只认 1–125 的整数（1.5 会被币安回 -1102）。
+                if (!Number.isFinite(next) || next < 1 || !Number.isInteger(next)) return;
+                patchExec({ leverage: Math.min(next, 125) });
               }}
             />
           </div>
@@ -281,6 +300,23 @@ export default function ExecutionConsole({
             />
           </div>
         </div>
+
+        {/* 杠杆在这里等于放大名义仓位：仓位比例 × 杠杆 = 占权益多少，
+            超过单笔上限（固定额与权益比例取大的那个）这一轮就不下单。
+            不写这句，把杠杆调到 10 倍后引擎每一轮都被风控拒，看着像杠杆没生效。 */}
+        <p className="faint">
+          {"仓位比例 × 杠杆 = 名义仓位：现在是 " +
+            Math.round(exec.position_pct * 100) +
+            "% × " +
+            exec.leverage +
+            "x，占权益 " +
+            Math.round(exec.position_pct * exec.leverage * 100) +
+            "%；超过单笔上限（" +
+            (settings?.risk?.max_order_quote ?? 0) +
+            " USDT 与权益 " +
+            Math.round(Number(settings?.risk?.max_order_pct ?? 0) * 100) +
+            "% 取大的那个）这一轮不会下单。"}
+        </p>
 
         <div className="exec-actions">
           <span className="faint" style={{ fontSize: "var(--fs-12-5)"}}>

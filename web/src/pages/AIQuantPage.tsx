@@ -261,7 +261,9 @@ export default function AIQuantPage({ settings, health, onSettingsChange, onNavi
           strategy: key,
           params: {},
           position_pct: 1,
-          leverage: 1,
+          // 杠杆跟执行台保存的那一项走：以前写死 1，用户在执行台设的倍数
+          // 一部署就没了，部署完是 1 倍在跑。
+          leverage: Number(settings?.exec?.leverage ?? 1) || 1,
           poll_seconds: 10,
           confirm_live: (health?.network ?? "testnet") === "mainnet",
         }),

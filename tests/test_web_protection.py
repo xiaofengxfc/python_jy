@@ -39,6 +39,8 @@ class _State:
 class _Ctx:
     def __init__(self, venue: FakeVenue, db: Database) -> None:
         settings = AppSettings(network=Network.TESTNET.value)
+        # 条件单路由要读 risk.max_leverage 与 trade.leverage 来收口，然后推给交易所。
+        self.settings = settings
         self.network = Network.TESTNET
         self.market_type = MarketType.USDM
         self.venue = venue

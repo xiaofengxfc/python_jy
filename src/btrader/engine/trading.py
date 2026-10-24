@@ -1051,6 +1051,17 @@ class TradingService:
             raise OrderRejected(f"设置杠杆 {venue_leverage}x 失败：{exc}") from exc
         self._leverage_applied[key] = float(venue_leverage)
 
+    def ensure_leverage(
+        self, market_type: MarketType, symbol: str, leverage: float
+    ) -> None:
+        """把交易所侧这一对的杠杆对齐，给不走 submit 的路径用（条件单）。
+
+        条件单直接调交易所的算法单接口，绕开了 _submit_locked，于是它以前是唯一
+        一条完全没人推杠杆的下单路径：面板上写着 10 倍，挂上去的是账户当时的杠杆。
+        规则与 submit 完全一致：整数、至少 1、失败即抛 OrderRejected。
+        """
+        self._ensure_leverage(market_type, symbol, leverage)
+
     def change_network(self, network: Network, credentials) -> None:
         self.network = network
         self.settings.network = network.value

@@ -295,6 +295,9 @@ class AITraderStartPayload(BaseModel):
     max_position_quote: float | None = Field(default=None, ge=0)
     # 决策深度：quick / standard / deep。空表示用设置里的值。
     depth: str = ""
+    # 杠杆：空或 null 表示用 ai_auto.leverage。声明成 Any 的理由和下单框一样——
+    # float 字段会把 true 悄悄变成 1.0，而「杠杆：是」在盘面上不是 1 倍的意思。
+    leverage: Any = None
 
 
 class AITraderPausePayload(BaseModel):
@@ -381,7 +384,8 @@ class AutoStartPayload(BaseModel):
     timeframe: str = "15m"
     strategy: str
     params: dict[str, Any] = Field(default_factory=dict)
-    position_pct: float = Field(default=1.0, gt=0, le=1)
+    # 默认与 ExecSettings 一致（0.2）：填 1 时名义额是「单笔上限」的 4 倍，引擎一笔都发不出去。
+    position_pct: float = Field(default=0.2, gt=0, le=1)
     leverage: float = Field(default=1.0, ge=1.0, le=125.0)
     poll_seconds: float = Field(default=10.0, ge=1.0)
     confirm_live: bool = False
@@ -526,6 +530,12 @@ class AutoController:
                 # 走，回滚这一条要等引擎停下来才谈得上。
                 ctx.set_market_type(market, persist=False)
 
+            # 杠杆先收口再进配置：真上限是 risk.max_leverage，输入框放到 125 也
+            # 不该让引擎「跑着但每根 K 线被风控拒一次」。被收口要说一声（写进
+            # status 的 config.leverage_note），静默改数比报错更糟。
+            leverage, leverage_note = resolve_engine_leverage(
+                ctx.settings, market, payload.leverage
+            )
             config = AutoTraderConfig(
                 symbol=payload.symbol,
                 market_type=market,
@@ -533,7 +543,7 @@ class AutoController:
                 strategy_key=payload.strategy,
                 params=params,
                 position_pct=payload.position_pct,
-                leverage=payload.leverage if market.is_futures else 1.0,
+                leverage=leverage,
                 poll_seconds=payload.poll_seconds,
             )
             trader = AutoTrader(config, strategy, ctx.trading, ctx.klines)
@@ -553,6 +563,7 @@ class AutoController:
                 "network": ctx.network.value,
                 "position_pct": config.position_pct,
                 "leverage": config.leverage,
+                "leverage_note": leverage_note,
             }
             self.last_signal = None
             trader.start()
@@ -804,6 +815,14 @@ class AITraderController:
         depth = (payload.depth or cfg.depth or "standard").strip()
         if depth not in DEPTHS:
             raise HTTPException(status_code=400, detail=f"未知的决策深度：{depth}")
+        # 杠杆走和下单框同一套口径（min(想要, risk.max_leverage, 125)）。以前
+        # 直接把 ai_auto.leverage 塞进 AITraderConfig：填 20 而风控上限 10 时，
+        # AIGuard 里的 risk.check_order 每一轮都拒一次，引擎显示在跑却一笔不成交。
+        leverage, leverage_note = resolve_engine_leverage(
+            ctx.settings,
+            market,
+            cfg.leverage if payload.leverage is None else payload.leverage,
+        )
         config = AITraderConfig(
             enabled=True,
             confirm_live=payload.confirm_live,
@@ -812,7 +831,8 @@ class AITraderController:
             strategy_key=strategy_key,
             market_type=market.value,
             timeframe=timeframe,
-            leverage=cfg.leverage,
+            leverage=leverage,
+            leverage_note=leverage_note,
             max_order_quote=(
                 cfg.max_order_quote if payload.max_order_quote is None else payload.max_order_quote
             ),
@@ -1965,6 +1985,17 @@ def _apply_risk(risk: RiskSettings, values: dict[str, Any]) -> None:
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail=f"风控字段 {key} 的值无效") from None
     _guard_finite("risk", risk)
+    # 杠杆上限是「合约能不能开仓」的那道闸：存成 0 之后 check_market 会把每一张
+    # 合约单都拒成「合约杠杆上限配置无效」，而收口那边（_clamp_leverage）又把
+    # 小于 1 当「没有上限」。两边口径不一致，只在真的发来这一项时拦住。
+    if "max_leverage" in values and not 1.0 <= float(risk.max_leverage) <= TRADE_LEVERAGE_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"risk.max_leverage 要在 1 到 {TRADE_LEVERAGE_MAX} 之间"
+                f"（现在是 {risk.max_leverage:g}）；合约杠杆按它收口，填 0 等于所有合约单都会被拒。"
+            ),
+        )
 
 
 def _apply_exec(target: ExecSettings, values: dict[str, Any]) -> None:
@@ -1991,6 +2022,17 @@ def _apply_exec(target: ExecSettings, values: dict[str, Any]) -> None:
         )
     if target.leverage < 1.0:
         raise HTTPException(status_code=400, detail="执行台的杠杆至少是 1（现货只能是 1）。")
+    if target.leverage > TRADE_LEVERAGE_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail=f"exec.leverage 最多 {TRADE_LEVERAGE_MAX}（交易所上限）。",
+        )
+    if abs(target.leverage - round(target.leverage)) > 1e-9:
+        # 交易所只认整数（浮点回 -1102）。存下 2.5 只会在下单那一刻才报错。
+        raise HTTPException(
+            status_code=400,
+            detail=f"exec.leverage 只能是整数：现在是 {target.leverage:g}x。",
+        )
     if target.poll_seconds < 1.0:
         raise HTTPException(status_code=400, detail="执行台的轮询间隔至少 1 秒。")
     _guard_finite("exec", target)
@@ -2097,6 +2139,14 @@ def resolve_order_leverage(
         return 1.0, ""
     saved = settings.trade.leverage.get(market.value, 1)
     wanted = float(saved) if requested is None else float(requested)
+    return _clamp_leverage(settings, wanted)
+
+
+def _clamp_leverage(settings: Any, wanted: float) -> tuple[float, str]:
+    """合约的收口规则只有一处：min(想要, risk.max_leverage, 125)，整数、至少 1。
+
+    下单框、执行台、AI 交易三条路共用这一份，免得「一条路收口、另一条路硬拒」。
+    """
     cap = float(getattr(settings.risk, "max_leverage", 0.0) or 0.0)
     limit = float(TRADE_LEVERAGE_MAX)
     if cap >= 1:
@@ -2122,6 +2172,40 @@ def resolve_order_leverage(
             f"这次按 {capped}x 下单。"
         )
     return float(capped), note
+
+
+def resolve_engine_leverage(
+    settings: Any, market: MarketType, wanted: Any
+) -> tuple[float, str]:
+    """引擎（执行台 / AI 交易）这一单用几倍，和下单框同一套口径。
+
+    以前两条引擎路径直接把配置里的杠杆塞进 AutoTraderConfig / AITraderConfig：
+    填 20 而 risk.max_leverage 是 10 时，risk.check_order 每次开仓都拒一次
+    「杠杆 20x 超过上限 10x」——界面显示在跑，一笔都不成交，而同一屏的下单框
+    填 20 却会按 10 下单。两个口径必须是一个。
+
+    和下单框的唯一区别：这里被收口不报错，按上限跑，并把说明交给调用方回显
+    （响应 / status 里的 leverage_note）。没人会盯着引擎的日志看。
+    """
+    if isinstance(wanted, bool):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"杠杆要的是倍数，不是开关：收到的是 {wanted!r}"
+                "（true / false 都不是倍数；合约写 1 到 125 的整数）。"
+            ),
+        )
+    _check_number_input("engine", "leverage", wanted)
+    try:
+        value = float(wanted)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=400, detail=f"杠杆要的是倍数，收到的是 {wanted!r}"
+        ) from None
+    if not market.is_futures:
+        return 1.0, ""
+    return _clamp_leverage(settings, value)
+
 
 def _clean_symbol_payload(values: Any, name: str) -> list[str]:
     """收藏 / 最近使用的一串交易对：去重、保序、判写法、卡上限。
@@ -2262,9 +2346,26 @@ def _apply_ai_auto(target: AIAutoSettings, values: dict[str, Any]) -> None:
                 status_code=400, detail=f"AI 自动交易字段 {key} 的值无效"
             ) from None
     _guard_finite("ai_auto", target)
-    for name in ("max_order_quote", "max_position_quote", "max_price_drift_pct", "leverage"):
+    for name in ("max_order_quote", "max_position_quote", "max_price_drift_pct"):
         if getattr(target, name) < 0:
             raise HTTPException(status_code=400, detail=f"ai_auto.{name} 不能为负")
+    # 杠杆单独判：0 以前能存下来，而下单那边按「大于 0 才推杠杆」处理，0 直接
+    # 跳过 set_leverage——AI 交易静默按账户默认杠杆开仓，界面上什么都没有。
+    if target.leverage < 1:
+        raise HTTPException(
+            status_code=400,
+            detail="ai_auto.leverage 至少是 1（合约杠杆只收 1–125 的整数）。",
+        )
+    if target.leverage > TRADE_LEVERAGE_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail=f"ai_auto.leverage 最多 {TRADE_LEVERAGE_MAX}（交易所上限）。",
+        )
+    if abs(target.leverage - round(target.leverage)) > 1e-9:
+        raise HTTPException(
+            status_code=400,
+            detail=f"ai_auto.leverage 只能是整数：现在是 {target.leverage:g}x。",
+        )
     if not (0.0 <= target.min_confidence <= 1.0):
         raise HTTPException(status_code=400, detail="ai_auto.min_confidence 必须在 0 到 1 之间")
     # 这几项存下来之后是启动 AI 交易的入参，写错了只会在点「开始」那一刻报 400。

@@ -572,6 +572,15 @@ def test_install_sh_grants_one_command_only():
 def test_the_root_script_rejects_a_bad_domain():
     script = str(ROOT / "deploy" / "set-domain.sh")
     for bad in ("a b", "http://x.example.com", "-bad.example.com", "1.2.3.4", ""):
-        done = subprocess.run(["bash", script, bad], capture_output=True, text=True, timeout=30)
+        # 脚本说的是中文：Windows 上 text=True 会按 GBK 解码 UTF-8 输出，
+        # 解码失败发生在 reader 线程里，断言拿不到 stdout。
+        done = subprocess.run(
+            ["bash", script, bad],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
         assert done.returncode != 0, "%r 不该被接受" % (bad,)
         assert "域名" in (done.stdout + done.stderr)

@@ -109,7 +109,17 @@ export default function OrderTicket({
 
   /** 杠杆按市场记：settings.trade.leverage = {"usdm": 10, "coinm": 5}。
    *  改动即存（500ms 攒一次），刷新页面还在。 */
-  const tradeSaver = useRef(createSectionSaver("trade"));
+  /** 杠杆没存进设置时的原话：以前写盘失败被静默吞掉，用户看到的是「改了又回去」。 */
+  const [leverageSaveError, setLeverageSaveError] = useState("");
+  const tradeSaver = useRef(
+    createSectionSaver("trade", {
+      onError: (error) =>
+        setLeverageSaveError(
+          "杠杆没存进设置：" + (error instanceof Error ? error.message : String(error)),
+        ),
+      onSaved: () => setLeverageSaveError(""),
+    }),
+  );
   const [leverageByMarket, setLeverageByMarket] = useState<Record<string, number>>({});
   const [leverageText, setLeverageText] = useState("1");
   /** risk.max_leverage 是全局一个数，但读数按市场各记一份：切市场先回到「还在读」，
@@ -136,7 +146,15 @@ export default function OrderTicket({
       const data = await api<{
         settings?: { trade?: TradeSettings; risk?: { max_leverage?: number } };
       }>("/api/settings");
-      setLeverageByMarket(data?.settings?.trade?.leverage ?? {});
+      const stored = data?.settings?.trade?.leverage ?? {};
+      setLeverageByMarket((prev) => {
+        // 有还没落盘的改动（正在攒、正在写、或上次写失败了）就保留本地那一项：
+        // 窗口拿回焦点会重读设置，以前这一步把用户刚敲的数打回旧值，看起来
+        // 就是「改不了杠杆」。服务器上那份确实是旧的，不能拿它当真相。
+        if (!tradeSaver.current.pending) return stored;
+        const kept = prev[target];
+        return kept === undefined ? stored : { ...stored, [target]: kept };
+      });
       const cap = data?.settings?.risk?.max_leverage;
       if (typeof cap === "number" && Number.isFinite(cap)) {
         remember("known", cap);
@@ -535,6 +553,9 @@ export default function OrderTicket({
         trigger: number;
         amount_base: number;
         kind: string;
+        // 挂出去的那一刻就定型：交易所按这个倍数给仓位算保证金。
+        leverage?: number;
+        leverage_note?: string;
       }>("/api/orders/conditional", {
         method: "POST",
         body: JSON.stringify({
@@ -562,7 +583,9 @@ export default function OrderTicket({
           (side === "buy" ? "买入 " : "卖出 ") +
           fmt(result.amount_base, 6) +
           " " +
-          base,
+          base +
+          (result.leverage ? "（按 " + result.leverage + "x）" : "") +
+          (result.leverage_note ? "。" + result.leverage_note : ""),
       });
       setTrigger("");
       onFilled();
@@ -790,7 +813,11 @@ export default function OrderTicket({
               step={1}
               value={leverageText}
               onChange={(event) => changeLeverage(event.target.value)}
+              /* 离开输入框时把显示改成真正会发出去的那个整数：以前打 "1.5"
+                 拦下了没存，可框里还留着 1.5，实际下单是 1，面板在骗人。 */
+              onBlur={() => setLeverageText(String(leverageValue))}
             />
+            {leverageSaveError && <div className="flash err">{leverageSaveError}</div>}
             {leverageNote && (
               <div className="protect-hint">
                 <span className="faint">{leverageNote}</span>

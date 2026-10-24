@@ -1106,13 +1106,13 @@ def test_the_run_config_saves_itself_and_can_go_back_to_defaults() -> None:
     # 回执是 {ok, section, settings}：直接当 AppSettings 用会拿到 undefined，界面就退回前端兜底值。
     assert "result.settings ?? result" in saver
     page = (UI_DIR / "pages" / "AITradePage.tsx").read_text(encoding="utf-8")
-    assert 'createSectionSaver("ai_auto")' in page
+    assert 'createSectionSaver("ai_auto", {' in page
     assert "saver.queue(" in page, "AI 交易的运行配置没存"
     assert 'resetSection("ai_auto")' in page
     assert "恢复默认" in page
     assert "只重置这一段" in page and "主题" in page, "二次确认要写清只重置运行配置"
     window = (UI_DIR / "components" / "ExecutionConsole.tsx").read_text(encoding="utf-8")
-    assert 'createSectionSaver("exec")' in window
+    assert 'createSectionSaver("exec", {' in window
     assert "settings?: AppSettings | null;" in window, "执行台没读设置的 exec 段"
     assert "readExec(settings)" in window
     assert 'resetSection("exec")' in window
@@ -1345,12 +1345,16 @@ def test_the_order_ticket_shows_leverage_only_on_futures() -> None:
 def test_the_leverage_is_saved_to_the_trade_section() -> None:
     """初值取 settings.trade.leverage[market]，改动即存（createSectionSaver("trade")）。"""
     src = _order_ticket_source()
-    assert 'createSectionSaver("trade")' in src
+    assert 'createSectionSaver("trade", {' in src
     assert "trade?.leverage" in src, "没读设置的 trade 段"
     assert "queue({ leverage:" in src, "改动没落盘"
     assert "String(Number.isFinite" in src or "Number.isFinite" in src, "拿不到就当 1"
     saver = (UI_DIR / "settingsAutoSave.ts").read_text(encoding="utf-8")
     assert '"trade"' in saver, "SettingsSection 里没有 trade"
+    # 写盘失败要说一声，而且重读设置不能盖掉还没落盘的杠杆：
+    # 「我改了、刷新又回 1」正是这两条一起缺的样子。
+    assert "onError" in saver and "get pending()" in saver, "写盘失败被静默吞掉"
+    assert "tradeSaver.current.pending" in src, "重读设置把用户刚敲的杠杆打回去了"
     types = (UI_DIR / "types.ts").read_text(encoding="utf-8")
     assert "export interface TradeSettings" in types and "trade?: TradeSettings;" in types
 

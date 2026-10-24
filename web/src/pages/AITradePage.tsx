@@ -99,6 +99,10 @@ export default function AITradePage({ settings, health, onSettingsChange }: Prop
   const [strategyKey, setStrategyKey] = useState("");
   const [auto, setAuto] = useState<AIAutoSettings>(FALLBACK_AUTO);
   const [depth, setDepth] = useState("standard");
+  // 本页亲手选过市场之后就不再跟设置走（和交易页 picked 同一口径）。缺了它，
+  // 首屏 settings 还没到、初始值是 "spot"，之后永远回不到设置里的合约市场——
+  // 于是「杠杆」这一栏（只在合约显示）根本出不来。
+  const pickedMarket = useRef(false);
 
   /* ------------------------------------------------------------ settings */
   useEffect(() => {
@@ -108,7 +112,7 @@ export default function AITradePage({ settings, health, onSettingsChange }: Prop
     setDepth(next.depth || "standard");
     if (next.symbol) setSymbol((current) => current || next.symbol);
     if (next.timeframe) setTimeframe((current) => current || next.timeframe);
-    setMarket((current) => current || settings.market_type);
+    setMarket((current) => (pickedMarket.current ? current : settings.market_type));
   }, [settings]);
 
   useEffect(() => {
@@ -186,7 +190,16 @@ export default function AITradePage({ settings, health, onSettingsChange }: Prop
   /* -------------------------------------------------------------- actions */
   /** 运行配置改动即存：界面先变，500ms 后写进 config.json 的 ai_auto。
    *  以前只有「深度」会存，金额上限改完一刷新就回去了。 */
-  const saver = useMemo(() => createSectionSaver("ai_auto"), []);
+  const saver = useMemo(
+    () =>
+      createSectionSaver("ai_auto", {
+        // 保存失败要说一声：这些是运行配置，静默失败会让人以为改好了。
+        onError: (caught) =>
+          setError("设置没存上：" + (caught instanceof Error ? caught.message : String(caught))),
+        onSaved: () => setError((current) => (current.startsWith("设置没存上：") ? "" : current)),
+      }),
+    [],
+  );
   useEffect(() => () => saver.flush(), [saver]);
 
   const patch = (values: Partial<AIAutoSettings>) => {
@@ -256,10 +269,22 @@ export default function AITradePage({ settings, health, onSettingsChange }: Prop
           max_order_quote: auto.max_order_quote,
           max_position_quote: auto.max_position_quote,
           depth,
+          // 杠杆以前根本没有这个字段，页面也没有控件：AI 交易永远按 1 倍跑。
+          leverage: auto.leverage,
         }),
       });
       setStatus(result.status);
-      setNotice(`已启动：${symbol} · ${timeframe} · ${depth}`);
+      const config = result.status?.config;
+      setNotice(
+        "已启动：" +
+          symbol +
+          " · " +
+          timeframe +
+          " · " +
+          depth +
+          (config?.leverage ? " · " + config.leverage + "x" : "") +
+          (config?.leverage_note ? "。" + config.leverage_note : ""),
+      );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -384,7 +409,10 @@ export default function AITradePage({ settings, health, onSettingsChange }: Prop
                 className="select"
                 value={market}
                 disabled={running}
-                onChange={(event) => setMarket(event.target.value)}
+                onChange={(event) => {
+                  pickedMarket.current = true;
+                  setMarket(event.target.value);
+                }}
               >
                 {(health?.markets ?? []).map((item) => (
                   <option key={item.value} value={item.value}>
@@ -524,8 +552,38 @@ export default function AITradePage({ settings, health, onSettingsChange }: Prop
                 }}
               />
             </div>
+            {market !== "spot" && (
+              <div className="field">
+                <label className="field-label" htmlFor="ai-leverage">
+                  <span>杠杆</span>
+                  <em>合约才用</em>
+                </label>
+                <input
+                  id="ai-leverage"
+                  className="input"
+                  type="number"
+                  min={1}
+                  max={125}
+                  step={1}
+                  disabled={running}
+                  value={auto.leverage}
+                  onChange={(event) => {
+                    const raw = event.target.value.trim();
+                    // 清空不写：0 在这条路上等于「不设杠杆」，后端会拒。
+                    if (raw === "") return;
+                    const next = Number(raw);
+                    // 交易所只认 1–125 的整数（1.5 会被币安回 -1102）。
+                    if (!Number.isFinite(next) || next < 1 || !Number.isInteger(next)) return;
+                    patch({ leverage: Math.min(next, 125) });
+                  }}
+                />
+              </div>
+            )}
             <div className="hint" style={{ gridColumn: "1 / -1" }}>
-              上限在启动时生效。改完要重新启动一次；改动会自己存下来，刷新之后还在。
+              上限和杠杆都在启动时生效。改完要重新启动一次；改动会自己存下来，刷新之后还在。
+              {"杠杆按风控上限收口：现在是 " +
+                (Number(settings?.risk?.max_leverage) || 125) +
+                "x，填得更大也按上限下单，启动后的提示里会说清实际用了几倍。"}
             </div>
           </div>
         </section>

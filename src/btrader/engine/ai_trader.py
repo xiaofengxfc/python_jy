@@ -86,6 +86,8 @@ class AITraderConfig:
     market_type: str = MarketType.SPOT.value
     timeframe: str = "15m"
     leverage: float = 1.0
+    # 被风控/交易所上限收口时那句话，原样回显给界面（静默改数比报错更糟）。
+    leverage_note: str = ""
     max_order_quote: float = 50.0
     max_position_quote: float = 200.0
     max_decisions_per_day: int = 96
@@ -1195,6 +1197,10 @@ class AITrader:
                 "depth": self.config.depth,
                 "max_order_quote": self.config.max_order_quote,
                 "max_position_quote": self.config.max_position_quote,
+                # 杠杆以前根本不出现在 status 里：界面既没控件也没回显，
+                # 用户无法确认这一轮到底按几倍在跑。
+                "leverage": self.config.leverage,
+                "leverage_note": self.config.leverage_note,
             },
             "counters": {
                 "decisions_today": self.budget.decisions_today,

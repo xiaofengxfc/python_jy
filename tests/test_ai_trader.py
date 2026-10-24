@@ -355,6 +355,10 @@ def test_status_payload_no_longer_has_live_enabled(tmp_path):
         "depth",
         "max_order_quote",
         "max_position_quote",
+        # 杠杆与「被收口」的那句话：界面既要有控件也要有回显，否则用户
+        # 无法确认这一轮到底按几倍在跑。
+        "leverage",
+        "leverage_note",
     }
 
 

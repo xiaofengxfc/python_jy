@@ -159,13 +159,17 @@ def test_the_exec_panel_survives_a_put_and_a_reload(tmp_path):
     assert saved.poll_seconds == pytest.approx(5.0)
 
 
-def test_the_exec_panel_defaults_are_the_old_literals(tmp_path):
-    """默认值要等于改这一版之前组件里写死的 1 / 1 / 10，否则第一次打开就变了。"""
+def test_the_exec_panel_defaults_leave_room_under_the_risk_cap(tmp_path):
+    """仓位比例默认 0.2 而不是 1：名义额 = 权益 × 比例 × 杠杆，单笔上限是
+    「500 USDT 与权益 25% 取大的」。填 1 时名义额是上限的 4 倍，执行台每一轮
+    都被拒成「单笔金额超过上限」，看着像杠杆没生效。也不取 0.25——那正好压在
+    上限线上，引擎自己读的权益与风控读的权益差一分钱就翻。"""
     ctx, _path = _ctx(tmp_path)
 
-    assert ctx.settings.exec.position_pct == 1.0
+    assert ctx.settings.exec.position_pct == pytest.approx(0.2)
     assert ctx.settings.exec.leverage == 1.0
     assert ctx.settings.exec.poll_seconds == 10.0
+    assert ctx.settings.exec.position_pct < ctx.settings.risk.max_order_pct, "默认仓位压在上限下面"
 
 
 def test_exec_rejects_a_share_above_one(tmp_path):
@@ -247,13 +251,13 @@ def test_reset_all_restores_the_runtime_blocks_only(tmp_path):
 
     reloaded = ConfigStore(path).settings
     assert reloaded.ai_auto.min_confidence == pytest.approx(0.6)
-    assert reloaded.exec.position_pct == pytest.approx(1.0)
+    assert reloaded.exec.position_pct == pytest.approx(0.2)
     assert reloaded.favorites == []
     assert reloaded.recent_symbols == []
     assert reloaded.theme == "dark"
     assert reloaded.timeframe == "1h"
     assert reloaded.market_type == AppSettings().market_type
-    assert out["settings"]["exec"]["position_pct"] == pytest.approx(1.0)
+    assert out["settings"]["exec"]["position_pct"] == pytest.approx(0.2)
 
 
 def test_an_unknown_section_is_rejected(tmp_path):

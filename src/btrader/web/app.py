@@ -298,6 +298,9 @@ class ConditionalPayload(BaseModel):
     direction: str | None = None
     reduce_only: bool = False
     confirm_live: bool = False
+    # 条件单也是真委托，杠杆同样按合约那一套：不填取设置值，超上限按上限收口。
+    # 以前这个字段根本不存在，面板里的 leverage 被 pydantic 静默丢掉。
+    leverage: Any = None
 
 
 class ProtectionPayload(BaseModel):
@@ -1496,6 +1499,11 @@ def create_app() -> FastAPI:
         )
 
         symbol = _venue_symbol(state, mt, payload.symbol)
+        # 口径与 /api/orders 完全一致（resolve_order_leverage）：请求值 > 设置里
+        # 记住的值 > risk.max_leverage 收口，被收口时把说明原样带回给面板。
+        leverage, leverage_note = resolve_order_leverage(
+            state.ctx.settings, mt, payload.leverage
+        )
         reference = _reference_price(state, mt, symbol)
         above = payload.trigger > reference
         if payload.direction and (payload.direction == "above") != above:
@@ -1520,16 +1528,27 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         try:
-            with state.locks[mt]:
-                order = state.ctx.rest_for(mt).create_conditional(
-                    mt,
-                    symbol,
-                    payload.side,
-                    exchange_amount,
-                    payload.trigger,
-                    take_profit=take_profit,
-                    reduce_only=payload.reduce_only,
-                )
+            # 杠杆对齐 + 挂单一起进提交锁（和 /api/orders、平仓同一条口径）。
+            # 只拿 locks[mt] 是不够的：那把锁管的是 ccxt 客户端，submit 拿的是
+            # account_lock，两条路都能改同一对的交易所杠杆，后写的赢——先挂上去的
+            # 那张条件单会按别人设的杠杆开仓。
+            with state.account_lock:
+                if not payload.reduce_only and leverage > 0:
+                    # 触发器一旦挂上去，仓位就是按交易所那一刻的杠杆开的：先对齐
+                    # 再挂。平仓单（reduce_only）和 submit 一样不动杠杆。
+                    state.ctx.trading.ensure_leverage(mt, symbol, leverage)
+                with state.locks[mt]:
+                    order = state.ctx.rest_for(mt).create_conditional(
+                        mt,
+                        symbol,
+                        payload.side,
+                        exchange_amount,
+                        payload.trigger,
+                        take_profit=take_profit,
+                        reduce_only=payload.reduce_only,
+                    )
+        except OrderRejected as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except ExchangeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
@@ -1546,6 +1565,8 @@ def create_app() -> FastAPI:
             "kind": "take_profit" if take_profit else "stop",
             "amount_base": base_qty,
             "amount_exchange": exchange_amount,
+            "leverage": leverage,
+            "leverage_note": leverage_note,
         }
 
     # ------------------------------------------------------- protections

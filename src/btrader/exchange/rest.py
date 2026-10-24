@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import Any
 
 import ccxt
@@ -648,15 +649,31 @@ class BinanceREST:
             log.debug("读取算法单失败，撤单只用算法单号", exc_info=True)
         return None
 
+    # 改杠杆只重试一次，而且只在明显的抖动（网络 / 限频）上重试：
+    # 一次抖动就让整张合约单 400，等于把用户挡在门外。
+    LEVERAGE_RETRIES = 1
+    LEVERAGE_RETRY_DELAY = 0.3
+
     def set_leverage(self, symbol: str, leverage: float, market: MarketType) -> dict:
         self._require_auth()
         client = self.client(market)
         if not client.has.get("setLeverage"):
-            return {}
-        try:
-            return client.set_leverage(leverage, symbol)
-        except Exception as exc:
-            raise ExchangeError(_message(exc)) from exc
+            # 以前这里安静地 return {}：面板写着 10 倍，交易所什么都没收到。
+            raise ExchangeError(
+                "这家交易所的客户端不支持设置杠杆，没法按指定倍数开仓。"
+            )
+        attempt = 0
+        while True:
+            try:
+                return client.set_leverage(leverage, symbol)
+            except (ccxt.NetworkError, ccxt.RateLimitExceeded) as exc:
+                attempt += 1
+                if attempt > self.LEVERAGE_RETRIES:
+                    raise ExchangeError(_message(exc)) from exc
+                log.debug("设置杠杆失败，重试一次：%s", exc)
+                time.sleep(self.LEVERAGE_RETRY_DELAY)
+            except Exception as exc:
+                raise ExchangeError(_message(exc)) from exc
 
     # ------------------------------------------------------- algo orders
     def fetch_algo_orders(
