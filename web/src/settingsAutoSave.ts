@@ -10,7 +10,8 @@ export type SettingsSection = "ai_auto" | "exec" | "trade";
 /** 存盘的回执：失败要说一声，成功要能把那条提示收回去。 */
 export interface SaverHandlers {
   onError?: (error: unknown) => void;
-  onSaved?: () => void;
+  /** 存成功后拿到服务器那份设置：页面要把它回填给 App，否则别的页面读到的还是旧值。 */
+  onSaved?: (saved: AppSettings | null) => void;
 }
 
 /** 一段设置攒 500ms 再写盘。同一段只排一个定时器，后来的改动覆盖前面的。
@@ -30,12 +31,14 @@ export function createSectionSaver(section: SettingsSection, handlers: SaverHand
     pending = null;
     if (!body) return true;
     try {
-      await api("/api/settings", {
+      const result = await api<{ settings?: AppSettings } & Partial<AppSettings>>("/api/settings", {
         method: "PUT",
         body: JSON.stringify({ [section]: body }),
       });
       unsaved = false;
-      handlers.onSaved?.();
+      // 回执是 {ok, section, settings}：这一份才是服务器真的存下来的（可能被收口过）。
+      const saved = (result?.settings ?? result) as AppSettings | null;
+      handlers.onSaved?.(saved);
       return true;
     } catch (error) {
       // 这次没存上：保持 unsaved，下一次改动还会再写一遍；界面也该知道

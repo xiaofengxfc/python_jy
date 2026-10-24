@@ -62,8 +62,12 @@ export default function ExecutionConsole({
         // 写盘失败要说一声：以前静默吞掉，用户只看到「改了又回去」。
         onError: (error) =>
           setError("设置没存上：" + (error instanceof Error ? error.message : String(error))),
-        onSaved: () =>
-          setError((current) => (current.startsWith("设置没存上：") ? "" : current)),
+        // 存成功后回填给 App：AI 量化的部署请求读的就是 settings.exec.leverage，
+        // 不回填的话「在执行台改了杠杆再部署」用的还是旧值。
+        onSaved: (saved) => {
+          setError((current) => (current.startsWith("设置没存上：") ? "" : current));
+          if (saved?.exec) onSettingsChange?.({ exec: saved.exec });
+        },
       }),
     [],
   );

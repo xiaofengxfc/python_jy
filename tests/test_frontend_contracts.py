@@ -1099,7 +1099,8 @@ def test_the_run_config_saves_itself_and_can_go_back_to_defaults() -> None:
     saver = (UI_DIR / "settingsAutoSave.ts").read_text(encoding="utf-8")
     assert "export const SAVE_DEBOUNCE_MS = 500;" in saver
     assert "window.setTimeout(() => void flush(), SAVE_DEBOUNCE_MS)" in saver
-    assert 'await api("/api/settings", {' in saver
+    assert '"/api/settings", {' in saver
+    assert 'method: "PUT"' in saver
     assert 'body: JSON.stringify({ [section]: body })' in saver
     assert '"/api/settings/reset"' in saver
     assert 'method: "POST", body: JSON.stringify({ section })' in saver
@@ -1108,6 +1109,10 @@ def test_the_run_config_saves_itself_and_can_go_back_to_defaults() -> None:
     page = (UI_DIR / "pages" / "AITradePage.tsx").read_text(encoding="utf-8")
     assert 'createSectionSaver("ai_auto", {' in page
     assert "saver.queue(" in page, "AI 交易的运行配置没存"
+    # 存成功要把服务器那份回填给 App：App 只在启动时读一次设置，不回填的话
+    # 执行台改了杠杆再去 AI 量化部署，部署请求里还是旧的 settings.exec.leverage。
+    assert "onSaved?.(saved)" in saver, "回执没带出服务器那份设置"
+    assert "onSettingsChange?.({ ai_auto: saved.ai_auto })" in page
     assert 'resetSection("ai_auto")' in page
     assert "恢复默认" in page
     assert "只重置这一段" in page and "主题" in page, "二次确认要写清只重置运行配置"
@@ -1115,6 +1120,7 @@ def test_the_run_config_saves_itself_and_can_go_back_to_defaults() -> None:
     assert 'createSectionSaver("exec", {' in window
     assert "settings?: AppSettings | null;" in window, "执行台没读设置的 exec 段"
     assert "readExec(settings)" in window
+    assert "onSettingsChange?.({ exec: saved.exec })" in window, "执行台存完没回填给 App"
     assert 'resetSection("exec")' in window
     assert "恢复默认" in window
     types = (UI_DIR / "types.ts").read_text(encoding="utf-8")

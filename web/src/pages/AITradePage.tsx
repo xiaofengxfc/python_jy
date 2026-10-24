@@ -104,17 +104,6 @@ export default function AITradePage({ settings, health, onSettingsChange }: Prop
   // 于是「杠杆」这一栏（只在合约显示）根本出不来。
   const pickedMarket = useRef(false);
 
-  /* ------------------------------------------------------------ settings */
-  useEffect(() => {
-    if (!settings) return;
-    const next = { ...FALLBACK_AUTO, ...(settings.ai_auto ?? {}) };
-    setAuto(next);
-    setDepth(next.depth || "standard");
-    if (next.symbol) setSymbol((current) => current || next.symbol);
-    if (next.timeframe) setTimeframe((current) => current || next.timeframe);
-    setMarket((current) => (pickedMarket.current ? current : settings.market_type));
-  }, [settings]);
-
   useEffect(() => {
     api<{ items: Strategy[] }>("/api/strategies")
       .then((data) => {
@@ -196,11 +185,32 @@ export default function AITradePage({ settings, health, onSettingsChange }: Prop
         // 保存失败要说一声：这些是运行配置，静默失败会让人以为改好了。
         onError: (caught) =>
           setError("设置没存上：" + (caught instanceof Error ? caught.message : String(caught))),
-        onSaved: () => setError((current) => (current.startsWith("设置没存上：") ? "" : current)),
+        // 存成功后把服务器那份回填给 App：App 只在启动时读一次设置，不回填的话
+        // 换个页面再回来，AI 量化部署（读 settings.exec.leverage）拿到的还是旧值。
+        onSaved: (saved) => {
+          setError((current) => (current.startsWith("设置没存上：") ? "" : current));
+          if (saved?.ai_auto) onSettingsChange?.({ ai_auto: saved.ai_auto });
+        },
       }),
     [],
   );
   useEffect(() => () => saver.flush(), [saver]);
+
+  /* ------------------------------------------------------------ settings */
+  // 放在 saver 之后：要读 saver.pending 才知道有没有还没落盘的改动。
+  useEffect(() => {
+    if (!settings) return;
+    const next = { ...FALLBACK_AUTO, ...(settings.ai_auto ?? {}) };
+    // 有还没落盘的改动就不覆盖。500ms 防抖里服务器的回声比用户的手慢一拍，
+    // 一覆盖就把刚敲的数字打回旧值——下单框的杠杆那一栏踩过同一个坑。
+    if (!saver.pending) {
+      setAuto(next);
+      setDepth(next.depth || "standard");
+    }
+    if (next.symbol) setSymbol((current) => current || next.symbol);
+    if (next.timeframe) setTimeframe((current) => current || next.timeframe);
+    setMarket((current) => (pickedMarket.current ? current : settings.market_type));
+  }, [settings, saver]);
 
   const patch = (values: Partial<AIAutoSettings>) => {
     setAuto((current) => ({ ...current, ...values }));
