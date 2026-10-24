@@ -571,6 +571,42 @@ sudo -u bitrader env BITRADER_DATA_DIR=/var/lib/bitrader \
 
 常见原因：依赖没装全（重跑 `pip install -r requirements.txt`）、`/opt/bitrader` 属主不对（`chown -R bitrader:bitrader /opt/bitrader`）、端口被占（`ss -lntp | grep 8765`）。
 
+### 8.6 下载卡住 / 传文件断掉
+
+先分清是「网慢」还是「根本没开始」——一条命令看四项数字：
+
+```bash
+df -h / ; for u in https://github.com https://pypi.org https://deb.debian.org; do \
+  curl -sS -o /dev/null --max-time 20 \
+    -w "$u dns=%{time_namelookup} conn=%{time_connect} tls=%{time_appconnect} ttfb=%{time_starttransfer} speed=%{speed_download}\n" \
+    "$u" || echo "$u 连不上"; done
+```
+
+- `dns` 大：DNS 慢或污染（`cat /etc/resolv.conf`，换 `1.1.1.1` 试）。
+- `conn` 大：TCP 出不去（安全组/机房线路）。
+- `ttfb` 大但 `conn` 正常：对端慢或被限速。
+- `speed` 是 0 且 `df` 快满了：**磁盘满了**，下载当然写不进去（`du -xh /var | sort -h | tail`）。
+
+单文件下载断了就接着下（同一条命令重跑即可，`-C -` 从断点续传）：
+
+```bash
+nohup curl -fL --retry 20 --retry-all-errors --retry-delay 3 --connect-timeout 15 \
+  -C - -O "<网址>" > dl.log 2>&1 &
+tail -f dl.log
+```
+
+前面那个 `nohup ... &` 是关键：网页版 SSH（CloudSSH 这类）一断线，前台命令会被一起带走，
+看着就是「下到一半没了」。长任务都放后台，或者先 `tmux new -s dl`。
+
+`git clone` / `git fetch` 卡在 `Receiving objects`：
+
+```bash
+git -c http.version=HTTP/1.1 clone --depth 1 https://github.com/<user>/<repo>.git /opt/biTrader
+```
+
+要整段历史再 `git fetch --unshallow`。`pip` 卡住先加重试和超时，别急着换源（这台机器在境外，
+换国内镜像只会更慢）：`pip install -r requirements.txt --retries 10 --timeout 60`。
+
 ---
 
 ## 9. 其它发行版
