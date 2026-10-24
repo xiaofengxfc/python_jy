@@ -440,3 +440,97 @@ def test_the_update_thread_is_not_a_daemon(monkeypatch):
             break
         time.sleep(0.02)
     assert seen == [False]
+
+
+# ------------------------------------------- 静默启动：一条子进程都不许弹黑框
+# Windows 上 DETACHED_PROCESS 与 CREATE_NO_WINDOW 互斥，带着前者 Windows 会无视后者：
+# 以前 restart 那两层就是 0x00000008，看起来「分离」了，实际上控制台照弹。
+_WIN_ONLY = pytest.mark.skipif(
+    sys.platform != "win32", reason="这些常量与 STARTUPINFO 只有 Windows 上有"
+)
+
+
+def test_the_hidden_flags_carry_create_no_window_and_never_detached_process():
+    assert updater.CREATE_NO_WINDOW == 0x08000000
+    assert updater.CREATE_NEW_PROCESS_GROUP == 0x00000200
+    assert updater.WINDOWS_HIDDEN == updater.CREATE_NO_WINDOW | updater.CREATE_NEW_PROCESS_GROUP
+    assert updater.WINDOWS_HIDDEN & updater.CREATE_NO_WINDOW
+    assert updater.WINDOWS_HIDDEN & updater.CREATE_NEW_PROCESS_GROUP
+    # DETACHED_PROCESS 一位都不许带：带上它 CREATE_NO_WINDOW 就被 Windows 丢掉。
+    assert updater.WINDOWS_HIDDEN & 0x00000008 == 0
+    assert not hasattr(updater, "WINDOWS_DETACHED"), "旧的 WINDOWS_DETACHED 要删掉"
+
+
+def test_the_no_window_helper_is_empty_off_windows(monkeypatch, tmp_path):
+    """别的平台上多传一个 creationflags 就是 ValueError：那里必须一个参数都不加。"""
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert updater._no_window() == {}
+    seen: list[dict] = []
+
+    def fake_run(args, **kwargs):
+        seen.append(kwargs)
+        return subprocess.CompletedProcess(list(args), 0, "ok", "")
+
+    monkeypatch.setattr(updater.subprocess, "run", fake_run)
+    updater._git(tmp_path, "status", "--porcelain")
+    updater._run_command(["pip", "--version"], cwd=tmp_path, timeout=5.0)
+    assert len(seen) == 2
+    for kwargs in seen:
+        assert "creationflags" not in kwargs
+        assert "startupinfo" not in kwargs
+
+
+@_WIN_ONLY
+def test_the_no_window_helper_hides_the_console_on_windows(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    kwargs = updater._no_window()
+    assert kwargs["creationflags"] == updater.CREATE_NO_WINDOW
+    info = kwargs["startupinfo"]
+    assert info.dwFlags & updater.STARTF_USESHOWWINDOW
+    assert info.wShowWindow == updater.SW_HIDE
+
+
+@_WIN_ONLY
+def test_git_and_pip_are_spawned_without_a_console(monkeypatch, tmp_path):
+    """父进程没有控制台时，每条 git.exe / pip 都会闪一个黑框——这是用户看到的弹窗之一。"""
+    seen: list[tuple[list[str], dict]] = []
+
+    def fake_run(args, **kwargs):
+        seen.append((list(args), kwargs))
+        return subprocess.CompletedProcess(list(args), 0, "ok", "")
+
+    monkeypatch.setattr(updater.subprocess, "run", fake_run)
+    updater._git(tmp_path, "status", "--porcelain")
+    updater._run_command(
+        ["pip", "install", "-r", "requirements.txt"], cwd=tmp_path, timeout=5.0
+    )
+    assert len(seen) == 2
+    for args, kwargs in seen:
+        assert kwargs["creationflags"] == updater.CREATE_NO_WINDOW, args
+        info = kwargs["startupinfo"]
+        assert info.dwFlags & updater.STARTF_USESHOWWINDOW, args
+        assert info.wShowWindow == updater.SW_HIDE, args
+
+
+def test_the_shim_spawns_run_web_without_a_console():
+    """垫片只用标准库、不能 import btrader，所以那里写的是数字——旁边得注明是哪两个常量。"""
+    assert "0x08000200" in updater._WINDOWS_SHIM
+    assert "0x00000008" not in updater._WINDOWS_SHIM
+    assert "CREATE_NO_WINDOW" in updater._WINDOWS_SHIM
+    assert "CREATE_NEW_PROCESS_GROUP" in updater._WINDOWS_SHIM
+
+
+@_WIN_ONLY
+def test_the_outer_shim_process_is_spawned_hidden(monkeypatch, data_dir):
+    popen = _Popen(pid=1234)
+    monkeypatch.setattr(updater.subprocess, "Popen", popen)
+    monkeypatch.setattr(updater, "_request_shutdown", lambda *a, **k: None)
+    monkeypatch.setattr(updater, "_wait_until", lambda fn, timeout, poll=0.0: True)
+    ok, output = updater._restart_windows()
+    assert ok is True and "1234" in output
+    kwargs = popen.calls[0][1]
+    assert kwargs["creationflags"] == updater.WINDOWS_HIDDEN
+    assert kwargs["creationflags"] & updater.CREATE_NO_WINDOW
+    assert kwargs["creationflags"] & 0x00000008 == 0
+    info = kwargs["startupinfo"]
+    assert info is not None and info.wShowWindow == updater.SW_HIDE

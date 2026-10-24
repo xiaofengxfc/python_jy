@@ -112,7 +112,16 @@ STEP_RESTART = "重启服务"
 # GitHub 这条路走不通时用 ls-remote：只有 SHA，没有标题，这一点要写在 source 里。
 LS_REMOTE_SOURCE = "ls-remote（只读到远端 SHA，没有提交标题）"
 
-WINDOWS_DETACHED = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+# 子进程的窗口。**只有 CREATE_NO_WINDOW 能真的让控制台不出现**：
+# DETACHED_PROCESS(0x00000008) 与它互斥，两者一起给时 Windows 会把 CREATE_NO_WINDOW
+# 丢掉——以前这条重启路径给的就是 0x00000008，看起来「分离」了，屏幕上照样闪黑框。
+CREATE_NO_WINDOW = 0x08000000
+CREATE_NEW_PROCESS_GROUP = 0x00000200
+# 重启垫片那两层用它：没有控制台，也就不会被老进程的控制台关闭连带杀掉。
+WINDOWS_HIDDEN = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+# STARTUPINFO 里的两格：照字面隐藏窗口（有些启动器只看这两格）。
+STARTF_USESHOWWINDOW = 0x00000001
+SW_HIDE = 0
 
 # 记下的起始提交得是这个样子才准拼进 git 命令（回滚用它）。
 SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
@@ -253,6 +262,32 @@ def _text(proc) -> str:
     return "\n".join(part for part in parts if part)
 
 
+def _hidden_startupinfo():
+    """STARTUPINFO(SW_HIDE)；别的平台给 None（那里传非 None 会直接 ValueError）。"""
+    if sys.platform != "win32":
+        return None
+    info = subprocess.STARTUPINFO()
+    info.dwFlags |= STARTF_USESHOWWINDOW
+    info.wShowWindow = SW_HIDE
+    return info
+
+
+def _no_window() -> dict[str, Any]:
+    """起子进程时额外带的 kwargs：Windows 上不给它控制台，别的平台一个都不加。
+
+    用法是 subprocess.run([...], **_no_window())。
+
+    为什么必须有这个：本程序常常自己就没有控制台（pythonw、桌面壳、更新时重启）。
+    那种情况下每起一条 git.exe / pip / npm 子进程，Windows 都会给它新开一个控制台窗口——
+    用户看到的就是更新时满屏闪的黑框。CREATE_NO_WINDOW 让它干脆不建控制台。
+
+    注意**不能**顺手加 DETACHED_PROCESS：它与 CREATE_NO_WINDOW 互斥，一起给时后者被丢掉。
+    """
+    if sys.platform != "win32":
+        return {}
+    return {"creationflags": CREATE_NO_WINDOW, "startupinfo": _hidden_startupinfo()}
+
+
 def _git(repo, *args, timeout: float = GIT_TIMEOUT):
     """跑一条 git 命令：列表参数、不开 shell、工作目录固定在仓库里。"""
     return subprocess.run(
@@ -263,6 +298,8 @@ def _git(repo, *args, timeout: float = GIT_TIMEOUT):
         encoding="utf-8",
         errors="replace",
         timeout=timeout,
+        # git fetch / merge / status / revert：每一条都会闪黑框，一条都不例外。
+        **_no_window(),
     )
 
 
@@ -312,6 +349,8 @@ def _run_command(
             errors="replace",
             timeout=timeout,
             env=merged,
+            # pip / npm 这一层同理：父进程没有控制台时，子进程会被塞一个新窗口。
+            **_no_window(),
         )
     except FileNotFoundError:
         return False, f"{shown}：找不到这个命令。"
@@ -1594,7 +1633,8 @@ _WINDOWS_SHIM = "\n".join(
         "    child = subprocess.Popen([py, 'run_web.py', '--host', host, '--port', str(port)],",
         "                             cwd=repo, stdin=subprocess.DEVNULL, stdout=sys.stdout,",
         "                             stderr=subprocess.STDOUT, close_fds=True,",
-        "                             creationflags=0x00000008)",
+        "                             # 0x08000200 = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP（垫片不能 import btrader，所以写数字）",
+        "                             creationflags=0x08000200)",
         "except OSError as exc:",
         "    say('拉新进程失败：%r' % (exc,))",
         "    sys.exit(3)",
@@ -1773,7 +1813,9 @@ def _restart_windows() -> tuple[bool, str]:
             stdin=subprocess.DEVNULL,
             stdout=handle,
             stderr=subprocess.STDOUT,
-            creationflags=WINDOWS_DETACHED,
+            # 垫片自己也不许弹窗：它是个普通 python 进程，一样会被塞一个控制台。
+            creationflags=WINDOWS_HIDDEN,
+            startupinfo=_hidden_startupinfo(),
             close_fds=True,
         )
     except OSError as exc:

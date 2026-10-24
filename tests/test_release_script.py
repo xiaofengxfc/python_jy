@@ -57,8 +57,9 @@ class Harness:
         # tag 上已经有 Release 时，GET /releases/tags/<tag> 该回什么；None 就是 404
         self.existing_release: dict | None = None
         self.fail_upload: str = ""
-        # 真实现留一份：有一条测试要看着它真的把文件一块块发出去
+        # 真实现留两份：一条测试要看它把文件一块块发出去，一条要看 git 是怎么被拉起的
         self.real_upload = module._upload_asset
+        self.real_git = module._git
         module._git = self._git
         module._post_json = self._post_json
         module._patch_json = self._patch_json
@@ -463,6 +464,50 @@ def test_the_installer_is_streamed_in_chunks(box, monkeypatch):
     assert asset["name"] == "biTrader-Setup-" + VERSION + ".exe"
     assert connection.closed
 
+# ---------------------------------------------------------------- 别弹黑框
+
+def _record_processes(module, monkeypatch):
+    """把 subprocess.run 换成录像机：只看它被怎么调起来的，不真跑。"""
+    seen: list[tuple[list[str], dict]] = []
+
+    def fake_run(argv, **kwargs):
+        seen.append((list(argv), kwargs))
+        return _Proc("")
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    return seen
+
+
+def test_git_runs_without_a_console_window_on_windows(box, monkeypatch):
+    """Windows 上父进程没有控制台，git.exe 会闪一个黑框：得给它 CREATE_NO_WINDOW。"""
+    seen = _record_processes(box.module, monkeypatch)
+    monkeypatch.setattr(box.module.sys, "platform", "win32")
+
+    box.real_git("status", "--porcelain")
+
+    assert len(seen) == 1
+    argv, kwargs = seen[0]
+    assert argv == ["git", "status", "--porcelain"]      # 列表参数，没拼 shell
+    assert box.module.CREATE_NO_WINDOW == 0x08000000
+    assert kwargs["creationflags"] == box.module.CREATE_NO_WINDOW
+    assert "shell" not in kwargs or kwargs["shell"] is False
+
+
+def test_off_windows_the_git_calls_carry_no_flags(box, monkeypatch):
+    seen = _record_processes(box.module, monkeypatch)
+    monkeypatch.setattr(box.module.sys, "platform", "linux")
+
+    box.real_git("tag", "--list", TAG)
+
+    assert seen[0][1]["creationflags"] == 0
+
+
+def test_git_is_the_only_thing_that_spawns_a_process():
+    """再有人加一条 subprocess.run，它就得自己记得藏窗口——所以钉住只有一条。"""
+    source = SCRIPT.read_text(encoding="utf-8")
+    assert source.count("subprocess.run(") == 1
+    assert "creationflags=" in source
+
 # ---------------------------------------------------------------- 文档别和脚本对不上
 
 RELEASE_DOC = ROOT / "docs" / "RELEASE.md"
@@ -470,6 +515,9 @@ RELEASE_DOC = ROOT / "docs" / "RELEASE.md"
 
 def test_the_release_doc_says_the_things_people_get_wrong():
     text = RELEASE_DOC.read_text(encoding="utf-8")
+    # t105：biTrader-backend.exe 是给壳用的 console 程序，双击必开黑窗口
+    assert "不要直接双击" in text
+    assert "CREATE_NO_WINDOW" in text
     # 三处版本号、权限、安装包不进仓库、桌面端必须传 exe、服务器版不看 Release
     for needle in (
         "pyproject.toml",

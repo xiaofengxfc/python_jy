@@ -48,6 +48,10 @@ REPORT_EVERY = 16 * 1024 * 1024
 TAG_PREFIX = "v"
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
 
+# Windows 的进程创建标志：不申请控制台窗口。发版常常是在没有控制台的父进程里跑的
+# （pythonw、冻结的壳、计划任务），不给这个标志，每条 git.exe 都会闪一个黑框。
+CREATE_NO_WINDOW = 0x08000000
+
 
 class ReleaseError(RuntimeError):
     """发版中途失败。message 直接给人看，里面不会有 token。"""
@@ -98,7 +102,11 @@ def read_versions(root: Path | None = None) -> dict[str, str]:
 # ------------------------------------------------------------------ git
 
 def _git(*args: str, cwd: Path | None = None, stdin_text: str | None = None):
-    """唯一一处调 git 的地方。测试把整块换掉，所以它只管把参数摆好。"""
+    """唯一一处调 git 的地方。测试把整块换掉，所以它只管把参数摆好。
+
+    Windows 上带 CREATE_NO_WINDOW：父进程没有控制台时，git.exe 会闪一个黑框。
+    列表参数、不开 shell——域名之类的东西进不了命令行。
+    """
     return subprocess.run(
         ["git", *args],
         cwd=str(cwd or ROOT),
@@ -107,6 +115,7 @@ def _git(*args: str, cwd: Path | None = None, stdin_text: str | None = None):
         text=True,
         encoding="utf-8",
         errors="replace",
+        creationflags=CREATE_NO_WINDOW if sys.platform == "win32" else 0,
     )
 
 

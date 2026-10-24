@@ -35,6 +35,10 @@ npm run dist
 产物是 `dist-electron\biTrader-Setup-<版本>.exe`，一百四十多 MB。`dist-electron/` 在
 `.gitignore` 里——**安装包不进仓库**，它只挂在 GitHub Release 上。
 
+顺带说一句 `dist\biTrader-backend\biTrader-backend.exe`：它是给 Electron 壳用的，console 子系统的
+程序，壳子拉它的时候用 `CREATE_NO_WINDOW` 把控制台窗口藏起来。**不要直接双击**——双击就是开一个
+黑窗口，窗口关掉服务就没了。要手动起后端看日志，照 AGENTS.md 第 1 节用 `pythonw.exe run_web.py`。
+
 ## 3. 发版
 
 ```powershell

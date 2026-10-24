@@ -17,10 +17,13 @@ biTrader：后端 Python + FastAPI，在 `src/btrader/`。前端 React + TS，�
 ```powershell
 Get-NetTCPConnection -LocalPort 8765 -State Listen -ErrorAction SilentlyContinue |
   ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }
-Start-Process -FilePath ".venv\Scripts\python.exe" `
+Start-Process -FilePath ".venv\Scripts\pythonw.exe" `
   -ArgumentList "run_web.py","--host","127.0.0.1","--port","8765" `
   -WorkingDirectory (Get-Location) -WindowStyle Hidden
 ```
+
+用 `pythonw.exe` 而不是 `python.exe`：pythonw 是 GUI 子系统的解释器，压根不申请控制台，屏幕上不会出现终端窗口。
+`-WindowStyle Hidden` 只藏住 PowerShell 拉起的那个进程自己的窗口，管不到子进程的控制台——以前用 python.exe，启动时就会闪一个黑框。
 
 Node 不在 PATH 时，先把 Node 目录加进去。
 
