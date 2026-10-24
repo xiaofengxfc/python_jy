@@ -101,7 +101,9 @@ def check_code(code: str) -> CheckReport:
     # 代码静态检查过得去（基类名对得上），导入时却直接 NameError。
     bound: set[str] = set()
     star_import = False
-    for node in ast.walk(tree):
+    # 只看模块顶层：函数体里的 import 不会让这个名字在模块级可见，按 ast.walk 收
+    # 会把「基类名没导入」这一条放开，而那种候选在导入时必 NameError。
+    for node in tree.body:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 bound.add(alias.asname or alias.name.split(".", 1)[0])
@@ -216,7 +218,13 @@ def check_code(code: str) -> CheckReport:
                             node.lineno,
                         )
                     )
-        elif isinstance(node, ast.While) and isinstance(node.test, ast.Constant) and node.test.value is True:
+        elif (
+            isinstance(node, ast.While)
+            and isinstance(node.test, ast.Constant)
+            # 只看「恒真」这个性质，不看写法：while 1 和 while True 一样不会自己结束。
+            # 以前只认 is True，换成 1 就从这一条下面溜过去了。
+            and bool(node.test.value)
+        ):
             issues.append(CheckIssue("infinite_loop", "禁止 while True 无限循环", node.lineno))
 
     if not star_import:

@@ -210,7 +210,9 @@ export default function PortfolioPage({ onEquity, defaultMarket = "" }: Props) {
               <span className={position.contracts > 0 ? "up" : "down"}>
                 {position.contracts > 0 ? "多头" : "空头"}
               </span>,
-              fmt(Math.abs(position.contracts), 6),
+              // 数量是基础币（后端按合约规格折好）。contracts 是张，币本位直接
+              // 显示会大 500 倍；多空仍看 contracts 的符号。
+              fmt(Math.abs(position.size_base ?? position.contracts), 6),
               position.entry_price > 0 ? fmtPrice(position.entry_price) : "—",
               fmtPrice(position.last),
               <span className={position.unrealized >= 0 ? "up" : "down"}>

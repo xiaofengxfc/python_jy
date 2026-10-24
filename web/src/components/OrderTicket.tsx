@@ -93,6 +93,9 @@ export default function OrderTicket({
   const [triggerDirection, setTriggerDirection] = useState<"below" | "above">("below");
   const [conditionalBusy, setConditionalBusy] = useState(false);
   const [preview, setPreview] = useState<OrderPreview | null>(null);
+  /** preview 属于哪一张票（市场/交易对/方向/类型/单位/数量/限价）。防抖 220ms
+   *  里数量还在改，上一份 preview 就不再代表这一单了。 */
+  const [previewFor, setPreviewFor] = useState("");
   const [previewError, setPreviewError] = useState("");
   const [flash, setFlash] = useState<Flash | null>(null);
   const [busy, setBusy] = useState(false);
@@ -362,6 +365,7 @@ export default function OrderTicket({
         });
         if (id !== requestId.current) return;
         setPreview(result);
+        setPreviewFor([market, symbol, side, orderType, sizeMode, size].join("|"));
         setPreviewError("");
       } catch (error) {
         if (id !== requestId.current) return;
@@ -377,7 +381,8 @@ export default function OrderTicket({
    * separate from the submit path: it must be possible to ignore it, and it
    * must never be able to block the order. */
   const askPrejudge = async () => {
-    if (!preview) return;
+    // 只要当前这张票的预览：拿上一单的名义额去问，回答的是另一笔单。
+    if (!currentPreview) return;
     setPrejudgeBusy(true);
     setPrejudgeError("");
     setPrejudgeText("");
@@ -389,7 +394,7 @@ export default function OrderTicket({
           symbol,
           timeframe: "1h",
           side,
-          quote: Number(preview.quote_notional ?? 0),
+          quote: Number(currentPreview.quote_notional ?? 0),
         }),
       });
       setPrejudgeText(result.text + (result.cached ? "\n（同一根 K 线的缓存结论）" : ""));
@@ -423,12 +428,29 @@ export default function OrderTicket({
   /** 交易所的最小下单量和最小名义额，preview 已经报上来了。低于它的单必然被交易所拒
    *  （实测 0.002 ETH = 4.77 USDT 被 -1013 Filter failure: NOTIONAL 拒），与其发出去
    *  再把交易所报文念一遍，不如在这里先拦下来。拿不到这两个数就不拦。 */
+  /** 这份 preview 是不是当前这张票的。数量一变（还没到 220ms 防抖）它就不代表这一单
+   *  了：拿它做最小量预检会把一个刚好合法的单按上一单的数字拦下来。界面照旧显示它，
+   *  只是不再拿它决定放行还是拦截。 */
+  const previewTicket = [
+    market,
+    symbol,
+    side,
+    orderType,
+    sizeMode,
+    size,
+    orderType === "limit" ? referencePrice : "",
+  ].join("|");
+  const currentPreview = preview && previewFor === previewTicket ? preview : null;
+
   const minimumProblem = (amount: number): string => {
-    const minAmount = preview?.min_amount ?? null;
-    const minNotional = preview?.min_notional ?? null;
+    const minAmount = currentPreview?.min_amount ?? null;
+    const minNotional = currentPreview?.min_notional ?? null;
     if (!minAmount && !minNotional) return "";
-    const baseAmount = preview?.amount_base ?? (sizeMode === "amount" ? amount : amount / (referencePrice || 1));
-    const notional = preview?.quote_notional ?? (sizeMode === "quote" ? amount : amount * referencePrice);
+    const baseAmount =
+      currentPreview?.amount_base ??
+      (sizeMode === "amount" ? amount : amount / (referencePrice || 1));
+    const notional =
+      currentPreview?.quote_notional ?? (sizeMode === "quote" ? amount : amount * referencePrice);
     if (minAmount && baseAmount > 0 && baseAmount < minAmount) {
       return `最小下单数量 ${fmt(minAmount, 8)} ${base}，这一单只有 ${fmt(baseAmount, 8)} ${base}，交易所会直接拒。`;
     }
@@ -444,7 +466,7 @@ export default function OrderTicket({
     const amount = parseNumber(size);
     if (!symbol || !(amount > 0)) return "";
     return minimumProblem(amount);
-  }, [symbol, size, preview, sizeMode, referencePrice, base, quote]);
+  }, [symbol, size, currentPreview, sizeMode, referencePrice, base, quote]);
 
   const send = async () => {
     const amount = parseNumber(size);
@@ -605,7 +627,12 @@ export default function OrderTicket({
     setBusy(true);
     setFlash(null);
     try {
-      await api("/api/positions/protection", {
+      // 回执只报真的挂上的那条腿。以前这里拿请求值拼文案，一条失败时另一条照样
+      // 写「已挂到持仓」，那一侧的仓位其实没有任何交易所侧保护。
+      const result = await api<{
+        protection?: { stop_loss?: number; take_profit?: number };
+        warnings?: string[];
+      }>("/api/positions/protection", {
         method: "PUT",
         body: JSON.stringify({
           symbol,
@@ -615,11 +642,19 @@ export default function OrderTicket({
           confirm_live: live,
         }),
       });
+      const armedStop = Number(result?.protection?.stop_loss ?? 0);
+      const armedTarget = Number(result?.protection?.take_profit ?? 0);
       const parts = [
-        stop > 0 ? "止损 " + fmtPrice(stop) : "",
-        target > 0 ? "止盈 " + fmtPrice(target) : "",
+        armedStop > 0 ? "止损 " + fmtPrice(armedStop) : "",
+        armedTarget > 0 ? "止盈 " + fmtPrice(armedTarget) : "",
       ].filter(Boolean);
-      setFlash({ tone: "ok", text: "已挂到持仓：" + parts.join(" · ") });
+      const warnings = result?.warnings ?? [];
+      setFlash({
+        tone: "ok",
+        text:
+          (parts.length ? "已挂到持仓：" + parts.join(" · ") : "一条都没挂上。") +
+          (warnings.length ? "（" + warnings.join("；") + "）" : ""),
+      });
       onFilled();
     } catch (error) {
       setFlash({ tone: "err", text: error instanceof Error ? error.message : String(error) });
@@ -653,7 +688,8 @@ export default function OrderTicket({
     void send();
   };
 
-  const blocked = preview ? !preview.allowed : false;
+  // 只有当前这张票的 preview 才有权说「不许下单」。
+  const blocked = currentPreview ? !currentPreview.allowed : false;
   const sizeLabel = sizeMode === "quote" ? `金额（${quote}）` : `数量（${base}）`;
   const canSubmit = !busy && !blocked && Boolean(size) && Boolean(symbol);
 
@@ -1030,10 +1066,13 @@ export default function OrderTicket({
           )}
           {previewError ? (
             <div className="verdict bad">无法预览：{previewError}</div>
-          ) : preview ? (
-            <div className={`verdict ${preview.allowed ? "ok" : "bad"}`}>
-              {preview.allowed ? "风控通过" : `风控拒绝：${preview.reason}`}
+          ) : currentPreview ? (
+            <div className={`verdict ${currentPreview.allowed ? "ok" : "bad"}`}>
+              {currentPreview.allowed ? "风控通过" : `风控拒绝：${currentPreview.reason}`}
             </div>
+          ) : preview ? (
+            // 数量改了、预览还没重算：结论先撤掉，别把上一单的「风控通过」留在屏上。
+            <div className="verdict">改动了，正在重算…</div>
           ) : (
             <div className="verdict">填写数量后显示风控校验结果</div>
           )}
@@ -1049,7 +1088,7 @@ export default function OrderTicket({
         <button
           type="button"
           className="link-btn"
-          disabled={prejudgeBusy || !preview}
+          disabled={prejudgeBusy || !currentPreview}
           onClick={() => void askPrejudge()}
         >
           {prejudgeBusy ? "AI 预判中…" : "AI 预判这笔委托"}

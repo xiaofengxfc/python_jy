@@ -136,3 +136,46 @@ def test_a_failing_reload_rolls_the_rename_back(monkeypatch, tmp_path: Path):
     renamed.discover([tmp_path])
     assert "rename_me" in renamed
     assert "renamed_ok" not in renamed
+
+def test_a_key_assignment_inside_a_function_is_not_the_class_key(tmp_path: Path):
+    """函数体里的 key = "..." 不是注册读的那一行，改名不能动它。
+
+    以前用的是正则扫全文（行首第一处 key = "..."）：函数写在类前面时改的是函数里
+    那一行，类上的 key 原样留着，紧接着的「重命名后的 key 与文件名不一致」把
+    话说成了另一个问题。
+    """
+    registry = make_registry(tmp_path)
+    code = (
+        "def _legacy_default():\n"
+        '    key = "rename_me"\n'
+        "    return key\n\n\n" + CODE
+    )
+    save_source(registry, code=code, key="rename_me", create=True, directory=tmp_path)
+    rename_source(registry, key="rename_me", new_key="renamed_ok", directory=tmp_path)
+
+    text = (tmp_path / "renamed_ok.py").read_text(encoding="utf-8")
+    assert text.count('key = "rename_me"') == 1, "函数体里那一行应当保持原样"
+    assert 'key = "renamed_ok"' in text
+
+
+def test_a_file_with_two_strategies_refuses_a_rename(tmp_path: Path):
+    """一个文件里两个策略：文件名只能对应一个 key，先拆开再改名。"""
+    registry = make_registry(tmp_path)
+    extra = (
+        "\n\nclass Another(Strategy):\n"
+        '    key = "another_one"\n'
+        '    name = "另一个"\n\n'
+        "    def generate(self, df, params):\n"
+        '        return pd.DataFrame({"target": 0.0}, index=df.index)\n'
+    )
+    save_source(
+        registry, code=CODE + extra, key="rename_me", create=True, directory=tmp_path
+    )
+
+    with pytest.raises(StrategySourceError) as caught:
+        rename_source(registry, key="rename_me", new_key="renamed_ok", directory=tmp_path)
+
+    assert "拆成一个文件一个策略" in str(caught.value)
+    assert (tmp_path / "rename_me.py").exists()
+    assert not (tmp_path / "renamed_ok.py").exists()
+

@@ -66,6 +66,10 @@ def _settings() -> AppSettings:
 def service(tmp_path):
     settings = _settings()
     venue = FakeVenue()
+    # 现货持仓按本地成交账本算，账本记的是**成交价**；替身交易所要有一个最后价
+    # 才报得出成交（和 test_spot_fill_sync 一样先喂价）。
+    venue._last["BTC/USDT"] = 100.0
+    venue._last["BTC/USDT:USDT"] = 100.0
     db = Database(tmp_path / "test.db")
     yield TradingService(settings, venue, RiskManager(settings.risk), db), venue
     db.close()

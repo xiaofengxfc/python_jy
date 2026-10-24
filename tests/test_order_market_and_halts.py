@@ -42,12 +42,13 @@ class _State:
 
 class _Venue(FakeVenue):
     """替身交易所：补上 AppContext 切市场时要碰的两个属性，
-    并能按开关让「读持仓」失败。"""
+    并能按开关让「读持仓 / 读余额」失败。"""
 
     def __init__(self) -> None:
         super().__init__()
         self.credentials = Credentials()
         self.fail_positions = False
+        self.fail_balance = False
 
     def reset(self) -> None:  # ccxt 客户端重建；替身没有可重建的东西
         return None
@@ -56,6 +57,11 @@ class _Venue(FakeVenue):
         if self.fail_positions:
             raise RuntimeError("交易所读取持仓超时")
         return super().fetch_positions(market, symbols)
+
+    def fetch_balance(self, market: MarketType):
+        if self.fail_balance:
+            raise RuntimeError("交易所读取余额超时")
+        return super().fetch_balance(market)
 
 
 def _app_context(tmp_path, monkeypatch, venue: _Venue) -> AppContext:
@@ -232,4 +238,54 @@ def test_an_entry_is_still_refused_during_a_halt(tmp_path, monkeypatch):
         place(payload)
     assert caught.value.status_code == 400
     assert venue.fills[-1]["side"] == "buy"  # 还是那条种子成交，没有新单
+
+def _held_spot(venue: _Venue, ctx: AppContext) -> None:
+    """让本地成交账本记着一条现货多头 0.5（钱包里那 0.5 是程序买的）。"""
+    venue._book[SPOT] = 0.5
+    venue._entry[SPOT] = 100.0
+    venue.fills.append(
+        {
+            "id": "spot-fill-1",
+            "symbol": SPOT,
+            "side": "buy",
+            "amount": 0.5,
+            "price": 100.0,
+            "timestamp": 1_700_000_000_000,
+            "fee": {"cost": 0.0, "currency": "USDT"},
+        }
+    )
+    # 现货没有持仓对象，同步线程发现不了这一对，只能点名同步（和成交后补记同一路）。
+    assert ctx.trading.sync_symbol_fills(MarketType.SPOT, SPOT) == []
+    assert ctx.trading._live_ledger()["books"][SPOT]["contracts"] == pytest.approx(0.5)
+
+
+def test_a_spot_sell_survives_a_halt_when_the_balance_read_fails(tmp_path, monkeypatch):
+    """现货卖出的「持仓」读不到时要退到账本：以前回 0 → 400「当前没有持仓」。
+
+    合约那条路早就这么做了（R12），现货分支当时漏了，于是熔断或急停期间
+    手里那个币卖不出去。
+    """
+    venue = _Venue()
+    venue._last[SPOT] = 100.0
+    ctx = _app_context(tmp_path, monkeypatch, venue)
+    _held_spot(venue, ctx)
+    ctx.settings.risk.kill_switch = True
+    venue.fail_balance = True
+    place = _endpoint(_serve(monkeypatch, ctx), "/api/orders", "POST")
+
+    result = place(
+        OrderPayload(
+            market=MarketType.SPOT.value,
+            symbol=SPOT,
+            side="sell",
+            order_type="market",
+            size=0.5,
+        )
+    )
+
+    assert result["ok"] is True
+    assert venue.fills[-1]["side"] == "sell"
+    # 现货没有 reduceOnly（交易所不认这个参数），关键是这一单真的出去了
+    assert venue.fills[-1]["market"] == MarketType.SPOT.value
+
 

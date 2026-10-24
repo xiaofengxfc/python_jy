@@ -47,9 +47,16 @@ export function symbolFitsMarket(market: string, symbol: string): boolean {
 const MAX_SYMBOLS = 50;
 const MAX_BATCHES = 6;
 
-/** 结果按市场缓存 10 秒：面板每 2 秒轮询一次，6 个请求不能每次都重发。
+/** 结果缓存 10 秒：面板每 2 秒轮询一次，6 个请求不能每次都重发。
  *  缓存只存「问到的那一批交易对」；过期整批重来——行情是快照，半新半旧比留空更糟。 */
 const CACHE_TTL_MS = 10_000;
+
+/** 缓存键要带上这一批交易对，不能只按市场记：交易页先问「当前对 + 收藏」，
+ *  10 秒内再打开交易对列表（要 300 行）会命中那份缺项的缓存、一次请求都不发，
+ *  列表里除了收藏全是空白。 */
+function bucketKey(market: string, wanted: string[]): string {
+  return market + "|" + wanted.join(",");
+}
 
 interface TickerCacheEntry {
   at: number;
@@ -80,26 +87,28 @@ export async function loadTickers(
   const usable = symbols.filter((item) => symbolFitsMarket(market, item));
   const wanted = Array.from(new Set(usable)).slice(0, MAX_SYMBOLS * MAX_BATCHES);
   if (!wanted.length) return {};
-  const cached = cache.get(market);
+  const key = bucketKey(market, wanted);
+  const cached = cache.get(key);
   if (cached && Date.now() - cached.at < CACHE_TTL_MS) return { ...cached.quotes };
-  const running = inflight.get(market);
+  const running = inflight.get(key);
   if (running && !running.cancelled()) return running.task;
   const signal = options.signal;
-  const task = fetchBatches(market, wanted, signal);
+  const task = fetchBatches(market, wanted, signal, key);
   const entry = { task, cancelled: () => Boolean(signal?.aborted) };
-  inflight.set(market, entry);
+  inflight.set(key, entry);
   try {
     return await task;
   } finally {
     // 只清自己那一条：中途被新一轮顶掉时别把新的删了。
-    if (inflight.get(market) === entry) inflight.delete(market);
+    if (inflight.get(key) === entry) inflight.delete(key);
   }
 }
 
 async function fetchBatches(
   market: string,
   wanted: string[],
-  signal?: AbortSignal,
+  signal: AbortSignal | undefined,
+  key: string,
 ): Promise<Record<string, TickerQuote>> {
   const merged: Record<string, TickerQuote> = {};
   const batches = Math.min(MAX_BATCHES, Math.ceil(wanted.length / MAX_SYMBOLS));
@@ -129,7 +138,7 @@ async function fetchBatches(
   }
   // 被中止的是半份快照，没失败才写缓存；全批失败也不写，让下一次还能重试。
   if (!signal?.aborted && (failures < batches || Object.keys(merged).length > 0)) {
-    cache.set(market, { at: Date.now(), quotes: merged });
+    cache.set(key, { at: Date.now(), quotes: merged });
   }
   return merged;
 }

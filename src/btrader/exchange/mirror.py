@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -56,8 +57,20 @@ def supports(market: MarketType, timeframe: str) -> bool:
     return market.is_futures and timeframe in _INTERVALS
 
 
+_DELIVERY = re.compile(r"-\d{6}$")
+
+
+def is_delivery(symbol: str) -> bool:
+    """交割合约：结算币段后面还挂着到期日（BTC/USDT:USDT-250328）。"""
+    return bool(_DELIVERY.search(str(symbol or "").partition(":")[2]))
+
+
 def contract_for(market: MarketType, symbol: str) -> str:
     """``BTC/USDT`` → ``BTC_USDT``。反向量合约 ``BTC/USD:BTC`` → ``BTC_USD``。"""
+    if is_delivery(symbol):
+        # Gate 的 usdt/btc 两路都是**永续**。交割合约切掉到期日之后正好等于同名永续，于是图上画的是永续行情、界面什么都不说：
+        # 贴水 / 升水与到期日全被抹掉。这里直接拒，让调用方把「币安不可用」原样说出来。
+        raise ExchangeError(f"备用行情只有永续合约，{symbol} 是交割合约，没有对应行情")
     base = symbol.split(":")[0].replace("/", "_")
     if market is MarketType.COINM:
         # 反向量合约以币计价；Binance 写作 BTC/USD:BTC。

@@ -52,6 +52,33 @@ def quote_asset_for(market: MarketType) -> str:
     return "BTC" if market is MarketType.COINM else "USDT"
 
 
+def _position_spec(
+    rest: Any, market: MarketType, symbol: str, cache: dict[str, Any]
+) -> Any:
+    """Contract spec for one pair, looked up once per snapshot.
+
+    The panel needs the base-coin size of a position; the venue reports
+    contracts, and for coin-M one contract is 100 USD rather than one coin, so
+    every row converts through the spec instead of assuming a 1:1 mapping.
+
+    None means unknown, never 1:1: contract_spec returns its default (contract
+    size 1, linear) when the market lookup fails, and for coin-M that default
+    would turn 10 contracts into 10 BTC - 500x the real size.
+    """
+    if symbol in cache:
+        return cache[symbol]
+    spec: Any = None
+    try:
+        spec = rest.contract_spec(market, symbol)
+    except Exception as exc:  # a per-row failure must not blank the table
+        log.debug("读取 %s 的合约规格失败：%s", symbol, exc)
+        spec = None
+    if spec is not None and market is MarketType.COINM and not spec.inverse:
+        spec = None
+    cache[symbol] = spec
+    return spec
+
+
 def replay_ledger(trades: list[dict]) -> dict[str, dict[str, float]]:
     """Rebuild each pair's open leg and realized PnL from the fill log.
 
@@ -325,12 +352,11 @@ class AccountService:
             snap.error = f"读取持仓失败：{exc}"
             log.warning("读取持仓失败 %s：%s", market.value, exc)
             return []
-        spec = None
-        if symbol:
-            try:
-                spec = rest.contract_spec(market, symbol)
-            except Exception:
-                spec = None
+        # 每一对都要规格，不是只有带 symbol 的那一次读要：资产页和侧栏走的是
+        # 全钱包读（symbol=None），拿不到规格就退回「张 × 价」，币本位 10 张
+        # （1,000 USD）会被算成 500,000，同一张仓在交易页和资产页显示两个数。
+        # 规格本身由 rest.contract_spec 按 (market, symbol) 缓存，一轮只问一次。
+        specs: dict[str, Any] = {}
         out: list[dict[str, Any]] = []
         for item in raw:
             contracts = float(item.get("contracts") or 0.0)
@@ -341,20 +367,33 @@ class AccountService:
             signed = -abs(contracts) if short else abs(contracts)
             entry = float(item.get("entryPrice") or 0.0)
             mark = float(item.get("markPrice") or 0.0)
+            price = mark or entry
+            spec = _position_spec(rest, market, pair, specs)
             unrealized = item.get("unrealizedPnl")
             if unrealized is None:
-                unrealized = (mark - entry) * signed if mark and entry else 0.0
-            notional = abs(contracts) * (mark or entry)
-            if spec is not None and pair == symbol:
+                unrealized = (price - entry) * signed if price and entry else 0.0
+            notional = abs(contracts) * price
+            # 基础币数量：界面上所有「数量」都读这个，contracts 只当交易所事实。
+            # 折不出来（币本位缺价格、规格读不到）就是 None，不填 0——0 会被
+            # 读成「空仓」。符号跟着 contracts 走，多空判断不用再换一套。
+            base_qty: float | None = None
+            if spec is not None:
                 try:
-                    notional = spec.notional(abs(contracts), mark or entry)
+                    notional = spec.notional(abs(contracts), price)
                 except Exception:
                     pass
+                try:
+                    converted = spec.contracts_to_base(abs(contracts), price)
+                except Exception:
+                    converted = 0.0
+                if converted > 0:
+                    base_qty = -converted if short else converted
             state = ledger.get(pair) or {}
             out.append(
                 {
                     "symbol": pair,
                     "contracts": signed,
+                    "size_base": base_qty,
                     "side": "short" if short else "long",
                     "entry_price": entry,
                     "last": mark or entry,
@@ -477,6 +516,9 @@ class AccountService:
                     {
                         "symbol": name,
                         "contracts": booked,
+                        # 现货的「张」就是币本身，两个字段同值：前端只读 size_base，
+                        # 一条读法覆盖现货与合约，不用再按市场分支。
+                        "size_base": booked,
                         "side": "long",
                         "entry_price": entry,
                         "last": last,
@@ -501,6 +543,7 @@ class AccountService:
                     {
                         "symbol": name,
                         "contracts": own,
+                        "size_base": own,
                         "side": "long",
                         "entry_price": 0.0,
                         "last": last,

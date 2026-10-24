@@ -192,36 +192,122 @@ def read_source(registry: StrategyRegistry, key: str) -> dict[str, Any]:
     }
 
 
+# 只给读的部分用（``ai_candidate.class_meta`` 取显示名）。改名本身走 AST，
+# 见 ``_rename_literals``：正则那套会改到别的类或函数体里去。
 _KEY_ASSIGN = re.compile(r'(?m)^([ \t]*)key[ \t]*=[ \t]*(["\'])([^"\'\n]*)\2')
 _NAME_ASSIGN = re.compile(r'(?m)^([ \t]*)name[ \t]*=[ \t]*(["\'])([^"\'\n]*)\2')
 
 
-def _rename_literals(code: str, *, old_key: str, new_key: str, new_name: str = "") -> str:
-    """Rewrite the class's ``key`` (and optionally ``name``) literal.
+def _class_literals(tree: ast.AST, name: str) -> list[tuple[ast.ClassDef, ast.stmt]]:
+    """每个类体里的 ``name = "..."``（只认类体，不认函数体与嵌套表达式）。"""
+    found: list[tuple[ast.ClassDef, ast.stmt]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for stmt in node.body:
+            target: ast.expr | None = None
+            if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+                target = stmt.targets[0]
+            elif isinstance(stmt, ast.AnnAssign):
+                target = stmt.target
+            if not isinstance(target, ast.Name) or target.id != name:
+                continue
+            value = getattr(stmt, "value", None)
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                found.append((node, stmt))
+    return found
 
-    Only the first ``key = "..."`` assignment is touched: that is the one the
-    registry reads, and a strategy with two of them is already broken.
+
+def _line_offsets(code: str) -> list[int]:
+    starts = [0]
+    for line in code.splitlines(keepends=True):
+        starts.append(starts[-1] + len(line))
+    return starts
+
+
+def _span(
+    code: str, lines: list[str], starts: list[int], node: ast.expr
+) -> tuple[int, int]:
+    """一个 AST 节点在源码里的字符区间。
+
+    ``col_offset`` / ``end_col_offset`` 是 **UTF-8 字节**偏移，不是字符偏移：直接拿
+    它去切 ``str``，行里只要出现过中文就会切错位置（实测把同行的
+    ``params_spec = ...` 一起删掉，重命名后的源码 SyntaxError）。这里先按字节切出来，
+    再按实际字符数折算。
     """
-    match = _KEY_ASSIGN.search(code)
-    if match is None:
+
+    def point(lineno: int, byte_col: int) -> int:
+        index = max(0, lineno - 1)
+        line = lines[index] if index < len(lines) else ""
+        prefix = line.encode("utf-8")[:byte_col]
+        return starts[index] + len(prefix.decode("utf-8", "ignore"))
+
+    begin = point(node.lineno, node.col_offset)
+    end_line = getattr(node, "end_lineno", None)
+    if end_line is None:  # pragma: no cover - 3.8 以前没有结束位置
+        literal = ast.get_source_segment(code, node) or ""
+        return begin, begin + len(literal)
+    return begin, point(end_line, node.end_col_offset)
+
+
+def _rename_literals(code: str, *, old_key: str, new_key: str, new_name: str = "") -> str:
+    """Rewrite one class's ``key`` (and optionally ``name``) literal.
+
+    用 AST 定位「哪个类的哪个类体赋值」，不再拿正则扫全文：
+    以前第一处「行首的 key = "..."」就改，一个文件里有两个策略时改的是上面那一类，
+    而 ``name`` 更是直接改文件里**第一个** name 字面量（可能落在另一个类、甚至函数体里）。
+    改错的地方正是注册读的那一行，重命名后加载失败只能看到一句「重命名后加载失败」。
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as exc:
+        raise StrategySourceError(f"源码语法错误，无法重命名：{exc.msg}") from exc
+
+    keys = _class_literals(tree, "key")
+    owners = [(cls, stmt) for cls, stmt in keys if getattr(stmt, "value").value == old_key]
+    if not owners:
+        if keys:
+            current = getattr(keys[0][1], "value").value
+            raise StrategySourceError(
+                f"源码里的 key='{current}' 与要重命名的 '{old_key}' 不一致"
+            )
         raise StrategySourceError('策略源码缺少 key = "..." 字面量，无法重命名')
-    if match.group(3) != old_key:
+    if len(keys) > 1:
+        # 一个文件里挂着多个 key：改名要动文件名，而文件名只对应其中一个，
+        # 注册读到的「第一处 key」也只有一个。说清要拆开，别猜作者的文件布局，
+        # 也别只改一半（改了 key、文件名没变，重载会报「key 与文件名不一致」）。
         raise StrategySourceError(
-            f"源码里的 key='{match.group(3)}' 与要重命名的 '{old_key}' 不一致"
+            f"源码里有 {len(keys)} 个类带 key，重命名只对单个策略文件生效，请先拆成一个文件一个策略"
         )
-    indent = match.group(1)
-    head = code[: match.start()]
-    key_line = f'{indent}key = "{new_key}"'
-    code = head + key_line + code[match.end():]
-    if not new_name:
-        return code
-    named = _NAME_ASSIGN.search(code)
-    if named is not None:
-        return code[: named.start()] + f'{named.group(1)}name = "{new_name}"' + code[named.end():]
-    # No display name yet: put one directly under the key so the UI stops
-    # showing the class name after a rename.
-    insert_at = len(head) + len(key_line)
-    return code[:insert_at] + f'\n{indent}name = "{new_name}"' + code[insert_at:]
+
+    target_class, key_stmt = owners[0]
+    lines = code.splitlines(keepends=True)
+    starts = _line_offsets(code)
+    edits: list[tuple[int, int, str]] = []
+    begin, end = _span(code, lines, starts, key_stmt.value)
+    edits.append((begin, end, f'"{new_key}"'))
+
+    if new_name:
+        named = [
+            stmt
+            for cls, stmt in _class_literals(tree, "name")
+            if cls is target_class
+        ]
+        if named:
+            begin, end = _span(code, lines, starts, named[0].value)
+            edits.append((begin, end, f'"{new_name}"'))
+        else:
+            # 没有显示名：紧跟着 key 那一行补一条，界面才不会退回显示类名。
+            indent = " " * key_stmt.col_offset
+            insert_at = _span(code, lines, starts, key_stmt.value)[1]
+            line_end = code.find("\n", insert_at)
+            insert_at = len(code) if line_end < 0 else line_end + 1
+            edits.append((insert_at, insert_at, f'{indent}name = "{new_name}"\n'))
+
+    # 从后往前改：前面的偏移不会被后面的编辑挪动。
+    for begin, end, text in sorted(edits, key=lambda item: item[0], reverse=True):
+        code = code[:begin] + text + code[end:]
+    return code
 
 def validate_source(code: str) -> dict[str, Any]:
     report = _report(code)

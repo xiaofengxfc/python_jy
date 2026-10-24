@@ -45,7 +45,14 @@ export interface Book {
 /** A position as the exchange reports it, marked in quote currency. */
 export interface Position {
   symbol: string;
+  /** 交易所口径的数量：合约是张、现货是币。只用于排查与换算，界面上显示的数量一律读
+   *  size_base。 */
   contracts: number;
+  /** 基础币数量（符号与 contracts 一致）。币本位一张是 100 USD 而不是一个币，
+   *  contracts 直接当币用会差 contractSize 倍（BTCUSD 差 500 倍）；这个字段由后端
+   *  按合约规格折好。折不出来（缺价格、规格读不到）是 null —— 不填 0，0 会被读成
+   *  「空仓」。现货行两个字段同值。 */
+  size_base?: number | null;
   side: "long" | "short" | "flat";
   entry_price: number;
   /** Result of the pair so far: net of every fee paid, closed rounds included. */

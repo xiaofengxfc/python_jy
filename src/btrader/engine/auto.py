@@ -56,6 +56,43 @@ class AutoTraderConfig:
     kline_limit: int = 500
 
 
+def _filled(order: dict[str, Any] | None) -> float:
+    """这张单成交了多少（基础币）。挂单未成交是 0。"""
+    if not isinstance(order, dict):
+        return 0.0
+    for key in ("filled", "amount"):
+        value = order.get(key)
+        if value is None:
+            continue
+        try:
+            amount = abs(float(value))
+        except (TypeError, ValueError):
+            continue
+        if key == "amount" and str(order.get("status") or "") not in ("closed", "filled"):
+            return 0.0
+        return amount
+    return 0.0
+
+
+def _held_amount(balance: Any, asset: str) -> float:
+    """钱包里这个币有多少：先看 total，没有再退回 free。
+
+    free 只是「现在能卖的」，挂在委托里被冻结的那部分不在里面；判断「有没有仓位」
+    要用 total，判断「能卖多少」才用 free。两者都有就用 total。
+    """
+    for block in ("total", "free"):
+        raw = balance.get(block) if isinstance(balance, dict) else None
+        if not isinstance(raw, dict):
+            continue
+        try:
+            value = float(raw.get(asset) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return 0.0
+
+
 class AutoTrader:
     """Background polling thread that exposes plain-callback hooks.
 
@@ -249,10 +286,13 @@ class AutoTrader:
         self._emit(self._candle_listeners, closed, target, changed, price)
         if not changed:
             return
-        self._current_target = target
         self._emit_signal(target, f"收盘价 {price:,.4f}")
 
-        self._rebalance(target, price)
+        # 目标要**调仓成功之后**才算达到。以前先记 target 再下单：被拒、网络抖动、
+        # 权益没读到时这一笔什么都没发生，而下一根 K 线的 changed 恒为 False，
+        # 于是仓位和目标长期背离，直到策略自己再次改主意——静默且无日志。
+        if self._rebalance(target, price):
+            self._current_target = target
 
     # ------------------------------------------------------------------ warmup
     def _warmup_limit(self, required: int) -> int:
@@ -298,18 +338,30 @@ class AutoTrader:
         # 恢复之后再出现同样的不足，要能再报一次。
         self._warned_shortfall = ""
 
+    def _client(self):
+        """这台引擎自己那个市场的客户端。
+
+        不能用 ``trading.rest``：那是**全局市场**的客户端（``AppContext.rest``），
+        引擎跑起来之后用户在设置页换个市场，这里就会拿另一个市场的 Key 去读余额和
+        持仓——币安回 -2015，异常被吞掉，界面显示「运行中」而一笔不成交。
+        ``rest_for`` 按 ``config.market_type`` 取，引擎启动时定下来的那个市场。
+        """
+        return self.trading.rest_for(self.config.market_type)
+
     def _refresh_equity(self, price: float) -> None:
         """Read the wallet straight from the venue before sizing an order.
 
         A stale equity from the previous candle turns a percentage-of-account
         rule into guesswork, and a wallet read is one signed call per candle.
+
+        读不到就把 ``self._equity`` 置空并说一句：以前是裸 ``except: pass``，
+        于是「读余额失败」和「余额没变」在界面上长得一模一样，引擎一直空转。
         """
         try:
-            balance = self.trading.rest.fetch_balance(self.config.market_type)
+            rest = self._client()
+            balance = rest.fetch_balance(self.config.market_type)
             totals = balance.get("total") or {}
-            spec = self.trading.rest.contract_spec(
-                self.config.market_type, self.config.symbol
-            )
+            spec = rest.contract_spec(self.config.market_type, self.config.symbol)
             if self.config.market_type is MarketType.COINM:
                 # Coin-M wallets hold the margin coin (BTC for BTCUSD), so the
                 # wallet balance has to be marked to USD before sizing.
@@ -321,15 +373,26 @@ class AutoTrader:
                 # A wallet shape without the key is not a 0 balance: sizing 0
                 # would sell a position the engine never meant to touch.
                 self._equity = None if value is None else float(value)
-        except Exception:
-            pass
+            if self._equity is None:
+                self._emit_log(
+                    "WARN", f"账户里没有 {self.config.market_type.label} 的可用余额，本轮跳过调仓"
+                )
+        except Exception as exc:
+            self._equity = None
+            self._emit_log("WARN", f"读取账户权益失败，本轮跳过调仓：{exc}")
 
-    def _rebalance(self, target: float, price: float) -> None:
+    def _rebalance(self, target: float, price: float) -> bool:
+        """Move toward ``target``; True when the target counts as reached.
+
+        False means "nothing happened, try again on the next candle" — the caller
+        must not record the target as reached, or a rejected order would never be
+        retried until the strategy changed its mind.
+        """
         equity = self._equity
         if price <= 0 or equity is None:
             # Never read the wallet yet: sizing an order against an assumed
             # balance is the same mistake as assuming a flat position.
-            return
+            return False
         notional = equity * self.config.position_pct * self.config.leverage
         # ``desired_qty`` is always expressed in base coins; TradingService
         # converts it to contracts for coin-margined markets.
@@ -339,11 +402,12 @@ class AutoTrader:
         if current_qty is None:
             # Unknown exposure: sizing against an assumed flat position is how
             # a transient read failure turns into a doubled order.
-            return
+            return False
 
         delta = desired_qty - current_qty
         if abs(delta) * price < 10.0:  # ignore dust
-            return
+            # 尘埃以内算到位：不算失败，否则每根 K 线都重算一遍同一笔小差额。
+            return True
 
         side = "buy" if delta > 0 else "sell"
         # Only a move to flat is a pure reduction. A flip (long -> short) also
@@ -365,10 +429,10 @@ class AutoTrader:
             result = self.trading.submit(request)
         except OrderRejected as exc:
             self._emit_log("WARN", f"下单被拒绝：{exc}")
-            return
+            return False
         except Exception as exc:
             self._emit_log("ERROR", f"下单失败：{exc}")
-            return
+            return False
 
         action = "买入" if side == "buy" else "卖出"
         self._emit_log(
@@ -376,6 +440,14 @@ class AutoTrader:
             f"{action} {abs(delta):.6f} {self.config.symbol} @ {price:,.4f} "
             f"(目标仓位 {target:+.0%}) → {result.order.get('status', '')}",
         )
+        if self.config.market_type is MarketType.SPOT and _filled(result.order) > 0:
+            # 现货的「持仓」就是这本账。成交同步是 5 秒一轮的，不在这里补一次，
+            # 引擎下一根 K 线读到的还是成交前的数量（0），会照着旧数量再买一遍。
+            try:
+                self.trading.sync_symbol_fills(self.config.market_type, self.config.symbol)
+            except Exception:  # 账本晚一轮更新不该让这张已经成交的单算失败
+                log.debug("自动交易成交后同步账本失败 %s", self.config.symbol, exc_info=True)
+        return True
 
     def _live_position_qty(self, price: float) -> float | None:
         """Current live position expressed in base coins, or ``None``.
@@ -385,11 +457,12 @@ class AutoTrader:
         made ``_rebalance`` treat the whole target as missing and buy it again —
         a transient network error could double a live position.
         """
-        spec = self.trading.rest.contract_spec(self.config.market_type, self.config.symbol)
+        rest = self._client()
+        spec = rest.contract_spec(self.config.market_type, self.config.symbol)
         if self.config.market_type is MarketType.SPOT:
             return self._live_spot_balance(spec)
         try:
-            positions = self.trading.rest.fetch_positions(
+            positions = rest.fetch_positions(
                 self.config.market_type, [self.config.symbol]
             )
         except Exception as exc:
@@ -405,10 +478,38 @@ class AutoTrader:
         return total
 
     def _live_spot_balance(self, spec) -> float | None:
+        """现货「持仓」= **本程序成交账本**里这一对的数量，钱包只当上限。
+
+        现货没有持仓对象，钱包里那个币混着用户自己充提的部分。以前这里读
+        ``balance["total"]`` 当持仓：钱包里有用户自己的 1 BTC 时，策略给出
+        ``target=0``（平仓信号）会算出「应卖 0 - 1 BTC」，把用户自己的币一次卖掉；
+        ``target=0.5`` 也一样永远多卖。AGENTS 第 4 节对 ``/api/positions/close``
+        定了这条口径，引擎这一路当时漏了。
+
+        账本比可用余额多说明币已被提走，按余额封顶；余额读不到就按账本数量继续
+        （宁可让交易所拒这一单并留一行 WARN，也不要因为读不到余额就不平仓）。
+        """
+        symbol = self.config.symbol
         try:
-            balance = self.trading.rest.fetch_balance(self.config.market_type)
+            book = self.trading._live_ledger()["books"].get(symbol) or {}
+            booked = float(book.get("contracts") or 0.0)
         except Exception as exc:
-            self._emit_log("WARN", f"读取实盘余额失败，本轮跳过调仓：{exc}")
+            self._emit_log("WARN", f"读取本地成交账本失败，本轮跳过调仓：{exc}")
             return None
-        asset = spec.base or self.config.symbol.split("/")[0]
-        return float((balance.get("total") or {}).get(asset) or 0.0)
+        asset = spec.base or symbol.split("/")[0]
+        try:
+            balance = self._client().fetch_balance(self.config.market_type)
+        except Exception as exc:
+            self._emit_log(
+                "WARN", f"读取实盘余额失败，按账本数量继续（可能超过可用余额）：{exc}"
+            )
+            return booked
+        if booked == 0.0:
+            return 0.0
+        # 封顶用的是「钱包里这个币还有多少」，不是「现在还能卖多少」：挂在卖单里被
+        # 冻结的那部分同样是仓位。只看 free 的话挂单期间 free = 0，这里回 0 等于
+        # 告诉引擎「空仓」，它照着 target 再买一份——实测把一份仓位买成了两份。
+        # 币真被提走了 total 也是 0，那种情况按 0 算才对。
+        holding = _held_amount(balance, asset)
+        capped = min(abs(booked), holding)
+        return capped if booked > 0 else -capped

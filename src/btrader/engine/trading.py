@@ -175,6 +175,10 @@ class TradingService:
         # the settings pair usually points at a contract, so a freshly bought
         # spot pair was invisible and its fills never reached the local ledger.
         self._traded: dict[MarketType, set[str]] = {}
+        # 成交账本是一份 JSON：读-改-写要串起来，否则两个写者各自覆盖对方的行。
+        # 写者有两条路：5 秒一轮的同步线程，和「成交/平仓之后立刻补记一次」的请求线程。
+        # 和 account_lock 分开：那把锁只包提交那一下，不该被一次成交同步占住。
+        self._ledger_lock = threading.RLock()
 
     # ------------------------------------------------------------------ sizing
     def amount_from_quote(self, market_type: MarketType, symbol: str, quote: float, price: float) -> float:
@@ -798,15 +802,20 @@ class TradingService:
         return pairs
 
     def _sync_pairs(self, pairs: list[tuple[MarketType, str]]) -> list[dict]:
-        ledger = self._live_ledger()
-        seen = set(ledger["seen"])
-        books = ledger["books"]
-        booked: list[dict] = []
-        # One exchange order can come back as several fills (a partially
-        # executed market order, or a stop that sweeps). Pushing each slice
-        # turned one close into a burst of near-identical WeChat messages, so
-        # the slices are announced once per order, with the merged PnL.
-        announced: dict[str, dict] = {}
+        """Pull fills for ``pairs`` and fold them into the ledger.
+
+        The ledger is one JSON document, so this is a read-modify-write: two
+        callers doing it at the same time silently drop each other's rows. There
+        *are* two callers — the 5-second poller (``sync_live_fills``) and the
+        request thread that books a fill right after an order
+        (``sync_symbol_fills``). A dropped row means the next poll books that
+        fill again and calls ``risk.record_trade`` a second time, so the daily
+        loss and losing-streak breakers count the same exit twice.
+
+        Network reads stay outside ``_ledger_lock``: a slow venue must not make a
+        close wait behind the poller. Booking and the write happen inside it.
+        """
+        fetched: list[tuple[MarketType, str, list[dict]]] = []
         for market, symbol in pairs:
             client = self.rest_for(market)
             try:
@@ -817,32 +826,55 @@ class TradingService:
             except Exception:  # network hiccup: try again next round
                 log.debug("拉取成交异常 %s %s", market.value, symbol, exc_info=True)
                 continue
-            for trade in sorted(trades, key=lambda item: item.get("timestamp") or 0):
-                trade_id = str(trade.get("id") or "")
-                # 去重键要带市场：现货与合约的成交编号各自从 1 数起，只按 id 记的话
-                # 合约那一笔会被当成「现货那笔已经记过」，账本少成交，风控也收不到
-                # 这次平仓的盈亏。
-                seen_id = f"{market.value}:{trade_id}" if trade_id else ""
-                if not seen_id or seen_id in seen:
-                    continue
-                seen.add(seen_id)
-                result = self._book_live_trade(trade, books)
-                if result is not None:
-                    booked.append(result)
-                    self.risk.record_trade(result["realized"])
-                    log.info(
-                        "实盘平仓 %s %s 已实现 %.4f",
-                        symbol,
-                        trade.get("side"),
-                        result["realized"],
-                    )
-                    self._merge_exit(announced, trade, result, market.value)
-                try:
-                    self.db.save_trade(
-                        self._account_id(), trade, RunMode.LIVE.value, market.value
-                    )
-                except Exception:  # pragma: no cover - history is best effort
-                    log.warning("实盘成交写库失败", exc_info=True)
+            fetched.append((market, symbol, list(trades or [])))
+
+        booked: list[dict] = []
+        # One exchange order can come back as several fills (a partially
+        # executed market order, or a stop that sweeps). Pushing each slice
+        # turned one close into a burst of near-identical WeChat messages, so
+        # the slices are announced once per order, with the merged PnL.
+        announced: dict[str, dict] = {}
+        with self._ledger_lock:
+            ledger = self._live_ledger()
+            # 顺序要留着：这是一份「最近 N 条」的窗口，截断时得知道哪头是新的。
+            # 以前存成 set 再 list()，重建顺序是任意的（还跟着 PYTHONHASHSEED 变），
+            # 超过上限之后可能把较新的去重键截掉、留下更旧的，下一轮同步就把那笔
+            # 成交重新记一次账，风控的当日亏损与连亏也跟着多数一次。
+            seen_order = [str(item) for item in ledger["seen"]]
+            seen = set(seen_order)
+            books = ledger["books"]
+            for market, symbol, trades in fetched:
+                for trade in sorted(trades, key=lambda item: item.get("timestamp") or 0):
+                    trade_id = str(trade.get("id") or "")
+                    # 去重键要带市场：现货与合约的成交编号各自从 1 数起，只按 id 记的话
+                    # 合约那一笔会被当成「现货那笔已经记过」，账本少成交，风控也收不到
+                    # 这次平仓的盈亏。
+                    seen_id = f"{market.value}:{trade_id}" if trade_id else ""
+                    if not seen_id or seen_id in seen:
+                        continue
+                    seen.add(seen_id)
+                    seen_order.append(seen_id)
+                    result = self._book_live_trade(trade, books)
+                    if result is not None:
+                        booked.append(result)
+                        self.risk.record_trade(result["realized"])
+                        log.info(
+                            "实盘平仓 %s %s 已实现 %.4f",
+                            symbol,
+                            trade.get("side"),
+                            result["realized"],
+                        )
+                        self._merge_exit(announced, trade, result, market.value)
+                    try:
+                        self.db.save_trade(
+                            self._account_id(), trade, RunMode.LIVE.value, market.value
+                        )
+                    except Exception:  # pragma: no cover - history is best effort
+                        log.warning("实盘成交写库失败", exc_info=True)
+            if booked or len(seen_order) != len(ledger["seen"]):
+                ledger["seen"] = seen_order[-LIVE_TRADE_LIMIT:]
+                ledger["books"] = books
+                self._save_live_ledger(ledger)
 
         for summary in announced.values():
             self._notify(
@@ -857,10 +889,6 @@ class TradingService:
                 ),
                 kind="fill",
             )
-        if booked or seen != set(ledger["seen"]):
-            ledger["seen"] = list(seen)[-LIVE_TRADE_LIMIT:]
-            ledger["books"] = books
-            self._save_live_ledger(ledger)
         return booked
 
     def _merge_exit(self, announced: dict, trade: dict, result: dict, market: str) -> None:

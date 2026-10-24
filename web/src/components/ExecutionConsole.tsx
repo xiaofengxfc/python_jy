@@ -154,6 +154,18 @@ export default function ExecutionConsole({
       setError("先选一个策略。");
       return;
     }
+    // 主网启动是真钱下单，后端要求 confirm_live=true（不带就 400「主网自动
+    // 交易需要显式确认」，以前这里从来没带过，主网执行台根本启动不了）。
+    const live = settings?.network === "mainnet";
+    if (
+      live &&
+      !window.confirm(
+        `即将在【主网】用 ${symbol} 跑 ${strategyKey}：${positionPct * 100}% 仓位、${leverage}x、每 ${pollSeconds} 秒一轮。\n\n` +
+          "引擎会按信号自动下单，用的是真钱。确认启动？",
+      )
+    ) {
+      return;
+    }
     setBusy("start");
     setError("");
     setNotice("");
@@ -169,6 +181,7 @@ export default function ExecutionConsole({
           position_pct: positionPct,
           leverage,
           poll_seconds: pollSeconds,
+          confirm_live: live,
         }),
       });
       setNotice("已启动。到下面看信号和日志。");

@@ -28,6 +28,8 @@ from ..context import AppContext
 from ..core.config import ConfigError
 from ..core.types import (
     TIMEFRAME_SECONDS,
+    PROTECTIVE_TYPES,
+    TAKE_PROFIT_TYPES,
     MarketType,
     Network,
     market_for_symbol,
@@ -437,7 +439,9 @@ def _ledger_entry_price(state: _State, market: MarketType, symbol: str) -> float
     return 0.0
 
 
-def _booked_held(state: _State, symbol: str) -> float | None:
+def _booked_held(
+    state: _State, symbol: str, market: MarketType | None = None
+) -> float | None:
     """The app's own record of the open leg on ``symbol``, signed; None if none.
 
     ``sync_live_fills`` folds every live fill into a cost book per symbol, so the
@@ -445,6 +449,10 @@ def _booked_held(state: _State, symbol: str) -> float | None:
     Used only to answer "is this order an exit?": being wrong there costs a
     reduce-only order the venue rejects, never an unproven entry that slips
     through.
+
+    The book counts **exchange amounts** (contracts on a futures venue), the same
+    unit ``fetch_positions`` reports, so a futures caller gets it folded into base
+    coins here — the ledger is not a second unit system.
     """
     try:
         books = state.ctx.trading._live_ledger()["books"]
@@ -455,9 +463,18 @@ def _booked_held(state: _State, symbol: str) -> float | None:
     if not isinstance(book, dict):
         return None
     try:
-        return float(book.get("contracts") or 0.0)
+        booked = float(book.get("contracts") or 0.0)
     except (TypeError, ValueError):  # pragma: no cover - ledger writes numbers
         return None
+    if market is None or not market.is_futures:
+        return booked
+    # 币本位的账本按张记，折币要用价；账本里那个 entry 就是这一腿的均价。
+    try:
+        rest = state.ctx.rest_for(market)
+    except Exception:  # pragma: no cover - a broken resolver keeps the old unit
+        log.debug("取交易所客户端失败 %s", market.value, exc_info=True)
+        return booked
+    return _contracts_to_base(rest, market, symbol, booked, float(book.get("entry") or 0.0))
 
 
 def _venue_symbol(state: _State, market: MarketType, symbol: str) -> str:
@@ -536,12 +553,62 @@ def _check_symbol_shape(market: MarketType, symbol: str) -> str:
     return text
 
 
+def _contracts_to_base(
+    rest: Any, market: MarketType, symbol: str, contracts: float, price: float
+) -> float | None:
+    """交易所的「张」换成基础币；换不出来就 ``None`。
+
+    调用方（平仓、保护单、减仓判定）拿到的数量会原样变成 ``OrderRequest.amount``，
+    而那个字段的量纲是**基础币**：``TradingService.exchange_amount`` 还会再按
+    ``contract_size`` 折一次。所以这一层必须先把张折成币，否则币本位（每张 100 USD）
+    会被放大 ``price / contract_size`` 倍——实测持仓 10 张、价格 78000 时算出 7800 张，
+    reduceOnly 单必然被交易所拒，仓位从界面平不掉。
+
+    线性合约的 contractSize 不总是 1（例如 1000SHIBUSDT），所以不能只判币本位：
+    统一走 ``ContractSpec.contracts_to_base``。币本位折币要价格，价格缺失时返回
+    ``None``（"不知道"），绝不拿 0 顶上——那等于告诉调用方「没有持仓」。
+    """
+    if abs(contracts) <= 1e-12:
+        return 0.0
+    try:
+        spec = rest.contract_spec(market, symbol)
+    except Exception:  # pragma: no cover - spec read is best effort
+        log.warning("读取合约规格失败 %s，无法把张折成币", symbol, exc_info=True)
+        return None
+    mark = float(price or 0.0)
+    if spec.inverse and mark <= 0:
+        return None
+    return float(spec.contracts_to_base(contracts, mark))
+
+
+def _live_spot_held(state: _State, symbol: str, market: MarketType) -> float | None:
+    """现货「持仓」= 交易所可用余额；读不到就退回本地成交账本。
+
+    现货没有持仓对象，钱包里那个币的可用余额就是唯一的持仓事实，所以正常路径读它。
+    读不到时**不能拿 0 顶上**：那等于说「没有持仓」，一笔卖出会被判成开仓，
+    撞上熔断或急停就再也卖不掉（合约那条路已经这么处理，见 ``_live_held``，
+    现货分支当时漏了）。两边都不知道才返回 ``None`` —— 平仓与挂保护单据此回 503。
+    """
+    base = symbol.split("/")[0].upper()
+    try:
+        with state.locks[market]:
+            balance = state.ctx.rest_for(market).fetch_balance(market)
+    except Exception:
+        log.warning("读取实盘余额失败 %s，改用本地成交账本", symbol, exc_info=True)
+        booked = _booked_held(state, symbol, market)
+        return booked if booked is not None and abs(booked) > 1e-12 else None
+    return _balance_free(balance, base)
+
+
 def _live_held(state: _State, symbol: str, market: MarketType) -> float | None:
-    """Signed live position size: positive long, negative short.
+    """Signed live position size **in base coins**: positive long, negative short.
 
     Spot has no position object, so what is held is the base balance. Futures
-    report contracts with a side; the sign is what this function owes its
-    callers, because the close route picks the opposite side from it.
+    report *contracts* with a side; the sign is what this function owes its
+    callers, because the close route picks the opposite side from it. The
+    contract count is converted through :func:`_contracts_to_base` so that every
+    caller sees the same unit the order path expects (base coins) — leaving the
+    raw contracts here is what made a coin-margined close 780x too large.
 
     ``None`` means "nobody knows": the venue read failed and the app has no
     booked leg either. It is deliberately not 0.0 — a failed read used to come
@@ -555,16 +622,17 @@ def _live_held(state: _State, symbol: str, market: MarketType) -> float | None:
                 positions = rest.fetch_positions(market, [symbol])
             except Exception:
                 log.warning("读取实盘持仓失败 %s，改用本地成交账本", symbol, exc_info=True)
-                return _booked_held(state, symbol)
+                return _booked_held(state, symbol, market)
             for item in positions:
                 if item.get("symbol") != symbol:
                     continue
                 contracts = float(item.get("contracts") or 0.0)
                 if item.get("side") == "short":
                     contracts = -abs(contracts)
-                return contracts
+                mark = item.get("markPrice") or item.get("entryPrice") or 0.0
+                return _contracts_to_base(rest, market, symbol, contracts, float(mark or 0.0))
             return 0.0
-        return _live_spot_available(state, symbol, market)
+        return _live_spot_held(state, symbol, market)
 
 
 def _minimum_order(spec: Any, price: float) -> tuple[float | None, float | None]:
@@ -645,9 +713,6 @@ def _is_reducing(
     (see :func:`_live_held`). Spot sells are always exits: spot cannot short, and
     the unheld-sell case is rejected earlier with its own message.
     """
-    if market is MarketType.SPOT:
-        held = _live_spot_available(state, symbol, market)
-        return side == "sell" and held > 0 and amount <= held * (1 + 1e-6) + 1e-12
     held = _live_held(state, symbol, market)
     if held is None:
         # 持仓读不到、本地账本也没有：这笔单子证明不了是减仓。当作开仓处理，
@@ -659,6 +724,83 @@ def _is_reducing(
     if side == "buy" and held < 0:
         return amount <= -held * (1 + 1e-6) + 1e-12
     return False
+
+
+def _protective_orders(state: _State, market: MarketType, symbol: str) -> list[dict]:
+    """这一对现在挂在交易所侧的止损 / 止盈单（两条链路都读）。
+
+    普通挂单和算法单是两个端点：止损止盈是**算法单**，``fetch_open_orders`` 里一条都
+    没有。重挂保护单之前需要这份「原样」，挂不上时才能挂回去。
+    """
+    rest = state.ctx.rest_for(market)
+    rows: list[dict] = []
+    with state.locks[market]:
+        try:
+            rows.extend(rest.fetch_open_orders(market, symbol) or [])
+        except Exception:
+            log.debug("读取挂单失败 %s", symbol, exc_info=True)
+        try:
+            rows.extend(rest.fetch_algo_orders(market, symbol) or [])
+        except Exception:
+            log.debug("读取算法单失败 %s", symbol, exc_info=True)
+    out: list[dict] = []
+    for row in rows:
+        kind = str(row.get("type") or "").lower()
+        if kind not in PROTECTIVE_TYPES:
+            continue
+        trigger = row.get("triggerPrice") or row.get("stopPrice") or row.get("trigger")
+        if trigger is None:
+            trigger = row.get("price")
+        try:
+            amount = abs(float(row.get("amount") or 0.0))
+            level = float(trigger or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if amount <= 0 or level <= 0:
+            continue
+        out.append(
+            {
+                "id": str(row.get("id") or ""),
+                "take_profit": kind in TAKE_PROFIT_TYPES,
+                "side": str(row.get("side") or "").lower(),
+                "amount": amount,
+                "trigger": level,
+            }
+        )
+    return out
+
+
+def _restore_protective_orders(
+    state: _State, market: MarketType, symbol: str, previous: list[dict]
+) -> tuple[int, int]:
+    """把撤掉的旧保护单按原触发价挂回去，返回 (挂回的, 没挂上的)。
+
+    只在「新的全部没挂上」时用：这时宁可回到上一份保护，也不要让持仓裸着。
+    """
+    rest = state.ctx.rest_for(market)
+    restored = 0
+    lost = 0
+    for item in previous:
+        try:
+            with state.locks[market]:
+                if item["take_profit"]:
+                    order = rest.create_take_profit_market(
+                        market, symbol, item["side"], item["amount"], item["trigger"]
+                    )
+                else:
+                    order = rest.create_stop_market(
+                        market, symbol, item["side"], item["amount"], item["trigger"]
+                    )
+        except Exception as exc:
+            log.warning("挂回旧保护单失败 %s %s：%s", symbol, item.get("id"), exc)
+            lost += 1
+            continue
+        restored += 1
+        try:
+            state.ctx.trading.save_external_order(market, order)
+        except Exception:  # pragma: no cover - 记录失败不影响这张单已经在交易所
+            log.debug("保存挂回的保护单失败 %s", symbol, exc_info=True)
+    return restored, lost
 
 
 def _check_protection_levels(
@@ -1222,7 +1364,15 @@ def create_app() -> FastAPI:
         # clamp that instead of rejecting what is clearly a full exit.
         adjusted = False
         if mt is MarketType.SPOT and payload.side == "sell":
-            available = _live_spot_available(state, payload.symbol, mt)
+            # 读余额失败不等于没有持仓（AGENTS 第 7 节的 R12 那条）：现货这条路
+            # 以前回 0 → 400「当前没有持仓」，熔断期想卖都卖不掉。退到本地成交账本，
+            # 两边都不知道才回 503 说实话。
+            available = _live_spot_held(state, payload.symbol, mt)
+            if available is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="无法读取现货余额，暂时无法卖出，请稍后再试。",
+                )
             if available <= 0:
                 raise HTTPException(
                     status_code=400,
@@ -1394,7 +1544,7 @@ def create_app() -> FastAPI:
                 state.ctx.trading.sync_symbol_fills(mt, symbol)
             except Exception:  # 读不到也不能挡住平仓的其它判据
                 log.debug("平仓前同步成交失败 %s", symbol, exc_info=True)
-            booked = _booked_held(state, symbol)
+            booked = _booked_held(state, symbol, mt)
             if booked is None or abs(booked) <= 1e-12:
                 raise HTTPException(
                     status_code=400,
@@ -1643,6 +1793,10 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         rest = state.ctx.rest_for(mt)
+        # 撤旧单之前先把它们记下来：新单一张都没挂上时要能挂回去。以前这里
+        # 撤完就往下走，全部失败只回一句「止损/止盈都没有挂上」——用户以为
+        # 「什么都没变」，实际仓位已经裸奔（实测就是这条把止损撤没了）。
+        previous = _protective_orders(state, mt, symbol)
         try:
             with state.locks[mt]:
                 cleared = rest.cancel_protective_orders(mt, symbol)
@@ -1650,6 +1804,7 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         placed: list[dict] = []
+        armed: dict[str, float] = {}
         warnings: list[str] = []
         for level, take_profit, label in (
             (payload.stop_loss, False, "止损"),
@@ -1671,19 +1826,27 @@ def create_app() -> FastAPI:
                 warnings.append(f"{label}单挂单失败：{exc}")
                 continue
             placed.append(order)
+            armed[label] = float(level)
             state.ctx.trading.save_external_order(mt, order)
         state.ctx.account.invalidate()
         if not placed:
-            raise HTTPException(
-                status_code=400,
-                detail="。".join(warnings) if warnings else "止损/止盈都没有挂上",
-            )
+            restored, lost = _restore_protective_orders(state, mt, symbol, previous)
+            detail = "。".join(warnings) if warnings else "止损/止盈都没有挂上"
+            if restored:
+                detail += f"。旧保护单已撤销，现已按原来的触发价挂回 {restored} 张"
+            else:
+                detail += "。旧保护单已撤销，当前这张持仓没有任何交易所侧保护"
+                if lost:
+                    detail += f"，挂回旧单也失败了（{lost} 张）"
+            raise HTTPException(status_code=400, detail=detail)
         return {
             "ok": True,
             "protection": {
                 "symbol": symbol,
-                "stop_loss": payload.stop_loss or 0.0,
-                "take_profit": payload.take_profit or 0.0,
+                # 只报真的挂上的价位：一条腿失败时这里回请求值，界面会把它画成
+                # 「已保护」，而那一侧在交易所其实什么都没挂。
+                "stop_loss": armed.get("止损", 0.0),
+                "take_profit": armed.get("止盈", 0.0),
                 "orders": [item.get("id") for item in placed],
             },
             "price": reference,

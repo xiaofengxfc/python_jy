@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .. import ai, ai_pipeline, paths
+from ..core.clock import local_day
 from ..core.types import MarketType, OrderSide, OrderType
 from .trading import OrderRequest, OrderResult
 
@@ -124,8 +125,8 @@ class TradeBudget:
         self._last_order_at = 0.0
 
     def roll(self, now: float) -> None:
-        """跨天清零。"""
-        day = time.strftime("%Y-%m-%d", time.localtime(now))
+        """跨天清零（本机时区的一天，和风控、模型调用次数同一口径）。"""
+        day = local_day(now)
         with self._lock:
             if day == self._day:
                 return
@@ -1177,17 +1178,29 @@ class AITrader:
         但交易照走。
         """
         written = self._audit_log.append(record)
-        self._seq = max(self._seq, int(written.get("seq") or 0))
+        with self._lock:
+            # 和 status 的读取同一把锁：seq 是事件流的游标，读者拿到它就必须能
+            # 拿到 seq 之前的那些行。
+            self._seq = max(self._seq, int(written.get("seq") or 0))
         return written
 
     def status(self, since: int = 0) -> dict[str, Any]:
         now = self.clock()
         self.budget.roll(now)
-        events = [item for item in list(self._events) if int(item.get("seq") or 0) > since]
+        # 这些字段由决策线程改（pause/resume/halt/_emit），而 status 被接口线程每几秒
+        # 调一次。以前裸读：读到「state 已 halted、halted_reason 还是空」这种半截快照，
+        # 界面就只显示一句「已熔断」不说原因；_events 在同一次 list() 里也可能漏掉
+        # 刚追加的那几行。
+        with self._lock:
+            state = self.state
+            paused = self._paused
+            halted_reason = self._halted_reason
+            events = [item for item in list(self._events) if int(item.get("seq") or 0) > since]
+            seq = self._seq
         return {
-            "state": self.state,
-            "paused": self._paused,
-            "halted_reason": self._halted_reason,
+            "state": state,
+            "paused": paused,
+            "halted_reason": halted_reason,
             "config": {
                 "network": self.config.network,
                 "symbol": self.config.symbol,
@@ -1210,5 +1223,5 @@ class AITrader:
             },
             "last_decision": self.last_decision,
             "events": events,
-            "seq": self._seq,
+            "seq": seq,
         }

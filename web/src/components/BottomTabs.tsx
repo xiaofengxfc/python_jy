@@ -159,23 +159,44 @@ export default function BottomTabs({
    *  点哪一行的按钮都按同一个数量走。 */
   const rowKey = (position: Position) => `${position.symbol}|${position.origin ?? "ledger"}`;
 
+  /** 界面上的数量一律是基础币：size_base 由后端按合约规格折好，contracts 是
+   *  交易所口径的张（币本位 10 张 = 0.02 BTC，差 500 倍）。拿不准时回落前者。 */
+  const sizeOf = (position: Position) => Math.abs(position.size_base ?? position.contracts);
+
+  /** 主网平仓要二次确认，并且请求必须带 confirm_live——不带它后端直接 400
+   *  「主网下单需要二次确认」，仓位一动不动。测试网不弹窗、不带真值。 */
+  const confirmClose = (what: string): boolean => {
+    if (network !== "mainnet") return true;
+    return window.confirm(`${what}\n\n这是主网，平仓按市价真成交。确认继续？`);
+  };
+
   /** 钱包余额的默认卖出量：整笔余额。买来的持仓留空，空值在 close() 里表示全平。
    *  现货的「持仓」就是钱包余额，不带 size 全平等于清空钱包，所以钱包行必须显式给数量。 */
   const defaultCloseSize = (position: Position) =>
-    position.origin === "wallet" ? plainAmount(Math.abs(position.contracts)) : "";
+    position.origin === "wallet" ? plainAmount(sizeOf(position)) : "";
 
   /** 数量框里该显示多少。钱包行是整笔余额；账本行只平账本那部分——contracts 是钱包事实，
-   *  `1\` 个自己充的 ETH 混在里面的时候写 1.002500 会让人以为一次平掉全部。实测就是：占位
+   *  1 个自己充的 ETH 混在里面的时候写 1.002500 会让人以为一次平掉全部。实测就是：占位
    *  写 1.002500，点「平仓」只卖掉 0.0025。 */
   const closeHint = (position: Position) =>
     Math.abs(
-      position.origin === "wallet" ? position.contracts : position.ledger_size || position.contracts,
+      position.origin === "wallet"
+        ? position.size_base ?? position.contracts
+        : position.ledger_size || position.size_base || position.contracts,
     );
 
   const close = (position: Position) => {
     const typed = parseNumber(closeSizes[rowKey(position)] ?? defaultCloseSize(position));
-    const held = Math.abs(position.contracts);
+    const held = sizeOf(position);
     const size = typed > 0 ? Math.min(typed, held) : undefined;
+    const label = position.origin === "wallet" ? "卖出" : "平仓";
+    if (
+      !confirmClose(
+        `${label} ${position.symbol} ${size ? size : held} ${position.symbol.split("/")[0] ?? ""}？`,
+      )
+    ) {
+      return;
+    }
     return run(`close:${rowKey(position)}`, async () => {
       await api("/api/positions/close", {
         method: "POST",
@@ -185,6 +206,8 @@ export default function BottomTabs({
           // futures exit could be looked up in the spot book.
           market,
           size,
+          // 主网没有这一行就是 400，平不掉。
+          confirm_live: network === "mainnet",
         }),
       });
       // 成交后把这个交易对的临时数量删掉，而不是留一个空串。空串不是「没填过」：
@@ -224,7 +247,7 @@ export default function BottomTabs({
     >
       {position.side === "long" ? "多头" : position.side === "short" ? "空头" : "—"}
     </span>,
-    fmt(position.contracts, 6),
+    fmt(sizeOf(position), 6),
     // No fill history for this coin (a transfer, or a position
     // opened elsewhere) means the cost basis is unknown: say so
     // instead of printing a fake zero.
@@ -350,16 +373,21 @@ export default function BottomTabs({
               className="link-btn"
               style={{ marginRight: 12, alignSelf: "center" }}
               disabled={busy !== null}
-              onClick={() =>
-                run("close:all", async () => {
+              onClick={() => {
+                if (!confirmClose(`平掉这 ${ledgerPositions.length} 张持仓？`)) return;
+                void run("close:all", async () => {
                   for (const position of ledgerPositions) {
                     await api("/api/positions/close", {
                       method: "POST",
-                      body: JSON.stringify({ symbol: position.symbol, market }),
+                      body: JSON.stringify({
+                        symbol: position.symbol,
+                        market,
+                        confirm_live: network === "mainnet",
+                      }),
                     });
                   }
-                })
-              }
+                });
+              }}
             >
               全部平仓
             </button>

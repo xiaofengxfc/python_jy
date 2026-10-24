@@ -44,7 +44,8 @@ export default function ProtectionDialog({
   onSaved,
 }: Props) {
   const long = position.side !== "short";
-  const held = Math.abs(position.contracts);
+  /** 数量是基础币：后端按合约规格折好的 size_base，不是交易所口径的张。 */
+  const held = Math.abs(position.size_base ?? position.contracts);
   const mark = position.last > 0 ? position.last : position.entry_price;
   const decimals = decimalsFor(mark || 1);
   const live = network === "mainnet";
@@ -99,7 +100,12 @@ export default function ProtectionDialog({
     setError("");
     setNotice("");
     try {
-      await api("/api/positions/protection", {
+      // 回执只报真的挂上的那条腿（后端一条失败时另一条照样挂上）。以前这里
+      // 拿请求值拼文案，没挂上的那条也被画成「已保护」。
+      const result = await api<{
+        protection?: { stop_loss?: number; take_profit?: number };
+        warnings?: string[];
+      }>("/api/positions/protection", {
         method: "PUT",
         body: JSON.stringify({
           symbol: position.symbol,
@@ -109,7 +115,16 @@ export default function ProtectionDialog({
           confirm_live: live,
         }),
       });
-      setNotice("已挂到交易所：触到该价位即以市价平仓，关掉本程序也有效。");
+      const armed: string[] = [];
+      const armedStop = Number(result?.protection?.stop_loss ?? 0);
+      const armedTarget = Number(result?.protection?.take_profit ?? 0);
+      if (armedStop > 0) armed.push("止损 " + fmtPrice(armedStop));
+      if (armedTarget > 0) armed.push("止盈 " + fmtPrice(armedTarget));
+      const warnings = result?.warnings ?? [];
+      const text = armed.length
+        ? "已挂到交易所：" + armed.join(" · ") + "，触到即以市价平仓，关掉本程序也有效。"
+        : "一条都没挂上。";
+      setNotice(warnings.length ? text + "（" + warnings.join("；") + "）" : text);
       onSaved?.();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));

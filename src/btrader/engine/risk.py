@@ -5,8 +5,8 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass
-from datetime import datetime, timezone
 
+from ..core.clock import local_day
 from ..core.config import RiskSettings
 from ..core.storage import Database
 from ..core.types import MarketType, Network
@@ -323,4 +323,9 @@ class RiskManager:
 
 
 def _today() -> str:
-    return datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+    """本机时区的今天（见 core.clock）：和 AI 决策次数、模型调用次数同一口径。
+
+    以前这里按 UTC 取日期，另外两处按本机时区，UTC+8 下熔断的「当日亏损」
+    早上 8 点就清零，而决策次数要到午夜——同一份审计里两个「今日」不是一天。
+    """
+    return local_day()

@@ -512,7 +512,7 @@ def test_wallet_balance_rows_sell_instead_of_closing() -> None:
     ), "钱包行点了卖出却没把余额带进请求"
 
     # 只有钱包行取整笔余额，买来的持仓留空（空值 = 全平，语义不变）
-    assert 'position.origin === "wallet" ? plainAmount(Math.abs(position.contracts)) : ""' in panel
+    assert 'position.origin === "wallet" ? plainAmount(sizeOf(position)) : ""' in panel
 
     # 钱包行「卖出」，账本行仍然是「平仓 / 部分平仓」
     for label in ('"卖出中…"', '"卖出"', '"平仓中…"', '"部分平仓"', '"平仓"'):
@@ -983,11 +983,13 @@ def test_the_close_box_shows_how_much_would_actually_be_closed() -> None:
     """
     tabs = (UI_DIR / "components" / "BottomTabs.tsx").read_text(encoding="utf-8")
     assert "const closeHint = (position: Position) =>" in tabs
-    assert "position.origin === \"wallet\" ? position.contracts : position.ledger_size || position.contracts" in tabs
+    # 数量一律是基础币：contracts 是交易所口径的张（币本位 10 张 = 0.02 BTC）
+    assert "const sizeOf = (position: Position) => Math.abs(position.size_base ?? position.contracts);" in tabs
+    assert "position.ledger_size || position.size_base || position.contracts" in tabs
     assert "placeholder={fmt(closeHint(position), 6)}" in tabs
     assert "placeholder={fmt(Math.abs(position.contracts), 6)}" not in tabs
     # 钱包行还是预填整笔余额
-    assert 'position.origin === "wallet" ? plainAmount(Math.abs(position.contracts)) : "";' in tabs
+    assert 'position.origin === "wallet" ? plainAmount(sizeOf(position)) : "";' in tabs
 
 
 def test_a_fill_refreshes_the_panel_with_a_live_read() -> None:
@@ -1013,7 +1015,10 @@ def test_the_order_ticket_blocks_below_the_minimum_before_sending() -> None:
     """
     ticket = (UI_DIR / "components" / "OrderTicket.tsx").read_text(encoding="utf-8")
     assert "const minimumProblem = (amount: number): string =>" in ticket
-    assert "preview?.min_amount ?? null" in ticket and "preview?.min_notional ?? null" in ticket
+    # 只认当前这张票的 preview：防抖窗口里上一份的数字会把合法的单误拦
+    assert "const currentPreview = preview && previewFor === previewTicket ? preview : null;" in ticket
+    assert "currentPreview?.min_amount ?? null" in ticket and "currentPreview?.min_notional ?? null" in ticket
+    assert 'setPreviewFor([market, symbol, side, orderType, sizeMode, size].join("|"));' in ticket
     assert "if (!minAmount && !minNotional) return \"\";" in ticket, "缺字段时要当没有"
     assert "最小下单数量" in ticket and "最小下单金额" in ticket, "提示里没说清最小是多少"
     # 两条提交路径（市价/限价、触发单）都拦一次
@@ -1051,7 +1056,7 @@ def test_a_spot_pair_can_be_two_rows_at_once() -> None:
     assert 'const wallet = position.origin === "wallet";' in tabs
     assert '"卖出"' in tabs and '"平仓"' in tabs
     # 自有余额行预填差额（defaultCloseSize 只给 wallet 行数量），账本行占位用账本数量
-    assert 'position.origin === "wallet" ? plainAmount(Math.abs(position.contracts)) : ""' in tabs
+    assert 'position.origin === "wallet" ? plainAmount(sizeOf(position)) : ""' in tabs
     assert "placeholder={fmt(closeHint(position), 6)}" in tabs
     # 两组分开渲染：账本行进持仓表，自有余额行进收起的那一组
     assert 'positions.filter((item) => item.origin !== "wallet")' in tabs
@@ -1272,13 +1277,16 @@ def test_the_ticker_batches_cover_the_whole_list() -> None:
 
 
 def test_the_ticker_cache_lists_ten_seconds_per_market() -> None:
-    """结果按市场缓存 10 秒：面板每 2 秒轮询一次，不能每次都重发 6 个请求。"""
+    """结果缓存 10 秒、键带交易对集合：面板每 2 秒轮询一次，不能每次都重发 6 个请求，
+    也不能让第二个调用方（交易对列表）命中一份缺项的快照。"""
     src = (UI_DIR / "tickers.ts").read_text(encoding="utf-8")
     assert "const CACHE_TTL_MS = 10_000;" in src
-    assert "const cache = new Map<string, TickerCacheEntry>();" in src, "缓存要按市场分"
+    # 键要带这一批交易对：只按市场记的话，第二个调用方会命中缺项的缓存、一条都不发
+    assert "function bucketKey(market: string, wanted: string[]): string {" in src
+    assert "const key = bucketKey(market, wanted);" in src
     assert "Date.now() - cached.at < CACHE_TTL_MS" in src, "没看时间戳就返回缓存"
-    assert "cache.set(market," in src, "拿到了不写缓存，等于每次都重发"
-    assert "const inflight = new Map<string," in src, "同一市场要串成一个序列"
+    assert "cache.set(key," in src, "拿到了不写缓存，等于每次都重发"
+    assert "const inflight = new Map<string," in src, "同一批交易对要串成一个序列"
 
 
 def test_a_closed_page_stops_the_remaining_batches() -> None:
@@ -1756,3 +1764,89 @@ def test_the_shell_guards_the_main_frame_navigation() -> None:
     assert "file:" not in nav and "data:" not in nav, "不许出现放行 file:/data: 的判断"
     # 壳自己的初始加载不能被挡：守卫只挂在 will-navigate 上，不碰 loadURL
     assert 'void win.loadURL(target);' in main
+
+
+# ------------------------------------------------ 前端复审 W1–W7（方案 A）
+
+
+def test_a_mainnet_close_asks_first_and_sends_confirm_live() -> None:
+    """主网平仓必须带 confirm_live：不带它后端直接 400，仓位一动不动。
+
+    实测（主网 ctx）：POST /api/positions/close 回
+    「主网下单需要二次确认（confirm_live=true）。测试网不需要。」，仓位还是 0.02 BTC。
+    界面上的单行平仓、部分平仓、钱包行卖出、全部平仓，在主网一条都走不通。
+    """
+    tabs = (UI_DIR / "components" / "BottomTabs.tsx").read_text(encoding="utf-8")
+    assert 'if (network !== "mainnet") return true;' in tabs, "测试网不该弹窗"
+    assert "const confirmClose = (what: string): boolean => {" in tabs
+    assert 'confirm_live: network === "mainnet",' in tabs
+    assert tabs.count('confirm_live: network === "mainnet",') == 2, "单行平仓与全部平仓都要带"
+    assert "!confirmClose(" in tabs, "两个入口都要先问一句"
+    # 数量框和 held 上限也按基础币收口，否则币本位会按 500 倍的数量下单
+    assert "const held = sizeOf(position);" in tabs
+
+
+def test_the_execution_console_can_start_on_mainnet() -> None:
+    """/api/auto/start 在主网要求 confirm_live。执行台以前从来没带过：主网启动必 400，
+    而同一个引擎从 AI 量化页的部署按钮却能启动。
+    """
+    console = (UI_DIR / "components" / "ExecutionConsole.tsx").read_text(encoding="utf-8")
+    assert 'const live = settings?.network === "mainnet";' in console
+    assert "confirm_live: live," in console, "请求体里没有 confirm_live"
+    assert "window.confirm(" in console, "主网启动要先问一句"
+
+
+def test_position_quantities_are_base_coins_not_contracts() -> None:
+    """界面上的数量一律读 size_base：contracts 是交易所口径的张。
+
+    币本位 BTC/USD:BTC 一张 100 USD：0.02 BTC 的仓位 contracts = 10。前端把 10 当
+    BTC 用，100% 按钮填 10（= 5,000 张），部分平仓按 10 做 reduceOnly 被交易所直接拒，
+    资产页数量列比真实大 500 倍（1000SHIB 那种一张 1000 币的更大）。
+    """
+    types = (UI_DIR / "types.ts").read_text(encoding="utf-8")
+    assert "size_base?: number | null;" in types, "Position 上没有基础币数量"
+    for name in (
+        "components/BottomTabs.tsx",
+        "components/ProtectionDialog.tsx",
+        "pages/PortfolioPage.tsx",
+        "pages/TradingPage.tsx",
+    ):
+        src = (UI_DIR / name).read_text(encoding="utf-8")
+        assert "size_base" in src, f"{name} 还在拿 contracts 当币用"
+    page = (UI_DIR / "pages" / "TradingPage.tsx").read_text(encoding="utf-8")
+    assert "held.size_base ?? held.contracts" in page, "下单框的数量预算没换成基础币"
+    # 权益兜底别自己拿数量乘价（合约数量是张），直接用后端算好的市值
+    assert "sum + (position.quote_value || 0)" in page
+    portfolio = (UI_DIR / "pages" / "PortfolioPage.tsx").read_text(encoding="utf-8")
+    assert "fmt(Math.abs(position.size_base ?? position.contracts), 6)" in portfolio
+
+
+def test_a_half_armed_guard_is_reported_as_half_armed() -> None:
+    """保护单回执只报真的挂上的那条腿，并带上 warnings。
+
+    后端一条腿失败时 protection 里的 stop_loss / take_profit 回 0.0 并在 warnings 里说明；
+    前端如果拿请求值拼文案，那一侧的仓位其实没有任何交易所侧保护，界面却写「已挂到持仓」。
+    """
+    for name in ("components/OrderTicket.tsx", "components/ProtectionDialog.tsx"):
+        src = (UI_DIR / name).read_text(encoding="utf-8")
+        assert "result?.protection?.stop_loss" in src, f"{name} 没读回执里真的挂上的止损"
+        assert "result?.protection?.take_profit" in src, f"{name} 没读回执里真的挂上的止盈"
+        assert "warnings" in src, f"{name} 没显示 warnings"
+
+
+def test_a_stale_preview_cannot_block_a_valid_order() -> None:
+    """preview 有 220ms 防抖：数量刚改、预览还没追上时，旧数字不许参与判定。
+
+    实测：先填 1（太小）、迅速改成 100，在 preview 追上之前点提交，会被按
+    「这一单只有 1.00」误拦。
+    """
+    ticket = (UI_DIR / "components" / "OrderTicket.tsx").read_text(encoding="utf-8")
+    assert "const currentPreview = preview && previewFor === previewTicket ? preview : null;" in ticket
+    assert "const tooSmall = minimumProblem(amount);" in ticket
+    # 结论行与 AI 预判也只认当前这张票
+    assert "currentPreview.allowed" in ticket
+    assert "if (!currentPreview) return;" in ticket
+    assert "disabled={prejudgeBusy || !currentPreview}" in ticket
+    # 过期时明确说一句，别把上一单的「风控通过」留在屏上
+    assert "改动了，正在重算…" in ticket
+

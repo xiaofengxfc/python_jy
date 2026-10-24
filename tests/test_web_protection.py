@@ -19,6 +19,7 @@ from btrader.core.types import MarketType, Network
 from btrader.engine.account import AccountService
 from btrader.engine.risk import RiskManager
 from btrader.engine.trading import TradingService
+from btrader.exchange.rest import ExchangeError
 from btrader.web import app as web_app
 from btrader.web.app import ConditionalPayload, ProtectionPayload
 
@@ -280,3 +281,122 @@ def test_protection_can_be_cleared(api):
     result = call("/api/positions/protection", "DELETE", symbol=SYMBOL)
     assert result == {"ok": True, "cleared": 2}
     assert venue.stop_orders == []
+
+# ------------------------------------- 新单全挂不上时不能把仓位留在裸奔状态
+class _PickyVenue(FakeVenue):
+    """只接受 ``allow_trigger`` 那一个触发价的止损/止盈；None = 一张都不接受。"""
+
+    allow_trigger: float | None = None
+
+    def _gate(self, trigger: float) -> None:
+        if self.allow_trigger is None or float(trigger) != float(self.allow_trigger):
+            raise ExchangeError("交易所拒绝：触发价不被接受")
+
+    def create_stop_market(self, market, symbol, side, amount, stop_price):
+        self._gate(stop_price)
+        return super().create_stop_market(market, symbol, side, amount, stop_price)
+
+    def create_take_profit_market(self, market, symbol, side, amount, target_price):
+        self._gate(target_price)
+        return super().create_take_profit_market(market, symbol, side, amount, target_price)
+
+
+@pytest.fixture()
+def picky_api(tmp_path, monkeypatch):
+    venue = _PickyVenue()
+    venue._last[SYMBOL] = 100.0
+    venue._book[SYMBOL] = 0.5
+    db = Database(tmp_path / "picky.db")
+    state = _State(
+        ctx=_Ctx(venue, db),
+        locks={market: threading.RLock() for market in MarketType},
+        account_lock=threading.RLock(),
+    )
+    monkeypatch.setattr(web_app, "_state", state, raising=False)
+    app = web_app.create_app()
+
+    def call(path: str, method: str, payload=None, **query):
+        endpoint = _endpoint(app, path, method)
+        return endpoint(payload) if payload is not None else endpoint(**query)
+
+    try:
+        yield call, venue
+    finally:
+        db.close()
+
+
+def _old_stop(venue: FakeVenue, trigger: float) -> None:
+    """让交易所侧先挂着一张旧止损（重挂之前它会被撤掉）。"""
+    venue.open_orders = [
+        {
+            "id": "old-stop",
+            "symbol": SYMBOL,
+            "type": "stop_market",
+            "side": "sell",
+            "amount": 0.5,
+            "price": trigger,
+            "triggerPrice": trigger,
+            "status": "open",
+        }
+    ]
+
+
+def test_failed_rearm_restores_the_previous_guard(picky_api):
+    """新止损止盈全被拒时，把撤掉的旧止损按原触发价挂回去，并说清楚。"""
+    call, venue = picky_api
+    _old_stop(venue, 90.0)
+    venue.allow_trigger = 90.0  # 只认旧单那个触发价
+
+    with pytest.raises(HTTPException) as caught:
+        call(
+            "/api/positions/protection",
+            "PUT",
+            ProtectionPayload(symbol=SYMBOL, stop_loss=95.0, take_profit=105.0),
+        )
+
+    detail = _detail(caught.value)
+    assert caught.value.status_code == 400
+    assert "挂回" in detail
+    assert venue.stop_orders == [("stop", SYMBOL, "sell", 0.5, 90.0)]
+
+
+def test_failed_rearm_reports_a_naked_position(picky_api):
+    """连旧单都挂不回去时必须直说「当前没有任何交易所侧保护」。"""
+    call, venue = picky_api
+    _old_stop(venue, 90.0)
+    venue.allow_trigger = None  # 一张都不接受
+
+    with pytest.raises(HTTPException) as caught:
+        call(
+            "/api/positions/protection",
+            "PUT",
+            ProtectionPayload(symbol=SYMBOL, stop_loss=95.0, take_profit=105.0),
+        )
+
+    detail = _detail(caught.value)
+    assert "没有任何交易所侧保护" in detail
+    assert "挂回旧单也失败" in detail
+    assert venue.stop_orders == []
+
+
+def test_a_half_failed_rearm_reports_only_the_armed_leg(picky_api):
+    """止损挂上了、止盈没挂上：响应里不能把止盈报成已挂。
+
+    以前回的是请求里那两个价位，界面据此把两条腿都画成「已保护」，而止盈那一侧
+    在交易所其实什么都没挂。
+    """
+    call, venue = picky_api
+    venue.allow_trigger = 95.0  # 只接受止损那个触发价
+
+    result = call(
+        "/api/positions/protection",
+        "PUT",
+        ProtectionPayload(symbol=SYMBOL, stop_loss=95.0, take_profit=105.0),
+    )
+
+    assert result["ok"] is True
+    assert result["protection"]["stop_loss"] == 95.0
+    assert result["protection"]["take_profit"] == 0.0, "没挂上的止盈不能报成已挂"
+    assert any("止盈" in item for item in result["warnings"])
+    assert len(result["protection"]["orders"]) == 1
+

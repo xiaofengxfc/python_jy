@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import shutil
 import tempfile
@@ -83,12 +84,21 @@ def json_safe(metrics: dict[str, Any]) -> dict[str, Any]:
     return clean
 
 
+def _tmp_path(path: Path) -> Path:
+    """同一目录下的临时文件名：带 pid 与纳秒，多个写者不会撞同一份半成品。"""
+    return path.with_name(f"{path.name}.{os.getpid()}-{time.time_ns()}.tmp")
+
+
 class CandidateStore:
     """File-backed candidate store. Every path is confined to the candidate dir."""
 
     def __init__(self, directory: Path | None = None) -> None:
         self.directory = (directory or paths.strategy_candidates_dir()).resolve()
         self.directory.mkdir(parents=True, exist_ok=True)
+        # 「先看有没有同名、再写盘」这两步之间会被第二个写者插进来（同一秒里
+        # 生成两条候选就会走 id 加后缀那条路），撞上就是后者覆盖前者的代码。
+        # 进程之间还有一道：临时文件名带 pid 与纳秒，谁也不覆盖谁的半成品。
+        self._lock = threading.RLock()
 
     # ------------------------------------------------------------------ paths
     def _path(self, candidate_id: str, suffix: str) -> Path:
@@ -113,29 +123,35 @@ class CandidateStore:
     ) -> Candidate:
         report: CheckReport = check_code(code)
         slug = re.sub(r"[^a-z0-9_]", "_", (strategy_key or "strategy").lower())[:32] or "strategy"
-        candidate_id = f"cand-{time.strftime('%Y%m%d-%H%M%S')}-{slug}"
-        # Same-second collisions are possible in tests; add a short suffix.
-        if self._path(candidate_id, ".py").exists():
-            candidate_id = f"{candidate_id}-{int(time.time() * 1000) % 1000:03d}"
-        candidate = Candidate(
-            id=candidate_id,
-            created_at=time.time(),
-            strategy_key=strategy_key,
-            name=name or strategy_key,
-            base_key=base_key,
-            model=model,
-            prompt_sha=prompt_sha,
-            source_sha256=hashlib.sha256(code.encode("utf-8")).hexdigest(),
-            status=STATUS_PENDING if report.ok else STATUS_REJECTED,
-            checks=report.as_dict(),
-            note=note,
-        )
-        code_path = self._path(candidate_id, ".py")
-        candidate.__dict__["_dir"] = str(self.directory)
-        tmp = code_path.with_suffix(".py.tmp")
-        tmp.write_text(code, encoding="utf-8")
-        tmp.replace(code_path)
-        self._write(candidate)
+        base_id = f"cand-{time.strftime('%Y%m%d-%H%M%S')}-{slug}"
+        # 「查重名 → 定 id → 写盘」必须整段在一把锁里。选 id 原来在锁外：同一秒里
+        # 第二个写者也能看到「不冲突」，两条候选拿到同一个 id，后写的把先写的
+        # .py 换掉——列表里只剩一条，代码是别人的。
+        with self._lock:
+            candidate_id = base_id
+            suffix = 0
+            while self._path(candidate_id, ".py").exists():
+                suffix += 1
+                candidate_id = f"{base_id}-{suffix}"
+            candidate = Candidate(
+                id=candidate_id,
+                created_at=time.time(),
+                strategy_key=strategy_key,
+                name=name or strategy_key,
+                base_key=base_key,
+                model=model,
+                prompt_sha=prompt_sha,
+                source_sha256=hashlib.sha256(code.encode("utf-8")).hexdigest(),
+                status=STATUS_PENDING if report.ok else STATUS_REJECTED,
+                checks=report.as_dict(),
+                note=note,
+            )
+            code_path = self._path(candidate_id, ".py")
+            candidate.__dict__["_dir"] = str(self.directory)
+            tmp = _tmp_path(code_path)
+            tmp.write_text(code, encoding="utf-8")
+            tmp.replace(code_path)
+            self._write(candidate)
         return candidate
 
     # ------------------------------------------------------------------- read
@@ -143,9 +159,16 @@ class CandidateStore:
         meta = candidate.to_dict()
         meta["code_file"] = f"{candidate.id}.py"
         path = self._path(candidate.id, ".json")
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(path)
+        with self._lock:
+            tmp = _tmp_path(path)
+            try:
+                tmp.write_text(
+                    json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8"
+                )
+                tmp.replace(path)
+            except Exception:
+                tmp.unlink(missing_ok=True)
+                raise
 
     def list(self) -> list[Candidate]:
         items: list[Candidate] = []
@@ -161,7 +184,14 @@ class CandidateStore:
         path = self._path(candidate_id, ".json")
         if not path.exists():
             raise CandidateError(f"候选不存在：{candidate_id}")
-        return self._from_dict(json.loads(path.read_text(encoding="utf-8")))
+        try:
+            raw = path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (OSError, ValueError) as exc:
+            # 手改坏的 JSON 以前让 json.JSONDecodeError 一路冒到接口层变成 500，
+            # 界面上只剩「服务内部错误」，看不出是哪一个候选文件坏了。
+            raise CandidateError(f"候选文件读不出来：{candidate_id}（{exc}）") from exc
+        return self._from_dict(data)
 
     def read_code(self, candidate_id: str) -> str:
         path = self._path(candidate_id, ".py")

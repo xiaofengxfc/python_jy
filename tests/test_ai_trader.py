@@ -1319,3 +1319,46 @@ def test_a_stuck_audit_lock_does_not_hang_or_raise(tmp_path, monkeypatch):
     assert isinstance(row["seq"], int)
     assert row["seq"] >= 1
     assert len(audit_rows(tmp_path / "audit.jsonl")) == 1
+
+# ------------------------------------------ 当日边界与状态的读取一致性
+def test_the_decision_day_uses_the_same_calendar_as_risk(tmp_path):
+    """「今日」只有一份口径：本机时区。
+
+    以前风控按 UTC 取日期、决策预算按本机时区取：UTC+8 下熔断的当日亏损早上 8 点
+    就清零，而决策次数要到午夜，同一份审计里两个「今日」不是同一天。
+    """
+    from btrader.core.clock import local_day
+    from btrader.engine.risk import _today
+
+    budget = TradeBudget()
+    stamp = 1_700_000_000.0
+    budget.roll(stamp)
+
+    assert budget._day == local_day(stamp)
+    assert _today() == local_day()
+
+
+def test_status_waits_for_the_state_lock(tmp_path):
+    """status 由接口线程每几秒调一次，必须和决策线程的改动互斥。
+
+    以前裸读 _paused / _halted_reason / _events：熔断那一刻能读到「state 已熔断、
+    原因还是空」这种半截快照，界面只显示「已熔断」不说原因。
+    """
+    trader, _llm, _trading, _risk = make_trader(tmp_path)
+    done = threading.Event()
+
+    def reader() -> None:
+        trader.status()
+        done.set()
+
+    reader_thread = threading.Thread(target=reader, daemon=True)
+    trader._lock.acquire()
+    try:
+        reader_thread.start()
+        assert not done.wait(0.2), "status 没有走 _lock，会读到半截状态"
+    finally:
+        trader._lock.release()
+
+    assert done.wait(5.0), "放开锁之后 status 应当立刻返回"
+    reader_thread.join(timeout=5)
+

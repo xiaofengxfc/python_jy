@@ -466,14 +466,12 @@ export default function TradingPage({
       // Server-side equity (cash + marked positions) so the sidebar quotes the
       // same number as the 资产 page. The local sum used to mark positions at
       // the last *trade* price, which drifted away from the portfolio total.
+      // 兜底只在后端没给 equity 时算：直接加市值得了，别自己拿数量乘价——
+      // contracts 是张，币本位自己乘出来差 500 倍；quote_value 是后端按合约
+      // 规格算好的。
       const equity =
         data.equity ??
-        data.cash +
-          data.positions.reduce(
-            (sum, position) =>
-              sum + Math.abs(position.contracts) * (position.last || position.entry_price),
-            0,
-          );
+        data.cash + data.positions.reduce((sum, position) => sum + (position.quote_value || 0), 0);
       onAccountChange(equity);
       return data;
     } catch (error) {
@@ -597,9 +595,12 @@ export default function TradingPage({
   /** 行情还没到（或后端读不到）时这些位留空显示「—」，不拿 0 冒充数据。 */
   const hasQuote = Boolean(ticker) || lastPrice > 0;
 
+  /** 下单框的数量预算：基础币。后端按合约规格折好放在 size_base 里，
+   *  contracts 是交易所口径的张——币本位直接拿去当币会差 500 倍。 */
   const positionQty = useMemo(() => {
     const held = account?.positions.find((position) => position.symbol === symbol);
-    return held?.contracts ?? 0;
+    if (!held) return 0;
+    return held.size_base ?? held.contracts ?? 0;
   }, [account, symbol]);
 
   const cash = account?.cash ?? 0;
