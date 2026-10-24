@@ -40,7 +40,7 @@ nslookup trade.example.com 8.8.8.8
 ```bash
 # A. 服务器上直接 clone（推荐，之后 --repo 就能升级）
 sudo apt-get update && sudo apt-get install -y git
-sudo git clone https://github.com/you/biTrader.git /root/biTrader
+sudo git clone https://github.com/xiaofengxfc/python_jy.git /root/biTrader
 
 # B. 从你这台机器上传（scp / rsync，.venv 和 node_modules 不要传）
 rsync -a --exclude .venv --exclude node_modules --exclude .git \
