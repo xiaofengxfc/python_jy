@@ -118,8 +118,14 @@ class RiskManager:
         """
         if self.db is None:
             return False
+        key = risk_state_key(self._scope)
         try:
-            data = self.db.get_json(risk_state_key(self._scope))
+            data = self.db.get_json(key)
+            if data is None:
+                # 0.6.3 只有一份 risk.state.v1（没有网络后缀）。不搬的话，升级上来的
+                # 用户当天已经用掉的额度与熔断状态会凭空复位，限额头一天等于不存在。
+                if self.db.adopt_legacy_key(RISK_STATE_KEY, key):
+                    data = self.db.get_json(key)
         except Exception:  # pragma: no cover - a corrupt row must not block startup
             log.warning("读取风控状态失败", exc_info=True)
             return False

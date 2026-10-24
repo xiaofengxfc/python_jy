@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bitrader"
-version = "0.6.3"
+version = "0.6.4"
 description = "Binance desktop trading workstation with backtesting"
 readme = "README.md"
 requires-python = ">=3.10"

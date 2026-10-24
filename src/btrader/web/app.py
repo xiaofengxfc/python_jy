@@ -45,6 +45,7 @@ from ..exchange.rest import (
     looks_unknown_symbol,
     ticker_bid_ask,
 )
+from .. import paths
 from ..logging_setup import error_buffer
 from .routes import build_router, resolve_order_leverage
 from .routes_deploy import build_deploy_router
@@ -783,6 +784,10 @@ def create_app() -> FastAPI:
             "ok": True,
             "market": state.ctx.market_type.value,
             "network": state.ctx.network.value,
+            # 桌面版与开发版落两套目录，把这件事直接报出来：对着界面查「我的成交去哪了」
+            # 时，先看这一行是哪份数据，比猜路径快。
+            "build": paths.data_dir_label(),
+            "data_dir": str(paths.data_dir()),
             "has_credentials": state.ctx.rest.has_credentials,
             "markets": [
                 {"value": m.value, "label": MARKET_LABELS[m.value]}

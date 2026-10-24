@@ -28,6 +28,19 @@ Start-Process -FilePath ".venv\Scripts\pythonw.exe" `
 
 Node 不在 PATH 时，先把 Node 目录加进去。
 
+数据目录按「跑的是什么」分两套，只由 `paths._base_dir()` 一处决定：
+
+| 跑的是什么 | 数据目录 |
+|---|---|
+| 装好的桌面端（PyInstaller 冻结，`sys.frozen` 为真） | `%APPDATA%\biTrader` |
+| 源码跑起来（`run_web.py`、`python -m btrader.web`、electron dev） | `%APPDATA%\biTrader-dev` |
+
+`BITRADER_DATA_DIR` 压过两者（测试与临时验证用它，`tests/conftest.py` 的
+`isolated_data_dir` 就是这条）。桌面壳只在 `app.isPackaged` 时把继承来的
+`BITRADER_DATA_DIR` 删掉，目录名不写在壳里——再加第三条启动路径也照这个来。
+`/api/health` 的 `build` 与 `data_dir` 两个字段直接说当前读的是哪一份，别再靠猜。
+开发时造的配置与成交因此进不了桌面端的库，反过来也一样。
+
 ## 2. 测试
 
 ```powershell
@@ -173,8 +186,9 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   读取方是 `AccountService._account_id()`，各算一份就等于成交历史永远读不出来，而且不报错。
   读历史一律带 `account` + `market_type`（`recent_trades` / `recent_orders`），
   不带就会把两个网络、两个市场的行混进同一个列表。
-  库版本在 `PRAGMA user_version`（`storage.SCHEMA_VERSION`）：v1 重建了 `orders` / `trades`
-  并丢弃旧行——旧行没有 `market_type`，撞号的那一条早被覆盖，反推只能是猜。
+  库版本在 `PRAGMA user_version`（`storage.SCHEMA_VERSION`）：v1 重建了 `orders` / `trades`，
+  旧表改名成 `orders_v0_backup` / `trades_v0_backup` 留档，不删——旧行没有 `market_type`，
+  撞号的那一条早被覆盖，读不出来，但用户的记录不该被一次启动悄悄抹掉。
 
 ## 5. 已确认的限制
 

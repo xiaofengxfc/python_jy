@@ -722,7 +722,13 @@ class TradingService:
         return ledger_key(self.network)
 
     def _live_ledger(self) -> dict:
-        data = self.db.get_json(self._ledger_key())
+        key = self._ledger_key()
+        data = self.db.get_json(key)
+        if not isinstance(data, dict):
+            # 0.6.3 的账本只存一份、没有网络后缀。升级上来先搬一次：不搬的话老用户
+            # 的现货仓位与成交记录会凭空消失（界面显示 0，平仓还报「账本里没有这一对」）。
+            self.db.adopt_legacy_key(LIVE_LEDGER_KEY, key)
+            data = self.db.get_json(key)
         if not isinstance(data, dict):
             data = {}
         return {

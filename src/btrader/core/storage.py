@@ -117,21 +117,42 @@ class Database:
 
         v0 的 orders / trades 主键只有 id，trades 连 market_type 都没有。改主键
         在 SQLite 里只能重建表，而重建时没有任何一列能说清旧行属于哪个市场——
-        撞号的那一行早就被覆盖掉了。所以直接丢表重建（口径已确认），
-        backtest_runs 与 settings_kv 不受影响：配置和回测历史都留着。
+        撞号的那一行早就被覆盖掉了。
+
+        旧表**改名留档**，不 DROP：对外发布之后，用户库里那份成交历史就算读不出来，
+        也不该被一次启动悄悄删掉。新表由紧随其后的 SCHEMA 建出来，backtest_runs 与
+        settings_kv 一个字节不动。
         """
         version = int(self._conn.execute("PRAGMA user_version").fetchone()[0] or 0)
         if version >= SCHEMA_VERSION:
             return
-        self._conn.executescript(
-            "DROP TABLE IF EXISTS orders;\n"
-            "DROP TABLE IF EXISTS trades;\n"
-            + "PRAGMA user_version = %d;" % SCHEMA_VERSION
-        )
+        statements = []
+        for table in ("orders", "trades"):
+            if self._table_exists(table):
+                statements.append(
+                    "ALTER TABLE %s RENAME TO %s;" % (table, self._backup_name(table))
+                )
+        statements.append("PRAGMA user_version = %d;" % SCHEMA_VERSION)
+        self._conn.executescript("\n".join(statements))
         self._conn.commit()
         log.info(
-            "数据库升级到 v%d：重建 orders / trades（旧行按约定丢弃）", SCHEMA_VERSION
+            "数据库升级到 v%d：orders / trades 重建，旧表留档为 *_v0_backup", SCHEMA_VERSION
         )
+
+    def _table_exists(self, name: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+        ).fetchone()
+        return row is not None
+
+    def _backup_name(self, table: str) -> str:
+        """给旧表找一个没被占的备份名：搬到一半断电、再来一次时不会撞名。"""
+        candidate = "%s_v0_backup" % table
+        suffix = 2
+        while self._table_exists(candidate):
+            candidate = "%s_v0_backup_%d" % (table, suffix)
+            suffix += 1
+        return candidate
 
     @contextmanager
     def cursor(self):
@@ -310,6 +331,25 @@ class Database:
     def delete_value(self, key: str) -> None:
         with self.cursor() as cur:
             cur.execute("DELETE FROM settings_kv WHERE key = ?", (key,))
+
+    def adopt_legacy_key(self, legacy: str, scoped: str) -> bool:
+        """把旧版没有作用域的 key 搬进现在按作用域命名的 key。
+
+        0.6.3 的成交账本与风控状态各只存一份（live.ledger.v1 / risk.state.v1），
+        0.6.4 起按网络分开。升级之后不搬，老用户第一眼就是「账本空了」——现货仓位
+        归零、平仓接口 400、当日额度也跟着复位。只在目标 key 不存在时搬，旧 key
+        原样留着：那是证据，也是万一 key 命名再变时的退路。
+        """
+        if self.get_value(scoped) or not self.get_value(legacy):
+            return False
+        with self.cursor() as cur:
+            cur.execute(
+                "INSERT OR IGNORE INTO settings_kv (key, value) "
+                "SELECT ?, value FROM settings_kv WHERE key = ?",
+                (scoped, legacy),
+            )
+        log.info("已把旧存储项 %s 搬到 %s", legacy, scoped)
+        return True
 
     def get_json(self, key: str) -> Any:
         raw = self.get_value(key)

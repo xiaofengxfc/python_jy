@@ -47,9 +47,15 @@ function startBackend() {
     "--watch-stdin",
   ];
 
+  // 装好的桌面版只认后端自己挑的那份数据（%APPDATA%\biTrader）。调试时常常设着
+  // BITRADER_DATA_DIR，继承下去桌面版就会去读开发目录——正是这一轮要断开的混用。
+  // 目录名由 Python 的 paths 决定，壳不复制一份。
+  const env = { ...process.env, ...(spec.env || {}) };
+  if (app.isPackaged) delete env.BITRADER_DATA_DIR;
+
   backend = spawn(spec.command, args, {
     cwd: spec.cwd,
-    env: { ...process.env, ...(spec.env || {}) },
+    env,
     stdio: ["pipe", "pipe", "pipe"],
     // This line is what keeps the black window away, and it is the only thing that
     // can: Node's spawn has no `creationflags` option at all (the option list is

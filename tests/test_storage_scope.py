@@ -15,7 +15,7 @@ from btrader.core.config import AppSettings, RiskSettings
 from btrader.core.credentials import account_id
 from btrader.core.storage import SCHEMA_VERSION, Database
 from btrader.core.types import MarketType, Network
-from btrader.engine.risk import RiskManager, risk_state_key
+from btrader.engine.risk import RiskManager, _today, risk_state_key
 from btrader.engine.trading import TradingService, ledger_key
 from btrader.exchange.klines import KlineStore
 
@@ -128,7 +128,7 @@ def test_the_history_does_not_mix_networks(tmp_path):
 
 # ------------------------------------------------------------------- 迁移
 def test_the_migration_rebuilds_the_unscoped_tables(tmp_path):
-    """v0 的库打开后自动重建：旧成交丢弃（口径已确认），配置和回测历史留着。"""
+    """v0 的库打开后自动重建：旧表改名留档，配置和回测历史留着。"""
     path = tmp_path / "old.db"
     conn = sqlite3.connect(path)
     conn.executescript(
@@ -159,6 +159,10 @@ def test_the_migration_rebuilds_the_unscoped_tables(tmp_path):
         columns = {row["name"] for row in db.query("PRAGMA table_info(trades)")}
         assert "market_type" in columns
         assert db.query("PRAGMA user_version")[0][0] == SCHEMA_VERSION
+        # 旧行没有 market_type，读不出来，但不能被一次启动悄悄删掉
+        backup = db.query("SELECT id FROM trades_v0_backup")
+        assert [row["id"] for row in backup] == ["1"]
+        assert db.query("SELECT id FROM orders_v0_backup") == []
         # 新表能正常写入，且按市场区分
         db.save_trade(
             account_id(Network.MAINNET),
@@ -205,3 +209,55 @@ def test_the_kline_cache_is_partitioned_by_source(tmp_path):
     assert "binance-testnet" in testnet_path.parts
     # 换源之后刷新时间表要清空，否则会拿旧的刷新时间当「刚刚拉过」
     assert store._refreshed == {}
+
+
+# ------------------------------------------------------- 旧版本的存储项兼容
+def test_the_legacy_ledger_key_is_adopted_on_upgrade(tmp_path):
+    """0.6.3 的账本只有一份（没有网络后缀）。升级上来要搬进当前网络，不能当没有。"""
+    db = Database(tmp_path / "upgrade.db")
+    try:
+        db.set_json("live.ledger.v1", {"seen": ["spot:1"], "books": {SPOT: {"contracts": 0.3}}})
+        ledger = _service(db, Network.TESTNET)._live_ledger()
+        assert ledger["books"][SPOT]["contracts"] == pytest.approx(0.3)
+        # 新 key 落地了，旧 key 原样留着当证据
+        assert db.get_json(ledger_key(Network.TESTNET))["books"] != {}
+        assert db.get_json("live.ledger.v1") is not None
+    finally:
+        db.close()
+
+
+def test_adopting_a_legacy_key_never_overwrites(tmp_path):
+    """新 key 已经有自己的数据时，旧 key 一个字节都不能盖上来。"""
+    db = Database(tmp_path / "conflict.db")
+    try:
+        db.set_json("live.ledger.v1", {"seen": [], "books": {SPOT: {"contracts": 9.0}}})
+        scoped = ledger_key(Network.TESTNET)
+        db.set_json(scoped, {"seen": ["usdm:2"], "books": {}})
+        assert db.adopt_legacy_key("live.ledger.v1", scoped) is False
+        assert db.get_json(scoped)["seen"] == ["usdm:2"]
+    finally:
+        db.close()
+
+
+def test_the_legacy_risk_state_is_adopted_on_upgrade(tmp_path):
+    """当日额度也要搬：不搬的话升级后限额复位，等于第一天没有熔断。"""
+    db = Database(tmp_path / "risk-upgrade.db")
+    settings = RiskSettings(max_daily_loss=100, max_consecutive_losses=1)
+    try:
+        db.set_json(
+            "risk.state.v1",
+            {
+                "day": _today(),
+                "realized_pnl": -150.0,
+                "trades": 3,
+                "consecutive_losses": 1,
+                "halted_reason": "",
+                "pnl_baseline": 0.0,
+                "trades_baseline": 0,
+            },
+        )
+        manager = RiskManager(settings, db, scope=Network.TESTNET.value)
+        assert manager.restore() is True
+        assert not manager.check_order(10, 0, 10), "旧版的当日亏损要带过来"
+    finally:
+        db.close()
