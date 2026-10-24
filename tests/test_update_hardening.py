@@ -37,6 +37,23 @@ def data_dir(monkeypatch, tmp_path):
     return tmp_path
 
 
+@pytest.fixture(autouse=True)
+def no_real_health_probe(monkeypatch):
+    """这条文件一条真请求都不许发。
+
+    以前 _heal_state 那组没打桩，_health_target 回落到 web_port()＝8765，于是
+    「提交前必须全绿」变成了「取决于你本机 8765 起没起」：8765 空着就红、开着就绿，
+    同一个提交跑两次能得出两个结论。要真请求的用例自己打桩
+    （tests/test_update_restart_confirm.py 里有一份现成的本地 HTTP 服务）。
+    """
+
+    def refuse(request, *args, **kwargs):
+        url = getattr(request, "full_url", request)
+        raise AssertionError(f"这次用例真的去请求了 {url}：健康探测要打桩，不许碰本机端口")
+
+    monkeypatch.setattr(updater.urllib.request, "urlopen", refuse)
+
+
 def _write_state(**overrides):
     state = {
         "job_id": "abc12345",
@@ -100,7 +117,11 @@ def test_a_restart_that_cannot_open_its_log_is_refused_before_anything_moves(mon
 
 
 def test_every_restart_gets_a_log_file_of_its_own(monkeypatch, data_dir):
-    """每次重启一个唯一的日志文件：共用的那个正被当前进程写着，Windows 锁成只读。"""
+    """每次重启一个唯一的日志文件：共用的那个正被当前进程写着，Windows 锁成只读。
+
+    文件名由父进程挑、写进去由垫片自己干（它 open 'a' 再 dup2 到 1/2），
+    父进程的 stdout / stderr 一起给 DEVNULL——共享同一个句柄会把老进程那句话写花。
+    """
     popen = _Popen()
     monkeypatch.setattr(updater.subprocess, "Popen", popen)
     answers = iter([True, True, True, True])
@@ -109,18 +130,17 @@ def test_every_restart_gets_a_log_file_of_its_own(monkeypatch, data_dir):
     first = updater._restart_windows()
     second = updater._restart_windows()
     assert first[0] is True and second[0] is True
-    paths = [call[1]["stdout"].name for call in popen.calls]
+    paths = [next(str(a) for a in args if str(a).endswith(".log")) for args, _ in popen.calls]
     assert len(set(paths)) == 2, paths
     for path in paths:
-        assert path.endswith(".log")
         assert ".run_out.log" not in path
         assert os.path.exists(path)
-    # 子进程的 stdout / stderr 都指向那个日志，不再有 DEVNULL。
+    # 垫片自己开那份日志：父进程一个句柄都不递（两个句柄共享文件位置会把彼此写花）。
     for args, kwargs in popen.calls:
-        assert kwargs.get("stderr") == subprocess.STDOUT
-        assert kwargs.get("stdout") is not subprocess.DEVNULL
+        assert kwargs.get("stdout") is subprocess.DEVNULL
+        assert kwargs.get("stderr") is subprocess.DEVNULL
         assert kwargs.get("shell") in (None, False)
-        assert str(kwargs["stdout"].name) in args  # 垫片也知道自己该往哪儿写
+        assert next(str(a) for a in args if str(a).endswith(".log")) in args
 
 
 def test_a_new_process_that_never_listens_is_a_failure_with_the_log_and_the_manual_command(
@@ -320,14 +340,26 @@ def test_another_live_process_cannot_finish_a_job(monkeypatch):
 
 
 def test_the_restart_is_finished_only_when_the_recorded_pid_is_gone(monkeypatch):
+    """记下的那个 pid 没了 → 新进程自己确认一次。地址与健康检查都归这条用例自己管。"""
     _write_state(
         state=updater.STATE_RUNNING,
         restart_pending=True,
         pid=4242,
+        host="127.0.0.1",
+        port=8792,  # 自己的端口：以前这里没写 port，就回落到本机 8765 真发了一次请求
         steps=[{"name": "git fetch --all --prune", "ok": True, "output": "", "seconds": 0.1}],
     )
     monkeypatch.setattr(updater, "_pid_alive", lambda pid: False)
+    monkeypatch.setattr(updater, "_port_free", lambda port=None, host=None: False)
+    seen: list[tuple[Any, Any]] = []
+
+    def healthy(host=None, port=None):
+        seen.append((host, port))
+        return True, f"http://{host}:{port}/api/health 回了 200"
+
+    monkeypatch.setattr(updater, "_health_ok", healthy)
     state = updater.read_state()
+    assert seen == [("127.0.0.1", 8792)], seen  # 确认的是状态里那个地址，不是本机默认的 8765
     assert state["state"] == updater.STATE_DONE
     assert state["steps"][-1]["name"] == updater.STEP_RESTART
     assert state["restart_pending"] is False
@@ -397,14 +429,18 @@ def test_without_a_real_port_it_falls_back_to_8765_and_says_so(monkeypatch):
     monkeypatch.setattr(updater, "_wait_until", lambda fn, timeout, poll=0.0: True)
     ok, output = updater._restart_windows()
     assert ok is True
-    assert "8765" in popen.calls[0][0]
+    # 「兜底就是 8765」这条口径单独钉在常量上；这里比的是「兜底值真被用了」，
+    # 免得整条用例跟着本机起没起 8765 变红。
+    assert updater.WEB_PORT == 8765
+    assert str(updater.WEB_PORT) in popen.calls[0][0]
     assert "兜底" in output
 
 
 def test_set_web_port_ignores_nonsense(monkeypatch):
+    assert updater.WEB_PORT == 8765  # 兜底值本身
     for value in (None, "", "abc", 0, -1, 70000, object()):
         updater.set_web_port(value)
-        assert updater.web_port() == 8765
+        assert updater.web_port() == updater.WEB_PORT
         assert updater.web_port_known() is False
     updater.set_web_port("8799")
     assert updater.web_port() == 8799
@@ -513,11 +549,36 @@ def test_git_and_pip_are_spawned_without_a_console(monkeypatch, tmp_path):
 
 
 def test_the_shim_spawns_run_web_without_a_console():
-    """垫片只用标准库、不能 import btrader，所以那里写的是数字——旁边得注明是哪两个常量。"""
-    assert "0x08000200" in updater._WINDOWS_SHIM
+    """垫片只用标准库、不能 import btrader，所以那段数字只能写死在源码里。
+
+    断言的是**数值**，不是注释里的常量名：以前这里查的是 "CREATE_NO_WINDOW" in 源码，
+    命中的是旁边那行注释，常量名改了、数值写错了它照样绿。
+    """
+    flags = hex(updater.WINDOWS_HIDDEN)
+    assert flags in updater._WINDOWS_SHIM
+    assert f"creationflags={flags})" in updater._WINDOWS_SHIM  # 真的接在 Popen 的参数上
     assert "0x00000008" not in updater._WINDOWS_SHIM
+    assert "0x00000008" != flags
+    # 注释留着：看代码的人得知道这个数是什么，但注释不是来源。
     assert "CREATE_NO_WINDOW" in updater._WINDOWS_SHIM
     assert "CREATE_NEW_PROCESS_GROUP" in updater._WINDOWS_SHIM
+
+
+def test_the_shim_flags_come_from_the_constants(monkeypatch):
+    """垫子源码由常量拼出来：常量一改，垫片跟着变（不许是两份来源）。"""
+    original = updater._windows_shim()
+    monkeypatch.setattr(updater, "WINDOWS_HIDDEN", 0x04000200)
+    changed = updater._windows_shim()
+    assert hex(0x04000200) in changed
+    assert hex(updater.CREATE_NO_WINDOW | updater.CREATE_NEW_PROCESS_GROUP) not in changed
+    assert changed != original
+    compile(changed, "<shim>", "exec")  # 拼出来的还是能跑的代码
+
+
+def test_the_shim_source_is_built_from_a_function():
+    """生成逻辑抽成函数才测得了「常量变了字符串跟着变」。"""
+    assert callable(updater._windows_shim)
+    assert updater._windows_shim() == updater._WINDOWS_SHIM
 
 
 @_WIN_ONLY
@@ -534,3 +595,57 @@ def test_the_outer_shim_process_is_spawned_hidden(monkeypatch, data_dir):
     assert kwargs["creationflags"] & 0x00000008 == 0
     info = kwargs["startupinfo"]
     assert info is not None and info.wShowWindow == updater.SW_HIDE
+
+
+# ------------------------------- t108-② 重启日志别再被两个句柄互相写花
+def test_the_shim_opens_the_log_by_itself_and_takes_over_stdout_stderr():
+    """父进程把 open(path,'ab') 的句柄当 stdout 递过去、自己又另开一个追加句柄，
+    两个句柄共享同一个文件位置——老进程那句「重启已经交给垫片（pid …）」就被垫片的
+    输出盖掉一半（量测三轮都复现）。现在垫片自己 open 'a' 再 dup2 到 1/2，各写各的。"""
+    shim = updater._WINDOWS_SHIM
+    assert "os.dup2(_log.fileno(), 1)" in shim
+    assert "os.dup2(_log.fileno(), 2)" in shim
+    assert "open(log_path" in shim
+    assert "sys.stdout = sys.stderr = _log" in shim
+    compile(shim, "<shim>", "exec")  # 垫片是被 -c 直接跑的，语法坏了整条重启就没了
+
+
+def test_the_parent_hands_the_shim_no_shared_log_handle(monkeypatch, data_dir):
+    """stdout / stderr 都给 DEVNULL，日志路径只当参数传过去。"""
+    popen = _Popen(pid=555)
+    monkeypatch.setattr(updater.subprocess, "Popen", popen)
+    monkeypatch.setattr(updater, "_request_shutdown", lambda *a, **k: None)
+    monkeypatch.setattr(updater, "_wait_until", lambda fn, timeout, poll=0.0: True)
+    ok, output = updater._restart_windows()
+    assert ok is True and "555" in output  # 垫片没起来（Popen 抛 OSError）仍然要报失败
+    args, kwargs = popen.calls[0]
+    assert kwargs["stdout"] is subprocess.DEVNULL
+    assert kwargs["stderr"] is subprocess.DEVNULL
+    assert str(updater._last_restart_log) in args
+    # 父进程自己那几行照旧追加进去：它的句柄跟垫片的不是同一个。
+    text = updater._last_restart_log.read_text(encoding="utf-8")
+    assert "重启已经交给垫片" in text
+
+
+def test_a_shim_that_cannot_be_started_is_still_a_failure(monkeypatch, data_dir):
+    """父进程不再握着日志句柄之后，「垫片根本没起来」这条别丢。"""
+
+    def refuse(args, **kwargs):
+        raise OSError("系统找不到指定的文件")
+
+    monkeypatch.setattr(updater.subprocess, "Popen", refuse)
+    monkeypatch.setattr(updater, "_request_shutdown", lambda *a, **k: None)
+    ok, output = updater._restart_windows()
+    assert ok is False
+    assert "拉新进程失败" in output
+    assert "日志" in output
+
+
+# ------------------------------- t108-③ 垫片报的 pid 是转发器，不是真正监听的那个
+def test_the_shim_does_not_pretend_it_knows_the_listening_pid():
+    """venv 的 python.exe 是个转发器，会再拉一层：Popen 拿到的 pid 不是监听的那个
+    （uvicorn 自己打的是另一个）。改文案，别编数字。"""
+    shim = updater._WINDOWS_SHIM
+    assert "转发器" in shim
+    assert "uvicorn" in shim
+    assert "child.pid" in shim, "pid 还是 Popen 给的那个，不许假装能拿到真 pid"

@@ -244,7 +244,9 @@ def test_a_failure_after_we_asked_ourselves_to_exit_goes_into_the_log(monkeypatc
     ok, output = updater.restart_service()
     assert ok is False
     assert "run_web.py" in output  # 手动命令
-    log_path = Path(popen.calls[0][1]["stdout"].name)
+    # 日志路径现在只当参数传给垫片（它自己 open 一份），父进程的 stdout 是 DEVNULL。
+    assert popen.calls[0][1]["stdout"] is subprocess.DEVNULL
+    log_path = Path(updater._last_restart_log)
     assert log_path.exists()
     text = log_path.read_text(encoding="utf-8")
     assert "run_web.py" in text, text

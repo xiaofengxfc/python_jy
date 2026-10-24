@@ -7,6 +7,7 @@ PATCH 发布，传崩了就停在 draft，用户看不到；任何一句打印�
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 from pathlib import Path
 
@@ -502,11 +503,82 @@ def test_off_windows_the_git_calls_carry_no_flags(box, monkeypatch):
     assert seen[0][1]["creationflags"] == 0
 
 
-def test_git_is_the_only_thing_that_spawns_a_process():
-    """再有人加一条 subprocess.run，它就得自己记得藏窗口——所以钉住只有一条。"""
+SPAWN_ATTRS = ("run", "Popen", "call", "check_call", "check_output")
+
+
+def _spawn_calls(source: str) -> list[ast.Call]:
+    """走一遍语法树，挑出真正起子进程的调用（subprocess.run / Popen / …）。
+
+    不数字符串：注释和文档字符串里提到那个写法不算调用，换个写法（`import subprocess as sp`、
+    `from subprocess import run`）也不能漏。
+    """
+    tree = ast.parse(source)
+    modules = set()      # import subprocess / import subprocess as sp
+    direct = set()       # from subprocess import run
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "subprocess":
+                    modules.add(alias.asname or "subprocess")
+        elif isinstance(node, ast.ImportFrom) and node.module == "subprocess":
+            for alias in node.names:
+                if alias.name in SPAWN_ATTRS:
+                    direct.add(alias.asname or alias.name)
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id in modules
+            and func.attr in SPAWN_ATTRS
+        ):
+            found.append(node)
+        elif isinstance(func, ast.Name) and func.id in direct:
+            found.append(node)
+    return found
+
+
+def _windowless_problems(source: str) -> list[str]:
+    """起子进程的调用该长什么样：带 creationflags（Windows 那条），不开 shell。"""
+    problems = []
+    for call in _spawn_calls(source):
+        keywords = {keyword.arg for keyword in call.keywords}
+        shown = ast.unparse(call).replace("\n", " ")
+        if "creationflags" not in keywords:
+            problems.append("没带 creationflags：" + shown)
+        if "shell" in keywords:
+            problems.append("开了 shell：" + shown)
+    return problems
+
+
+def test_every_process_release_py_starts_is_windowless():
+    """以后谁在这个脚本里再起一条子进程，它也得自己记得藏窗口。"""
     source = SCRIPT.read_text(encoding="utf-8")
-    assert source.count("subprocess.run(") == 1
-    assert "creationflags=" in source
+    calls = _spawn_calls(source)
+    assert calls, "一条起子进程的调用都没找到，这条检查就成了空的（脚本至少要跑 git）"
+    assert _windowless_problems(source) == []
+
+
+def test_the_windowless_check_is_not_fooled():
+    """这条替上面那条做体检：提到不算调用、换个写法要认得、漏了 flags 要报。"""
+    mention = '# 顺手写下 subprocess.run( 这三个字，这一行并没有调用。\n'
+    assert _spawn_calls(mention) == []
+
+    aliased = "import subprocess as sp\nsp.run(['git', 'status'])\n"
+    assert len(_spawn_calls(aliased)) == 1
+
+    real = SCRIPT.read_text(encoding="utf-8")
+    sneaky = real.replace(
+        "def _git_step",
+        "def _sneaky():\n    subprocess.run(['git'])\n\n\ndef _git_step",
+        1,
+    )
+    problems = _windowless_problems(sneaky)
+    assert len(problems) == 1
+    assert "creationflags" in problems[0]
 
 # ---------------------------------------------------------------- 文档别和脚本对不上
 
@@ -515,9 +587,15 @@ RELEASE_DOC = ROOT / "docs" / "RELEASE.md"
 
 def test_the_release_doc_says_the_things_people_get_wrong():
     text = RELEASE_DOC.read_text(encoding="utf-8")
-    # t105：biTrader-backend.exe 是给壳用的 console 程序，双击必开黑窗口
+    # biTrader-backend.exe 是给壳用的 console 程序，双击必开黑窗口；壳那条 spawn 靠的是
+    # windowsHide（libuv 据此置 CREATE_NO_WINDOW），不是 Node 的 creationflags
     assert "不要直接双击" in text
-    assert "CREATE_NO_WINDOW" in text
+    assert "windowsHide" in text
+    assert "creationflags" in text          # 说的是「Node 的 spawn 没有这个选项」
+    assert "壳子拉它的时候用" not in text    # 老写法：点名一个不存在的选项
+    # pythonw 没有 stdio，光说「用 pythonw 起」等于把人指到一个没有日志的地方
+    assert "logs\\bitrader.log" in text
+    assert "python.exe run_web.py" in text
     # 三处版本号、权限、安装包不进仓库、桌面端必须传 exe、服务器版不看 Release
     for needle in (
         "pyproject.toml",

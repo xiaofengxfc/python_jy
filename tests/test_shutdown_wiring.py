@@ -156,3 +156,99 @@ def test_run_web_no_longer_calls_uvicorn_run_directly():
     main_text = (ROOT / "src" / "btrader" / "web" / "__main__.py").read_text(encoding="utf-8")
     assert "def build_server(" in main_text
     assert "def serve(" in main_text
+
+
+# ---------------------------------------------- t108-① pythonw 下也得有日志
+def test_run_web_wires_logging_up_like_the_other_launch_path():
+    """run_web.py 以前一次都没调过 setup_logging：pythonw 起来的服务等于把日志整个丢掉。
+
+    顺序也要钉住——先兜住 stdio（pythonw 下它是 None），再配日志，最后才装配 Server。
+    """
+    text = (ROOT / "run_web.py").read_text(encoding="utf-8")
+    assert "_ensure_stdio()" in text
+    assert "setup_logging(" in text
+    assert "console_stream=sys.stderr" in text
+    assert text.index("_ensure_stdio()") < text.index("setup_logging(")
+    assert text.index("setup_logging(") < text.index("build_server(")
+
+
+def test_ensure_stdio_gives_pythonw_somewhere_to_write(monkeypatch, tmp_path):
+    """pythonw 是 GUI 子系统的解释器：不重定向时 sys.stdout / sys.stderr 都是 None。"""
+    monkeypatch.setenv("BITRADER_DATA_DIR", str(tmp_path))
+    run_web = _load_run_web()
+    monkeypatch.setattr(sys, "stdout", None)
+    monkeypatch.setattr(sys, "stderr", None)
+    run_web._ensure_stdio()
+    assert sys.stdout is not None and sys.stderr is not None
+    assert sys.stdout is sys.stderr, "两个都缺就都指向同一个文件"
+    sys.stdout.write("pythonw 也得有地方写日志\n")
+    sys.stdout.flush()
+    log = tmp_path / "logs" / "console.log"
+    assert log.exists(), "没有落到 <数据目录>/logs/console.log"
+    assert "pythonw 也得有地方写日志" in log.read_text(encoding="utf-8")
+    assert not sys.stdout.closed
+
+
+def test_ensure_stdio_keeps_a_stream_that_still_works(monkeypatch, tmp_path):
+    """只缺一个就只补那一个：能写的那条流不许被换掉。"""
+    monkeypatch.setenv("BITRADER_DATA_DIR", str(tmp_path))
+    run_web = _load_run_web()
+    real_out = sys.stdout
+    monkeypatch.setattr(sys, "stderr", None)
+    run_web._ensure_stdio()
+    assert sys.stdout is real_out
+    assert sys.stderr is not None and sys.stderr is not real_out
+    assert (tmp_path / "logs" / "console.log").exists()
+
+
+def test_ensure_stdio_touches_nothing_when_both_streams_work(monkeypatch, tmp_path):
+    """正常终端里起服务不该多出一个 console.log。"""
+    monkeypatch.setenv("BITRADER_DATA_DIR", str(tmp_path))
+    run_web = _load_run_web()
+    real_out, real_err = sys.stdout, sys.stderr
+    run_web._ensure_stdio()
+    assert sys.stdout is real_out and sys.stderr is real_err
+    assert not (tmp_path / "logs" / "console.log").exists()
+
+
+def test_the_uvicorn_loggers_hand_their_lines_to_the_root_handler():
+    """pythonw / 桌面壳没有控制台：uvicorn 自己挂一个 propagate=False 的 stderr 处理器，
+    那几行「Started server process / Uvicorn running」就写到 None 上，日志里一个字都没有。"""
+    loggers = web_main.LOG_CONFIG["loggers"]
+    assert loggers["uvicorn"]["propagate"] is True
+    assert not loggers["uvicorn"].get("handlers")
+    assert loggers["uvicorn.error"]["propagate"] is True
+
+
+def test_a_uvicorn_startup_line_lands_in_bitrader_log(monkeypatch, tmp_path):
+    """按进程里真实的那套配置走一遍：dictConfig 之后 uvicorn 的行要进 bitrader.log。"""
+    import io
+    import logging.config
+
+    from btrader import logging_setup
+
+    monkeypatch.setenv("BITRADER_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(logging_setup, "_CONFIGURED", False)
+    root = logging.getLogger()
+    saved_handlers = list(root.handlers)
+    saved_hook = sys.excepthook
+    try:
+        logging_setup.setup_logging(logging.INFO, console_stream=io.StringIO())
+        logging.config.dictConfig(web_main.LOG_CONFIG)
+        logging.getLogger("uvicorn.error").info("Uvicorn running on http://127.0.0.1:8799")
+        for handler in root.handlers:
+            handler.flush()
+        text = (tmp_path / "logs" / "bitrader.log").read_text(encoding="utf-8")
+        assert "Uvicorn running on http://127.0.0.1:8799" in text, text
+    finally:
+        sys.excepthook = saved_hook
+        for handler in root.handlers:
+            if handler not in saved_handlers:
+                handler.close()
+        root.handlers[:] = saved_handlers
+
+
+def test_ensure_stdio_happens_before_the_logging_setup(monkeypatch, tmp_path):
+    """兜住 stdio 必须排在 setup_logging 之前：不然后者会把 None 当控制台流装上去。"""
+    text = (ROOT / "run_web.py").read_text(encoding="utf-8")
+    assert text.index("_ensure_stdio()") < text.index("setup_logging(")

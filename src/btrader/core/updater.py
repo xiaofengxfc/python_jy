@@ -1602,46 +1602,69 @@ def _request_shutdown() -> None:
 
 # 等端口释放、拉起新进程的小垫片。只用标准库、不 import btrader，能被 -c 直接跑。
 #
-# 它自己不打开任何文件：日志由父进程开好、用每次唯一的文件名传进来当 stdout/stderr，
-# 往 stdout 说话就是往日志里说话。以前垫片自己 open(<仓库>/.run_out.log)，那个文件正被
-# 活着的进程写着（Windows 上锁成只读），open 抛 PermissionError → exit 1；父进程又把它的
-# stderr 指到 DEVNULL、也没人看退出码，于是「垫片死了」被当成「重启成功」，服务就这么停死了。
-_WINDOWS_SHIM = "\n".join(
-    [
-        "import socket, subprocess, sys, time",
-        "port, repo, py = int(sys.argv[1]), sys.argv[2], sys.argv[3]",
-        "log_path, host = sys.argv[4], sys.argv[5]",
-        "probe_host = '127.0.0.1' if host in ('', '0.0.0.0', '::', '*') else host",
-        "def say(msg):",
-        "    print(time.strftime('%Y-%m-%d %H:%M:%S ') + msg, flush=True)",
-        "say('垫片起来，日志 ' + log_path + '，等 ' + probe_host + ':%d 放开端口' % port)",
-        f"deadline = time.time() + {LISTEN_TIMEOUT:.0f}",
-        "while time.time() < deadline:",
-        "    probe = socket.socket()",
-        "    probe.settimeout(0.3)",
-        "    try:",
-        "        busy = probe.connect_ex((probe_host, port)) == 0",
-        "    finally:",
-        "        probe.close()",
-        "    if not busy:",
-        "        break",
-        "    time.sleep(0.2)",
-        "else:",
-        f"    say('{LISTEN_TIMEOUT:.0f} 秒里端口一直没放开，放弃拉起新进程')",
-        "    sys.exit(2)",
-        "try:",
-        "    child = subprocess.Popen([py, 'run_web.py', '--host', host, '--port', str(port)],",
-        "                             cwd=repo, stdin=subprocess.DEVNULL, stdout=sys.stdout,",
-        "                             stderr=subprocess.STDOUT, close_fds=True,",
-        "                             # 0x08000200 = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP（垫片不能 import btrader，所以写数字）",
-        "                             creationflags=0x08000200)",
-        "except OSError as exc:",
-        "    say('拉新进程失败：%r' % (exc,))",
-        "    sys.exit(3)",
-        "say(('新进程 pid {0} 已拉起（run_web.py --host ' + host + ' --port {1}）').format(child.pid, port))",
-        "",
-    ]
+# 日志由**垫片自己开**（open(log_path, 'a') 再 dup2 到 1/2）。以前是父进程把手里的
+# open(path,'ab') 递过来当 stdout，自己又另开一个追加句柄写它那几行——两个句柄共享同一个
+# 文件位置，于是老进程那句「重启已经交给垫片（pid …）」被垫片的输出盖掉一半（量测三轮都复现）。
+# 各开各的句柄 + O_APPEND 之后，两边都是整行追加，谁也不踩谁。
+#
+# 文件名仍由父进程挑（每次唯一）、开不出来当场失败：垫片自己 open(<仓库>/.run_out.log) 那套
+# 早就删了——那个文件正被活着的进程写着，Windows 上锁成只读，open 抛 PermissionError。
+def _windows_shim() -> str:
+    """垫片源码：现拼一份，数值一律从常量来。
+
+    垫片是被 -c 直接跑的，不能 import btrader，所以那段十六进制数字只能写死在源码里——
+    但它不该是**第二份**来源：以前这里是字面量 0x08000200，常量改了垫片不跟着改，
+    测试断言的 CREATE_NO_WINDOW 命中的还是注释文字、不是数值。现在由 hex(WINDOWS_HIDDEN) 拼。
+    """
+    flags = hex(WINDOWS_HIDDEN)
+    return "\n".join(
+        [
+            "import os, socket, subprocess, sys, time",
+            "port, repo, py = int(sys.argv[1]), sys.argv[2], sys.argv[3]",
+            "log_path, host = sys.argv[4], sys.argv[5]",
+            "try:",
+            "    _log = open(log_path, 'a', buffering=1, encoding='utf-8', errors='replace')",
+            "except OSError:",
+            "    sys.exit(4)",
+            "os.dup2(_log.fileno(), 1)",
+            "os.dup2(_log.fileno(), 2)",
+            "sys.stdout = sys.stderr = _log",
+            "probe_host = '127.0.0.1' if host in ('', '0.0.0.0', '::', '*') else host",
+            "def say(msg):",
+            "    print(time.strftime('%Y-%m-%d %H:%M:%S ') + msg, flush=True)",
+            "say('垫片起来，日志 ' + log_path + '，等 ' + probe_host + ':%d 放开端口' % port)",
+            f"deadline = time.time() + {LISTEN_TIMEOUT:.0f}",
+            "while time.time() < deadline:",
+            "    probe = socket.socket()",
+            "    probe.settimeout(0.3)",
+            "    try:",
+            "        busy = probe.connect_ex((probe_host, port)) == 0",
+            "    finally:",
+            "        probe.close()",
+            "    if not busy:",
+            "        break",
+            "    time.sleep(0.2)",
+            "else:",
+            f"    say('{LISTEN_TIMEOUT:.0f} 秒里端口一直没放开，放弃拉起新进程')",
+            "    sys.exit(2)",
+            "try:",
+            "    child = subprocess.Popen([py, 'run_web.py', '--host', host, '--port', str(port)],",
+            "                             cwd=repo, stdin=subprocess.DEVNULL, stdout=sys.stdout,",
+            "                             stderr=subprocess.STDOUT, close_fds=True,",
+            f"                             # {flags} = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP（垫片不能 import btrader，所以写数字）",
+            f"                             creationflags={flags})",
+            "except OSError as exc:",
+            "    say('拉新进程失败：%r' % (exc,))",
+            "    sys.exit(3)",
+            "say(('垫片已拉起 run_web.py（pid {0} 是转发器进程，真正监听的那个 pid 看下面 uvicorn 那行）：--host ' + host + ' --port {1}').format(child.pid, port))",
+            "",
+        ]
 )
+
+
+
+# 模块级那一份给 _restart_windows 和测试直接用；要「常量改了跟着变」就走 _windows_shim()。
+_WINDOWS_SHIM = _windows_shim()
 
 
 def _restart_log_path() -> Path:
@@ -1780,7 +1803,8 @@ def _restart_windows() -> tuple[bool, str]:
     拉起之后没确认就当成功。现在：
 
     1. 每次一个唯一日志文件，开不出来当场失败，什么都不动；
-    2. 垫片的 stdout / stderr 都指向那份日志，它说了什么都在里面；
+    2. 日志由垫片自己打开（open 'a' + dup2 到 1/2），父进程的 stdout / stderr 给 DEVNULL：
+       两个句柄共享同一个文件位置会把彼此的行写花，各开各的 + O_APPEND 才不会；
     3. 地址与端口都是真的（--host 0.0.0.0 / 8799 的实例不会被拉成 127.0.0.1:8765）。
     """
     global _last_restart_log
@@ -1795,6 +1819,8 @@ def _restart_windows() -> tuple[bool, str]:
             f"重启没做成：这次的日志开不出来（{log_path}：{exc}）。"
             "什么都没动，服务还在这个进程里跑着。"
         )
+    # 这个句柄只用来确认「这个路径写得进去」，不递给垫片：垫片自己 open 一份。
+    handle.close()
     _last_restart_log = log_path
     shim = [
         sys.executable,
@@ -1811,23 +1837,21 @@ def _restart_windows() -> tuple[bool, str]:
             shim,
             cwd=str(root),
             stdin=subprocess.DEVNULL,
-            stdout=handle,
-            stderr=subprocess.STDOUT,
+            # 垫片自己把 log_path 接成 stdout/stderr。这里给 DEVNULL 是有意的：
+            # 父进程把自己的句柄递过去，两个句柄共享同一个文件位置，父进程随后追加的
+            # 那句「重启已经交给垫片（pid …）」就会被垫片的输出覆盖掉一半。
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             # 垫片自己也不许弹窗：它是个普通 python 进程，一样会被塞一个控制台。
             creationflags=WINDOWS_HIDDEN,
             startupinfo=_hidden_startupinfo(),
             close_fds=True,
         )
     except OSError as exc:
-        handle.close()
         detail = f"拉新进程失败：{exc}（日志 {log_path}）"
         _append_restart_log(log_path, detail, who="老进程")
         return False, detail
     pid = getattr(proc, "pid", "?")
-    try:
-        handle.close()  # 子进程手里有自己的那一份
-    except OSError:
-        pass
     _request_shutdown()
     # 只等一件事：本进程把端口放开（顺序不能反，垫片正等在这儿）。等服务真起来是
     # 新进程的事——它读状态时自己打 /api/health，2xx 才把这次更新收成 done。

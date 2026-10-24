@@ -37,8 +37,15 @@ READY_PREFIX = "BITRADER_READY "
 GRACEFUL_TIMEOUT = 30
 log = logging.getLogger(__name__)
 
-# uvicorn writes its banner and access log to stdout by default, which would
-# interleave with the handshake line. Send it to stderr instead.
+# uvicorn 的日志走 root 的处理器，不自己挂一个非传播的 StreamHandler。
+#
+# 两条原因：
+#   1. root 上挂着 <数据目录>/logs/bitrader.log 那份文件处理器——uvicorn 的
+#      「Started server process / Uvicorn running / 异常」必须落进文件。以前它自己带
+#      一个 stderr 处理器且 propagate=False，于是 pythonw / 桌面壳这类没有控制台的
+#      进程里，这些行写到 None 上，日志里一个字都没有（量测就是这么发现的）；
+#   2. 控制台流由 setup_logging 统一指向 stderr，不会和 stdout 上的
+#      BITRADER_READY 握手行搅在一起。
 LOG_CONFIG = {
     "version": 1,
     "disable_existing_loggers": False,
@@ -67,8 +74,10 @@ LOG_CONFIG = {
         },
     },
     "loggers": {
-        "uvicorn": {"handlers": ["default"], "level": "INFO", "propagate": False},
-        "uvicorn.error": {"level": "INFO"},
+        # 交给 root：文件日志（bitrader.log）与控制台是同一套出口，
+        # 无控制台的进程里才留得下 uvicorn 的启动行。
+        "uvicorn": {"handlers": [], "propagate": True},
+        "uvicorn.error": {"propagate": True},
         "uvicorn.access": {
             "handlers": ["access"],
             "level": "WARNING",

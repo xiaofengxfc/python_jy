@@ -24,6 +24,7 @@ Start-Process -FilePath ".venv\Scripts\pythonw.exe" `
 
 用 `pythonw.exe` 而不是 `python.exe`：pythonw 是 GUI 子系统的解释器，压根不申请控制台，屏幕上不会出现终端窗口。
 `-WindowStyle Hidden` 只藏住 PowerShell 拉起的那个进程自己的窗口，管不到子进程的控制台——以前用 python.exe，启动时就会闪一个黑框。
+代价是没有控制台就没有 stdio：`sys.stdout` / `sys.stderr` 都是 `None`，所以 `run_web.py` 自己调 `setup_logging` 并把 console 输出兜到 `<数据目录>/logs/console.log`，日志看 `<数据目录>/logs/bitrader.log`（不是终端）。
 
 Node 不在 PATH 时，先把 Node 目录加进去。
 
@@ -499,3 +500,6 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   `GITHUB_TOKEN`，没有就 `git credential fill`，**任何情况下不进日志**。桌面端靠 Release 判断有没有
   新版，所以每次发版**必须把安装包传上去**；Linux 服务器版按提交 SHA 比，不发 Release 也能更新。
   安装包 140+ MB，不进仓库（`dist-electron/` 在 `.gitignore` 里）。细节见 `docs/RELEASE.md`。
+- 任何子进程都不许在桌面上开控制台窗口（t96 起）。Windows 上一条铁律：**`DETACHED_PROCESS` 不等于无窗口**——它只是不继承父进程的控制台，console 子进程照样会拿到自己的控制台（实测 `GetConsoleWindow()` 非 0，量测也是这样看到黑框的）。要真正无窗口只有 `CREATE_NO_WINDOW`（0x08000000）。所以：`updater._no_window()` 统一给 `git` / `pip` / 重启垫片两层用；垫片里起 `run_web.py` 是 `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`，数值由常量 `hex()` 拼进垫片源码，别写死两份；`electron/main.cjs` 靠 `windowsHide: true`（libuv 自己置 `CREATE_NO_WINDOW`，Node 的 spawn **没有** `creationflags` 这个选项，写了也不生效）；开发机用 `pythonw.exe` 起服务。
+  加新的起进程点时照这个来，并在真机上验「可见控制台窗口前后差集为空」——只数 `conhost` 或 `ConsoleWindowClass` 会假阴性（Windows 11 的终端宿主是 `CASCADIA_HOSTING_WINDOW_CLASS`）。
+  记住代价：`.venv\Scripts\pythonw.exe` 是 GUI 子系统，没有控制台，`biTrader-backend.exe` 仍是 console 子系统（双击它必开黑窗，只给壳用）。

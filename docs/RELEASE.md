@@ -36,8 +36,14 @@ npm run dist
 `.gitignore` 里——**安装包不进仓库**，它只挂在 GitHub Release 上。
 
 顺带说一句 `dist\biTrader-backend\biTrader-backend.exe`：它是给 Electron 壳用的，console 子系统的
-程序，壳子拉它的时候用 `CREATE_NO_WINDOW` 把控制台窗口藏起来。**不要直接双击**——双击就是开一个
-黑窗口，窗口关掉服务就没了。要手动起后端看日志，照 AGENTS.md 第 1 节用 `pythonw.exe run_web.py`。
+程序。壳那边起它只给了 `windowsHide: true` —— libuv 自己据此置上 `CREATE_NO_WINDOW`，窗口压根
+不会出现。（Node 的 `spawn` 没有 `creationflags` 这个选项，照 Windows API 那套写上去并不生效。）
+
+**不要直接双击它**——双击就是开一个黑窗口，窗口关掉服务就没了。要手动起后端：在已经开着的终端里跑
+`python.exe run_web.py`，日志直接打在终端里（别用 `Start-Process -WindowStyle Hidden` 隐身拉起，
+那样仍会闪一个黑框）；用 `pythonw.exe run_web.py` 起的话没有 stdio，日志去
+`<数据目录>\logs\bitrader.log` 看（`run_web.py` 自己 `setup_logging`，终端那点输出兜到
+`<数据目录>\logs\console.log`）。
 
 ## 3. 发版
 

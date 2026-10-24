@@ -15,13 +15,6 @@ const fs = require("node:fs");
 const READY_PREFIX = "BITRADER_READY ";
 const DEV_URL = process.env.BITRADER_DEV_URL || "";
 
-// CREATE_NO_WINDOW (win32). Node's `windowsHide: true` already maps onto this, but
-// say it outright instead of relying on that: the backend exe is built with
-// console=True, so it is a console-subsystem program, and the parent here is an
-// Electron GUI process with no console attached. Without the flag Windows allocates
-// a brand-new console for the child, i.e. a black window flashes on screen.
-const CREATE_NO_WINDOW = 0x08000000;
-
 let win = null;
 let backend = null;
 /** Set once the backend handshake arrives; cleared on exit. */
@@ -58,11 +51,15 @@ function startBackend() {
     cwd: spec.cwd,
     env: { ...process.env, ...(spec.env || {}) },
     stdio: ["pipe", "pipe", "pipe"],
-    windowsHide: true,
-    // The child is a console program and we own no console: pass the flag explicitly
-    // so Windows never opens one for it. Non-Windows has no such flag, 0 means "none".
+    // This line is what keeps the black window away, and it is the only thing that
+    // can: Node's spawn has no `creationflags` option at all (the option list is
+    // windowsHide / detached / windowsVerbatimArguments, and an unknown key is
+    // silently ignored). `windowsHide: true` is the switch — libuv turns it into
+    // CREATE_NO_WINDOW when it creates the process. Without it Windows gives the
+    // child a console of its own, because the backend exe is built with console=True
+    // (console subsystem) and this Electron GUI process has no console to inherit.
     // Deliberately not `detached`: the backend must die with the window.
-    creationflags: process.platform === "win32" ? CREATE_NO_WINDOW : 0,
+    windowsHide: true,
   });
 
   return new Promise((resolve, reject) => {
