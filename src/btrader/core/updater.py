@@ -1045,6 +1045,23 @@ def _confirm_restart(state: dict[str, Any]) -> tuple[bool, str]:
     return _health_ok(host, port)
 
 
+def _merge_restart_step(steps: list[dict[str, Any]], output: str) -> None:
+    """把「重启服务」这一步收成一条，别出现两个。
+
+    老进程那次 systemctl 交出去之后已经记过一条；新进程确认重启时再 append 一份，
+    界面上就是两个「重启服务」（服务器上真跑一次 apply 撞出来的）。已经有就补一句，
+    没有才新增——判据只看最后一步的名字，顺序就是执行顺序。
+    """
+    if steps and isinstance(steps[-1], dict) and steps[-1].get("name") == STEP_RESTART:
+        steps[-1] = {
+            **steps[-1],
+            "ok": True,
+            "output": f"{steps[-1].get('output') or ''}{output}",
+        }
+        return
+    steps.append({"name": STEP_RESTART, "ok": True, "output": output, "seconds": 0.0})
+
+
 def _heal_state(state: dict[str, Any]) -> dict[str, Any]:
     """把盘上那条 running 收个尾。两种结局，判据都只认「记下的那个 pid」。
 
@@ -1090,16 +1107,10 @@ def _heal_state(state: dict[str, Any]) -> dict[str, Any]:
                 if late and deadline
                 else ""
             )
-            steps.append(
-                {
-                    "name": STEP_RESTART,
-                    "ok": True,
-                    "output": (
-                        f"服务已重启：{detail}；pid {owner} 已经退出，新进程（pid {os.getpid()}）"
-                        f"读到这一步{late_note}"
-                    ),
-                    "seconds": 0.0,
-                }
+            _merge_restart_step(
+                steps,
+                f"新进程（pid {os.getpid()}）确认：{detail}{late_note}"
+                f"（pid {owner} 已经退出）",
             )
             _append_restart_log(log_path, f"新进程确认：{detail}", who="新进程")
             state = {
@@ -1673,16 +1684,7 @@ def settle_restart(state: dict[str, Any]) -> dict[str, Any]:
             write_state(state)
             return state
         time.sleep(1.0)
-    if steps and isinstance(steps[-1], dict) and steps[-1].get("name") == STEP_RESTART:
-        steps[-1] = {
-            **steps[-1],
-            "ok": True,
-            "output": f"{steps[-1].get('output') or ''}已确认服务起来了：{detail}",
-        }
-    else:
-        steps.append(
-            {"name": STEP_RESTART, "ok": True, "output": f"服务已重启：{detail}", "seconds": 0.0}
-        )
+    _merge_restart_step(steps, f"已确认服务起来了：{detail}")
     _append_restart_log(log_path, f"CLI 确认：{detail}", who="CLI")
     state.update(
         {

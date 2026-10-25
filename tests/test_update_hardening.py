@@ -366,6 +366,42 @@ def test_the_restart_is_finished_only_when_the_recorded_pid_is_gone(monkeypatch)
     assert state["restart_pending"] is False
 
 
+
+
+def test_the_restart_step_is_not_written_twice(monkeypatch):
+    """老进程记过一条「重启服务」，新进程确认时不许再 append 一条。
+
+    服务器上真跑一次 apply 撞出来的：systemctl 返回 0（或 SIGTERM）之后老进程已经记了
+    一条 ok，_heal_state 又补一条，界面上就是两个「重启服务」并排。
+    """
+    _write_state(
+        state=updater.STATE_RUNNING,
+        restart_pending=True,
+        pid=4242,
+        host="127.0.0.1",
+        port=8793,
+        steps=[
+            {"name": "git fetch --all --prune", "ok": True, "output": "", "seconds": 0.1},
+            {
+                "name": updater.STEP_RESTART,
+                "ok": True,
+                "output": "重启请求已被 systemd 受理（退出码 -15）",
+                "seconds": 0.0,
+            },
+        ],
+    )
+    monkeypatch.setattr(updater, "_pid_alive", lambda pid: False)
+    monkeypatch.setattr(updater, "_port_free", lambda port=None, host=None: False)
+    monkeypatch.setattr(updater, "_health_ok", lambda host=None, port=None: (True, "回了 200"))
+    state = updater.read_state()
+    names = [step["name"] for step in state["steps"]]
+    assert names.count(updater.STEP_RESTART) == 1, names
+    assert state["state"] == updater.STATE_DONE
+    # 老进程那句留着，新进程的确认接在后面
+    assert "已被 systemd 受理" in state["steps"][-1]["output"]
+    assert "回了 200" in state["steps"][-1]["output"]
+
+
 def test_our_own_running_job_is_never_finished_by_a_read(monkeypatch):
     _write_state(state=updater.STATE_RUNNING, restart_pending=True, pid=os.getpid())
     monkeypatch.setattr(updater, "_pid_alive", lambda pid: True)
