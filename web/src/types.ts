@@ -545,6 +545,15 @@ export interface AITraderStatus {
     max_decisions_per_day?: number;
     max_orders_per_hour?: number;
   };
+  /** 决策节奏：跟着 K 线周期走（1h → 每根 1h K 线收盘后一次）。 */
+  cadence?: {
+    /** 这根 K 线多长（秒）。0 = 周期不认识，界面按本页选的周期自己换算。 */
+    bar_seconds?: number;
+    /** 下一次决策的预计时刻（epoch 秒）。没在跑就是 null。 */
+    next_run_at?: number | null;
+    /** 上一次真正决策的那根 K 线的开放时间（毫秒）。 */
+    last_bar_ts?: number;
+  };
   last_decision?: AIDecisionRecord | null;
   events?: AIDecisionRecord[];
   seq?: number;
@@ -844,6 +853,8 @@ export interface AutoStatus {
   events: { seq: number; kind: string; level: string; message: string; when: string }[];
   /** 没在跑的时候是 null。 */
   data: AutoDataStatus | null;
+  /** 下一根 K 线收盘（下一次可能调仓）的预计时刻，epoch 秒。引擎没报就是 null。 */
+  next_run_at?: number | null;
 }
 
 export interface EquityPoint {

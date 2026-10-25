@@ -45,7 +45,9 @@ class _FakeTrader:
     def pause(self, paused: bool = True) -> None:
         self.paused = bool(paused)
 
-    def decide_once(self) -> dict:
+    def decide_once(self, *, force: bool = False) -> dict:
+        # 真引擎的签名带 force（「立即决策」要绕开「这根 K 线已经决策过」），
+        # 替身照抄，否则控制器一改调用方式这里就 TypeError。
         self.decided = True
         return {"kind": "decision", "outcome": "order", "seq": 2}
 

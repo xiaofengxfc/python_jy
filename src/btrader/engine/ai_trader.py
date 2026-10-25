@@ -26,7 +26,7 @@ from typing import Any, Callable
 
 from .. import ai, ai_pipeline, paths
 from ..core.clock import local_day
-from ..core.types import MarketType, OrderSide, OrderType
+from ..core.types import MarketType, OrderSide, OrderType, timeframe_seconds
 from .trading import OrderRequest, OrderResult
 
 log = logging.getLogger(__name__)
@@ -42,6 +42,20 @@ STATE_HALTED = "halted"
 
 # 裁决段的输出格式在 ai_pipeline 里，解析和提示词必须同源。
 DECISION_PROMPT = ai_pipeline.DECISION_PROMPT
+
+# ------------------------------------------------------------------- cadence
+# 决策节奏跟着 K 线周期走，不再按固定秒数轮询：选 1h 就是每根 1h K 线收盘后决策
+# 一次。以前固定每 poll_sec（默认 60 秒）跑一整轮，1h 周期下每小时问 60 次模型、
+# 拿回 60 个互相打架的方向，还都是按同一根没走完的 K 线做的判断。
+#
+# 一根 K 线之内只决策一次，判据是「已收盘 K 线的时间戳」，不是墙上时钟：睡过头、
+# 系统休眠、进程重启都不会把同一根算两遍，也不会因为本机时钟差几秒就跳过一整根。
+#
+# 收盘后等 BAR_SETTLE_SECONDS 才去问（整点那一秒读，交易所常常还给的是上一根）。
+# 这根 K 线迟迟不来（交易所延迟、或被闸门拦住）就在 BAR_WINDOW_AFTER 这个窗口里
+# 按 poll_sec 小步重试；窗口过了就认这一根没数据，等下一根——不会退化成每秒轮询。
+BAR_SETTLE_SECONDS = 3.0
+BAR_WINDOW_AFTER = 120.0
 
 
 # --------------------------------------------------------------- data types
@@ -82,7 +96,8 @@ class AITraderConfig:
     confirm_live: bool = False
     network: str = "mainnet"
     symbol: str = "BTC/USDT"
-    # 策略只是「复核方向」的来源，但重命名/删除策略时后端要能认出它。
+    # 策略只是「参考方向」的来源（策略为辅、AI 为主），但重命名/删除策略时
+    # 后端要能认出它，所以还是记下 key。
     strategy_key: str = ""
     market_type: str = MarketType.SPOT.value
     timeframe: str = "15m"
@@ -97,6 +112,8 @@ class AITraderConfig:
     decision_ttl_sec: float = 120.0
     max_price_drift_pct: float = 0.005
     cooldown_sec: float = 30.0
+    # 节奏由 timeframe 决定（见上面的 BAR_WINDOW_*）。poll_sec 现在只剩一个作用：
+    # 收盘窗口里小步重试的间隔上限。改它动不了「每根 K 线决策一次」这条。
     poll_sec: float = 60.0
     require_stop: bool = True
     # 决策深度：quick 一次调用，standard 四段，deep 六段。引擎默认最省。
@@ -649,6 +666,14 @@ class AITrader:
         self._seq = 0
         self._events: deque[dict[str, Any]] = deque(maxlen=200)
         self.last_decision: dict[str, Any] | None = None
+        # 上一次真正花掉模型调用的那根 K 线的开放时间（毫秒）：「这一根处理过
+        # 没有」的去重键。只在真要调模型那一刻前进——模型失败、被闸门拦住都不算
+        # 跑过，那根 K 线还在收盘窗口里就还能重试。
+        self._last_bar_ts = 0
+        # 下一根该收盘的时刻（epoch 秒）。从「刚处理的那根 K 线」推出来：它的
+        # 收盘点是 bar_ts + 周期，再下一根就是 + 2 个周期。睡到这儿之前什么都不
+        # 用问，这就是「1h 周期 = 每小时决策一次」落到实处的地方。
+        self._pending_close = 0.0
 
     # ------------------------------------------------------------- lifecycle
     @property
@@ -779,7 +804,71 @@ class AITrader:
                 self.step()
             except Exception:  # pragma: no cover - poller must never die silently
                 log.warning("AI 自主交易轮询失败", exc_info=True)
-            self._stop_event.wait(max(1.0, self.config.poll_sec))
+            # 睡多久算错也不许把 poller 弄死：线程静默退出时界面还显示在跑，
+            # 那是最坏的一种状态。算不出来就按 poll_sec 重试。
+            try:
+                wait = max(1.0, self.next_wait_sec())
+            except Exception:
+                log.warning("计算下次唤醒时间失败，按 poll_sec 重试", exc_info=True)
+                wait = self._poll_seconds()
+            self._stop_event.wait(wait)
+
+    def _bar_seconds(self) -> float:
+        """这根 K 线有多长（秒）。取不到就是 0，调用方退回旧的定时轮询。"""
+        try:
+            return float(timeframe_seconds(self.config.timeframe))
+        except (KeyError, TypeError, ValueError):
+            return 0.0
+
+    def _poll_seconds(self) -> float:
+        return max(1.0, float(self.config.poll_sec or 60.0))
+
+    def next_wait_sec(self, now: float | None = None) -> float:
+        """这一轮之后等多久再看：节奏跟着 K 线周期（见上面的 BAR_SETTLE_*）。
+
+        ``_pending_close`` 是「下一根该收盘」的时刻，由刚处理过的那根 K 线推出来：
+          * 还没到收盘点 → 一觉睡到收盘后 BAR_SETTLE_SECONDS，中间不醒；
+          * 收盘点前后几秒 → 睡到那个落定点；
+          * 收盘过了、这根还没到手 → 按 poll_sec 小步重试，最远到 BAR_WINDOW_AFTER；
+          * 窗口也过了（这一根没数据）→ 顺延到墙上的下一根。
+
+        K 线周期不认识时退回旧行为：每 poll_sec 一轮。
+        """
+        bar = self._bar_seconds()
+        if bar <= 0:
+            return self._poll_seconds()
+        clock = self.clock() if now is None else now
+        poll = self._poll_seconds()
+        with self._lock:
+            pending = self._pending_close
+        if pending <= 0:
+            # 还没有「已处理的那一根」当锚：短间隔重试，别一上来就睡一整根。
+            return min(poll, BAR_WINDOW_AFTER)
+        if clock < pending + BAR_SETTLE_SECONDS:
+            return max(1.0, pending + BAR_SETTLE_SECONDS - clock)
+        if clock <= pending + BAR_WINDOW_AFTER:
+            return max(1.0, min(poll, pending + BAR_WINDOW_AFTER - clock))
+        next_close = (math.floor(clock / bar) + 1) * bar
+        return max(1.0, next_close + BAR_SETTLE_SECONDS - clock)
+
+    def next_run_at(self, now: float | None = None) -> float | None:
+        """下一次决策的预计时刻（epoch 秒）。界面显示用，算不出来就是 None。"""
+        bar = self._bar_seconds()
+        if bar <= 0:
+            return None
+        clock = self.clock() if now is None else now
+        with self._lock:
+            state = self._state
+            paused = self._paused
+            pending = self._pending_close
+        if state != STATE_RUNNING or paused:
+            return None
+        if pending <= 0:
+            return clock
+        if pending + BAR_WINDOW_AFTER < clock:
+            # 这一根没等到（或已经处理完一段时间了）：算墙上的下一根。
+            return (math.floor(clock / bar) + 1) * bar + BAR_SETTLE_SECONDS
+        return pending + BAR_SETTLE_SECONDS
 
     # ------------------------------------------------------------------ step
     def step(self) -> dict[str, Any] | None:
@@ -789,10 +878,27 @@ class AITrader:
                 return None
         return self.decide_once()
 
-    def decide_once(self) -> dict[str, Any] | None:
+    @staticmethod
+    def _frame_bar_ts(frame: Any) -> int:
+        """已收盘 K 线里最后一根的开放时间（毫秒）；读不到就是 0。
+
+        这就是「这根 K 线处理过没有」的键。用行情自己的时间戳而不是墙上时钟：
+        重启、休眠、本机时钟偏移都不会让同一根决策两遍，也不会整根跳过。
+        """
+        try:
+            return int(frame["timestamp"].iloc[-1])
+        except (KeyError, TypeError, ValueError, IndexError, AttributeError):
+            return 0
+
+    def decide_once(self, *, force: bool = False) -> dict[str, Any] | None:
         """同步执行一次「取行情 → 问模型 → 校验 → 闸门 → 下单」。
 
         与状态机解耦，供测试、``/preview`` 和人工「立即决策」复用。
+
+        同一根 K 线只决策一次：节奏由 K 线周期决定，轮询只是「什么时候醒」。
+        这一根跑过就返回 ``None``，连审计都不写——否则时间线上每根 K 线会多一条
+        什么都没发生的记录，把真正的那几条挤下去。``force=True`` 给「立即决策」
+        用：人点了就该真的跑一次。
         """
         now = self.clock()
         self.budget.roll(now)
@@ -810,8 +916,20 @@ class AITrader:
         if frame is None or getattr(frame, "empty", True):
             return self._record("skip", reason="行情数据不可用", decision=None, now=now)
 
-        # Strategy first: the model may only confirm or veto the direction that
-        # the selected strategy already produced. It never invents an entry.
+        bar_ts = self._frame_bar_ts(frame)
+        if not force and bar_ts > 0:
+            with self._lock:
+                seen = self._last_bar_ts
+            # 只认「更新的那一根」：相等是同一根 K 线（收盘窗口里在重试），变小说明
+            # 这次读到的行情比上次还旧——币安不可达时会回落到 Gate 永续镜像，两边的
+            # 最后一根收盘 K 线不总是同一根。用相等判断时这种回退会被当成新 K 线，
+            # 同一根再调一次模型，还可能在同一个收盘点上下第二单。
+            if seen and bar_ts <= seen:
+                return None
+
+        # 策略是参考，不是命令（「策略为辅，AI 为主」）。它只剩两处作用：喂给
+        # 流水线当一条输入，以及「不许反着做」。空仓信号不再让这一轮什么都不做
+        # ——以前空仓直接 return，AI 一次模型调用都拿不到，等于策略才是决策者。
         signal_target: float | None = None
         if self.signal_provider is not None:
             try:
@@ -819,10 +937,6 @@ class AITrader:
             except Exception as exc:
                 return self._record(
                     "skip", reason=f"策略信号不可用：{exc}", decision=None, now=now
-                )
-            if abs(signal_target) < 1e-9:
-                return self._record(
-                    "skip", reason="策略无信号（空仓）", decision=None, now=now
                 )
         self._last_signal = signal_target
 
@@ -835,6 +949,17 @@ class AITrader:
                 "skip", reason="已达 AI 当日决策次数上限", decision=None, now=now
             )
 
+        # 花模型调用之前先把「这一根处理过了」记下来：模型调用失败、决策被闸门
+        # 拒掉都算这一根跑过，下一轮要等下一根收盘。不然一次超时就会在同一个收盘
+        # 点上反复问，一小时里问坏几次、扣几次额度。
+        if bar_ts > 0:
+            bar = self._bar_seconds()
+            with self._lock:
+                self._last_bar_ts = bar_ts
+                # bar_ts 是刚收盘那根的开放时间：它收盘在 +1 个周期，下一根在
+                # +2 个。周期不认识时不动锚，节奏退回 poll_sec。
+                if bar > 0:
+                    self._pending_close = bar_ts / 1000.0 + 2 * bar
         pipeline = self._decide(frame, portfolio, signal_target)
         if not pipeline.ok:
             return self._record(
@@ -858,11 +983,14 @@ class AITrader:
                 "reject", reason="；".join(errors), decision=decision, now=now,
                 trace=pipeline.trace,
             )
+        # 策略只是参考，唯一的硬约束是「不反着做」：用户选了这条策略，模型却在
+        # 相反方向开仓，事后没人解释得清。策略空仓时不拦——那正是「AI 为主」的地方，
+        # 方向由模型自己判断。
         if signal_target is not None:
             if signal_target > 0 and decision.action == "open_short":
                 return self._record(
                     "reject",
-                    reason="策略信号为多，AI 不得反向开空",
+                    reason="策略信号为多，AI 不做反向开空（策略信号只作参考，方向相反的一单不下）",
                     decision=decision,
                     now=now,
                     trace=pipeline.trace,
@@ -870,15 +998,7 @@ class AITrader:
             if signal_target < 0 and decision.action == "open_long":
                 return self._record(
                     "reject",
-                    reason="策略信号为空，AI 不得反向开多",
-                    decision=decision,
-                    now=now,
-                    trace=pipeline.trace,
-                )
-            if decision.is_entry and signal_target == 0:
-                return self._record(
-                    "reject",
-                    reason="策略无信号，AI 不得开仓",
+                    reason="策略信号为空，AI 不做反向开多（策略信号只作参考，方向相反的一单不下）",
                     decision=decision,
                     now=now,
                     trace=pipeline.trace,
@@ -986,19 +1106,14 @@ class AITrader:
         if fresh_error:
             return GuardVerdict(False, f"提交前复核：{fresh_error}"), fresh, price
 
-        # 方向：拿最新的策略信号再对一次。读不到、变空仓、反向，一律不下单。
+        # 方向：拿最新的策略信号再对一次。读不到、或者和这一单相反，就不下单。
+        # 空仓不拦：策略只是参考，空信号本来就允许 AI 自己开仓（见 decide_once）。
         if self.signal_provider is not None:
             try:
                 latest_signal = float(self.signal_provider())
             except Exception as exc:
                 return (
                     GuardVerdict(False, f"提交前复核：策略信号读不到（{exc}）"),
-                    fresh,
-                    price,
-                )
-            if abs(latest_signal) < 1e-9:
-                return (
-                    GuardVerdict(False, "提交前复核：策略信号已转为空仓，不再开仓"),
                     fresh,
                     price,
                 )
@@ -1155,6 +1270,9 @@ class AITrader:
             "network": self.config.network,
             "state": self.state,
             "depth": self.config.depth,
+            # 这一条决策属于哪根 K 线（毫秒开放时间）：界面上要能说清「这是 1h
+            # 那根收盘后做的」，同一根只该有一条。
+            "bar_ts": int(self._last_bar_ts),
             "trace": list(trace or []),
         }
         # NaN/inf 不是合法 JSON：写进审计文件会让那一行解析不了，塞进 status 的
@@ -1220,6 +1338,13 @@ class AITrader:
                 "orders_last_hour": self.budget.orders_last_hour(now),
                 "max_decisions_per_day": self.config.max_decisions_per_day,
                 "max_orders_per_hour": self.config.max_orders_per_hour,
+            },
+            # 节奏：决策跟着 K 线周期走，界面据此显示「下次 ≈ 10:00:03」。
+            # bar_seconds 为 0 表示周期不认识，退回旧的定时轮询。
+            "cadence": {
+                "bar_seconds": self._bar_seconds(),
+                "next_run_at": self.next_run_at(now),
+                "last_bar_ts": int(self._last_bar_ts),
             },
             "last_decision": self.last_decision,
             "events": events,

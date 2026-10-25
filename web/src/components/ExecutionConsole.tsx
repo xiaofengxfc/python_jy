@@ -35,6 +35,12 @@ function readExec(settings: AppSettings | null | undefined): ExecSettings {
   };
 }
 
+/** epoch 秒 → 本机时间。下一根 K 线收盘的时刻就用它显示。 */
+function clockOf(epoch: number | null | undefined): string {
+  if (!epoch) return "";
+  return new Date(epoch * 1000).toLocaleTimeString("zh-CN", { hour12: false });
+}
+
 const STATE_LABEL: Record<string, string> = {
   signal: "信号",
   order: "下单",
@@ -98,7 +104,7 @@ export default function ExecutionConsole({
   /** 恢复默认：只重置 exec 这一段，市场、交易对、主题都不动。 */
   const resetExec = async () => {
     const ok = window.confirm(
-      "恢复执行台的默认值？（仓位比例 20%、杠杆 1、轮询 10 秒）\n\n" +
+      "恢复执行台的默认值？（仓位比例 20%、杠杆 1、检查间隔 10 秒）\n\n" +
         "只重置这三项，市场、交易对、主题和策略都不动。",
     );
     if (!ok) return;
@@ -160,7 +166,8 @@ export default function ExecutionConsole({
     if (
       live &&
       !window.confirm(
-        `即将在【主网】用 ${symbol} 跑 ${strategyKey}：${positionPct * 100}% 仓位、${leverage}x、每 ${pollSeconds} 秒一轮。\n\n` +
+        `即将在【主网】用 ${symbol} 跑 ${strategyKey}：${positionPct * 100}% 仓位、${leverage}x、` +
+          `按 ${timeframe} K 线调仓（每根收盘后一次）。\n\n` +
           "引擎会按信号自动下单，用的是真钱。确认启动？",
       )
     ) {
@@ -210,6 +217,8 @@ export default function ExecutionConsole({
 
   const lastSignal = status?.last_signal ?? null;
   const data = status?.data ?? null;
+  /** 下一根 K 线收盘的时刻：节奏跟着周期走，界面要说清「不是每 10 秒下一次单」。 */
+  const nextClose = running ? (status?.next_run_at ?? null) : null;
   const events = [...(status?.events ?? [])].reverse().slice(0, 60);
 
   return (
@@ -298,8 +307,8 @@ export default function ExecutionConsole({
           </div>
           <div className="field">
             <label className="field-label" htmlFor="exec-poll">
-              <span>轮询间隔</span>
-              <em>秒</em>
+              <span>检查间隔</span>
+              <em>秒 · 只决定多快发现新 K 线</em>
             </label>
             <input
               id="exec-poll"
@@ -360,6 +369,13 @@ export default function ExecutionConsole({
         )}
 
         <div className="gate-list">
+          <div className="gate-row">
+            <span>调仓节奏</span>
+            <b>
+              {`每根 ${TIMEFRAMES.find(([value]) => value === timeframe)?.[1] ?? timeframe} K 线收盘后调仓` +
+                (nextClose ? ` · 下次 ${clockOf(nextClose)}` : "")}
+            </b>
+          </div>
           <div className="gate-row">
             <span>当前信号</span>
             <b>

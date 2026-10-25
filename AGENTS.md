@@ -200,7 +200,7 @@ Node 不在 PATH 时，先把 Node 目录加进去。
 - 本机时钟偏差也走这一层：币安对时间戳的容忍度很小，实测本机快 1.3 秒，所有签名请求
   都被 `-1021` 拒，界面上只有一句「无法读取当前持仓」，看不出是时钟。`rest.BinanceREST`
   在客户端 `fetch` 那一层装了守卫：只拦这一类错误，`load_time_difference()` 后重试一次。
-  这个版本的 ccxt python 客户端没有 `adjustForTimeDifference`，别把守卫删掉。
+  这个版本的 ccxt 客户端没有 `adjustForTimeDifference`，别删守卫。
 - SQLite 里 `mode='paper'` 的旧成交还在库里，界面只显示 `live` 的成交。
 - 存储的每一项都要带作用域，别让两个账户（或两个市场）共用一个 key：
   成交账本 `live.ledger.v1:<network>`（`trading.ledger_key`；`seen` 的元素是
@@ -287,6 +287,8 @@ Node 不在 PATH 时，先把 Node 目录加进去。
 
 ## 7. AI 交易与 AI 量化
 
+- **节奏跟着 K 线周期、策略只作参考**（t107）：选 1h 就每根 1h 收盘后决策一次，同一根只跑一次；
+  空仓照常调模型、AI 可自己开仓，只拦「反着做」。
 - AI 交易的决策拆在 `ai_pipeline.py`：技术面 → 新闻面 → 多空辩论 → 风控复核 → 裁决。
   流水线只出文本。方向约束、`AIGuard`、下单都在 `engine/ai_trader.py`，分段不能放宽任何一条。
 - 深度三档存在 `ai_auto.depth`：quick 一次调用，standard 四段，deep 六段。
@@ -319,8 +321,8 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   计数要是留在实例里，点第二下就从零开始数，96 次/日、12 单/时、30 秒冷却等于不存在。
   控制器把同一份 budget 传给每一个实例（`AITrader(budget=)`），别在实例里另起一份。
 - 提交前复核：模型调用那几十秒里行情、持仓、策略信号都可能变了。`_recheck_before_submit`
-  在 AIGuard 之前重读一遍——策略信号反向或掉成空仓就拒、持仓数量变了就拒（不自己改数量重算）、
-  读不到持仓也拒。拒单文案一律以「提交前复核：」开头。只拦新开仓，平仓和观望放行：拦减仓比
+  在 AIGuard 之前重读一遍——策略信号反向就拒（空仓**不**拒）、持仓数量变了就拒（不自己改数量
+  重算）、读不到持仓也拒。拒单文案一律以「提交前复核：」开头。只拦新开仓，平仓和观望放行：拦减仓比
   漏减仓更糟，和 RiskManager「只在 entry 上判熔断」同一条理由。复核过之后 AIGuard 与 submit
   用的是最新的持仓与价格，漂移闸、持仓上限、急停看到的都是提交前的数。
   这份持仓必须现读（`AccountService.live_snapshot`，`refresh=True`），不能吃面板那 3/10 秒缓存：
@@ -415,7 +417,7 @@ Node 不在 PATH 时，先把 Node 目录加进去。
 - `exec` 是执行台最后用过的那三项：`position_pct`（0 到 1 的比例，1 = 全部可用余额，不是
   百分数）、`leverage`（≥ 1）、`poll_seconds`（≥ 1）。默认 **0.2 / 1 / 10**（t97 起；原来是
   1 / 1 / 10，等于组件里写死的字面值）。它们不是风控：真上限在 `risk` 与 `AITrader` 的闸里，
-  改这三项动不了任何一条闸。
+  改它们动不了任何一条闸。
   改默认值的理由：执行台的名义额是「权益 × position_pct × leverage」，而单笔上限是
   「`max_order_quote`（500）与权益 `max_order_pct`（默认 25%）取大的」，量的是**占用保证金**
   ——`check_order` 把名义额按杠杆折回来（`quote_notional / leverage`；杠杆 ≤ 1 时不除，
@@ -572,8 +574,8 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   git 都可能慢），在老进程里等重启等于自杀，还会把「重启真的成功了吗」这个判断一起带走。所以改用
   `--no-block`：把重启交给 systemd 就返回，确认挪到新进程——新进程读到「重启中」时自己打一次
   `/api/health`，2xx 才把这一步收成 `done`，超期收成 `failed` 并说清等到什么时候。
-- 端口通了不等于服务起来了：只 `connect_ex` 会被「绑了 0.3 秒就关」的进程骗过（端口探测刚通过、
-  进程已经死了），所以判据是 `/api/health` 回 2xx。端口探测只用来决定「可以开始问 health 了」。
+- 端口通了不等于服务起来了：只 `connect_ex` 会被「绑了 0.3 秒就关」的进程骗过，判据是
+  `/api/health` 回 2xx。端口探测只用来决定「可以开始问 health 了」。
 - 端口跟着真实进程走，不写死：`web/__main__.build_server` 把 `--port` 交给
   `updater.set_web_port()`，垫片与端口探测都用 `web_port()`；拿不到时按 8765 兜底，并在那一步的
   输出里写明「按兜底值算」（t84 之前写死 8765：在 8799 上跑的实例，更新完重启必然
@@ -632,4 +634,4 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   安装包 140+ MB，不进仓库（`dist-electron/` 在 `.gitignore` 里）。细节见 `docs/RELEASE.md`。
 - 任何子进程都不许在桌面上开控制台窗口（t96 起）。Windows 上一条铁律：**`DETACHED_PROCESS` 不等于无窗口**——它只是不继承父进程的控制台，console 子进程照样会拿到自己的控制台（实测 `GetConsoleWindow()` 非 0，量测也是这样看到黑框的）。要真正无窗口只有 `CREATE_NO_WINDOW`（0x08000000）。所以：`updater._no_window()` 统一给 `git` / `pip` / 重启垫片两层用；垫片里起 `run_web.py` 是 `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`，数值由常量 `hex()` 拼进垫片源码，别写死两份；`electron/main.cjs` 靠 `windowsHide: true`（libuv 自己置 `CREATE_NO_WINDOW`，Node 的 spawn **没有** `creationflags` 这个选项，写了也不生效）；开发机用 `pythonw.exe` 起服务。
   加新的起进程点时照这个来，并在真机上验「可见控制台窗口前后差集为空」——只数 `conhost` 或 `ConsoleWindowClass` 会假阴性（Windows 11 的终端宿主是 `CASCADIA_HOSTING_WINDOW_CLASS`）。
-  记住代价：`.venv\Scripts\pythonw.exe` 是 GUI 子系统，没有控制台，`biTrader-backend.exe` 仍是 console 子系统（双击它必开黑窗，只给壳用）。
+  代价：`pythonw.exe` 是 GUI 子系统没有控制台，`biTrader-backend.exe` 仍是 console 子系统（双击必开黑窗，只给壳用）。

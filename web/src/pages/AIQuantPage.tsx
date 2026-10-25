@@ -237,7 +237,8 @@ export default function AIQuantPage({ settings, health, onSettingsChange, onNavi
     }
     const ok = window.confirm(
       `部署 ${selected.name ?? key} 到执行台\n\n${symbol} · ${timeframe} · 满仓\n\n` +
-        "部署后会立刻开始按轮询间隔下单。确认？",
+        `节奏跟着 K 线周期：等下一根 ${timeframe} K 线收盘才可能下单，` +
+        "同一根不会重复调仓。确认？",
     );
     if (!ok) return;
     setBusy("deploy");

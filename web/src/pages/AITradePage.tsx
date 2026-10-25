@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, query } from "../api";
 import SymbolFallbackNote from "../components/SymbolFallbackNote";
-import { MARKET_LABELS, TIMEFRAMES, fmt, fmtPrice } from "../format";
+import { MARKET_LABELS, TIMEFRAMES, TIMEFRAME_MS, fmt, fmtPrice } from "../format";
 import type {
   Account,
   AIAutoSettings,
@@ -258,6 +258,7 @@ export default function AITradePage({ settings, health, onSettingsChange }: Prop
     if (mainnet) {
       const ok = window.confirm(
         `即将在主网启动 AI 交易\n\n${symbol} · ${timeframe} · 深度 ${depth}\n\n` +
+          `节奏跟着 K 线周期：每根 ${timeframe} K 线收盘后决策一次。\n\n` +
           "模型会真实下单，盈亏由交易所结算。确认继续？",
       );
       if (!ok) return;
@@ -332,6 +333,14 @@ export default function AITradePage({ settings, health, onSettingsChange }: Prop
     [status?.events],
   );
   const blocked = events.filter((item) => item.outcome === "reject").length;
+  // 决策节奏：跟着 K 线周期。跑起来时用后端给的 cadence（真实锚点），没跑时按本页选的周期算，
+  // 于是启动前这一行也是「每根 1时 收盘后一次」——节奏跟周期走，跟 poll_sec 没有关系。
+  const cadence = status?.cadence;
+  const activeTf = status?.config?.timeframe || timeframe;
+  const barSeconds =
+    Number(cadence?.bar_seconds ?? 0) || Math.round((TIMEFRAME_MS[activeTf] ?? 0) / 1000);
+  const nextRun = cadence?.next_run_at ?? null;
+  const barLabel = TIMEFRAMES.find(([value]) => value === activeTf)?.[1] ?? activeTf ?? "";
 
   const equity = Number(account?.equity ?? 0);
   const dayPnl = Number(risk?.day_pnl ?? 0);
@@ -479,7 +488,8 @@ export default function AITradePage({ settings, health, onSettingsChange }: Prop
             </div>
             <div className="field">
               <label className="field-label" htmlFor="ai-strategy">
-                <span>信号策略</span>
+                <span>参考策略</span>
+                <em>只作参考，方向由 AI 定</em>
               </label>
               <select
                 id="ai-strategy"
@@ -591,6 +601,7 @@ export default function AITradePage({ settings, health, onSettingsChange }: Prop
             )}
             <div className="hint" style={{ gridColumn: "1 / -1" }}>
               上限和杠杆都在启动时生效。改完要重新启动一次；改动会自己存下来，刷新之后还在。
+              {"节奏跟着 K 线周期：选 1h 就是每根 1h K 线收盘后决策一次，同一根不会跑两次（「立即决策」除外）。"}
               {"杠杆按风控上限收口：现在是 " +
                 (Number(settings?.risk?.max_leverage) || 125) +
                 "x，填得更大也按上限下单，启动后的提示里会说清实际用了几倍。"}
@@ -719,6 +730,15 @@ export default function AITradePage({ settings, health, onSettingsChange }: Prop
               <div className="gate-row">
                 <span>连续亏损</span>
                 <b>{risk?.consecutive_losses ?? 0} 次</b>
+              </div>
+              <div className="gate-row">
+                <span>决策节奏</span>
+                <b>
+                  {barSeconds > 0
+                    ? `每根 ${barLabel} 收盘后一次` +
+                      (running && nextRun ? ` · 下次 ${clockText(nextRun)}` : "")
+                    : "跟着 K 线周期"}
+                </b>
               </div>
               <div className="gate-row">
                 <span>运行中的规则</span>

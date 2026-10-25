@@ -582,6 +582,18 @@ class AutoController:
         if trader is not None and trader.running:
             trader.stop()
 
+    @staticmethod
+    def _next_run_at(trader) -> float | None:
+        """下一根 K 线收盘的预计时刻。引擎报不出来（替身、周期不认识）就是 None。"""
+        reader = getattr(trader, "next_run_at", None)
+        if not callable(reader):
+            return None
+        try:
+            value = reader()
+        except Exception:
+            return None
+        return None if value is None else float(value)
+
     def status(self, since: int = 0) -> dict[str, Any]:
         items, seq = self.events.since(since)
         with self._lock:
@@ -595,6 +607,8 @@ class AutoController:
             # 新增字段，既有字段一个没动：K 线供给情况。预热不够时引擎在跑却
             # 什么都不做，界面要能看见「不足 N 根」，不能只看见 running=true。
             "data": trader.data_status() if trader is not None else None,
+            # 调仓节奏跟着 K 线周期：下一根收盘后几秒才可能有动作。
+            "next_run_at": self._next_run_at(trader),
         }
 
     # ------------------------------------------------------------- notifications
@@ -908,7 +922,9 @@ class AITraderController:
                 status_code=409, detail="AI 交易正在运行，请先停止再用「立即决策」"
             )
         trader = self._build(state, payload)
-        record = trader.decide_once() or {}
+        # force：人点了「立即决策」就该真跑一次，不受「这根 K 线已经决策过」的限制
+        # （那个去重是给 poller 用的，见 engine.ai_trader.decide_once）。
+        record = trader.decide_once(force=True) or {}
         # 「立即决策」点一次 new 一个实例，跑完就扔：这条路径的配置、这条决策和
         # 事件同样要留给 status，否则刚点完就只看到空状态。
         self._remember(trader)
@@ -2515,9 +2531,9 @@ def _strategy_signal(
 ) -> float:
     """Latest target of the selected strategy on closed candles.
 
-    Positive means long, negative means short, zero means stay flat. The AI
-    layer is only allowed to confirm/veto this direction; it cannot originate
-    a trade without a signal.
+    Positive means long, negative means short, zero means stay flat. 策略只是
+    参考（策略为辅、AI 为主）：空仓时 AI 仍然自己判断方向，策略只约束「不许
+    反着做」，见 engine.ai_trader.decide_once。
     """
     frame = _closed_only(_market_frame(state, ctx, market, symbol, timeframe, 300), timeframe)
     if frame is None or getattr(frame, "empty", True):

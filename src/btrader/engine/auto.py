@@ -14,6 +14,7 @@ engine run headless in the desktop shell.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from dataclasses import dataclass, field
@@ -33,6 +34,12 @@ MAX_KLINES = 1000
 # 预热除了策略要的根数，还要多两根：一根留给「丢掉尚未收盘的那根」，
 # 一根让最后一个指标的数值落定。少这两根策略会在指标还没值的时候空转。
 WARMUP_EXTRA = 2
+
+# 节奏跟着 K 线周期：这根 K 线收盘之前，去交易所问也只会拿到同一根。
+# 以前固定每 poll_seconds（默认 10 秒）拉一次 K 线，1h 周期下是每小时 360 次
+# 请求，只为了发现那一根新收盘。
+CLOSE_SETTLE_SECONDS = 3.0
+CLOSE_WINDOW_AFTER = 120.0
 
 LogListener = Callable[[str, str], None]
 SignalListener = Callable[[float, str], None]
@@ -115,6 +122,9 @@ class AutoTrader:
         self._stop = threading.Event()
         self._current_target = 0.0
         self._last_candle_ts = 0
+        # 下一根该收盘的时刻（epoch 秒）：从刚处理的那根 K 线推出来。它之前
+        # 什么都不用问，1h 周期下就是每小时只拉几次 K 线。
+        self._pending_close = 0.0
         self._position_quote = 0.0
         # Unknown until the venue answers. A made-up starting figure would size
         # the first order against money the account may not have.
@@ -211,7 +221,62 @@ class AutoTrader:
             except Exception as exc:  # never let the loop die silently
                 log.exception("自动交易循环异常")
                 self._emit_log("ERROR", f"循环异常：{exc}")
-            self._stop.wait(self.config.poll_seconds)
+            # 同 ai_trader：算下一次唤醒失败不许让线程静默死掉，按检查间隔重试。
+            try:
+                wait = max(1.0, self._next_wait())
+            except Exception:
+                log.warning("计算下次唤醒时间失败，按检查间隔重试", exc_info=True)
+                wait = self._poll_seconds()
+            self._stop.wait(wait)
+
+    def _bar_seconds(self) -> float:
+        """这根 K 线有多长（秒）。取不到就是 0，退回旧的定时轮询。"""
+        try:
+            return float(timeframe_seconds(self.config.timeframe))
+        except (KeyError, TypeError, ValueError):
+            return 0.0
+
+    def _poll_seconds(self) -> float:
+        return max(1.0, float(self.config.poll_seconds or 1.0))
+
+    def _next_wait(self) -> float:
+        """这一轮之后等多久再看：节奏跟着 K 线周期。
+
+        ``_pending_close`` 是「下一根该收盘」的时刻，处理器吃到一根新收盘 K 线时
+        重设：
+          * 还没到收盘点 → 一觉睡到收盘后 CLOSE_SETTLE_SECONDS，中间不醒；
+          * 收盘过了、这根还没落地 → 按 poll_seconds 小步问，最远到 CLOSE_WINDOW_AFTER；
+          * 窗口也过了 → 顺延到墙上的下一根。
+        ``poll_seconds`` 现在只是这段窗口里的检查间隔上限，改它动不了节奏。
+        """
+        step = self._bar_seconds()
+        if step <= 0:
+            return self._poll_seconds()
+        poll = self._poll_seconds()
+        now = time.time()
+        pending = self._pending_close
+        if pending <= 0:
+            # 还没有「已处理的那一根」当锚：短间隔重试，别一上来就睡一整根。
+            return min(poll, CLOSE_WINDOW_AFTER)
+        if now < pending + CLOSE_SETTLE_SECONDS:
+            return max(1.0, pending + CLOSE_SETTLE_SECONDS - now)
+        if now <= pending + CLOSE_WINDOW_AFTER:
+            return max(1.0, min(poll, pending + CLOSE_WINDOW_AFTER - now))
+        next_close = (math.floor(now / step) + 1) * step
+        return max(1.0, next_close + CLOSE_SETTLE_SECONDS - now)
+
+    def next_run_at(self) -> float | None:
+        """下一根 K 线收盘（也就是下一次可能调仓）的预计时刻，epoch 秒。"""
+        step = self._bar_seconds()
+        if step <= 0:
+            return None
+        now = time.time()
+        pending = self._pending_close
+        if pending <= 0:
+            return now
+        if pending + CLOSE_WINDOW_AFTER < now:
+            return (math.floor(now / step) + 1) * step + CLOSE_SETTLE_SECONDS
+        return pending + CLOSE_SETTLE_SECONDS
 
     def _tick(self) -> None:
         cfg = self.config
@@ -263,9 +328,14 @@ class AutoTrader:
             return
         self._clear_shortfall(required, bars)
         last_ts = int(closed["timestamp"].iloc[-1])
-        if last_ts == self._last_candle_ts:
+        # 只认「更新的那一根」：相等是同一根（收盘窗口里在重试），变小说明这次读到的
+        # 行情比上次还旧——币安不可达时行情会回落到 Gate 永续镜像，最后一根收盘 K 线
+        # 不总是同一根。相等判断会把它当成新 K 线，同一根收盘点上再调一次仓。
+        if last_ts <= self._last_candle_ts:
             return
         self._last_candle_ts = last_ts
+        # closed 最后一根的开放时间是 last_ts：它收盘在 +1 个周期，下一根在 +2 个。
+        self._pending_close = last_ts / 1000.0 + 2 * step / 1000.0
 
         frame = self.strategy.generate(closed, self.config.params)
         raw = frame["target"].reindex(closed.index).to_numpy(dtype=float)

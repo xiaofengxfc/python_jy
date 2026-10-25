@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -9,7 +11,12 @@ import pytest
 from btrader.core.config import AppSettings, RiskSettings
 from btrader.core.storage import Database
 from btrader.core.types import MarketType
-from btrader.engine.auto import AutoTrader, AutoTraderConfig
+from btrader.engine.auto import (
+    CLOSE_SETTLE_SECONDS,
+    CLOSE_WINDOW_AFTER,
+    AutoTrader,
+    AutoTraderConfig,
+)
 from btrader.engine.risk import RiskManager
 from btrader.engine.trading import OrderRejected, OrderRequest, TradingService
 from btrader.strategy.base import IntParam, Strategy
@@ -135,6 +142,58 @@ def test_auto_skips_unchanged_signal(service):
     trader._tick()
     trader._tick()
     assert len(venue.fills) == 1
+
+
+def test_auto_waits_for_the_next_close_instead_of_polling(service):
+    """节奏跟着 K 线周期：这根收盘之前不醒。以前固定每 poll_seconds（10 秒）拉一次 K 线。"""
+    trading, _venue = service
+    trader = _trader(trading, MarketType.SPOT, 1.0)
+    hour = 3600.0
+    poll = trader.config.poll_seconds
+
+    # 下一根还有 100 秒才收盘：一觉睡到收盘后 CLOSE_SETTLE_SECONDS。
+    trader._pending_close = time.time() + 100.0
+    assert trader._next_wait() == pytest.approx(100.0 + CLOSE_SETTLE_SECONDS, abs=1.0)
+    # 界面上的「下次」也读这个锚，不再按轮询间隔报。
+    assert trader.next_run_at() == pytest.approx(
+        trader._pending_close + CLOSE_SETTLE_SECONDS, abs=1.0
+    )
+
+    # 收盘点了、这根还没落地：按 poll_seconds 小步问。
+    trader._pending_close = time.time() - 5.0
+    assert trader._next_wait() == pytest.approx(min(poll, CLOSE_WINDOW_AFTER - 5.0), abs=1.0)
+
+    # 这一根的窗口也过了：顺延到墙上的下一根，不再每 10 秒醒一次。
+    trader._pending_close = time.time() - CLOSE_WINDOW_AFTER - 60.0
+    wait = trader._next_wait()
+    assert 0.0 < wait <= hour + CLOSE_SETTLE_SECONDS
+
+
+def test_auto_ignores_a_candle_older_than_the_last_one(service):
+    """行情往回退时（镜像源）别把旧的那根当新 K 线再调一次仓。"""
+    trading, venue = service
+    frame = make_candles(120, price=100.0, drift=0.0, volatility=0.0)
+    trader = _trader(trading, MarketType.SPOT, 1.0)
+    trader.klines = StubKlines(frame)
+    trader._tick()
+    assert venue.sides() == ["buy"]
+
+    trader.klines = StubKlines(frame.iloc[:-1].reset_index(drop=True))
+    trader._tick()
+    assert venue.sides() == ["buy"]
+
+
+def test_auto_anchors_the_cadence_on_the_bar_it_just_ate(service):
+    """吃完一根就把锚挪到下一根收盘：_pending_close = 那根开盘 + 2 个周期。"""
+    trading, _venue = service
+    trader = _trader(trading, MarketType.SPOT, 1.0)
+    trader._tick()
+    assert trader._pending_close == pytest.approx(
+        trader._last_candle_ts / 1000.0 + 2 * 3600.0
+    )
+    # 替身 K 线的时间戳是历史数据，锚已经过期，于是 next_run_at 顺延到墙上下一根：
+    # 无论哪种情况它都得是「将来的一个收盘点」，不能是过去。
+    assert trader.next_run_at() > time.time()
 
 
 def test_live_equity_reads_nested_total():

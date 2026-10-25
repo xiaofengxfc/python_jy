@@ -60,15 +60,20 @@ class PipelineContext:
     news: str = ""
 
     def signal_line(self) -> str:
+        """策略信号那一段。策略是参考，AI 才是决策者。
+
+        以前这里写的是「你只做复核…不得在空仓信号下开新仓」：策略空仓时模型连
+        调用都发不出去（engine.ai_trader 在调用前就 return 了），方向也完全由策略
+        定。现在策略降为一条输入，空仓时由模型自己判断。
+        """
         if self.signal_target is None:
             return ""
         target = self.signal_target
         direction = "做多" if target > 0 else "做空" if target < 0 else "空仓"
-        return (
-            f"【策略信号】目标仓位 {target:+.0%}（{direction}）。"
-            "你只做复核。同意该方向才可开对应方向，不同意就 hold。"
-            "不得反向开仓，不得在空仓信号下开新仓。"
-        )
+        head = f"【策略信号】目标仓位 {target:+.0%}（{direction}）。这只是参考，不是命令。"
+        if abs(target) < 1e-9:
+            return head + "策略现在是空仓，要不要开仓、开哪个方向，由你按上面的行情自己判断。"
+        return head + "你同意就顺势开仓，不同意就 hold。策略看多时不要开空，看空时不要开多。"
 
     def account_block(self) -> str:
         price = "未知" if self.price is None else f"{self.price}"

@@ -19,6 +19,8 @@ import pandas as pd
 import pytest
 
 from btrader.engine.ai_trader import (
+    BAR_SETTLE_SECONDS,
+    BAR_WINDOW_AFTER,
     AIDecision,
     AIGuard,
     AITrader,
@@ -398,7 +400,9 @@ def test_disabled_trader_does_not_start(tmp_path):
 def test_daily_decision_limit_stops_before_llm_call(tmp_path):
     trader, llm, _trading, _risk = make_trader(tmp_path, max_decisions_per_day=1)
     assert trader.decide_once()["outcome"] == "order"
-    second = trader.decide_once()
+    # 同一根 K 线已经决策过（去重会返回 None）；force 模拟「下一根收盘后又来一次」，
+    # 这一次撞上当天的额度，模型不该被调用。
+    second = trader.decide_once(force=True)
     assert second["outcome"] == "skip"
     assert "当日决策次数" in second["reason"]
     assert len(llm.calls) == 1
@@ -499,13 +503,109 @@ def test_strategy_signal_vetoes_opposite_entry(tmp_path):
     assert trading.requests == []
 
 
-def test_zero_strategy_signal_skips_before_calling_model(tmp_path):
+def test_zero_strategy_signal_still_lets_ai_decide(tmp_path):
+    """策略为辅、AI 为主：策略空仓时模型照常被调用，也可以自己开仓。
+
+    以前空仓直接 return，一次模型调用都不发——那等于策略才是决策者。
+    """
     trader, llm, trading, _risk = make_trader(tmp_path, signal_target=0.0)
     record = trader.decide_once()
-    assert record is not None and record["outcome"] == "skip"
-    assert "策略无信号" in record["reason"]
-    assert llm.calls == []
-    assert trading.requests == []
+    assert record is not None and record["outcome"] == "order"
+    assert llm.calls, "空仓信号不该截掉这次模型调用"
+    assert "【策略信号】" in llm.calls[0]
+    assert "空仓" in llm.calls[0]
+    assert len(trading.requests) == 1
+
+
+def test_same_bar_is_decided_only_once(tmp_path):
+    """节奏跟着 K 线周期：同一根 K 线只跑一次，force 才允许重跑。"""
+    # 冷却设 0：时钟是冻结的固定值，30 秒冷却在测试里永远过不去。
+    trader, llm, _trading, _risk = make_trader(
+        tmp_path, signal_target=0.6, cooldown_sec=0.0
+    )
+    first = trader.decide_once()
+    assert first is not None and first["outcome"] == "order"
+    # 同一根 K 线（frame 的时间戳没变）再问一次：什么都不做，也不写审计。
+    assert trader.decide_once() is None
+    assert len(llm.calls) == 1
+    # 人点「立即决策」时要真的再跑一次。
+    forced = trader.decide_once(force=True)
+    assert forced is not None and forced["outcome"] == "order"
+    assert len(llm.calls) == 2
+
+
+def test_next_wait_sleeps_to_the_next_bar_close(tmp_path):
+    """1h 周期：睡到下一根收盘后几秒，不再按 poll_sec 每分钟醒一次。"""
+    hour = 3600.0
+    aligned = 1_800_000_000.0 - (1_800_000_000.0 % hour)
+    now = aligned + 3.0  # 上一根刚收盘 3 秒
+    trader, _llm, _trading, _risk = make_trader(
+        tmp_path, timeframe="1h", clock=lambda: now, poll_sec=60.0
+    )
+    # 上一根（开盘于 aligned-hour）刚跑完，下一根收盘在 aligned+hour。
+    trader._last_bar_ts = int((aligned - hour) * 1000)
+    trader._pending_close = aligned + hour
+    assert trader.next_wait_sec() == pytest.approx(hour - 3.0 + BAR_SETTLE_SECONDS)
+
+    # 收盘点到了、这根却还没落地：按 poll_sec 小步重试。
+    trader._pending_close = now - 5.0
+    assert trader.next_wait_sec() == pytest.approx(60.0)
+
+    # 这一根的窗口也过了：直接睡到下一根，不再一秒醒一次。
+    trader._pending_close = now - BAR_WINDOW_AFTER - 10.0
+    wait = trader.next_wait_sec()
+    assert hour - BAR_WINDOW_AFTER < wait <= hour
+
+
+def test_next_run_at_is_the_close_plus_settle(tmp_path):
+    hour = 3600.0
+    aligned = 1_800_000_000.0 - (1_800_000_000.0 % hour)
+    trader, _llm, _trading, _risk = make_trader(
+        tmp_path, timeframe="1h", clock=lambda: aligned + 3.0
+    )
+    assert trader.next_run_at() is None  # 没在跑就不报
+    trader._state = "running"
+    trader._pending_close = aligned + hour
+    assert trader.next_run_at() == pytest.approx(aligned + hour + BAR_SETTLE_SECONDS)
+
+
+def test_a_stale_frame_is_not_decided_twice(tmp_path):
+    """行情往回退时（币安不可达 → Gate 永续镜像）别把同一根再决策一次。
+
+    相等判断会放行比上一根更旧的 K 线：同一根里再调一次模型，还可能在同一个
+    收盘点上下第二单。所以判据是「有没有更新」，不是「是否相等」。
+    """
+    frame = make_frame(30)
+    holder = {"frame": frame}
+    trader, llm, _trading, _risk = make_trader(
+        tmp_path, timeframe="15m", frame_provider=lambda: holder["frame"]
+    )
+    assert trader.decide_once() is not None
+    assert len(llm.calls) == 1
+
+    # 同一根：不跑。
+    assert trader.decide_once() is None
+    assert len(llm.calls) == 1
+
+    # 比上一根还旧：也不跑。
+    holder["frame"] = frame.iloc[:-1].reset_index(drop=True)
+    assert trader.decide_once() is None
+    assert len(llm.calls) == 1
+
+    # 真出了一根新的：照常跑。
+    holder["frame"] = make_frame(31)
+    assert trader.decide_once() is not None
+    assert len(llm.calls) == 2
+
+
+def test_status_reports_the_bar_cadence(tmp_path):
+    """界面上的「决策节奏」读的是这条：bar_seconds 从周期换算，没在跑就不报 next_run_at。"""
+    trader, _llm, _trading, _risk = make_trader(tmp_path, timeframe="1h")
+    cadence = trader.status()["cadence"]
+    assert cadence["bar_seconds"] == 3600
+    assert cadence["next_run_at"] is None
+    assert cadence["last_bar_ts"] == 0
+
 
 def test_closing_a_short_buys_and_closing_a_long_sells(tmp_path):
     """平空必须是买、平多是卖：方向写错时卖单会把空头做得更大。"""
@@ -873,8 +973,12 @@ def test_a_signal_flip_during_the_model_call_blocks_the_entry(tmp_path):
     assert audit_rows(tmp_path / "audit.jsonl")[-1]["reason"] == record["reason"]
 
 
-def test_a_signal_that_goes_flat_during_the_model_call_blocks_the_entry(tmp_path):
-    """信号从 +60% 掉到空仓：不确定就不下单。"""
+def test_a_signal_that_goes_flat_during_the_model_call_no_longer_blocks(tmp_path):
+    """策略在模型调用期间掉成空仓，不再拒这一单。
+
+    策略是参考（策略为辅、AI 为主）：空信号本来就允许 AI 开仓，所以「变成空仓」
+    不算方向翻脸。该拦的是反向（上一个用例），不是「策略没主意了」。
+    """
     signals = [0.6]
     trader, llm, trading, _risk = make_trader(
         tmp_path, signal_provider=lambda: signals[-1]
@@ -889,9 +993,8 @@ def test_a_signal_that_goes_flat_during_the_model_call_blocks_the_entry(tmp_path
 
     record = trader.decide_once()
 
-    assert record is not None and record["outcome"] == "reject", record
-    assert "空仓" in record["reason"], record["reason"]
-    assert trading.requests == []
+    assert record is not None and record["outcome"] == "order", record
+    assert len(trading.requests) == 1
 
 
 def test_the_signal_recheck_failing_blocks_the_entry(tmp_path):
