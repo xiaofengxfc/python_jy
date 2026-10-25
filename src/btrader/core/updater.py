@@ -1920,7 +1920,8 @@ def _restart_linux() -> tuple[bool, str]:
     确认由新进程做（_heal_state 里自己打 /api/health）。
 
     返回码非 0 仍是失败：stdout / stderr 原样带走（systemctl 与 sudo 的报错都在里面），
-    不替它编原因。
+    不替它编原因。唯一的例外是 SIGTERM（-15 / 143）——那是本单元正在停，命令已经被
+    systemd 受理了，见下面 returncode 那一段。
     """
     global _last_restart_log
     args = ["sudo", "-n", "systemctl", "--no-block", "restart", SERVICE_NAME]
@@ -1946,6 +1947,20 @@ def _restart_linux() -> tuple[bool, str]:
         _append_restart_log(log_path, detail, who="老进程")
         return False, detail
     output = _text(proc)
+    # -15 / 143（128+15）：systemctl 是跟着本单元一起被 SIGTERM 的——unit 默认
+    # KillMode=control-group，stop 时整组都收信号。这不是「重启没做成」，恰恰说明
+    # 请求已经被 systemd 受理、本单元正在停。实测 --no-block 也躲不掉这段（请求入队
+    # 之后 stop 立刻就开始了），只看「非 0 即失败」会把一次成功的重启记成 failed，
+    # 界面显示更新失败、实际代码已经换掉。新进程的 /api/health 才是判据。
+    if proc.returncode in (-15, 143):
+        message = (
+            f"重启请求已被 systemd 受理（{shown} 被 SIGTERM 结束，退出码 {proc.returncode}）："
+            f"本单元正跟着停。确认留给新进程——它起来之后自己请求 {HEALTH_PATH}，拿到 2xx 才把"
+            f"这次更新收成 done（{RESTART_CONFIRM_TIMEOUT:.0f} 秒内没新进程接手就算失败）。"
+            f"日志 {log_path}{_port_note()}。"
+        )
+        _append_restart_log(log_path, message, who="老进程")
+        return True, message
     if proc.returncode != 0:
         detail = output or f"重启失败：退出码 {proc.returncode}"
         _append_restart_log(log_path, f"重启失败（{shown}）：{detail}", who="老进程")

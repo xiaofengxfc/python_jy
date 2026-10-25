@@ -552,8 +552,12 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   open 就 `PermissionError`；stderr 又给了 DEVNULL，退出码没人看，于是「垫片死了」被当成
   「重启成功」，服务就这么停死了。老进程这边等两段：先等自己放开端口（`RELEASE_TIMEOUT`），
   再等新进程绑上端口（`LISTEN_TIMEOUT`），任何一段超时都算失败，`error` 里带垫片日志路径和
-  手动命令（`_manual_hint`）。Linux 那条只看 `sudo -n systemctl --no-block restart` 的返回码
-  （非 0 即失败，stdout / stderr 原文照贴）——它**立刻返回**，真正的确认在新进程里做。
+  手动命令（`_manual_hint`）。Linux 那条看 `sudo -n systemctl --no-block restart` 的返回码
+  （非 0 即失败，stdout / stderr 原文照贴），但 **-15 / 143 是例外**：`--no-block` 只让它不等待，
+  systemd 收到请求就开始 stop，systemctl 客户端跟着本单元一起收 SIGTERM（unit 默认
+  `KillMode=control-group`），实测一次成功的重启被记成「重启失败：退出码 -15」——界面说失败、
+  代码其实已经换掉（t103，服务器上真跑过一次 apply 撞出来的）。SIGTERM 记成「已受理」，
+  成没成仍由新进程的 `/api/health` 判。
 - 为什么 Linux 不能在老进程里等重启（t88 的结论，别再改回去）：默认的 `systemctl restart` 要等本
   单元停完才返回，而本单元就是发命令的那个进程——老进程等 systemctl、systemctl 等老进程退出，
   互锁到 `TimeoutStopSec=20` 被 SIGKILL 硬切；而流水线前面几步最坏能跑 2000 秒以上（pip、构建、

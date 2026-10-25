@@ -489,6 +489,27 @@ def test_the_linux_restart_uses_sudo_with_a_list(monkeypatch):
     assert "restarted" in output
 
 
+def test_a_linux_restart_killed_with_sigterm_counts_as_handed_over(monkeypatch):
+    """-15 是「本单元正在停」，不是「重启没做成」。
+
+    实测：--no-block 发出请求之后 systemd 立刻开始 stop，systemctl 客户端跟着本单元
+    一起收 SIGTERM。只看「非 0 即失败」会把一次成功的重启记成 failed，而新进程其实
+    已经起来了（journal 里 Started 都在）。判据交给新进程的 /api/health。
+    """
+    for code in (-15, 143):
+        monkeypatch.setattr(updater, "restart_service", REAL_RESTART)
+        monkeypatch.setattr(updater.sys, "platform", "linux")
+        monkeypatch.setattr(
+            updater.subprocess,
+            "run",
+            lambda args, **kwargs: subprocess.CompletedProcess(args, code, "", ""),
+        )
+        ok, output = updater.restart_service()
+        assert ok is True, output
+        assert "SIGTERM" in output
+        assert "/api/health" in output  # 确认在新进程那边
+
+
 def test_a_failed_linux_restart_reports_the_raw_output(monkeypatch):
     monkeypatch.setattr(updater, "restart_service", REAL_RESTART)
     monkeypatch.setattr(updater.sys, "platform", "linux")
