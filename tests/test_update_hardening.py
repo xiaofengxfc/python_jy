@@ -191,6 +191,7 @@ def test_a_restart_that_comes_back_up_is_success(monkeypatch):
     assert "888" in output
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="垫片用 creationflags 起进程，Linux 上传这个参数就是 ValueError")
 def test_the_shim_really_spawns_the_child_and_keeps_its_output(tmp_path):
     """真跑一次垫片：它等端口放开 → 拉起 run_web.py → 子进程的输出（含 stderr）进日志。"""
     with socket.socket() as probe:

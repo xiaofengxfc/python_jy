@@ -266,7 +266,12 @@ def _hidden_startupinfo():
     """STARTUPINFO(SW_HIDE)；别的平台给 None（那里传非 None 会直接 ValueError）。"""
     if sys.platform != "win32":
         return None
-    info = subprocess.STARTUPINFO()
+    # getattr 兜底：平台判据被 mock / 未来的解释器上少这个类时，退回 None，
+    # 不要让重启这一步死在 AttributeError 上（那会变成「什么都没做却报失败」）。
+    klass = getattr(subprocess, "STARTUPINFO", None)
+    if klass is None:
+        return None
+    info = klass()
     info.dwFlags |= STARTF_USESHOWWINDOW
     info.wShowWindow = SW_HIDE
     return info

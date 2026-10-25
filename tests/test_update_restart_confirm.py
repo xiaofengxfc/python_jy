@@ -214,6 +214,7 @@ class _Popen:
         return proc
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="这条钉的是 Windows 分支（Popen + 垫片），Linux 上走 systemctl")
 def test_the_windows_restart_only_confirms_that_we_let_go(monkeypatch):
     """Windows 同一条语义：垫片拉起来了、本进程放手了，就算交出去了；
     「新进程起没起来」由新进程自己认，老进程不再等第二段。"""
@@ -234,6 +235,7 @@ def test_the_windows_restart_only_confirms_that_we_let_go(monkeypatch):
     assert "手动" not in output
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="这条钉的是 Windows 分支（Popen + 垫片），Linux 上走 systemctl")
 def test_a_failure_after_we_asked_ourselves_to_exit_goes_into_the_log(monkeypatch, data_dir):
     """确认失败时服务已经停着，/api/update/status 要等用户手动起回来才看得到——
     失败详情与手动命令必须同时进那一轮的 restart-*.log。"""

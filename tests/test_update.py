@@ -502,6 +502,7 @@ def test_a_failed_linux_restart_reports_the_raw_output(monkeypatch):
     assert "a password is required" in output
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows 垫片与 STARTUPINFO 只有 Windows 上有")
 def test_the_windows_restart_spawns_a_detached_process_then_exits_gracefully(monkeypatch):
     spawned: list[tuple[list[str], dict]] = []
     shut: list[str] = []
