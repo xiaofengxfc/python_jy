@@ -578,6 +578,38 @@ curl -s "http://127.0.0.1:8765/api/credentials" | python3 -m json.tool | head -2
 | 显示「不可用」 | 既没有密钥环，也没装 `cryptography` | `sudo /opt/bitrader/.venv/bin/pip install cryptography` 然后重启服务 |
 | 保存 Key 报 500 | 数据目录写不进去 | `sudo chown -R bitrader:bitrader /var/lib/bitrader` |
 
+**币安域名解析不到（DNS 污染）：先查 DNS，别先当成「交易所封了这台机器的地区」。**
+
+现象：图表一根 K 线都没有、`/api/ticker` 回 503，日志里是
+`网络错误：binanceusdm GET https://fapi.binance.com/fapi/v1/exchangeInfo`。
+机房的默认 DNS 对币安域名返回的往往是别人的 IP（实测 `fapi.binance.com` 解析成
+`31.13.94.49` / `108.160.163.106` / `2001::453f:b00f`），名字解析错了，后面 curl、pip、
+代理全都跟着错，看起来像「线路不通」。
+
+```bash
+getent hosts fapi.binance.com            # 不是 cloudfront / AWS 网段就是被污染了
+dig +short @1.1.1.1 fapi.binance.com     # 对照：公共 DNS 给的是真实地址
+curl -s -o /dev/null -w '%{http_code}\n' https://fapi.binance.com/fapi/v1/ping
+```
+
+换掉上游 DNS（香港 / 海外机器用 1.1.1.1 + 8.8.8.8 就够）：
+
+```bash
+sudo tee /etc/systemd/resolved.conf.d/10-public-dns.conf <<'EOF'
+[Resolve]
+DNS=1.1.1.1 8.8.8.8
+FallbackDNS=223.5.5.5 223.6.6.6
+EOF
+sudo systemctl restart systemd-resolved && sudo resolvectl flush-caches
+```
+
+Debian 云镜像多半还带一份 `netplan` 配置，那里面也写着 `nameservers.addresses`：不改的话
+下次重启网络，link 上又回到污染 DNS。改完 `sudo netplan generate`（不必 `apply`），
+再 `sudo resolvectl dns ens17 1.1.1.1 8.8.8.8` 立刻生效（`ens17` 换成实际网卡名）。
+
+改完重启服务：`/api/ticker` 应该从 503 变 200，`/api/klines` 的 `source` 从
+「Gate.io 永续」变回 `Binance`，`/api/symbols?market=usdm` 从 4 个降级对变回全量。
+
 ### 8.4 时钟 / 时区
 
 表现：所有签名请求报 `-1021 Timestamp for this request is outside of the recvWindow`，界面上往往只是一句「无法读取当前持仓」。
