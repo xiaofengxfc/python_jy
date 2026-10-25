@@ -883,7 +883,9 @@ class AITrader:
         """已收盘 K 线里最后一根的开放时间（毫秒）；读不到就是 0。
 
         这就是「这根 K 线处理过没有」的键。用行情自己的时间戳而不是墙上时钟：
-        重启、休眠、本机时钟偏移都不会让同一根决策两遍，也不会整根跳过。
+        poller 停了再起、机器休眠、本机时钟偏移都不会让同一根决策两遍，也不会整根
+        跳过。进程重启会退回 0（这个值没落盘），重启后那根要再决策一次——受冷却与
+        每小时订单上限约束，但别在注释或文档里写成「重启也不会重复」。
         """
         try:
             return int(frame["timestamp"].iloc[-1])
@@ -959,7 +961,17 @@ class AITrader:
                 # bar_ts 是刚收盘那根的开放时间：它收盘在 +1 个周期，下一根在
                 # +2 个。周期不认识时不动锚，节奏退回 poll_sec。
                 if bar > 0:
-                    self._pending_close = bar_ts / 1000.0 + 2 * bar
+                    pending = bar_ts / 1000.0 + 2 * bar
+                    # 时间戳离谱时（单位写成微秒、交易所时钟错、镜像源给了未来的
+                    # bar）不能照着睡过去：锚最多推到「现在 + 2 根 + 窗口」，再远就
+                    # 按墙上的下一根。否则引擎会静默睡到那一天，界面上显示「下次
+                    # 2262 年」，而状态一直是 running。
+                    limit = now + 2 * bar + BAR_WINDOW_AFTER
+                    self._pending_close = (
+                        pending
+                        if pending <= limit
+                        else (math.floor(now / bar) + 1) * bar
+                    )
         pipeline = self._decide(frame, portfolio, signal_target)
         if not pipeline.ok:
             return self._record(

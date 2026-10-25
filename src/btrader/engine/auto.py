@@ -41,6 +41,20 @@ WARMUP_EXTRA = 2
 CLOSE_SETTLE_SECONDS = 3.0
 CLOSE_WINDOW_AFTER = 120.0
 
+def _bar_label(ms: int) -> str:
+    """K 线开放时间写成「月-日 时:分」。
+
+    时间戳越界时（单位写成微秒、脏数据）原样报出来，不让 strftime 抛异常——一抛
+    整轮 tick 就没了：策略跑完了、锚也挪了，可调仓和事件都不发生，界面上只看到一条
+    「循环异常」。pandas 对超出 Python 标准库范围的 Timestamp 是直接抛
+    NotImplementedError 的，不是返回空串。
+    """
+    try:
+        return f"{pd.Timestamp(ms, unit='ms'):%m-%d %H:%M}"
+    except (ValueError, OverflowError, NotImplementedError):
+        return str(ms)
+
+
 LogListener = Callable[[str, str], None]
 SignalListener = Callable[[float, str], None]
 StateListener = Callable[[bool], None]
@@ -335,7 +349,15 @@ class AutoTrader:
             return
         self._last_candle_ts = last_ts
         # closed 最后一根的开放时间是 last_ts：它收盘在 +1 个周期，下一根在 +2 个。
-        self._pending_close = last_ts / 1000.0 + 2 * step / 1000.0
+        bar_s = step / 1000.0
+        pending = last_ts / 1000.0 + 2 * bar_s
+        # 时间戳离谱时（单位错、镜像源给了未来的 bar）别照着睡过去，按墙上的下一根，
+        # 否则引擎会静默睡到那一天、界面一直显示在跑。
+        now_s = time.time()
+        limit = now_s + 2 * bar_s + CLOSE_WINDOW_AFTER
+        self._pending_close = (
+            pending if pending <= limit else (math.floor(now_s / bar_s) + 1) * bar_s
+        )
 
         frame = self.strategy.generate(closed, self.config.params)
         raw = frame["target"].reindex(closed.index).to_numpy(dtype=float)
@@ -347,7 +369,7 @@ class AutoTrader:
         self._refresh_equity(price)
         self._emit_log(
             "INFO",
-            f"新收盘 K 线 {pd.Timestamp(last_ts, unit='ms'):%m-%d %H:%M} "
+            f"新收盘 K 线 {_bar_label(last_ts)} "
             f"策略目标 {target:+.0%}（当前 {self._current_target:+.0%}）",
         )
         changed = target != self._current_target

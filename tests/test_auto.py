@@ -183,6 +183,17 @@ def test_auto_ignores_a_candle_older_than_the_last_one(service):
     assert venue.sides() == ["buy"]
 
 
+def test_auto_ignores_an_absurd_candle_timestamp(service):
+    """时间戳单位写错时不能照着睡到几百年后，按墙上的下一根算。"""
+    trading, _venue = service
+    frame = make_candles(120, price=100.0, drift=0.0, volatility=0.0)
+    frame["timestamp"] = frame["timestamp"] * 1000  # 毫秒 → 微秒
+    trader = _trader(trading, MarketType.SPOT, 1.0)
+    trader.klines = StubKlines(frame)
+    trader._tick()
+    assert trader._pending_close <= time.time() + 3600.0
+
+
 def test_auto_anchors_the_cadence_on_the_bar_it_just_ate(service):
     """吃完一根就把锚挪到下一根收盘：_pending_close = 那根开盘 + 2 个周期。"""
     trading, _venue = service

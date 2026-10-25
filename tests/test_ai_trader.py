@@ -598,6 +598,18 @@ def test_a_stale_frame_is_not_decided_twice(tmp_path):
     assert len(llm.calls) == 2
 
 
+def test_an_absurd_bar_timestamp_falls_back_to_the_wall_clock(tmp_path):
+    """时间戳写成微秒时不能照着睡到 2262 年：锚最多推到「现在 + 2 根 + 窗口」。"""
+    frame = make_frame(30)
+    frame["timestamp"] = frame["timestamp"] * 1000  # 毫秒 → 微秒
+    trader, _llm, _trading, _risk = make_trader(
+        tmp_path, timeframe="15m", frame_provider=lambda: frame
+    )
+    assert trader.decide_once() is not None
+    # 现在 = 1_800_000_000，15m 一根 900 秒：最多推到墙上的下一根，不可能到几百年后。
+    assert trader._pending_close <= 1_800_000_000.0 + 900.0
+
+
 def test_status_reports_the_bar_cadence(tmp_path):
     """界面上的「决策节奏」读的是这条：bar_seconds 从周期换算，没在跑就不报 next_run_at。"""
     trader, _llm, _trading, _risk = make_trader(tmp_path, timeframe="1h")
