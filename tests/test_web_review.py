@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 from dataclasses import dataclass
 
@@ -271,4 +272,31 @@ def test_a_dead_watcher_is_replaced_on_the_next_subscribe() -> None:
     asyncio.run(scenario())
 
     assert started == ["BTC/USDT", "BTC/USDT"]
+
+
+# ------------------------------------------- 断线重连：退避 + 日志限频
+def test_a_dead_stream_backs_off_and_stops_flooding_the_log(caplog) -> None:
+    """币安域名不可达时，固定 3 秒重连会把 journal 刷成几万行。两件都要在：
+
+    重连要按指数退避，同一条通道的失败日志每 5 分钟最多一条，收到一帧就清零并
+    补一条「恢复」。原因原样带出，不吞。
+    """
+    hub = StreamHub(Network.TESTNET)
+    with caplog.at_level(logging.WARNING, logger="btrader.web.stream"):
+        delays = [hub._fail_sleep("ticker", SYMBOL, RuntimeError("boom")) for _ in range(8)]
+    assert delays == [3.0, 6.0, 12.0, 24.0, 48.0, 60.0, 60.0, 60.0]
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1, [r.getMessage() for r in warnings]
+    assert "boom" in warnings[0].getMessage()  # 原因照实写出来
+    # 另一条通道自己数自己的，不受这一条影响
+    assert hub._fail_sleep("盘口", SYMBOL, RuntimeError("boom")) == 3.0
+    # 真的收到一帧：计数清零，补一条恢复
+    with caplog.at_level(logging.INFO, logger="btrader.web.stream"):
+        hub._recovered("ticker", SYMBOL)
+    assert ("ticker", SYMBOL) not in hub._fails
+    assert any("已恢复" in r.getMessage() for r in caplog.records)
+    # 没断过、直接来帧的通道不写「恢复」
+    before = len(caplog.records)
+    hub._recovered("成交", SYMBOL)
+    assert len(caplog.records) == before
 

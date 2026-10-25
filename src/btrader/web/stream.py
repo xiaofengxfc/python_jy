@@ -31,6 +31,12 @@ QUEUE_SIZE = 16
 # Binance accepts these depth limits only; 12 is rejected with -4021.
 BOOK_DEPTH = 10
 _RETRY_SECONDS = 3.0
+# 断线后按 3 → 6 → 12 → 24 → 48 → 60 秒退避。固定 3 秒重连时，币安域名被 DNS
+# 污染会每秒一条 WARNING 把 journal 刷满（实测一台机器一天几十万行），日志里
+# 真正有用的那一行反而找不到。
+_RETRY_MAX_SECONDS = 60.0
+# 同一路推送的失败日志最多每 5 分钟一条：次数在退避，日志也一起收住。
+_FAIL_LOG_EVERY_SECONDS = 300.0
 # Trades arrive per fill; folding a short window into one frame keeps the
 # bounded client queue from being flushed by a busy market.
 TRADE_FLUSH_SECONDS = 0.25
@@ -77,6 +83,8 @@ class StreamHub:
         # remembers the top of the ladder so the ticker frame can still show a
         # real spread instead of zeroes.
         self._top: dict[tuple[str, str], tuple[float, float]] = {}
+        # 连续失败状态：(连续次数, 上次记日志的 monotonic 时刻)，键是 (通道, 交易对)。
+        self._fails: dict[tuple[str, str], tuple[int, float]] = {}
 
     # ------------------------------------------------------------- exchange
     def _exchange(self, market: MarketType) -> Any:
@@ -237,10 +245,34 @@ class StreamHub:
         except Exception:  # pragma: no cover - defensive, gather already isolates
             log.exception("行情订阅异常 %s", symbol)
 
+    # ------------------------------------------------------------- 重连节流
+    def _fail_sleep(self, kind: str, symbol: str, exc: Exception) -> float:
+        """记一次失败，返回下次重试要等几秒。
+
+        指数退避管住重连频率，日志管住行数：第一次必记，之后同一条通道每
+        _FAIL_LOG_EVERY_SECONDS 才再说一句。原因原样带上，不吞。
+        """
+        slot = (kind, symbol)
+        count, last = self._fails.get(slot, (0, 0.0))
+        count += 1
+        now = time.monotonic()
+        if count == 1 or now - last >= _FAIL_LOG_EVERY_SECONDS:
+            log.warning("%s 推送中断 %s（连续 %d 次）: %s", kind, symbol, count, exc)
+            last = now
+        self._fails[slot] = (count, last)
+        return min(_RETRY_SECONDS * (2 ** (count - 1)), _RETRY_MAX_SECONDS)
+
+    def _recovered(self, kind: str, symbol: str) -> None:
+        """真的收到一帧：清掉失败计数，断过的话补一条「恢复」。"""
+        count, _last = self._fails.pop((kind, symbol), (0, 0.0))
+        if count:
+            log.info("%s 推送已恢复 %s（此前连续失败 %d 次）", kind, symbol, count)
+
     async def _watch_ticker(self, exchange: Any, key, symbol: str) -> None:
         while True:
             try:
                 ticker = await exchange.watch_ticker(symbol)
+                self._recovered("ticker", symbol)
                 # 币安合约的 ticker 没有买一卖一，用盘口帧记住的两档补上；
                 # 两样都没有就是 0，前端显示「—」，绝不编一个价。
                 bid, ask = ticker_bid_ask(ticker, *self._top.get(key, (0.0, 0.0)))
@@ -263,13 +295,13 @@ class StreamHub:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                log.warning("ticker 推送中断 %s: %s", symbol, exc)
-                await asyncio.sleep(_RETRY_SECONDS)
+                await asyncio.sleep(self._fail_sleep("ticker", symbol, exc))
 
     async def _watch_book(self, exchange: Any, key, symbol: str) -> None:
         while True:
             try:
                 book = await exchange.watch_order_book(symbol, BOOK_DEPTH)
+                self._recovered("盘口", symbol)
                 bids = [[_num(p), _num(q)] for p, q in (book.get("bids") or [])[:BOOK_DEPTH]]
                 asks = [[_num(p), _num(q)] for p, q in (book.get("asks") or [])[:BOOK_DEPTH]]
                 if bids and asks:
@@ -287,8 +319,7 @@ class StreamHub:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                log.warning("盘口推送中断 %s: %s", symbol, exc)
-                await asyncio.sleep(_RETRY_SECONDS)
+                await asyncio.sleep(self._fail_sleep("盘口", symbol, exc))
 
     async def _watch_trades(self, exchange: Any, key, symbol: str) -> None:
         """Fold public trades into short frames.
@@ -302,6 +333,7 @@ class StreamHub:
         while True:
             try:
                 trades = await exchange.watch_trades(symbol)
+                self._recovered("成交", symbol)
                 volume = 0.0
                 last_price = 0.0
                 last_time = 0
@@ -338,8 +370,7 @@ class StreamHub:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                log.warning("成交推送中断 %s: %s", symbol, exc)
-                await asyncio.sleep(_RETRY_SECONDS)
+                await asyncio.sleep(self._fail_sleep("成交", symbol, exc))
 
     # --------------------------------------------------------------- teardown
     async def close(self) -> None:
