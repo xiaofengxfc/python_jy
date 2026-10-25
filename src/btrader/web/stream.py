@@ -260,7 +260,9 @@ class StreamHub:
             log.warning("%s 推送中断 %s（连续 %d 次）: %s", kind, symbol, count, exc)
             last = now
         self._fails[slot] = (count, last)
-        return min(_RETRY_SECONDS * (2 ** (count - 1)), _RETRY_MAX_SECONDS)
+        # 翻倍到封顶就够了：count 再大也只是 60 秒，不去算 2**10000 那种大数。
+        doublings = min(count - 1, 5)
+        return min(_RETRY_SECONDS * (2**doublings), _RETRY_MAX_SECONDS)
 
     def _recovered(self, kind: str, symbol: str) -> None:
         """真的收到一帧：清掉失败计数，断过的话补一条「恢复」。"""
