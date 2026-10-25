@@ -270,9 +270,17 @@ def test_a_451_says_the_region_is_blocked_not_the_network() -> None:
     assert "restricted location" not in text, "别把英文原文原样甩出来"
 
 
-def test_a_plain_network_error_is_still_just_a_network_error() -> None:
-    text = _message(ccxt.NetworkError("binance GET https://api.binance.com/api/v3/ping timeout"))
+def test_a_plain_network_error_says_where_to_fix_it() -> None:
+    """光一句「网络错误：binanceusdm GET https://...」等于没说：既没说谁连不上谁，
+    也没说能怎么办。地址要留着，还要指向设置页那个代理框，并给一条能自己跑的自检。"""
+    text = _message(
+        ccxt.NetworkError("binanceusdm GET https://fapi.binance.com/fapi/v1/exchangeInfo")
+    )
     assert text.startswith("网络错误")
+    assert "fapi.binance.com" in text, "把连的是哪个地址留着，别抹掉"
+    assert "网络代理" in text, "要指向设置页那个输入框"
+    assert "API Key" in text, "排除「密钥没配」这条歧路"
+    assert "curl" in text, "给一条能在服务器上自己跑的自检"
 
 
 def test_retired_futures_testnet_error_is_explained_in_chinese() -> None:

@@ -178,6 +178,23 @@ def test_the_installer_checks_that_caddy_actually_started():
     )
 
 
+def test_the_installer_adopts_the_source_repo_so_updates_work():
+    """照文档装机不带 --repo：以前 rsync 把 .git 排除在外，装完设置页那张卡永远是
+    「读不到本地提交：fatal: not a git repository」。现在把源码目录的远端接过去。"""
+    text = INSTALL.read_text(encoding="utf-8")
+    assert "adopt_git_repo" in text
+    assert "remote.origin.url" in text, "远端从源码目录读，别让人再填一次 --repo"
+    assert "symbolic-ref HEAD 'refs/heads/$branch'" in text, (
+        "分支名要跟远端对齐，别留在 git init 默认的 master（远端是 main 就对不上）"
+    )
+    assert "reset -q FETCH_HEAD" in text, (
+        "默认不动工作树：源码目录有未提交的改动要如实显示出来，别静默盖掉"
+    )
+    assert "safe.directory" in text, (
+        "重跑安装时目录属主是 bitrader、脚本是 root，不带这条 git 会以 dubious ownership 拒跑"
+    )
+
+
 def test_the_ip_comes_from_the_cloud_metadata_before_a_public_service():
     text = INSTALL.read_text(encoding="utf-8")
     for needle in ("100.100.100.200", "metadata.tencentyun.com", "169.254.169.254", "api.ipify.org"):

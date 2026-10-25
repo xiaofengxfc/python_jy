@@ -298,6 +298,41 @@ create_user() {
   note "数据目录：$DATA_DIR（SQLite / 配置 / 日志 / secrets.bin 都在这里）"
 }
 
+# ------------------------------------------------------- 6 之前的 git 小工具
+# 远端默认分支名。读不到就按 main：分支名猜错的后果是「本地 master / 远端 main」，
+# updater 读不到 upstream，更新卡报的是「读不到远端提交」，看着像网络问题。
+git_remote_head_branch() {
+  local url=$1 branch=""
+  if [ -z "$DRY_RUN" ]; then
+    branch="$(git ls-remote --symref "$url" HEAD 2>/dev/null \
+      | sed -n 's|^ref: refs/heads/\([^[:space:]]*\).*|\1|p' | head -n 1)"
+  fi
+  printf '%s' "${branch:-main}"
+}
+
+# 把一个「有代码、没有 .git」的目录接到远端仓库上。
+#   adopt_git_repo <目录> <远端地址> <分支> [--hard]
+# 默认只动 index（reset 不带 --hard）：工作树里 rsync 过来的内容一个字节都不改，
+# 源码目录那边有未提交的改动就如实显示成未提交改动，在线更新照规矩拒绝。
+# --hard 只给「带 --repo 的旧机器迁移」那条路用，那是全脚本唯一一次硬对齐。
+adopt_git_repo() {
+  local dir=$1 url=$2 branch=$3 mode=${4:-}
+  # 每条都带 -c safe.directory：重跑安装时目录属主已经是 bitrader 而脚本是 root，
+  # git 2.35+ 会以「detected dubious ownership」拒跑，装到第 6 步就退出了。
+  run_sh "git -c safe.directory='$dir' -C '$dir' init -q"
+  # git init 造出来的分支名是 master 还是 main，看版本和 init.defaultBranch；远端叫什么
+  # 也不一定。先把 HEAD 定到远端那个分支名，否则本地 master / 远端 main 对不上。
+  run_sh "git -c safe.directory='$dir' -C '$dir' symbolic-ref HEAD 'refs/heads/$branch'"
+  run_sh "git -c safe.directory='$dir' -C '$dir' remote add origin '$url' 2>/dev/null || git -c safe.directory='$dir' -C '$dir' remote set-url origin '$url'"
+  run_sh "git -c safe.directory='$dir' -C '$dir' fetch --depth 1 origin '+refs/heads/$branch:refs/remotes/origin/$branch'"
+  if [ "$mode" = "--hard" ]; then
+    run_sh "git -c safe.directory='$dir' -C '$dir' reset --hard FETCH_HEAD"
+  else
+    run_sh "git -c safe.directory='$dir' -C '$dir' reset -q FETCH_HEAD"
+  fi
+  run_sh "git -c safe.directory='$dir' -C '$dir' branch --set-upstream-to='origin/$branch' >/dev/null 2>&1 || true"
+}
+
 # ---------------------------------------------------------------- 6. 代码
 place_code() {
   CURRENT_STEP="6/11 放置代码"
@@ -307,16 +342,17 @@ place_code() {
       note "已有代码，快进到远端最新：$APP_DIR"
       # 和 core/updater.py 同一语义：只做快进，不 reset、不 --force。本地分叉时
       # merge 会失败并停在这一步，输出里就是 git 自己说的话，不会静默丢掉本地提交。
-      run_sh "git -C '$APP_DIR' fetch --depth 1 origin && git -C '$APP_DIR' merge --ff-only FETCH_HEAD"
+      # safe.directory：重跑安装时 $APP_DIR 已归 bitrader，脚本还是 root，git 2.35+ 会
+      # 「detected dubious ownership」直接拒——「重跑一次补权限」这条路最容易撞上。
+      run_sh "git -c safe.directory='$APP_DIR' -C '$APP_DIR' fetch --depth 1 origin"
+      run_sh "git -c safe.directory='$APP_DIR' -C '$APP_DIR' merge --ff-only FETCH_HEAD"
     elif [ -n "$(ls -A "$APP_DIR" 2>/dev/null || true)" ]; then
       # 以前用 rsync 装的机器：目录里有代码但没 .git，git clone 到非空目录必失败
       # （destination path already exists and is not an empty directory）。这里补一个
       # 仓库壳再把工作树对齐到远端。这是全脚本唯一一次硬对齐，只覆盖仓库跟踪的文件；
       # 数据目录（$DATA_DIR）一个字节都不碰。
       note "$APP_DIR 里已经有代码但没有 .git（以前是 rsync / scp 装的）：补上远端再对齐"
-      run_sh "git -C '$APP_DIR' init -q"
-      run_sh "git -C '$APP_DIR' remote add origin '$REPO_URL' 2>/dev/null || git -C '$APP_DIR' remote set-url origin '$REPO_URL'"
-      run_sh "git -C '$APP_DIR' fetch --depth 1 origin && git -C '$APP_DIR' reset --hard FETCH_HEAD"
+      adopt_git_repo "$APP_DIR" "$REPO_URL" "$(git_remote_head_branch "$REPO_URL")" --hard
       note "已对齐；以后在线更新（设置页那张卡，或 sudo bash deploy/update.sh）就走 git 了"
     else
       run install -d -m 755 "$APP_DIR"
@@ -325,12 +361,26 @@ place_code() {
   elif [ -f "$SRC_DIR/run_web.py" ]; then
     note "用当前这份代码：$SRC_DIR"
     run install -d -m 755 "$APP_DIR"
-    # 注意：这里不拷 .git。rsync 装上来的机器没有仓库，在线更新用不了；
-    # 要用更新就在这台机器上重跑一次带 --repo 的安装（第 6 步会补 .git 再对齐）。
     run rsync -a --delete \
       --exclude .git --exclude .venv --exclude node_modules \
       --exclude .devdata --exclude .probe --exclude __pycache__ \
       "$SRC_DIR/" "$APP_DIR/"
+    # 以前到这儿就结束了，注释还写着「要用更新就重跑带 --repo 的安装」。可文档里的装机命令
+    # 本来就不带 --repo，于是照文档装出来的机器一打开设置页的更新卡就是
+    # 「读不到本地提交：fatal: not a git repository」——在线更新等于从来没存在过。
+    # 部署机上源码目录几乎总是 clone 下来的，把它的远端和分支一起接过去就够了。
+    # 没有远端（复制粘贴上来的代码）就直说，不假装能更新。
+    local src_remote="" src_branch=""
+    src_remote="$(git -C "$SRC_DIR" config --get remote.origin.url 2>/dev/null || true)"
+    src_branch="$(git -C "$SRC_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    case "$src_branch" in ''|HEAD) src_branch="main" ;; esac
+    if [ -n "$src_remote" ] && printf '%s' "$src_remote" | grep -Eq '^[A-Za-z0-9._~:/@%+,-]+$'; then
+      note "源码目录是 git 仓库：远端一起接过去（$src_remote · $src_branch）"
+      adopt_git_repo "$APP_DIR" "$src_remote" "$src_branch"
+    else
+      note "源码目录没有可用的 git 远端：这台机器装完不能在线更新"
+      note "  要更新就重跑一次带 --repo 的安装（第 6 步会补 .git 再对齐）"
+    fi
   else
     die "既没给 --repo，当前目录也不像仓库（找不到 run_web.py）：$SRC_DIR"
   fi

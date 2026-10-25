@@ -1068,5 +1068,12 @@ def _message(exc: Exception) -> str:
     if isinstance(exc, ccxt.RateLimitExceeded):
         return f"触发限频，请稍后再试：{text}"
     if isinstance(exc, ccxt.NetworkError):
-        return f"网络错误：{text}"
+        # 原文是 "binanceusdm GET https://fapi.binance.com/fapi/v1/exchangeInfo"，对用户
+        # 等于什么都没说：既没说是这台机器出不去，也没说能怎么办。补上后半句：跟什么无关、
+        # 在这里能做什么（自检 + 设置页那个代理框）。
+        return (
+            f"网络错误：{text}。这台机器的出口连不上交易所，跟 API Key、证书、反向代理都无关："
+            "先在这台机器上 curl 一下那个地址（DNS、IPv6、线路都可能），"
+            "确实出不去就在设置页「网络代理」填一个能出去的代理，保存后立刻按代理走。"
+        )
     return text

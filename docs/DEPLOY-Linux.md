@@ -46,7 +46,7 @@ nslookup trade.example.com 8.8.8.8
 两种都行，脚本都支持：
 
 ```bash
-# A. 服务器上直接 clone（推荐，之后 --repo 就能升级）
+# A. 服务器上直接 clone（推荐：.git 在，装完设置页那张更新卡就能用）
 sudo apt-get update && sudo apt-get install -y git
 sudo git clone https://github.com/xiaofengxfc/python_jy.git /root/biTrader
 
@@ -68,7 +68,8 @@ cd /root/biTrader
 bash deploy/install.sh --dry-run --domain trade.example.com
 
 # 真跑
-sudo bash deploy/install.sh --domain trade.example.com
+sudo bash deploy/install.sh --domain trade.example.com \
+  --repo https://github.com/xiaofengxfc/python_jy.git
 ```
 
 脚本做的事（11 步，任一步失败立刻停并说清是哪一步）：
@@ -79,7 +80,8 @@ sudo bash deploy/install.sh --domain trade.example.com
 4. `apt-get` 装 `ca-certificates curl gnupg git rsync python3-venv python3-pip sudo`
    （`sudo` 是必须的：第 9 步那条 NOPASSWD 之后，程序靠 `sudo -n` 执行那一个 root 脚本）
 5. 建系统用户 `bitrader`（不能登录）、数据目录 `/var/lib/bitrader`（750）
-6. 代码放 `/opt/bitrader`（`--repo` 就给 git pull / clone，否则用当前目录 rsync 过去）
+6. 代码放 `/opt/bitrader`（`--repo` 就给 git pull / clone；不给就用当前目录 rsync 过去，
+   同时把那个目录的 git 远端和分支接上——不接的话设置页那张更新卡会报「读不到本地提交」）
 7. `/opt/bitrader/.venv` + `pip install -r requirements.txt`
 8. 写 `/etc/systemd/system/bitrader.service`、`enable` + `restart`，并检查 `is-active`
 9. 装域名切换脚本到 `/usr/local/lib/bitrader/set-domain.sh`（root:root 755），
@@ -99,9 +101,19 @@ sudo bash deploy/install.sh --domain trade.example.com
 | `--no-caddy` | 不装 Caddy，自己拿 nginx 反代到 `127.0.0.1:<端口>` |
 | `--dry-run` | 只打印要写什么，一个字节都不落盘 |
 
-重复跑的时候，代码目录有三条路：已有 `.git` → `git fetch --depth 1` + `git merge --ff-only`
-（只快进，和在线更新同一语义）；有文件但没 `.git`（rsync 装的老机器）→ `git init` 补上仓库壳再对齐；
-目录基本是空的 → `git clone --depth 1`。数据目录 `/var/lib/bitrader` 三条路都不碰。
+重复跑的时候，代码目录有四条路：
+
+- 已有 `.git` → `git fetch --depth 1` + `git merge --ff-only`（只快进，和在线更新同一语义）。
+  git 调用都带 `-c safe.directory`：目录属主是 bitrader 而脚本是 root，不带这条 git 2.35+ 会以
+  `dubious ownership` 拒跑，「重跑一次补权限」那条路就卡在第 6 步。
+- 有文件但没 `.git`（rsync 装的老机器）→ `git init` 补上仓库壳，再对齐到远端。
+- **没给 `--repo`** → 用当前目录 rsync 过去，同时把那个目录的 `remote.origin.url` 和当前分支
+  一起接上：`symbolic-ref` 先把分支名定成远端那个（否则本地 master、远端 main 对不上），
+  `fetch --depth 1` 后 `reset` 只动 index，**工作树一个字节都不改**。所以照文档装机也能在线更新；
+  源码目录自己不是 git 仓库时，脚本直说「这台机器装完不能在线更新」，不假装。
+- 目录基本是空的 → `git clone --depth 1`。
+
+数据目录 `/var/lib/bitrader` 四条路都不碰。
 
 公网 IP 不用你填：脚本先问云厂商的元数据服务（阿里云 `100.100.100.200`、腾讯云
 `metadata.tencentyun.com`、`169.254.169.254`），都没有才问 `https://api.ipify.org`，
