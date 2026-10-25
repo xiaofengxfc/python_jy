@@ -162,6 +162,17 @@ def test_the_installer_checks_that_caddy_actually_started():
     assert "LogsDirectory=caddy" in text, "目录属主要靠 systemd 自己的机制兜一层"
     assert "systemctl is-active --quiet caddy" in text
     assert "journalctl -u caddy -n 20 --no-pager" in text, "没起来就把日志原文贴出来"
+    assert "ls -l /var/log/caddy" in text, "没起来时连目录属主一起贴，别让人再猜一次"
+    # caddy validate 以 root 跑，会按 provision=true 把 Caddyfile 里的 output file 真建出来：
+    # access.log 落成 root:root 0000，然后服务以 caddy 用户起 → EACCES → exit 1。
+    # 所以 chown 必须排在 validate 之后、查 is-active 之前。只 chown 目录不够，这里用的是 -R。
+    assert "chown -R caddy:caddy /var/log/caddy" in text
+    assert text.index("caddy validate --config") < text.index("chown -R caddy:caddy"), (
+        "chown 要排在 validate 之后，否则收不回 validate 建出来的那个文件"
+    )
+    assert text.index("chown -R caddy:caddy") < text.index("systemctl is-active --quiet caddy"), (
+        "chown 要在查 is-active 之前，别等服务起不来才想起"
+    )
     assert text.index("systemctl is-active --quiet caddy") < text.index('note "Caddy 已就绪'), (
         "「已就绪」必须排在 is-active 检查之后"
     )

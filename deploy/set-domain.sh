@@ -192,6 +192,14 @@ if ! "$CADDY_BIN" validate --config "$STAGE" --adapter caddyfile; then
   die "caddy validate 没通过（上面是它自己的输出）。$CADDYFILE 没有写入，磁盘上没留下坏文件"
 fi
 
+# 上面这一跑也是以 root 跑的，而 validate 会按 provision=true 真把配置装一遍：
+# /var/log/caddy/access.log 原本不存在的话，就是刚才这一跑建出来的（属主 root、权限 0000）。
+# 随后 caddy 以 caddy 用户 reload 同一个文件 → EACCES → reload 失败、新配置上不去，
+# 界面上报的是「签发证书失败」，看着像证书的问题。install.sh 那边同一处，两边都别漏。
+if id -u caddy >/dev/null 2>&1; then
+  chown -R caddy:caddy /var/log/caddy
+fi
+
 # 校验过了才换上去：同一个目录里的 mv 是原子改名，Caddy 不会读到半个文件。
 mv -f "$STAGE" "$CADDYFILE"
 chmod 644 "$CADDYFILE"

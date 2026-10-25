@@ -529,6 +529,14 @@ install_caddy() {
     fi
   fi
   run caddy validate --config /etc/caddy/Caddyfile
+  # validate 不是「只读一遍语法」：Caddy 按 provision=true 把配置真装一遍，走到 Caddyfile 里的
+  # `output file` 就 os.OpenFile(..., O_CREATE) 把 access.log 建出来 —— 建它的是跑 validate 的
+  # 那个人，也就是这里的 root；Caddyfile 没写 mode，落盘是 root:root 0000。0.9 秒后服务以
+  # USER=caddy 起，open 同一个文件就是 EACCES → exit 1：
+  #   setting up custom log 'log0': ... open /var/log/caddy/access.log: permission denied
+  # 真机上栽的就是这一下：目录属主已经对了（上面那段检查也过了），Caddy 照样起不来。
+  # 所以校验完要把目录连同里面这个文件一起交回 caddy —— 只 chown 目录不够。
+  run chown -R caddy:caddy /var/log/caddy
   run systemctl daemon-reload
   run systemctl enable caddy
   # 刚装好时 caddy 通常已经在跑（apt 会 enable），reload 不行就 restart 兜底
@@ -545,7 +553,9 @@ install_caddy() {
     if ! systemctl is-active --quiet caddy; then
       printf '\n[失败] caddy 没起来。最近 20 行日志：\n\n' >&2
       journalctl -u caddy -n 20 --no-pager >&2 || true
-      die "caddy 没起来（原因见上面的日志）。常见：/var/log/caddy 不归 caddy、80/443 被别的程序占了、Caddyfile 里域名写错"
+      printf '\n/var/log/caddy 现在长这样（access.log 属主是 root 就是权限这一条）：\n\n' >&2
+      ls -l /var/log/caddy >&2 || true
+      die "caddy 没起来（原因见上面的日志）。常见：/var/log/caddy 或里面的 access.log 归 root、80/443 被别的程序占了、Caddyfile 里域名写错"
     fi
   fi
   note "Caddy 已就绪；证书申请日志：journalctl -u caddy -f"

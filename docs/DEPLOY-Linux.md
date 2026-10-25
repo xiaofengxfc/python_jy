@@ -311,7 +311,8 @@ sudo ufw status numbered        # 看完再决定要不要删旧的 80/443 规�
    不写这一段，服务看到的全是边缘 IP：日志、失败计数、按 IP 限流全错。
    - Caddy 没有续行符，这一行必须**一整行写完**（`deploy/Caddyfile.example` 就是这么放的）；
    - `trusted_proxies` 要 Caddy ≥ 2.7（apt 源装的是 2.10，够用）；
-   - 改完 `sudo caddy validate --config /etc/caddy/Caddyfile` 再 reload。
+   - 改完 `sudo caddy validate --config /etc/caddy/Caddyfile` 再 `sudo chown -R caddy:caddy /var/log/caddy`
+     和 reload。validate 是 root 跑的，会把 `access.log` 建成 root 的，跳过 chown 服务就再也起不来（见 8.1）。
 5. **网段会变。** `routes_deploy.py` 每天问一次 `https://api.cloudflare.com/client/v4/ips`，
    问不到就用内置表（并记下失败时间，一小时后重试）。同一份网段写在三处，必须一致：
    `web/routes_deploy.py`（判定用）、`deploy/Caddyfile.example`（还原真实 IP 用）、
@@ -471,26 +472,44 @@ t81 之前的安装没有这一条，重跑一次 `sudo bash deploy/install.sh -
 
 ### 8.1 域名没生效 / 证书拿不到
 
-先看 Caddy 到底有没有在跑。`caddy validate` 通过**不代表**服务起来了——它只适配配置，不打开日志文件、
-不绑端口。装完（或改完配置）第一件事：
+先看 Caddy 到底有没有在跑。`caddy validate` 通过**不代表**服务起来了——它不绑端口，退出码也看不出来
+（但它**会**打开日志文件，见下面第 2 条）。装完（或改完配置）第一件事：
 
 ```bash
 systemctl is-active caddy                       # 要 active
 journalctl -u caddy -n 40 --no-pager            # 没起来就看这一段
 ```
 
-真机上撞过的一例：`systemctl is-active` 是 `failed`，日志里是
-`open /var/log/caddy/access.log: permission denied` → 服务 exit 1 → 外面一路 521。
-原因是 `/var/log/caddy` 不归 caddy 用户。修法：
+真机上撞过两次同一条报错，原因不是同一个。判断只有一条命令：
 
 ```bash
-sudo install -d -m 0755 -o caddy -g caddy /var/log/caddy
-sudo systemctl restart caddy && systemctl is-active caddy
+ls -l /var/log/caddy        # 目录和里面的 access.log 各归谁
 ```
 
-新的 install.sh 已经这么建目录，并且额外写一条 systemd drop-in
-（`/etc/systemd/system/caddy.service.d/bitrader-logs.conf` 里的 `LogsDirectory=caddy`，
-由 systemd 自己保证目录和属主），装完还会等 `is-active` 通过才算完——不通过就把日志原文贴出来并停下。
+日志里是 `open /var/log/caddy/access.log: permission denied` → 服务 exit 1 → 外面一路 521。
+
+1. **目录不归 caddy。** 修法：
+
+   ```bash
+   sudo install -d -m 0755 -o caddy -g caddy /var/log/caddy
+   sudo systemctl restart caddy && systemctl is-active caddy
+   ```
+
+2. **目录是对的，文件是 root 的**（`---------- 1 root root access.log`）。`caddy validate`
+   不是只读一遍语法：Caddy 按 `provision=true` 把配置真装一遍，走到 Caddyfile 里的
+   `output file` 就把 `access.log` 建出来了，而跑 validate 的是 root（安装脚本、§6 第 4 条
+   那条命令都是）。文件属 root、权限 0，紧接着服务以 `USER=caddy` 起，open 同一个文件就是
+   EACCES。修法就这一条，**别只 chown 目录**：
+
+   ```bash
+   sudo chown -R caddy:caddy /var/log/caddy
+   sudo systemctl restart caddy && systemctl is-active caddy
+   ```
+
+`install.sh` 两条都做了：目录连属主一起建，validate 之后再 `chown -R` 把 root 建出来的文件收回来；
+另外写一条 systemd drop-in（`/etc/systemd/system/caddy.service.d/bitrader-logs.conf` 里的
+`LogsDirectory=caddy`，由 systemd 自己保证目录和属主）。装完还会等 `is-active` 通过才算完，
+不通过就把 journal 原文和 `ls -l /var/log/caddy` 一起贴出来并停下。
 
 表现：`https://域名` 打不开，`journalctl -u caddy` 里有 `no such host` 或 `HTTP 403` 之类的 ACME 报错。
 

@@ -599,6 +599,12 @@ def test_the_root_script_guards_itself():
     script = (ROOT / "deploy" / "set-domain.sh").read_text(encoding="utf-8")
     assert "set -Eeuo pipefail" in script
     assert "caddy validate" in script
+    # 这一跑也是 root：validate 会按 provision=true 把 /var/log/caddy/access.log 建出来，
+    # 属主是 root。之后 caddy 以 caddy 用户 reload 同一个文件就是 EACCES，新配置上不去。
+    assert "chown -R caddy:caddy /var/log/caddy" in script
+    assert script.index('validate --config "$STAGE"') < script.index("chown -R caddy:caddy"), (
+        "chown 要紧跟在 validate 后面，别等到 reload 失败才发现"
+    )
     assert "systemctl reload caddy" in script
     assert "eval" not in script
     assert '"$DOMAIN"' in script, "域名要加引号传参"
