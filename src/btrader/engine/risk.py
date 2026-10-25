@@ -200,10 +200,22 @@ class RiskManager:
                 return RiskDecision(False, f"已达当日最大亏损（{s.max_daily_loss:.2f}）。")
         if entry:
             limit, label = self._order_limit(equity)
-            if limit and quote_notional > limit + 1e-9:
-                return RiskDecision(
-                    False, f"单笔金额 {quote_notional:.2f} 超过上限 {limit:.2f}{label}。"
-                )
+            if limit:
+                # 上限量的是这一单吃掉多少**保证金**。合约里名义额天生是它的
+                # leverage 倍：拿名义额直接比上限，杠杆越高越容易被拒——10 倍下
+                # 点「25%」（名义额 = 权益的 250%）必撞「单笔金额超过上限」，
+                # 用户看到的就是「杠杆一调高，一单都下不出去」。先折回保证金再比。
+                # leverage <= 1（现货恒 1）时不除，判定与文案都和以前逐位相同。
+                margin = quote_notional / leverage if leverage > 1 else quote_notional
+                if margin > limit + 1e-9:
+                    if leverage > 1:
+                        reason = (
+                            f"单笔保证金 {margin:.2f}（名义额 {quote_notional:.2f} ÷ "
+                            f"{leverage:g}x）超过上限 {limit:.2f}{label}。"
+                        )
+                    else:
+                        reason = f"单笔金额 {quote_notional:.2f} 超过上限 {limit:.2f}{label}。"
+                    return RiskDecision(False, reason)
         if entry and s.max_position_quote and current_position_quote + added_quote > s.max_position_quote + 1e-9:
             return RiskDecision(
                 False,
@@ -214,13 +226,17 @@ class RiskManager:
         return RiskDecision(True)
 
     def _order_limit(self, equity: float) -> tuple[float, str]:
-        """Effective per-order notional cap, and a short label for the reason.
+        """Effective per-order **margin** cap, and a short label for the reason.
 
         ``max_order_quote == 0`` keeps its established meaning of "no cap at
         all". Otherwise the cap scales with equity but never drops below the
         fixed ceiling: without that, a full-size buy from a 10,000 balance was
         refused by a 500 USDT constant while the panel's "全部" button offered
         exactly that amount.
+
+        比较的是占用的保证金（``check_order`` 把名义额按杠杆折回来），不是名义额：
+        期货 10 倍时名义额天然是权益的数倍，按名义额卡等于「杠杆越高越下不了单」。
+        持仓上限（``max_position_quote``）仍然量名义额，两者不是一回事。
         """
         s = self.settings
         fixed = s.max_order_quote if s.max_order_quote else 0.0

@@ -415,8 +415,39 @@ export default function OrderTicket({
     return side === "buy" ? (referencePrice > 0 ? cash / referencePrice : 0) : positionQty;
   }, [side, sizeMode, cash, positionQty, referencePrice]);
 
+  /** 百分比按钮的放大倍数。合约开仓时按钮给的是「占用保证金」的比例，
+   *  名义额 = 可用 × ratio × 杠杆。不乘的话 10 倍下点「25%」只占掉 2.5% 保证金，
+   *  看起来就像杠杆没生效。现货没有杠杆；合约卖出且已有多头持仓是平仓，
+   *  乘上去会让卖单超过持仓量被交易所拒，两者都按 1 倍。 */
+  const ratioLeverage = useMemo(() => {
+    if (market === "spot") return 1;
+    if (side === "sell" && positionQty > 0) return 1;
+    return leverageValue > 1 ? leverageValue : 1;
+  }, [market, side, positionQty, leverageValue]);
+
+  /** 这一档实际填进输入框的数（单位跟着 sizeMode 走）。 */
+  const ratioSize = (ratio: number) => available * ratio * ratioLeverage;
+
+  /** 按钮上那句话：乘了杠杆就把「保证金 → 名义额」这笔账摆出来，别让人自己算。 */
+  const ratioTitle = (ratio: number): string => {
+    if (ratioLeverage <= 1) {
+      return sizeMode === "quote"
+        ? `可用 ${quote} 的 ${ratio * 100}%`
+        : `可卖 ${base} 的 ${ratio * 100}%`;
+    }
+    return sizeMode === "quote"
+      ? `可用 ${quote} 的 ${ratio * 100}% 作保证金 × ${ratioLeverage}x ≈ 名义额 ${fmt(
+          ratioSize(ratio),
+          2,
+        )} ${quote}`
+      : `可用 ${base} 的 ${ratio * 100}% × ${ratioLeverage}x ≈ ${fmt(
+          ratioSize(ratio),
+          6,
+        )} ${base}（名义额）`;
+  };
+
   const applyRatio = (ratio: number) => {
-    const amount = available * ratio;
+    const amount = ratioSize(ratio);
     if (!(amount > 0)) return;
     setSize(
       sizeMode === "quote"
@@ -762,7 +793,8 @@ export default function OrderTicket({
             <span>{sizeLabel}</span>
             <em>
               {side === "buy"
-                ? `可用 ${fmt(cash, 2)} ${quote}`
+                ? `可用 ${fmt(cash, 2)} ${quote}` +
+                  (ratioLeverage > 1 ? ` × ${ratioLeverage}x` : "")
                 : `持有 ${fmt(positionQty, 6)} ${base}`}
             </em>
           </label>
@@ -801,11 +833,7 @@ export default function OrderTicket({
                 type="button"
                 className="ratio"
                 onClick={() => applyRatio(ratio)}
-                title={
-                  sizeMode === "quote"
-                    ? `可用 ${quote} 的 ${ratio * 100}%`
-                    : `可卖 ${base} 的 ${ratio * 100}%`
-                }
+                title={ratioTitle(ratio)}
               >
                 {ratio === 1 ? "全部" : `${ratio * 100}%`}
               </button>
@@ -837,7 +865,7 @@ export default function OrderTicket({
           <div className="field">
             <label className="field-label" htmlFor="leverage-input">
               <span>杠杆</span>
-              <em>倍数，只对合约生效</em>
+              <em>倍数；百分比按钮按保证金 × 倍数</em>
             </label>
             <input
               id="leverage-input"

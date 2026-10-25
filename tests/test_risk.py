@@ -140,6 +140,32 @@ def test_order_cap_zero_means_disabled():
     assert risk.check_order(9_999, 0, 9_999, equity=10_000).allowed
 
 
+def test_order_cap_counts_margin_not_notional():
+    """合约的上限量的是**占用保证金**，不是名义额。
+
+    10 倍下点「25%」是「权益 250% 的名义额」。按名义额卡的话，杠杆一调高就
+    一单都下不出去（用户看到的是「杠杆设了不生效」）。先折回保证金再比：
+    名义额 2500 / 10x = 保证金 250，在 500 的上限之内。
+    """
+    risk = _risk(max_order_quote=500, max_order_pct=0.25, max_position_quote=0)
+    assert risk.check_order(2_500, 0, 2_500, leverage=10).allowed
+    decision = risk.check_order(6_000, 0, 6_000, leverage=10)
+    assert not decision
+    assert "保证金" in decision.reason
+    assert "10x" in decision.reason and "600.00" in decision.reason
+    # 权益 10,000 时上限升到 25%（2,500）：10 倍下名义额 25,000 才到线
+    assert risk.check_order(25_000, 0, 25_000, leverage=10, equity=10_000).allowed
+    assert not risk.check_order(25_100, 0, 25_100, leverage=10, equity=10_000).allowed
+
+
+def test_leverage_one_reads_as_a_plain_notional_cap():
+    """现货（杠杆恒 1）的判定与文案逐位不变：老的单据与提示不该跟着换说法。"""
+    risk = _risk(max_order_quote=100)
+    decision = risk.check_order(150, 0, 150, leverage=1)
+    assert not decision
+    assert decision.reason == "单笔金额 150.00 超过上限 100.00（固定上限）。"
+
+
 def test_realized_pnl_feeds_daily_loss_breaker():
     """record_trade must actually move the daily-loss counter."""
     risk = _risk(max_daily_loss=100, max_order_quote=0, max_position_quote=0)

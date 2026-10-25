@@ -1850,3 +1850,21 @@ def test_a_stale_preview_cannot_block_a_valid_order() -> None:
     # 过期时明确说一句，别把上一单的「风控通过」留在屏上
     assert "改动了，正在重算…" in ticket
 
+
+def test_the_percent_buttons_multiply_by_the_leverage() -> None:
+    """交易页「25%」是**保证金**比例：合约 10 倍下应下 2.5 倍权益的名义额。
+
+    以前 applyRatio 只做 available * ratio，杠杆没进这个式子：填 10 倍、点 25%，
+    实际只占掉 2.5% 保证金，用户看到的是「设了杠杆，点 25% 没加杠杆」。
+    现货没有杠杆、合约卖出已有多头是平仓，这两种都不能乘。
+    """
+    ticket = _order_ticket_source()
+    assert "const ratioSize = (ratio: number) => available * ratio * ratioLeverage;" in ticket
+    assert "const amount = ratioSize(ratio);" in ticket
+    assert "title={ratioTitle(ratio)}" in ticket
+    assert 'if (market === "spot") return 1;' in ticket
+    assert 'if (side === "sell" && positionQty > 0) return 1;' in ticket
+    assert "return leverageValue > 1 ? leverageValue : 1;" in ticket
+    # 按钮上要把「保证金 → 名义额」这笔账写出来
+    assert "作保证金 × " in ticket and "名义额" in ticket
+
