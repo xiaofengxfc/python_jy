@@ -24,6 +24,19 @@ TIMEFRAME_SECONDS: dict[str, int] = {
 
 TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d", "1w"]
 
+# 决策节奏：`bar` 表示「跟着主周期收盘」，其余是固定节拍。节奏与用于分析的
+# K 线周期是两件事：4h 结构 + 每 15m 决策一次是合法组合，以前它们被焊在一起，
+# 想快只能把分析周期也改小，于是模型每根都看同一根没走完的 K 线。
+CADENCE_CHOICES: tuple[str, ...] = ("bar", "5m", "15m", "30m", "1h", "4h")
+CADENCE_LABELS: dict[str, str] = {
+    "bar": "跟主周期",
+    "5m": "每 5 分钟",
+    "15m": "每 15 分钟",
+    "30m": "每 30 分钟",
+    "1h": "每小时",
+    "4h": "每 4 小时",
+}
+
 
 # Exchange-side protective orders, recognised by ccxt's normalized type.
 STOP_TYPES = {
@@ -213,3 +226,11 @@ def timeframe_seconds(timeframe: str) -> int:
         return TIMEFRAME_SECONDS[timeframe]
     except KeyError as exc:
         raise ValueError(f"不支持的周期: {timeframe}") from exc
+
+
+def cadence_seconds(cadence: str) -> int:
+    """节拍秒数。`bar`（或空串）返回 0：由调用方按主周期换算。"""
+    text = (cadence or "").strip()
+    if not text or text == "bar":
+        return 0
+    return timeframe_seconds(text)

@@ -58,6 +58,8 @@ class PipelineContext:
     max_position_quote: float = 0.0
     min_confidence: float = 0.0
     news: str = ""
+    # 参考周期（除主周期之外的结构周期）。空元组表示只看一根。
+    reference_timeframes: tuple[str, ...] = ()
 
     def signal_line(self) -> str:
         """策略信号那一段。策略是参考，AI 才是决策者。
@@ -126,9 +128,16 @@ def _seen(trace: list[dict[str, Any]], keys: tuple[str, ...]) -> str:
 
 
 def _technical(ctx: PipelineContext, trace: list[dict[str, Any]]) -> str:
+    role = ""
+    if ctx.reference_timeframes:
+        role = (
+            "下面有多根周期。主周期负责触发，参考周期负责结构：先判断大级别方向，"
+            "再看主周期这一根是不是逆着它。两边打架时要说清冲突在哪、以哪边为准，"
+            "不要只挑顺手的那个周期讲。\n"
+        )
     return (
         "你负责技术面。只看下面的行情摘要，不猜消息面。\n"
-        f"{ctx.digest}\n\n"
+        f"{role}{ctx.digest}\n\n"
         f"{_context_block(ctx)}\n\n"
         "用不超过 5 行说清：趋势方向、关键支撑和压力、量能是否配合、最可能出错的地方。"
         "不要给下单建议。"

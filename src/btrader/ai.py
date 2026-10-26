@@ -54,6 +54,7 @@ def digest(
     timeframe: str = "1h",
     label: str = "",
     bars: int = MAX_DIGEST_BARS,
+    include_tail: bool = True,
 ) -> str:
     """One candle frame as a compact, model-readable block of facts.
 
@@ -134,18 +135,69 @@ def digest(
     if swings:
         parts.append("结构: " + " | ".join(swings))
 
-    tail = frame.tail(min(bars, len(frame)))
-    rows = []
-    for _, row in tail.iterrows():
-        when = datetime.fromtimestamp(int(row["timestamp"]) / 1000).strftime("%m-%d %H:%M")
-        rows.append(
-            f"{when} 开{float(row['open']):,.2f} 高{float(row['high']):,.2f} "
-            f"低{float(row['low']):,.2f} 收{float(row['close']):,.2f} "
-            f"量{float(row.get('volume') or 0):,.1f}"
-        )
-    parts.append(f"最近 {len(rows)} 根（每根 {timeframe}）：")
-    parts.extend(rows)
+    # 参考周期只给结论级事实，不列逐根明细：三个周期各列十几根，摘要会从
+    # 一两千字涨到五六千字，模型反而更容易抓错重点。主周期仍然给明细。
+    if include_tail:
+        tail = frame.tail(min(bars, len(frame)))
+        rows = []
+        for _, row in tail.iterrows():
+            when = datetime.fromtimestamp(int(row["timestamp"]) / 1000).strftime("%m-%d %H:%M")
+            rows.append(
+                f"{when} 开{float(row['open']):,.2f} 高{float(row['high']):,.2f} "
+                f"低{float(row['low']):,.2f} 收{float(row['close']):,.2f} "
+                f"量{float(row.get('volume') or 0):,.1f}"
+            )
+        parts.append(f"最近 {len(rows)} 根（每根 {timeframe}）：")
+        parts.extend(rows)
     return "\n".join(parts)
+
+
+def digest_set(
+    frames: dict[str, pd.DataFrame],
+    *,
+    primary: str,
+    label: str = "",
+    reference_timeframes: Sequence[str] | None = None,
+    bars: int = MAX_DIGEST_BARS,
+    ref_bars: int = 8,
+) -> str:
+    """多周期摘要：主周期一整段 + 每个参考周期一段结论。
+
+    frames 里没有的周期直接跳过（拉不到就当作没有这个参考）；主周期缺失时
+    返回「数据不足」——没有主周期的决策等于凭空猜。
+    """
+    primary_frame = (frames or {}).get(primary)
+    if primary_frame is None or getattr(primary_frame, "empty", True):
+        return f"【{label or primary}】数据不足"
+    blocks = [
+        digest(
+            primary_frame,
+            timeframe=primary,
+            label=f"{label} 主周期 {primary}",
+            bars=bars,
+        )
+    ]
+    wanted = list(reference_timeframes or [])
+    if not wanted:
+        wanted = [key for key in frames if key != primary]
+    for timeframe in wanted:
+        if timeframe == primary:
+            continue
+        frame = frames.get(timeframe)
+        if frame is None or getattr(frame, "empty", True):
+            blocks.append(f"【{label} 参考周期 {timeframe}】数据不可用")
+            continue
+        blocks.append(
+            digest(
+                frame,
+                timeframe=timeframe,
+                label=f"{label} 参考周期 {timeframe}",
+                bars=ref_bars,
+                include_tail=False,
+            )
+        )
+    head = "【多周期】主周期负责触发，参考周期只用来判断方向是否被更大级别结构否掉。"
+    return "\n\n".join([head, *blocks])
 
 
 def candle_key(symbol: str, timeframe: str, df: pd.DataFrame) -> str:

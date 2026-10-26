@@ -47,6 +47,18 @@ const ACTION_LABEL: Record<string, string> = {
   hold: "观望",
 };
 
+const CADENCES: [string, string][] = [
+  ["bar", "跟主周期"],
+  ["5m", "每 5 分钟"],
+  ["15m", "每 15 分钟"],
+  ["30m", "每 30 分钟"],
+  ["1h", "每小时"],
+  ["4h", "每 4 小时"],
+];
+
+/** 参考周期最多两个：再多模型看不过来，摘要也会被撑长。 */
+const MAX_REFERENCE_TFS = 2;
+
 const DEPTHS: [string, string, string][] = [
   ["quick", "快速", "只跑裁决，一次调用"],
   ["standard", "标准", "技术面 → 辩论 → 裁决"],
@@ -69,6 +81,8 @@ const FALLBACK_AUTO: AIAutoSettings = {
   poll_sec: 60,
   require_stop: true,
   depth: "standard",
+  cadence: "bar",
+  timeframes: [],
 };
 
 function clockText(value: number | undefined): string {
@@ -99,6 +113,10 @@ export default function AITradePage({ settings, health, onSettingsChange }: Prop
   const [strategyKey, setStrategyKey] = useState("");
   const [auto, setAuto] = useState<AIAutoSettings>(FALLBACK_AUTO);
   const [depth, setDepth] = useState("standard");
+  // 节奏与参考周期都是「和主周期分开选」的：4h 结构 + 每 15 分钟决策一次
+  // 以前做不到，只能把主周期也改小。
+  const [cadenceMode, setCadenceMode] = useState("bar");
+  const [refTimeframes, setRefTimeframes] = useState<string[]>([]);
   // 本页亲手选过市场之后就不再跟设置走（和交易页 picked 同一口径）。缺了它，
   // 首屏 settings 还没到、初始值是 "spot"，之后永远回不到设置里的合约市场——
   // 于是「杠杆」这一栏（只在合约显示）根本出不来。
@@ -206,6 +224,8 @@ export default function AITradePage({ settings, health, onSettingsChange }: Prop
     if (!saver.pending) {
       setAuto(next);
       setDepth(next.depth || "standard");
+      setCadenceMode(next.cadence || "bar");
+      setRefTimeframes(Array.isArray(next.timeframes) ? next.timeframes : []);
     }
     if (next.symbol) setSymbol((current) => current || next.symbol);
     if (next.timeframe) setTimeframe((current) => current || next.timeframe);
@@ -220,6 +240,33 @@ export default function AITradePage({ settings, health, onSettingsChange }: Prop
   const saveDepth = (value: string) => {
     setDepth(value);
     saver.queue({ depth: value });
+  };
+
+  const saveCadence = (value: string) => {
+    setCadenceMode(value);
+    saver.queue({ cadence: value });
+  };
+
+  /** 换主周期时把同名参考周期一起摘掉：后端启动时也会剔除，这里同步一份，
+   *  否则界面上还标着「已选」，实际那一根不会进摘要。 */
+  const pickTimeframe = (value: string) => {
+    setTimeframe(value);
+    if (refTimeframes.includes(value)) {
+      const next = refTimeframes.filter((item) => item !== value);
+      setRefTimeframes(next);
+      saver.queue({ timeframes: next });
+    }
+  };
+
+  /** 参考周期是「多选最多两个」：点已选的就取消。主周期本身不在候选里。 */
+  const toggleReference = (value: string) => {
+    const next = refTimeframes.includes(value)
+      ? refTimeframes.filter((item) => item !== value)
+      : refTimeframes.length >= MAX_REFERENCE_TFS
+        ? refTimeframes
+        : [...refTimeframes, value];
+    setRefTimeframes(next);
+    saver.queue({ timeframes: next });
   };
 
   /** 恢复默认：只重置 ai_auto 这一段，市场、交易对、主题都不动。 */
@@ -237,6 +284,8 @@ export default function AITradePage({ settings, health, onSettingsChange }: Prop
       const restored = { ...FALLBACK_AUTO, ...(next.ai_auto ?? {}) };
       setAuto(restored);
       setDepth(restored.depth || "standard");
+      setCadenceMode(restored.cadence || "bar");
+      setRefTimeframes(Array.isArray(restored.timeframes) ? restored.timeframes : []);
       onSettingsChange?.({ ai_auto: next.ai_auto });
       setNotice("运行配置已恢复默认。");
     } catch (caught) {
@@ -255,10 +304,15 @@ export default function AITradePage({ settings, health, onSettingsChange }: Prop
       return;
     }
     const mainnet = (health?.network ?? "testnet") === "mainnet";
+    const cadenceText =
+      cadenceMode === "bar"
+        ? `跟主周期：每根 ${timeframe} K 线收盘后一次`
+        : `每 ${cadenceMode} 一次`;
+    const refsText = refTimeframes.length ? ` · 参考 ${refTimeframes.join(" / ")}` : "";
     if (mainnet) {
       const ok = window.confirm(
-        `即将在主网启动 AI 交易\n\n${symbol} · ${timeframe} · 深度 ${depth}\n\n` +
-          `节奏跟着 K 线周期：每根 ${timeframe} K 线收盘后决策一次。\n\n` +
+        `即将在主网启动 AI 交易\n\n${symbol} · ${timeframe} · 深度 ${depth}${refsText}\n\n` +
+          `决策节奏：${cadenceText}。\n\n` +
           "模型会真实下单，盈亏由交易所结算。确认继续？",
       );
       if (!ok) return;
@@ -280,6 +334,9 @@ export default function AITradePage({ settings, health, onSettingsChange }: Prop
           max_order_quote: auto.max_order_quote,
           max_position_quote: auto.max_position_quote,
           depth,
+          // 节奏与参考周期：不传就用设置里存的那份，传了以本页为准。
+          cadence: cadenceMode,
+          reference_timeframes: refTimeframes,
           // 杠杆以前根本没有这个字段，页面也没有控件：AI 交易永远按 1 倍跑。
           leverage: auto.leverage,
         }),
@@ -293,6 +350,9 @@ export default function AITradePage({ settings, health, onSettingsChange }: Prop
           timeframe +
           " · " +
           depth +
+          " · " +
+          cadenceText +
+          (refTimeframes.length ? " · 参考 " + refTimeframes.join(" / ") : "") +
           (config?.leverage ? " · " + config.leverage + "x" : "") +
           (config?.leverage_note ? "。" + config.leverage_note : ""),
       );
@@ -349,7 +409,7 @@ export default function AITradePage({ settings, health, onSettingsChange }: Prop
     <>
       <div className="page-head">
         <h1 className="page-title">AI 交易</h1>
-        <span className="page-sub">全自动：一根 K 线一次决策，人只管开关和上限</span>
+        <span className="page-sub">全自动：按选定节奏决策，人只管开关和上限</span>
         <span className="spacer" />
         <span className={`state-chip ${state}`}>{STATE_LABEL[state] ?? state}</span>
         {running ? (
@@ -477,7 +537,7 @@ export default function AITradePage({ settings, health, onSettingsChange }: Prop
                 className="select"
                 value={timeframe}
                 disabled={running}
-                onChange={(event) => setTimeframe(event.target.value)}
+                onChange={(event) => pickTimeframe(event.target.value)}
               >
                 {TIMEFRAMES.map(([value, label]) => (
                   <option key={value} value={value}>
@@ -485,6 +545,52 @@ export default function AITradePage({ settings, health, onSettingsChange }: Prop
                   </option>
                 ))}
               </select>
+            </div>
+            <div className="field">
+              <label className="field-label" htmlFor="ai-cadence">
+                <span>决策节奏</span>
+                <em>和 K 线周期分开选</em>
+              </label>
+              <select
+                id="ai-cadence"
+                className="select"
+                value={cadenceMode}
+                disabled={running}
+                onChange={(event) => saveCadence(event.target.value)}
+              >
+                {CADENCES.map(([value, label]) => (
+                  <option key={value} value={value}>
+                    {label}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="field" style={{ gridColumn: "1 / -1" }}>
+              <span className="field-label">
+                <span>参考周期</span>
+                <em>最多两个，用来看更大级别的结构</em>
+              </span>
+              <div className="tf-pick">
+                {TIMEFRAMES.filter(([value]) => value !== timeframe).map(([value, label]) => (
+                  <button
+                    key={value}
+                    type="button"
+                    aria-pressed={refTimeframes.includes(value)}
+                    disabled={
+                      running ||
+                      (!refTimeframes.includes(value) &&
+                        refTimeframes.length >= MAX_REFERENCE_TFS)
+                    }
+                    onClick={() => toggleReference(value)}
+                  >
+                    <b>{label}</b>
+                  </button>
+                ))}
+              </div>
+              <div className="hint">
+                不选就只看主周期。参考周期只作结构参考，触发仍看主周期；
+                换主周期时同名的那一项会被后端自动剔除。
+              </div>
             </div>
             <div className="field">
               <label className="field-label" htmlFor="ai-strategy">
@@ -601,7 +707,8 @@ export default function AITradePage({ settings, health, onSettingsChange }: Prop
             )}
             <div className="hint" style={{ gridColumn: "1 / -1" }}>
               上限和杠杆都在启动时生效。改完要重新启动一次；改动会自己存下来，刷新之后还在。
-              {"节奏跟着 K 线周期：选 1h 就是每根 1h K 线收盘后决策一次，同一根不会跑两次（「立即决策」除外）。"}
+              {"节奏由「决策节奏」决定：跟主周期时每根 K 线收盘后一次；选固定节拍时按那个间隔跑，" +
+                "同一片不会跑两次（「立即决策」除外）。"}
               {"杠杆按风控上限收口：现在是 " +
                 (Number(settings?.risk?.max_leverage) || 125) +
                 "x，填得更大也按上限下单，启动后的提示里会说清实际用了几倍。"}
@@ -734,17 +841,23 @@ export default function AITradePage({ settings, health, onSettingsChange }: Prop
               <div className="gate-row">
                 <span>决策节奏</span>
                 <b>
-                  {barSeconds > 0
-                    ? `每根 ${barLabel} 收盘后一次` +
+                  {(cadence?.mode ?? cadenceMode) === "bar"
+                    ? (barSeconds > 0
+                        ? `跟主周期：每根 ${barLabel} 收盘后一次`
+                        : "跟主周期") +
                       (running && nextRun ? ` · 下次 ${clockText(nextRun)}` : "")
-                    : "跟着 K 线周期"}
+                    : `每 ${cadence?.mode ?? cadenceMode} 一次` +
+                      (running && nextRun ? ` · 下次 ${clockText(nextRun)}` : "")}
                 </b>
               </div>
               <div className="gate-row">
                 <span>运行中的规则</span>
                 <b>
                   {running
-                    ? `${status?.config?.symbol ?? ""} · ${status?.config?.timeframe ?? ""}`
+                    ? `${status?.config?.symbol ?? ""} · ${status?.config?.timeframe ?? ""}` +
+                      ((status?.config?.timeframes ?? []).length
+                        ? ` · 参考 ${(status?.config?.timeframes ?? []).join(" / ")}`
+                        : "")
                     : "未启动"}
                 </b>
               </div>

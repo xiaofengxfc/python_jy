@@ -355,6 +355,11 @@ def test_status_payload_no_longer_has_live_enabled(tmp_path):
         "market_type",
         "timeframe",
         "depth",
+        # 节奏与参考周期：界面要能回显「这一轮按什么节奏、看了几根周期」，
+        # 排查时不用去翻审计文件。
+        "cadence",
+        "cadence_seconds",
+        "timeframes",
         "max_order_quote",
         "max_position_quote",
         # 杠杆与「被收口」的那句话：界面既要有控件也要有回显，否则用户

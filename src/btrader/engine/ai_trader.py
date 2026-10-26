@@ -26,7 +26,13 @@ from typing import Any, Callable
 
 from .. import ai, ai_pipeline, paths
 from ..core.clock import local_day
-from ..core.types import MarketType, OrderSide, OrderType, timeframe_seconds
+from ..core.types import (
+    TIMEFRAME_SECONDS,
+    MarketType,
+    OrderSide,
+    OrderType,
+    timeframe_seconds,
+)
 from .trading import OrderRequest, OrderResult
 
 log = logging.getLogger(__name__)
@@ -118,6 +124,11 @@ class AITraderConfig:
     require_stop: bool = True
     # 决策深度：quick 一次调用，standard 四段，deep 六段。引擎默认最省。
     depth: str = "quick"
+    # 决策节奏：bar = 跟主周期收盘一次；其余按固定节拍（5m / 15m / ...）。
+    # 节奏与主周期是两个独立选项：4h 结构 + 每 15 分钟决策一次是合法组合。
+    cadence: str = "bar"
+    # 参考周期（除主周期之外的结构周期，最多两个）。
+    timeframes: tuple[str, ...] = ()
 
 
 @dataclass
@@ -627,6 +638,7 @@ class AITrader:
         trading: Any,
         llm: Any,
         frame_provider: Callable[[], Any] | None = None,
+        frames_provider: Callable[[], dict[str, Any]] | None = None,
         portfolio_provider: Callable[[], dict[str, Any]] | None = None,
         signal_provider: Callable[[], float] | None = None,
         news_provider: Callable[[], str] | None = None,
@@ -640,6 +652,9 @@ class AITrader:
         self.trading = trading
         self.llm = llm
         self.frame_provider = frame_provider
+        # 多周期：返回 {周期: 已收盘 K 线}。给了它就用它，frame_provider 只留给
+        # 老调用方（测试与单周期路径）。主周期必须在这个字典里。
+        self.frames_provider = frames_provider
         self.portfolio_provider = portfolio_provider
         self.signal_provider = signal_provider
         self.news_provider = news_provider
@@ -674,6 +689,11 @@ class AITrader:
         # 收盘点是 bar_ts + 周期，再下一根就是 + 2 个周期。睡到这儿之前什么都不
         # 用问，这就是「1h 周期 = 每小时决策一次」落到实处的地方。
         self._pending_close = 0.0
+        # 固定节拍用另一对锚：已处理的那一片的起点（epoch 秒）与它的编号。
+        # 去重键是编号，不是 K 线时间戳——这正是「节奏与周期解耦」的地方：
+        # 同一根 1h K 线之内可以按 15m 决策四次，每次拿到的仍是已收盘的那根。
+        self._pending_slot = 0.0
+        self._last_slot = 0
 
     # ------------------------------------------------------------- lifecycle
     @property
@@ -823,22 +843,29 @@ class AITrader:
     def _poll_seconds(self) -> float:
         return max(1.0, float(self.config.poll_sec or 60.0))
 
-    def next_wait_sec(self, now: float | None = None) -> float:
-        """这一轮之后等多久再看：节奏跟着 K 线周期（见上面的 BAR_SETTLE_*）。
+    def _cadence_mode(self) -> str:
+        """当前节奏：bar（跟主周期）或一个固定周期。认不得的按 bar。
 
-        ``_pending_close`` 是「下一根该收盘」的时刻，由刚处理过的那根 K 线推出来：
-          * 还没到收盘点 → 一觉睡到收盘后 BAR_SETTLE_SECONDS，中间不醒；
-          * 收盘点前后几秒 → 睡到那个落定点；
-          * 收盘过了、这根还没到手 → 按 poll_sec 小步重试，最远到 BAR_WINDOW_AFTER；
-          * 窗口也过了（这一根没数据）→ 顺延到墙上的下一根。
-
-        K 线周期不认识时退回旧行为：每 poll_sec 一轮。
+        配置在路由那层已经校验过，这里再兜一次是因为测试与别的调用方会直接
+        构造 AITraderConfig：一个写错的 cadence 不该让引擎按 1 秒节拍烧模型。
         """
-        bar = self._bar_seconds()
-        if bar <= 0:
-            return self._poll_seconds()
-        clock = self.clock() if now is None else now
-        poll = self._poll_seconds()
+        mode = (self.config.cadence or "bar").strip()
+        if mode == "bar" or mode in TIMEFRAME_SECONDS:
+            return mode
+        return "bar"
+
+    def _cadence_seconds(self) -> float:
+        """一步节拍多长（秒）。0 表示算不出来，调用方退回 poll_sec。"""
+        mode = self._cadence_mode()
+        if mode == "bar":
+            return self._bar_seconds()
+        try:
+            return float(timeframe_seconds(mode))
+        except (KeyError, TypeError, ValueError):
+            return self._bar_seconds()
+
+    def _bar_wait(self, clock: float, bar: float, poll: float) -> float:
+        """跟主周期：睡到下一根收盘后几秒（见上面的 BAR_SETTLE_* 注释）。"""
         with self._lock:
             pending = self._pending_close
         if pending <= 0:
@@ -851,24 +878,63 @@ class AITrader:
         next_close = (math.floor(clock / bar) + 1) * bar
         return max(1.0, next_close + BAR_SETTLE_SECONDS - clock)
 
+    def next_wait_sec(self, now: float | None = None) -> float:
+        """这一轮之后等多久再看。
+
+        两种节奏：
+          * bar（默认）——跟主周期，逻辑与改前逐位相同：还没到收盘点就一觉睡到
+            收盘后 BAR_SETTLE_SECONDS；收盘点前后按 poll_sec 小步重试，最远
+            BAR_WINDOW_AFTER；窗口过了顺延到墙上的下一根。
+          * 固定节拍——睡到下一片开始后 BAR_SETTLE_SECONDS。错过就立刻跑，
+            不再有「窗口重试」：节拍是墙上的，下一片自然会把这一片覆盖掉。
+
+        周期不认识时退回旧行为：每 poll_sec 一轮。
+        """
+        clock = self.clock() if now is None else now
+        poll = self._poll_seconds()
+        if self._cadence_mode() == "bar":
+            bar = self._bar_seconds()
+            if bar <= 0:
+                return poll
+            return self._bar_wait(clock, bar, poll)
+        step = self._cadence_seconds()
+        if step <= 0:
+            return poll
+        with self._lock:
+            pending = self._pending_slot
+        if pending <= 0:
+            return min(poll, step)
+        target = pending + step + BAR_SETTLE_SECONDS
+        if clock < target:
+            return max(1.0, target - clock)
+        return 1.0
+
     def next_run_at(self, now: float | None = None) -> float | None:
         """下一次决策的预计时刻（epoch 秒）。界面显示用，算不出来就是 None。"""
-        bar = self._bar_seconds()
-        if bar <= 0:
-            return None
         clock = self.clock() if now is None else now
         with self._lock:
             state = self._state
             paused = self._paused
-            pending = self._pending_close
+            pending_close = self._pending_close
+            pending_slot = self._pending_slot
         if state != STATE_RUNNING or paused:
             return None
-        if pending <= 0:
+        if self._cadence_mode() == "bar":
+            bar = self._bar_seconds()
+            if bar <= 0:
+                return None
+            if pending_close <= 0:
+                return clock
+            if pending_close + BAR_WINDOW_AFTER < clock:
+                # 这一根没等到（或已经处理完一段时间了）：算墙上的下一根。
+                return (math.floor(clock / bar) + 1) * bar + BAR_SETTLE_SECONDS
+            return pending_close + BAR_SETTLE_SECONDS
+        step = self._cadence_seconds()
+        if step <= 0:
+            return None
+        if pending_slot <= 0:
             return clock
-        if pending + BAR_WINDOW_AFTER < clock:
-            # 这一根没等到（或已经处理完一段时间了）：算墙上的下一根。
-            return (math.floor(clock / bar) + 1) * bar + BAR_SETTLE_SECONDS
-        return pending + BAR_SETTLE_SECONDS
+        return pending_slot + step + BAR_SETTLE_SECONDS
 
     # ------------------------------------------------------------------ step
     def step(self) -> dict[str, Any] | None:
@@ -907,7 +973,19 @@ class AITrader:
         portfolio = self._portfolio()
         market_price = portfolio.get("price")
         frame = None
-        if self.frame_provider is not None:
+        frames: dict[str, Any] = {}
+        if self.frames_provider is not None:
+            # 多周期：主周期必须拿到，参考周期缺了就当没有。
+            try:
+                frames = self.frames_provider() or {}
+            except Exception as exc:
+                return self._record(
+                    "skip", reason=f"行情不可达：{exc}", decision=None, now=now
+                )
+            frame = frames.get(self.config.timeframe)
+            if frame is None:
+                frame = next(iter(frames.values()), None)
+        elif self.frame_provider is not None:
             try:
                 frame = self.frame_provider()
             except Exception as exc:
@@ -919,14 +997,23 @@ class AITrader:
             return self._record("skip", reason="行情数据不可用", decision=None, now=now)
 
         bar_ts = self._frame_bar_ts(frame)
-        if not force and bar_ts > 0:
+        mode = self._cadence_mode()
+        step = self._cadence_seconds()
+        slot = int(math.floor(now / step)) if step > 0 else 0
+        if not force:
             with self._lock:
-                seen = self._last_bar_ts
-            # 只认「更新的那一根」：相等是同一根 K 线（收盘窗口里在重试），变小说明
-            # 这次读到的行情比上次还旧——币安不可达时会回落到 Gate 永续镜像，两边的
-            # 最后一根收盘 K 线不总是同一根。用相等判断时这种回退会被当成新 K 线，
-            # 同一根再调一次模型，还可能在同一个收盘点上下第二单。
-            if seen and bar_ts <= seen:
+                seen_bar = self._last_bar_ts
+                seen_slot = self._last_slot
+            if mode == "bar":
+                # 只认「更新的那一根」：相等是同一根 K 线（收盘窗口里在重试），变小说明
+                # 这次读到的行情比上次还旧——币安不可达时会回落到 Gate 永续镜像，两边的
+                # 最后一根收盘 K 线不总是同一根。用相等判断时这种回退会被当成新 K 线，
+                # 同一根再调一次模型，还可能在同一个收盘点上下第二单。
+                if bar_ts > 0 and seen_bar and bar_ts <= seen_bar:
+                    return None
+            elif slot > 0 and seen_slot and slot <= seen_slot:
+                # 固定节拍：同一片只跑一次。和 K 线时间戳无关——4h 结构配 15m
+                # 节拍时，同一根 4h/1h K 线之内本来就该按节拍决策多次。
                 return None
 
         # 策略是参考，不是命令（「策略为辅，AI 为主」）。它只剩两处作用：喂给
@@ -951,28 +1038,37 @@ class AITrader:
                 "skip", reason="已达 AI 当日决策次数上限", decision=None, now=now
             )
 
-        # 花模型调用之前先把「这一根处理过了」记下来：模型调用失败、决策被闸门
-        # 拒掉都算这一根跑过，下一轮要等下一根收盘。不然一次超时就会在同一个收盘
-        # 点上反复问，一小时里问坏几次、扣几次额度。
+        # 花模型调用之前先把「这一根 / 这一片处理过了」记下来：模型调用失败、决策
+        # 被闸门拒掉都算跑过，下一轮要等下一根收盘或下一片。不然一次超时就会在同一
+        # 个点上反复问，一小时里问坏几次、扣几次额度。
         if bar_ts > 0:
-            bar = self._bar_seconds()
             with self._lock:
                 self._last_bar_ts = bar_ts
-                # bar_ts 是刚收盘那根的开放时间：它收盘在 +1 个周期，下一根在
-                # +2 个。周期不认识时不动锚，节奏退回 poll_sec。
-                if bar > 0:
+        if step > 0:
+            if mode == "bar":
+                bar = step
+                if bar_ts > 0:
+                    # bar_ts 是刚收盘那根的开放时间：它收盘在 +1 个周期，下一根在
+                    # +2 个。时间戳离谱时（单位写成微秒、交易所时钟错、镜像源给了
+                    # 未来的 bar）不能照着睡过去：锚最多推到「现在 + 2 根 + 窗口」，
+                    # 再远就按墙上的下一根。否则引擎会静默睡到那一天，界面上显示
+                    # 「下次 2262 年」，而状态一直是 running。
                     pending = bar_ts / 1000.0 + 2 * bar
-                    # 时间戳离谱时（单位写成微秒、交易所时钟错、镜像源给了未来的
-                    # bar）不能照着睡过去：锚最多推到「现在 + 2 根 + 窗口」，再远就
-                    # 按墙上的下一根。否则引擎会静默睡到那一天，界面上显示「下次
-                    # 2262 年」，而状态一直是 running。
                     limit = now + 2 * bar + BAR_WINDOW_AFTER
-                    self._pending_close = (
-                        pending
-                        if pending <= limit
-                        else (math.floor(now / bar) + 1) * bar
-                    )
-        pipeline = self._decide(frame, portfolio, signal_target)
+                    with self._lock:
+                        self._pending_close = (
+                            pending
+                            if pending <= limit
+                            else (math.floor(now / bar) + 1) * bar
+                        )
+            else:
+                # 固定节拍：锚就是这一片的起点。同一片重试（模型失败）不会推锚，
+                # 所以下一轮还会落在这一片里再试一次；这是刻意的——节拍是墙上的，
+                # 一片之内重试比等下一片更接近「每 15 分钟决策一次」的本意。
+                with self._lock:
+                    self._last_slot = max(self._last_slot, slot)
+                    self._pending_slot = float(slot * step)
+        pipeline = self._decide(frame, portfolio, signal_target, frames)
         if not pipeline.ok:
             return self._record(
                 "skip",
@@ -1216,12 +1312,13 @@ class AITrader:
         frame: Any,
         portfolio: dict[str, Any],
         signal_target: float | None,
+        frames: dict[str, Any] | None = None,
     ) -> ai_pipeline.PipelineResult:
         """跑一遍流水线。深度、账户和限额都在这里翻译成流水线的输入。"""
         ctx = ai_pipeline.PipelineContext(
             symbol=self.config.symbol,
             timeframe=self.config.timeframe,
-            digest=self._digest(frame),
+            digest=self._digest(frame, frames),
             equity=float(portfolio.get("equity") or 0.0),
             position_quote=float(portfolio.get("position_quote") or 0.0),
             price=portfolio.get("price"),
@@ -1230,11 +1327,19 @@ class AITrader:
             max_position_quote=self.config.max_position_quote,
             min_confidence=self.config.min_confidence,
             news=self._news(),
+            reference_timeframes=tuple(self.config.timeframes),
         )
         return ai_pipeline.run(self.llm, ctx, depth=self.config.depth)
 
-    def _digest(self, frame: Any) -> str:
+    def _digest(self, frame: Any, frames: dict[str, Any] | None = None) -> str:
         try:
+            if frames:
+                return ai.digest_set(
+                    frames,
+                    primary=self.config.timeframe,
+                    label=self.config.symbol,
+                    reference_timeframes=self.config.timeframes,
+                )
             return ai.digest(frame, timeframe=self.config.timeframe, label=self.config.symbol)
         except Exception:  # pragma: no cover - digest is best effort
             return ""
@@ -1282,6 +1387,11 @@ class AITrader:
             "network": self.config.network,
             "state": self.state,
             "depth": self.config.depth,
+            "cadence": self._cadence_mode(),
+            # 固定节拍下的时间片编号（bar 模式恒 0）。复盘与界面上要能分清
+            # 「同一根 K 线上按节拍决策了四次」和「换了四根 K 线」。
+            "slot": int(self._last_slot),
+            "timeframes": list(self.config.timeframes),
             # 这一条决策属于哪根 K 线（毫秒开放时间）：界面上要能说清「这是 1h
             # 那根收盘后做的」，同一根只该有一条。
             "bar_ts": int(self._last_bar_ts),
@@ -1338,6 +1448,11 @@ class AITrader:
                 "market_type": self.config.market_type,
                 "timeframe": self.config.timeframe,
                 "depth": self.config.depth,
+                # 节奏与参考周期也是「这一轮到底怎么跑的」的一部分：界面要能
+                # 回显，排查时才不用去翻审计。
+                "cadence": self._cadence_mode(),
+                "cadence_seconds": self._cadence_seconds(),
+                "timeframes": list(self.config.timeframes),
                 "max_order_quote": self.config.max_order_quote,
                 "max_position_quote": self.config.max_position_quote,
                 # 杠杆以前根本不出现在 status 里：界面既没控件也没回显，
@@ -1351,12 +1466,16 @@ class AITrader:
                 "max_decisions_per_day": self.config.max_decisions_per_day,
                 "max_orders_per_hour": self.config.max_orders_per_hour,
             },
-            # 节奏：决策跟着 K 线周期走，界面据此显示「下次 ≈ 10:00:03」。
-            # bar_seconds 为 0 表示周期不认识，退回旧的定时轮询。
+            # 节奏：mode=bar 时跟着主周期，否则按固定节拍。界面据此显示
+            # 「每 15 分钟一次 · 下次 ≈ 10:00:03」。seconds 为 0 表示周期不认识，
+            # 退回旧的定时轮询。
             "cadence": {
+                "mode": self._cadence_mode(),
+                "seconds": self._cadence_seconds(),
                 "bar_seconds": self._bar_seconds(),
                 "next_run_at": self.next_run_at(now),
                 "last_bar_ts": int(self._last_bar_ts),
+                "last_slot": int(self._last_slot),
             },
             "last_decision": self.last_decision,
             "events": events,

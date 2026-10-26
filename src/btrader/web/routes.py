@@ -26,6 +26,7 @@ import pandas as pd
 
 from ..backtest import BacktestConfig, grid_search, run_backtest
 from ..core.config import (
+    REFERENCE_TIMEFRAME_LIMIT,
     SYMBOL_LIST_LIMIT,
     TRADE_LEVERAGE_MAX,
     TRADE_LEVERAGE_MARKETS,
@@ -34,11 +35,14 @@ from ..core.config import (
     ExecSettings,
     RiskSettings,
     TradeSettings,
+    clean_cadence,
     clean_symbol_list,
+    clean_timeframes,
 )
 from ..core.credentials import Credentials
 from ..core.secret_store import ReadError as SecretReadError
 from ..core.types import (
+    CADENCE_CHOICES,
     TIMEFRAME_SECONDS,
     MarketType,
     Network,
@@ -295,6 +299,10 @@ class AITraderStartPayload(BaseModel):
     max_position_quote: float | None = Field(default=None, ge=0)
     # 决策深度：quick / standard / deep。空表示用设置里的值。
     depth: str = ""
+    # 决策节奏：bar / 5m / 15m / 30m / 1h / 4h。空表示用设置里的值。
+    cadence: str = ""
+    # 参考周期（除主周期之外还要看的结构周期），最多两个。
+    reference_timeframes: list[str] = Field(default_factory=list)
     # 杠杆：空或 null 表示用 ai_auto.leverage。声明成 Any 的理由和下单框一样——
     # float 字段会把 true 悄悄变成 1.0，而「杠杆：是」在盘面上不是 1 倍的意思。
     leverage: Any = None
@@ -829,6 +837,16 @@ class AITraderController:
         depth = (payload.depth or cfg.depth or "standard").strip()
         if depth not in DEPTHS:
             raise HTTPException(status_code=400, detail=f"未知的决策深度：{depth}")
+        cadence = (payload.cadence or cfg.cadence or "bar").strip()
+        if cadence not in CADENCE_CHOICES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"未知的决策节奏：{cadence}（可选：{'、'.join(CADENCE_CHOICES)}）",
+            )
+        # 请求体 > 设置。清洗两件事：主周期不能出现在参考里（同一段摘要看两遍，
+        # 还白占一个参考位），重复的只留一个，认不得的周期丢掉。
+        refs = clean_timeframes(payload.reference_timeframes or cfg.timeframes)
+        refs = [item for item in refs if item != timeframe][:REFERENCE_TIMEFRAME_LIMIT]
         # 杠杆走和下单框同一套口径（min(想要, risk.max_leverage, 125)）。以前
         # 直接把 ai_auto.leverage 塞进 AITraderConfig：填 20 而风控上限 10 时，
         # AIGuard 里的 risk.check_order 每一轮都拒一次，引擎显示在跑却一笔不成交。
@@ -864,6 +882,8 @@ class AITraderController:
             poll_sec=cfg.poll_sec,
             require_stop=cfg.require_stop,
             depth=depth,
+            cadence=cadence,
+            timeframes=tuple(refs),
         )
         trader = AITrader(
             config,
@@ -872,8 +892,10 @@ class AITraderController:
             risk=ctx.trading.risk,
             lease=self.lease,
             budget=self.budget,
-            frame_provider=lambda: _closed_only(
-                _market_frame(state, ctx, market, symbol, timeframe, 300), timeframe
+            # 多周期：主周期 + 参考周期一次取齐。主周期失败照旧抛（这一轮没数据），
+            # 参考周期失败只在 digest 里标「数据不可用」，不影响决策。
+            frames_provider=lambda: _multi_frames(
+                state, ctx, market, symbol, timeframe, refs
             ),
             # 现读，不吃账户快照缓存：这一路每轮决策会多一次签名请求，但模型调用
             # 本身就要几十秒，这点开销无所谓；关键是复核看见的必须是此刻的仓位，
@@ -2345,6 +2367,35 @@ def _apply_ai_auto(target: AIAutoSettings, values: dict[str, Any]) -> None:
                 cleaned[str(strategy_key)] = dict(params)
             target.strategy_params = cleaned
             continue
+        if key == "timeframes":
+            # 参考周期是数组：写错一个周期名时整段 400 并点名。静默丢掉的话，
+            # 用户以为自己选了 4h 结构，模型实际只看了主周期。
+            if not isinstance(value, (list, tuple)):
+                raise HTTPException(
+                    status_code=400, detail="ai_auto.timeframes 必须是数组"
+                )
+            wanted: list[str] = []
+            for item in value:
+                text = str(item or "").strip()
+                if not text:
+                    continue
+                if text not in TIMEFRAME_SECONDS:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"ai_auto.timeframes 里有不支持的周期：{text}",
+                    )
+                if text not in wanted:
+                    wanted.append(text)
+            if len(wanted) > REFERENCE_TIMEFRAME_LIMIT:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"参考周期最多 {REFERENCE_TIMEFRAME_LIMIT} 个，"
+                        f"现在给了 {len(wanted)} 个"
+                    ),
+                )
+            target.timeframes = wanted
+            continue
         current = getattr(target, key)
         if value is None and isinstance(current, (bool, str)):
             # 同 _apply_ai：null 不该把 symbol/depth 写成 "None"，也不该悄悄关开关。
@@ -2392,8 +2443,20 @@ def _apply_ai_auto(target: AIAutoSettings, values: dict[str, Any]) -> None:
         )
     if target.depth and target.depth not in DEPTHS:
         raise HTTPException(status_code=400, detail=f"未知的决策深度：{target.depth}")
+    if target.cadence and target.cadence not in CADENCE_CHOICES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"未知的决策节奏：{target.cadence}（可选：{'、'.join(CADENCE_CHOICES)}）",
+        )
     if target.timeframe and target.timeframe not in TIMEFRAME_SECONDS:
         raise HTTPException(status_code=400, detail=f"不支持的周期：{target.timeframe}")
+    # 参考周期和主周期是两件事：把主周期再填进参考里，模型会看到两段一模一样
+    # 的摘要，还占掉一个参考位。
+    if target.timeframe and target.timeframe in target.timeframes:
+        raise HTTPException(
+            status_code=400,
+            detail=f"参考周期不能等于主周期（{target.timeframe}）",
+        )
     if target.symbol:
         problem = symbol_shape_error(target.symbol)
         if problem:
@@ -2578,6 +2641,32 @@ def _market_frame(state, ctx, market, symbol: str, timeframe: str, limit: int):
             return frame
         frame["timestamp"] = frame["timestamp"].astype("int64")
         return frame
+
+
+def _multi_frames(
+    state,
+    ctx,
+    market,
+    symbol: str,
+    primary: str,
+    references,
+):
+    """主周期 + 参考周期的已收盘 K 线。
+
+    主周期拿不到就抛（没有主周期的决策等于凭空猜）；参考周期拿不到只记一条
+    warning，digest 里会写明「数据不可用」——一个 4h 拉不到不该让整轮停摆。
+    """
+    frames: dict[str, Any] = {}
+    for timeframe in [primary, *references]:
+        try:
+            frames[timeframe] = _closed_only(
+                _market_frame(state, ctx, market, symbol, timeframe, 300), timeframe
+            )
+        except Exception as exc:
+            if timeframe == primary:
+                raise
+            log.warning("参考周期 %s 的 K 线拉不到：%s", timeframe, exc)
+    return frames
 
 
 def _closed_only(frame, timeframe: str):

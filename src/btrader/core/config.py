@@ -12,7 +12,7 @@ from typing import Any
 from .. import paths
 from ..llm import AISettings
 from ..notify import NotifySettings
-from .types import MarketType, Network, symbol_shape_error
+from .types import CADENCE_CHOICES, TIMEFRAME_SECONDS, MarketType, Network, symbol_shape_error
 
 log = logging.getLogger(__name__)
 
@@ -115,6 +115,18 @@ class AIAutoSettings:
     # Best parameter sets explicitly applied from the strategy lab, keyed by
     # strategy. They never change without a human clicking “apply”.
     strategy_params: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # 决策节奏：`bar` = 跟着主周期收盘（改前唯一的行为），其余是固定节拍。
+    # 和 timeframe 是两件事：4h 结构 + 每 15 分钟决策一次是合法组合。
+    cadence: str = "bar"
+    # 参考周期：除了主周期之外还要看的结构周期（最多两个，不能等于主周期）。
+    # 主周期负责触发，参考周期负责「方向有没有被更大级别的结构否掉」。
+    timeframes: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        # 读盘与 replace()（设置页那段草稿副本）都会走到这里：手改坏的值在入口
+        # 就收干净，下游（引擎、路由）不必各自再兜一遍。
+        self.cadence = clean_cadence(self.cadence)
+        self.timeframes = clean_timeframes(self.timeframes)
 
 
 @dataclass
@@ -152,6 +164,38 @@ class TradeSettings:
     leverage: dict[str, int] = field(
         default_factory=lambda: {name: 1 for name in TRADE_LEVERAGE_MARKETS}
     )
+
+
+def clean_cadence(value: Any, default: str = "bar") -> str:
+    """读盘用：认得的节拍照留，认不得（或写坏）的退回「跟主周期」。"""
+    text = str(value or "").strip()
+    if text in CADENCE_CHOICES:
+        return text
+    if text:
+        log.warning("配置里的 ai_auto.cadence 不是已知节拍（%r），按跟主周期处理", value)
+    return default
+
+
+# 参考周期最多两个：再多模型看不过来，digest 也会被撑长，决策反而变慢变糊。
+REFERENCE_TIMEFRAME_LIMIT = 2
+
+
+def clean_timeframes(values: Any, limit: int = REFERENCE_TIMEFRAME_LIMIT) -> list[str]:
+    """读盘用：去重、保序、截到上限，认不得的周期丢掉。"""
+    out: list[str] = []
+    for value in values if isinstance(values, (list, tuple)) else ():
+        text = str(value or "").strip()
+        if not text:
+            continue
+        if text not in TIMEFRAME_SECONDS:
+            log.warning("配置里的 ai_auto.timeframes 有不认识的周期（%r），已忽略", text)
+            continue
+        if text in out:
+            continue
+        out.append(text)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def clean_trade_leverage(values: Any) -> dict[str, int]:

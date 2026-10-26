@@ -3955,6 +3955,42 @@ main.main > .stage-bar:not(.page-head) {
   color: var(--text-3);
 }
 
+/* 参考周期：一排可多选的周期按钮，窄窗口自动换行。 */
+.tf-pick {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tf-pick button {
+  padding: 5px 10px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-2);
+  cursor: pointer;
+}
+
+.tf-pick button:hover {
+  background: var(--bg-hover);
+}
+
+.tf-pick button[aria-pressed="true"] {
+  border-color: var(--border-strong);
+  background: var(--bg);
+  color: var(--ink);
+}
+
+.tf-pick button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.tf-pick b {
+  font-size: var(--fs-13);
+  font-weight: 500;
+}
+
 /* 决策时间线：一条一行，点开看各段。 */
 .timeline {
   display: flex;

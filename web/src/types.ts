@@ -482,6 +482,10 @@ export interface AIAutoSettings {
   require_stop: boolean;
   /** 决策深度：quick 一次调用，standard 四段，deep 六段。 */
   depth: string;
+  /** 决策节奏：bar 跟主周期，其余是固定节拍（5m / 15m / 30m / 1h / 4h）。 */
+  cadence: string;
+  /** 参考周期：除主周期之外还要看的结构周期，最多两个。 */
+  timeframes: string[];
   strategy_params?: Record<string, Record<string, unknown>>;
 }
 
@@ -518,6 +522,12 @@ export interface AIDecisionRecord {
   network?: string;
   state?: string;
   depth?: string;
+  /** 这一条决策按什么节奏跑出来的（bar / 15m / …）。 */
+  cadence?: string;
+  /** 固定节拍下的时间片编号；bar 模式恒 0。 */
+  slot?: number;
+  /** 这一轮看过的参考周期。 */
+  timeframes?: string[];
   trace?: PipelineStage[];
 }
 
@@ -538,6 +548,12 @@ export interface AITraderStatus {
     leverage?: number;
     /** 被收口时的那句话，原样显示。 */
     leverage_note?: string;
+    /** 这一轮按什么节奏在跑：bar / 15m / …。 */
+    cadence?: string;
+    /** 节拍秒数（0 = 周期不认识）。 */
+    cadence_seconds?: number;
+    /** 参考周期。 */
+    timeframes?: string[];
   };
   counters?: {
     decisions_today?: number;
@@ -547,12 +563,18 @@ export interface AITraderStatus {
   };
   /** 决策节奏：跟着 K 线周期走（1h → 每根 1h K 线收盘后一次）。 */
   cadence?: {
-    /** 这根 K 线多长（秒）。0 = 周期不认识，界面按本页选的周期自己换算。 */
+    /** bar = 跟主周期；其余是固定节拍（15m / 1h / …）。 */
+    mode?: string;
+    /** 一步节拍多少秒。0 = 算不出来，界面退回本页选的周期。 */
+    seconds?: number;
+    /** 主周期这根 K 线多长（秒）。 */
     bar_seconds?: number;
     /** 下一次决策的预计时刻（epoch 秒）。没在跑就是 null。 */
     next_run_at?: number | null;
     /** 上一次真正决策的那根 K 线的开放时间（毫秒）。 */
     last_bar_ts?: number;
+    /** 固定节拍下已处理的时间片编号。 */
+    last_slot?: number;
   };
   last_decision?: AIDecisionRecord | null;
   events?: AIDecisionRecord[];
