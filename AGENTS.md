@@ -297,6 +297,15 @@ Node 不在 PATH 时，先把 Node 目录加进去。
   流水线只出文本。方向约束、`AIGuard`、下单都在 `engine/ai_trader.py`，分段不能放宽任何一条。
   行情摘要走 `ai.digest_set`（`ai.py`）：主周期一整段（含逐根明细），参考周期只给结论级
   事实，开头一句说明「主周期负责触发、参考周期负责结构」。单周期路径仍用 `ai.digest`。
+- 决策准则（`ai_policy.py`）是一段人确认过的文本 + 参数补丁 + 版本历史，存在数据目录的
+  `ai-policy.json`。补丁只认 `ai_policy.PATCH_FIELDS`（就是 `ai_auto` 那一段的字段），
+  校验走 `routes._apply_ai_auto` 同一条路，再经 `clamp_ai_auto` 收口到 `risk` 的硬顶。
+  三条不变量：`confirm_live` 不在 `ai_auto` 里（改不到）、急停/熔断在 `risk` 段（不在白名单）、
+  `enabled` 也不收。**应用与回滚都是人的动作**（`POST /api/ai/policy/apply` / `rollback`），
+  模型只出建议（`POST /api/ai/policy/review`，提示词在 `ai_review.py`）。每次应用记一版历史
+  加一条 `kind=policy` 审计；`rollback(version)` 恢复那一版应用之前的 `ai_auto` 快照、
+  并把这件撤销本身记成新的一版，历史只追加不回写。准则文本经 `PipelineContext.policy`
+  进技术面与裁决段的提示词，并写明「只能更严，冲突以上限和引擎闸门为准」。
 - 深度三档存在 `ai_auto.depth`：quick 一次调用，standard 四段，deep 六段。
   `AITraderConfig.depth` 默认 quick（测试和「决策一次」用），界面默认 standard。
 - 裁决段的提示词只有一份，在 `ai_pipeline.DECISION_PROMPT`，`engine/ai_trader` 直接引用。

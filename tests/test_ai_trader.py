@@ -360,6 +360,8 @@ def test_status_payload_no_longer_has_live_enabled(tmp_path):
         "cadence",
         "cadence_seconds",
         "timeframes",
+        # 准则版本：审计与界面都要能对上「这条决策按哪一版准则做的」。
+        "policy_version",
         "max_order_quote",
         "max_position_quote",
         # 杠杆与「被收口」的那句话：界面既要有控件也要有回显，否则用户

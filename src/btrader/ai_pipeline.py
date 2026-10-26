@@ -60,6 +60,8 @@ class PipelineContext:
     news: str = ""
     # 参考周期（除主周期之外的结构周期）。空元组表示只看一根。
     reference_timeframes: tuple[str, ...] = ()
+    # 人确认过的决策准则（见 ai_policy）。空串就是没有，行为与改前一致。
+    policy: str = ""
 
     def signal_line(self) -> str:
         """策略信号那一段。策略是参考，AI 才是决策者。
@@ -76,6 +78,16 @@ class PipelineContext:
         if abs(target) < 1e-9:
             return head + "策略现在是空仓，要不要开仓、开哪个方向，由你按上面的行情自己判断。"
         return head + "你同意就顺势开仓，不同意就 hold。策略看多时不要开空，看空时不要开多。"
+
+    def policy_block(self) -> str:
+        """当前生效的决策准则。明说优先级：准则可以更严，不能更松。"""
+        text = (self.policy or "").strip()
+        if not text:
+            return ""
+        return (
+            "【决策准则】下面是人确认过的操作纪律。它只能比上面的【上限】更严，"
+            "冲突时以上限和引擎闸门为准：\n" + text
+        )
 
     def account_block(self) -> str:
         price = "未知" if self.price is None else f"{self.price}"
@@ -115,6 +127,9 @@ def _context_block(ctx: PipelineContext) -> str:
     line = ctx.signal_line()
     if line:
         parts.append(line)
+    policy = ctx.policy_block()
+    if policy:
+        parts.append(policy)
     return "\n".join(parts)
 
 

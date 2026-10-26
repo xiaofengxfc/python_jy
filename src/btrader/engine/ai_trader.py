@@ -129,6 +129,10 @@ class AITraderConfig:
     cadence: str = "bar"
     # 参考周期（除主周期之外的结构周期，最多两个）。
     timeframes: tuple[str, ...] = ()
+    # 人确认过的决策准则（ai_policy 当前版本）。空串 = 没有，提示词和改前一致。
+    policy_text: str = ""
+    # 准则版本号，只用来回填审计：事后要能对上「这条决策是按哪一版准则做的」。
+    policy_version: int = 0
 
 
 @dataclass
@@ -1328,6 +1332,7 @@ class AITrader:
             min_confidence=self.config.min_confidence,
             news=self._news(),
             reference_timeframes=tuple(self.config.timeframes),
+            policy=self.config.policy_text,
         )
         return ai_pipeline.run(self.llm, ctx, depth=self.config.depth)
 
@@ -1392,6 +1397,8 @@ class AITrader:
             # 「同一根 K 线上按节拍决策了四次」和「换了四根 K 线」。
             "slot": int(self._last_slot),
             "timeframes": list(self.config.timeframes),
+            # 按哪一版准则做的决策。准则换过之后回头看，这一条仍是当时那版。
+            "policy_version": int(self.config.policy_version),
             # 这一条决策属于哪根 K 线（毫秒开放时间）：界面上要能说清「这是 1h
             # 那根收盘后做的」，同一根只该有一条。
             "bar_ts": int(self._last_bar_ts),
@@ -1453,6 +1460,7 @@ class AITrader:
                 "cadence": self._cadence_mode(),
                 "cadence_seconds": self._cadence_seconds(),
                 "timeframes": list(self.config.timeframes),
+                "policy_version": int(self.config.policy_version),
                 "max_order_quote": self.config.max_order_quote,
                 "max_position_quote": self.config.max_position_quote,
                 # 杠杆以前根本不出现在 status 里：界面既没控件也没回显，

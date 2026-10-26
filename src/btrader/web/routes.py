@@ -53,6 +53,7 @@ from ..ai_pipeline import DEPTHS
 from ..engine.ai_trader import (
     AITrader,
     AITraderConfig,
+    AuditLog,
     TradeBudget,
     TradeLease,
     read_audit_rows,
@@ -74,7 +75,7 @@ from ..strategy.source import (
     restore_builtin,
     save_source,
 )
-from .. import ai, llm
+from .. import ai, ai_policy, ai_review, llm
 from .. import paths
 
 log = logging.getLogger(__name__)
@@ -306,6 +307,28 @@ class AITraderStartPayload(BaseModel):
     # 杠杆：空或 null 表示用 ai_auto.leverage。声明成 Any 的理由和下单框一样——
     # float 字段会把 true 悄悄变成 1.0，而「杠杆：是」在盘面上不是 1 倍的意思。
     leverage: Any = None
+
+
+class AIPolicyReviewPayload(BaseModel):
+    """复盘：读最近多少条决策。上限在路由里收。"""
+
+    limit: int = 30
+
+
+class AIPolicyApplyPayload(BaseModel):
+    """应用一份补丁。参数走设置层校验，文本进准则历史。"""
+
+    text: str = ""
+    overrides: dict[str, Any] = Field(default_factory=dict)
+    note: str = ""
+    author: str = ""
+    findings: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class AIPolicyRollbackPayload(BaseModel):
+    """撤销某一版：恢复它应用之前的那份参数。"""
+
+    version: int
 
 
 class AITraderPausePayload(BaseModel):
@@ -855,6 +878,8 @@ class AITraderController:
             market,
             cfg.leverage if payload.leverage is None else payload.leverage,
         )
+        # 决策准则：这一版文本进提示词，版本号进审计。准则为空时与改前完全一致。
+        policy_state = ai_policy.load()
         config = AITraderConfig(
             enabled=True,
             confirm_live=payload.confirm_live,
@@ -884,6 +909,8 @@ class AITraderController:
             depth=depth,
             cadence=cadence,
             timeframes=tuple(refs),
+            policy_text=str(policy_state.get("text") or ""),
+            policy_version=int(policy_state.get("version") or 0),
         )
         trader = AITrader(
             config,
@@ -1754,6 +1781,54 @@ def build_router(get_state: Callable[[], Any]) -> APIRouter:
             raise HTTPException(status_code=500, detail=f"读取审计日志失败：{exc}") from exc
         return {"items": list(rows)}
 
+    # ---------------------------------------------------------------- policy
+    # AI 交易的决策准则。四条：看当前版本、复盘出建议、应用一份补丁、撤销某一版。
+    # 应用是唯一会写配置的入口，且只有人能点——模型自己碰不到这个接口。
+    @router.get("/api/ai/policy")
+    def ai_policy_view() -> dict[str, Any]:
+        """当前准则 + 历史版本摘要（不含每版的两份完整参数快照）。"""
+        return ai_policy.public_view(ai_policy.load())
+
+    @router.post("/api/ai/policy/review")
+    def ai_policy_review(payload: AIPolicyReviewPayload) -> dict[str, Any]:
+        """复盘最近几轮决策，给「不足 + 候选补丁」。只出建议，不动任何配置。"""
+        ctx = get_state().ctx
+        rows: list[dict[str, Any]] = []
+        path = paths.logs_dir() / "ai-trade-audit.jsonl"
+        if path.exists():
+            try:
+                rows = [
+                    row
+                    for row in read_audit_rows(path, since=0, limit=500)
+                    if row.get("kind") == "decision"
+                ]
+            except OSError as exc:
+                raise HTTPException(
+                    status_code=500, detail=f"读取审计日志失败：{exc}"
+                ) from exc
+        policy_state = ai_policy.load()
+        result = ai_review.review(
+            ctx.ai,
+            rows,
+            ai_auto=asdict(ctx.settings.ai_auto),
+            policy_text=str(policy_state.get("text") or ""),
+            limit=max(1, min(int(payload.limit or 30), 200)),
+        )
+        if not result.get("ok"):
+            raise HTTPException(status_code=400, detail=result.get("error") or "复盘失败")
+        result["policy_version"] = int(policy_state.get("version") or 0)
+        return result
+
+    @router.post("/api/ai/policy/apply")
+    def ai_policy_apply(payload: AIPolicyApplyPayload) -> dict[str, Any]:
+        """应用一份补丁。逻辑在 apply_policy_patch（测试直接调那个函数）。"""
+        return apply_policy_patch(get_state().ctx, payload)
+
+    @router.post("/api/ai/policy/rollback")
+    def ai_policy_rollback(payload: AIPolicyRollbackPayload) -> dict[str, Any]:
+        """撤销某一版。逻辑在 rollback_policy。"""
+        return rollback_policy(get_state().ctx, payload.version)
+
     # ------------------------------------------------------------- backtest
     @router.post("/api/backtest/run")
     def backtest_run(payload: BacktestPayload) -> dict[str, Any]:
@@ -1805,6 +1880,146 @@ def _last_price(state, market: MarketType, symbol: str) -> float | None:
         return price or None
     except Exception:
         return None
+
+
+def clamp_ai_auto(draft: AIAutoSettings, risk: RiskSettings) -> list[str]:
+    """把 AI 自己的上限收口到风控硬顶内，返回被收口的说明。
+
+    AITrader 的每单还要过 RiskManager，所以 AI 的上限比风控松时，结果是「每一轮
+    都被拒一次」而界面显示「已放宽」。这里当场收回来，并把那句话原样回显给人。
+    """
+    notes: list[str] = []
+    caps = (
+        ("max_order_quote", float(risk.max_order_quote or 0.0), "单笔上限"),
+        ("max_position_quote", float(risk.max_position_quote or 0.0), "持仓上限"),
+        ("leverage", float(risk.max_leverage or 0.0), "杠杆"),
+    )
+    for field_name, cap, label in caps:
+        if cap <= 0:  # 风控里 0 表示这条不限，不再收口
+            continue
+        current = float(getattr(draft, field_name) or 0.0)
+        if current > cap:
+            setattr(draft, field_name, cap)
+            notes.append(f"{label} {current:g} 超过风控上限 {cap:g}，按 {cap:g} 存")
+    return notes
+
+
+def apply_policy_patch(ctx: Any, payload: "AIPolicyApplyPayload") -> dict[str, Any]:
+    """应用一份补丁：参数过设置层校验 → 收口到风控硬顶 → 记一版历史。
+
+    这是唯一会写 ai_auto 的 AI 入口，而且必须由人点「应用」才会走到：模型只提建议，
+    碰不到这个函数。三条不变量在这里落实——confirm_live 不在 ai_auto 里（改不到），
+    急停 / 熔断在 risk 段（补丁白名单不收），风控硬顶在下面 clamp_ai_auto 里收口。
+    """
+    try:
+        overrides = ai_policy.clean_overrides(payload.overrides)
+    except ai_policy.PolicyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    before = asdict(ctx.settings.ai_auto)
+    draft = replace(ctx.settings.ai_auto)
+    warnings: list[str] = []
+    if overrides:
+        # 和 PUT /api/settings 走同一条校验：AI 写进去的和人手动改的不能有两套口径。
+        _apply_ai_auto(draft, overrides)
+        warnings = clamp_ai_auto(draft, ctx.settings.risk)
+    after = asdict(draft)
+    changed = {key: value for key, value in after.items() if before.get(key) != value}
+    if changed:
+        ctx.settings.ai_auto = draft
+        ctx.save_settings()
+    policy_state = ai_policy.load()
+    try:
+        next_state = ai_policy.apply_version(
+            policy_state,
+            text=payload.text,
+            overrides=changed,
+            note=payload.note,
+            author=payload.author or "人工",
+            before=before,
+            after=after,
+            findings=payload.findings,
+        )
+    except ai_policy.PolicyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    ai_policy.save(next_state)
+    _audit_policy(next_state, changed, warnings)
+    log.info(
+        "决策准则升到 v%s：%s", next_state["version"], "、".join(changed) or "只有文本"
+    )
+    return {
+        "policy": ai_policy.public_view(next_state),
+        "ai_auto": after,
+        "changed": changed,
+        "warnings": warnings,
+    }
+
+
+def rollback_policy(ctx: Any, version: int) -> dict[str, Any]:
+    """撤销某一版：恢复它应用之前的那份参数，并把这次撤销也记成一版。
+
+    历史只追加、不回写：撤销本身也是一次变更，事后能看到「谁在什么时候撤了哪一版」。
+    """
+    policy_state = ai_policy.load()
+    entry = ai_policy.find_version(policy_state, version)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"没有第 {version} 版")
+    restore = entry.get("before")
+    if not isinstance(restore, dict) or not restore:
+        raise HTTPException(
+            status_code=400, detail="这一版没有留下应用之前的参数，无法回滚"
+        )
+    before = asdict(ctx.settings.ai_auto)
+    draft = replace(ctx.settings.ai_auto)
+    # enabled 不在回滚范围里：它记的是「当时开关是什么状态」，恢复它只会让人困惑。
+    wanted = {key: value for key, value in restore.items() if key != "enabled"}
+    _apply_ai_auto(draft, wanted)
+    warnings = clamp_ai_auto(draft, ctx.settings.risk)
+    after = asdict(draft)
+    ctx.settings.ai_auto = draft
+    ctx.save_settings()
+    next_state = ai_policy.apply_version(
+        policy_state,
+        text=str(entry.get("text") or ""),
+        overrides={key: value for key, value in after.items() if before.get(key) != value},
+        note=f"撤销 v{version}：恢复它应用之前的参数",
+        author="人工",
+        before=before,
+        after=after,
+    )
+    ai_policy.save(next_state)
+    _audit_policy(next_state, {"rollback_to": version}, warnings, event="rollback")
+    log.warning("决策准则回滚：撤销 v%s，记成 v%s", version, next_state["version"])
+    return {
+        "policy": ai_policy.public_view(next_state),
+        "ai_auto": after,
+        "warnings": warnings,
+    }
+
+
+def _audit_policy(
+    state: dict[str, Any],
+    changed: dict[str, Any],
+    warnings: list[str],
+    *,
+    event: str = "apply",
+) -> None:
+    """准则变更也写进 ai-trade-audit.jsonl：事后能对上「这条决策按哪一版做的」。"""
+    path = paths.logs_dir() / "ai-trade-audit.jsonl"
+    try:
+        AuditLog(path).append(
+            {
+                "at": time.time(),
+                "kind": "policy",
+                "event": event,
+                "version": int(state.get("version") or 0),
+                "author": str(state.get("author") or ""),
+                "note": str(state.get("note") or ""),
+                "changed": dict(changed or {}),
+                "warnings": list(warnings or []),
+            }
+        )
+    except Exception:  # pragma: no cover - 磁盘满等
+        log.warning("写入准则变更审计失败", exc_info=True)
 
 
 def apply_settings(ctx: Any, payload: "SettingsPayload") -> list[str]:

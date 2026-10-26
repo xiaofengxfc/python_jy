@@ -3991,6 +3991,78 @@ main.main > .stage-bar:not(.page-head) {
   font-weight: 500;
 }
 
+/* 决策准则：一段文本 + 建议 + 历史。 */
+.policy-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.policy-review {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle);
+}
+
+.policy-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: var(--fs-13);
+}
+
+.policy-finding {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  font-size: var(--fs-13);
+  color: var(--text-2);
+}
+
+.policy-finding .sev {
+  flex: none;
+  padding: 0 5px;
+  border-radius: 4px;
+  font-size: var(--fs-12);
+  background: var(--bg-hover);
+  color: var(--text-2);
+}
+
+.policy-finding .sev.high {
+  color: #b42318;
+}
+
+.policy-finding .sev.medium {
+  color: #b54708;
+}
+
+.policy-finding em {
+  font-style: normal;
+  color: var(--text-3);
+}
+
+.policy-preview {
+  white-space: pre-wrap;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  font-size: var(--fs-13);
+  line-height: 1.5;
+}
+
+.policy-history {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
 /* 决策时间线：一条一行，点开看各段。 */
 .timeline {
   display: flex;

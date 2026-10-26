@@ -961,3 +961,45 @@ export interface StreamFrame {
   asks?: [number, number][];
   message?: string;
 }
+/** 决策准则（ai_policy）：一段文本 + 参数补丁 + 版本历史。 */
+export interface AIPolicyVersion {
+  version: number;
+  at: number;
+  author: string;
+  note: string;
+  overrides: Record<string, unknown>;
+}
+
+export interface AIPolicyField {
+  key: string;
+  label: string;
+}
+
+export interface AIPolicy {
+  version: number;
+  text: string;
+  updated_at: number;
+  author: string;
+  overrides: Record<string, unknown>;
+  /** 补丁能改的字段，后端给，界面不自己写一份。 */
+  fields: AIPolicyField[];
+  history: AIPolicyVersion[];
+}
+
+export interface AIPolicyFinding {
+  issue: string;
+  evidence: string;
+  severity: string;
+}
+
+/** 一次复盘的结果：只出建议，应用与否由人决定。 */
+export interface AIPolicyReview {
+  ok: boolean;
+  count: number;
+  findings: AIPolicyFinding[];
+  patch: { text: string; overrides: Record<string, unknown>; rationale: string };
+  /** 被丢掉的补丁键（不在白名单、值不合法、文本超长）。 */
+  rejected: string[];
+  expected_effect: string;
+  policy_version: number;
+}

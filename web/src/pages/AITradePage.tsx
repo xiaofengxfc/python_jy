@@ -14,6 +14,7 @@ import type {
   SymbolInfo,
 } from "../types";
 import MetricGrid from "../components/MetricGrid";
+import PolicyCard from "../components/PolicyCard";
 import { createSectionSaver, resetSection } from "../settingsAutoSave";
 
 /** 全自动 AI 交易：一次决策走完整条流水线，人只负责开关和上限。 */
@@ -880,6 +881,11 @@ export default function AITradePage({ settings, health, onSettingsChange }: Prop
             </div>
           </div>
         </section>
+        <PolicyCard
+          running={running}
+          auto={auto}
+          onApplied={(next) => setAuto((prev) => ({ ...prev, ...next }))}
+        />
       </div>
     </>
   );
